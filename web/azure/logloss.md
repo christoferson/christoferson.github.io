@@ -60,3 +60,43 @@ Business Understanding: Intuitive metrics help stakeholders make decisions
 Model Selection: You might choose a model with slightly higher training loss but better business metrics
 Key Takeaway
 Think of cost functions as the "language" your algorithm uses to learn, while evaluation metrics are the "language" you use to communicate model performance to humans and make business decisions. The best approach often involves optimizing one function while monitoring several others.
+
+
+
+Access Control Models - Study Guide Summary
+Discretionary Access Control (DAC)
+Control: Object owner decides who gets access and what permissions
+Flexibility: High - owners can freely grant/revoke access
+Best For: Small organizations, personal systems, collaborative environments
+Key Feature: User discretion in access decisions
+Weakness: Vulnerable to insider threats, inconsistent security
+Mandatory Access Control (MAC)
+Control: System enforces access based on security labels/classifications
+Flexibility: Low - users cannot override system decisions
+Best For: High-security environments (military, government)
+Key Feature: Prevents unauthorized information flow between security levels
+Strength: Strong security, prevents data leakage
+Role-Based Access Control (RBAC)
+Control: Access granted based on user's organizational role
+Flexibility: Medium - roles define permissions, not individuals
+Best For: Corporate environments with clear organizational roles
+Key Feature: Users inherit permissions from assigned roles
+Advantage: Simplifies administration, aligns with business structure
+Attribute-Based Access Control (ABAC)
+Control: Multiple attributes (user, resource, environment) determine access
+Flexibility: Very High - considers context and multiple factors
+Best For: Complex environments requiring fine-grained, context-aware control
+Key Feature: Dynamic decisions based on real-time attributes
+Advantage: Most flexible and context-sensitive
+Rule-Based Access Control
+Control: Predefined rules automatically grant/deny access
+Flexibility: Low - follows strict predetermined rules
+Best For: Network security, automated systems
+Key Feature: Consistent, automated enforcement without human intervention
+Use Case: Firewalls, intrusion detection systems
+Quick Comparison Memory Aid:
+DAC: "Owner decides"
+MAC: "System decides based on labels"
+RBAC: "Role decides"
+ABAC: "Attributes decide"
+Rule-Based: "Rules decide"
