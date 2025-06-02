@@ -100,3 +100,12 @@ MAC: "System decides based on labels"
 RBAC: "Role decides"
 ABAC: "Attributes decide"
 Rule-Based: "Rules decide"
+
+
+Quick Reference Table
+Metric	Formula	What it measures
+Accuracy	(TP + TN) / Total	Overall performance
+Recall	TP / (TP + FN)	Coverage of actual positives
+Precision	TP / (TP + FP)	Accuracy of positive predictions
+Specificity	TN / (TN + FP)	Coverage of actual negatives
+FPR	FP / (FP + TN)	Rate of false alarms
