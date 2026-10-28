@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 1.2: Integrate Automated Testing into CI/CD Pipelines | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 Task 1.2 study guide: test types and where they belong in a pipeline, pull request builds, load testing at scale, exit codes, unit tests and code coverage, and invoking AWS services for testing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DOP-C02</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">Task 1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; SDLC Automation &middot; 22%</span>
+		<h1>Task 1.2: Integrate automated testing into CI/CD pipelines</h1>
+		<p>Which tests to run, where in the pipeline to run them, and how a pipeline decides from test results whether a change may move forward.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CodeBuild</span><span class="tag">CodePipeline</span><span class="tag">Lambda</span><span class="tag">Step Functions</span><span class="tag">CloudWatch Synthetics</span><span class="tag">Fault Injection Service</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#k1">Types of tests</a></li>
+				<li><a href="#k2">Tests at each pipeline stage</a></li>
+				<li><a href="#s1">Builds on pull requests and merges</a></li>
+				<li class="sub"><a href="#pr-github">GitHub, GitLab, Bitbucket</a></li>
+				<li class="sub"><a href="#pr-codecommit">CodeCommit</a></li>
+				<li><a href="#s2">Load tests and testing at scale</a></li>
+				<li><a href="#s3">Health from exit codes</a></li>
+				<li><a href="#s4">Unit tests and code coverage</a></li>
+				<li><a href="#s5">Invoking AWS services for testing</a></li>
+				<li class="sub"><a href="#lambda-invoke">Lambda invoke action</a></li>
+				<li class="sub"><a href="#ephemeral">Ephemeral test environments</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task statement 1.2</span>
+				<p><strong>Integrate automated testing into CI/CD pipelines.</strong></p>
+			</div>
+			<p>A pipeline is only as safe as the tests inside it. This task tests whether you can choose the right kind of test for a requirement, place it at the right stage, and wire it in so that a failure actually stops the pipeline. Typical scenarios: "every pull request must be built and tested before merge", "the release must handle 10,000 requests per second", or "a validation function runs but the pipeline never moves on".</p>
+			<div class="table-wrap">
+				<table>
+					<thead><tr><th>Exam guide item</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>Knowledge: types of tests</td><td>Tell unit, integration, acceptance, UI and security tests apart, and know what each catches</td></tr>
+						<tr><td>Knowledge: tests at different stages</td><td>Put fast, cheap tests early and slow, expensive tests later</td></tr>
+						<tr><td>Skill: builds on pull requests and merges</td><td>Trigger CodeBuild on pull request events and report the result back</td></tr>
+						<tr><td>Skill: load tests and testing at scale</td><td>Generate realistic load, measure performance and fail on regressions</td></tr>
+						<tr><td>Skill: health from exit codes</td><td>Make sure every test step reports success or failure correctly</td></tr>
+						<tr><td>Skill: unit tests and code coverage</td><td>Publish test and coverage reports, and enforce a coverage threshold</td></tr>
+						<tr><td>Skill: invoking AWS services for testing</td><td>Use Lambda, Step Functions, CloudFormation and other services as test actions</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Knowledge 1 -->
+			<h2 id="k1">Different types of tests</h2>
+			<div class="item">
+				<span class="kicker">Knowledge</span>
+				<p>Each test type answers a different question. The exam often describes a problem that slipped through ("the API returned the wrong format to the mobile app") and asks which test would have caught it.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Test type</th><th>What it checks</th><th>Speed</th><th>Typical tools on AWS</th></tr></thead>
+						<tbody>
+							<tr><td>Unit</td><td>One function or class in isolation, with dependencies mocked</td><td>Seconds</td><td>JUnit, pytest, Jest run in CodeBuild</td></tr>
+							<tr><td>Integration</td><td>Components working together: the app with a real database, queue or API</td><td>Minutes</td><td>CodeBuild against a test environment; LocalStack or containers for local dependencies</td></tr>
+							<tr><td>Acceptance (end-to-end)</td><td>The system meets business requirements from the user's point of view</td><td>Minutes</td><td>CodeBuild running Cucumber or API test suites against a deployed stage</td></tr>
+							<tr><td>User interface</td><td>Screens and user flows in real browsers or devices</td><td>Minutes</td><td>Selenium or Playwright in CodeBuild, AWS Device Farm, CloudWatch Synthetics canaries</td></tr>
+							<tr><td>Smoke</td><td>A few critical paths work right after a deployment</td><td>Seconds</td><td>CodeDeploy hooks, Lambda invoke actions, Synthetics canaries</td></tr>
+							<tr><td>Load and performance</td><td>Latency and throughput under expected and peak traffic</td><td>Tens of minutes</td><td>Distributed Load Testing on AWS, JMeter, k6, Locust</td></tr>
+							<tr><td>Resilience (chaos)</td><td>The system recovers when parts fail</td><td>Tens of minutes</td><td>AWS Fault Injection Service <span class="badge renamed">formerly Fault Injection Simulator</span></td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Security scans</h3>
+				<p>Security scans are tests too. Each kind looks at a different layer:</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Scan</th><th>What it looks at</th><th>Examples</th></tr></thead>
+						<tbody>
+							<tr><td>Static analysis (SAST)</td><td>Source code, for injection flaws, hard-coded credentials and unsafe patterns</td><td>Amazon CodeGuru Reviewer, Amazon Q Developer code reviews, SonarQube</td></tr>
+							<tr><td>Dependency scanning</td><td>Open source libraries with known vulnerabilities (CVEs)</td><td>Amazon Inspector, OWASP Dependency-Check</td></tr>
+							<tr><td>Container image scanning</td><td>OS packages and libraries inside an image</td><td>Amazon ECR scanning (basic, or enhanced with Inspector)</td></tr>
+							<tr><td>Infrastructure as code scanning</td><td>Templates that would create insecure resources (public buckets, open security groups)</td><td>cfn-lint, CloudFormation Guard, cfn-nag, Checkov</td></tr>
+							<tr><td>Secrets scanning</td><td>Credentials committed to the repository</td><td>git-secrets, Amazon CodeGuru Reviewer secrets detection</td></tr>
+							<tr><td>Dynamic analysis (DAST)</td><td>A running application, probed from the outside like an attacker</td><td>OWASP ZAP in CodeBuild against a test stage</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>"Find vulnerable libraries before the image is deployed" points to <strong>image or dependency scanning in the build stage</strong>. "Block templates that create public S3 buckets" points to <strong>IaC scanning</strong> (for example, CloudFormation Guard rules) before the deploy stage. AWS Config rules catch the same problem only <em>after</em> deployment.</p></div>
+			</div>
+
+			<!-- Knowledge 2 -->
+			<h2 id="k2">Reasonable use of tests at different stages of the pipeline</h2>
+			<div class="item">
+				<span class="kicker">Knowledge</span>
+				<p>The rule of thumb is <strong>fail fast and cheap</strong>. Run quick tests that need no infrastructure first, so most bad changes are rejected within minutes. Run slow tests that need a deployed environment later, on fewer changes. This is the <strong>test pyramid</strong>: many unit tests, fewer integration tests, and a small number of end-to-end and UI tests.</p>
+				<p>A typical layout, from the earliest stage to the last:</p>
+				<ol class="flow">
+					<li class="group">Before merge</li>
+					<li><span class="name">Pull request validation</span><span class="desc">Build, lint, unit tests, static analysis and secrets scanning on every pull request. Results are posted back to the pull request, and merge is blocked until they pass.</span></li>
+					<li class="group">Build stage</li>
+					<li><span class="name">Unit tests and code coverage</span><span class="desc">Run again on the merged code. Fail if coverage drops below the agreed threshold.</span></li>
+					<li><span class="name">Package and scan</span><span class="desc">Build the image or artifact, then scan dependencies, the image and the IaC templates.</span></li>
+					<li class="group">Test stage (deployed test environment)</li>
+					<li><span class="name">Integration and API tests</span><span class="desc">Deploy to a test environment, then test against real AWS services such as DynamoDB, SQS or an RDS database.</span></li>
+					<li><span class="name">Acceptance and UI tests</span><span class="desc">Run user journeys end to end, in browsers or on devices.</span></li>
+					<li class="group">Staging stage (production-like)</li>
+					<li><span class="name">Load, performance and resilience tests</span><span class="desc">Run at production scale in an environment that mirrors production. Add DAST and fault injection experiments here.</span></li>
+					<li><span class="name">Manual approval (optional)</span><span class="desc">Only if the scenario requires a human sign-off before production.</span></li>
+					<li class="group">Production stage</li>
+					<li><span class="name">Gradual rollout with alarms</span><span class="desc">Canary or linear deployment, with CloudWatch alarms that roll back automatically.</span></li>
+					<li><span class="name">Post-deployment smoke tests and monitoring</span><span class="desc">CodeDeploy validation hooks run quick checks, and Synthetics canaries keep testing critical paths around the clock.</span></li>
+				</ol>
+				<div class="callout trap"><p>Running full load tests or long UI suites on <strong>every pull request</strong> slows feedback and costs money. Running only unit tests and then deploying straight to production misses integration problems. The exam expects the layered approach above.</p></div>
+				<div class="callout tip"><p>Run load and chaos tests in a <strong>separate staging account</strong>. Generated traffic then can't exhaust production service quotas or trigger production alarms.</p></div>
+			</div>
+
+			<!-- Skill 1 -->
+			<h2 id="s1">Running builds or tests on pull requests and code merges</h2>
+			<div class="item" id="pr-github">
+				<span class="kicker">Skill</span>
+				<h3>GitHub, GitLab and Bitbucket: CodeBuild webhooks</h3>
+				<p>A CodeBuild project with a webhook starts a build when the Git provider sends an event. <strong>Filter groups</strong> decide which events count. Inside a group, every filter must match (AND); across groups, any group can match (OR).</p>
+				<span class="file">codebuild-pr-project.yml</span>
+<pre><code><span class="k">PullRequestBuild:</span>
+  <span class="k">Type:</span> AWS::CodeBuild::Project
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> orders-pr-validation
+    <span class="k">ServiceRole:</span> !GetAtt CodeBuildRole.Arn
+    <span class="k">Source:</span>
+      <span class="k">Type:</span> GITHUB
+      <span class="k">Location:</span> https://github.com/example/orders.git
+      <span class="k">ReportBuildStatus:</span> true                      <span class="c"># green tick or red cross on the pull request</span>
+      <span class="k">BuildSpec:</span> buildspec-pr.yml
+    <span class="k">Triggers:</span>
+      <span class="k">Webhook:</span> true
+      <span class="k">FilterGroups:</span>
+        - - { Type: EVENT, Pattern: "PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED" }
+          - { Type: BASE_REF, Pattern: "^refs/heads/main$" }   <span class="c"># only pull requests into main</span>
+    <span class="k">Environment:</span>
+      <span class="k">Type:</span> LINUX_CONTAINER
+      <span class="k">ComputeType:</span> BUILD_GENERAL1_SMALL
+      <span class="k">Image:</span> aws/codebuild/standard:7.0
+    <span class="k">Artifacts:</span> { Type: NO_ARTIFACTS }</code></pre>
+				<ul>
+					<li><strong>Other filter types:</strong> <code>HEAD_REF</code> (source branch), <code>FILE_PATH</code> (changed files), <code>ACTOR_ACCOUNT_ID</code> (who triggered it), and <code>COMMIT_MESSAGE</code> (for example, skip builds on <code>[skip ci]</code>).</li>
+					<li><strong>Branch protection:</strong> in the Git provider, require the CodeBuild status check to pass before merge. This is what actually blocks a bad merge.</li>
+					<li><strong>Pipeline alternative:</strong> a CodePipeline <strong>V2</strong> pipeline can trigger on pull request events directly. Use <strong>Parallel</strong> execution mode so pull requests don't queue behind each other.</li>
+					<li><strong>After merge:</strong> the merge is a push to <code>main</code>, which starts the main delivery pipeline. That's where the full test sequence runs.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="pr-codecommit">
+				<span class="kicker">Skill</span>
+				<h3>CodeCommit: EventBridge rule, CodeBuild and a Lambda function</h3>
+				<p>CodeCommit doesn't use webhooks. Pull request events go to <strong>EventBridge</strong> instead, and you connect the pieces yourself:</p>
+				<ol class="flow">
+					<li><span class="name">A developer opens or updates a pull request</span><span class="desc">CodeCommit emits a <code>CodeCommit Pull Request State Change</code> event.</span></li>
+					<li><span class="name">An EventBridge rule matches the event</span><span class="desc">It filters on <code>pullRequestCreated</code> and <code>pullRequestSourceBranchUpdated</code>.</span></li>
+					<li><span class="name">The rule starts a CodeBuild build</span><span class="desc">It passes the source commit as the source version, so the build tests the pull request's code.</span></li>
+					<li><span class="name">A second rule reacts to the build result</span><span class="desc">A Lambda function posts a comment on the pull request and can approve it (approval rule templates can require that approval).</span></li>
+				</ol>
+				<span class="file">eventbridge-rule.yml</span>
+<pre><code><span class="k">PullRequestRule:</span>
+  <span class="k">Type:</span> AWS::Events::Rule
+  <span class="k">Properties:</span>
+    <span class="k">EventPattern:</span>
+      <span class="k">source:</span> [aws.codecommit]
+      <span class="k">detail-type:</span> [CodeCommit Pull Request State Change]
+      <span class="k">resources:</span> [arn:aws:codecommit:us-east-1:111111111111:orders]
+      <span class="k">detail:</span>
+        <span class="k">event:</span> [pullRequestCreated, pullRequestSourceBranchUpdated]
+    <span class="k">Targets:</span>
+      - <span class="k">Id:</span> start-pr-build
+        <span class="k">Arn:</span> !GetAtt PullRequestBuild.Arn             <span class="c"># the CodeBuild project</span>
+        <span class="k">RoleArn:</span> !GetAtt EventsInvokeCodeBuildRole.Arn  <span class="c"># allows codebuild:StartBuild</span>
+        <span class="k">InputTransformer:</span>
+          <span class="k">InputPathsMap:</span>
+            <span class="k">commit:</span> "$.detail.sourceCommit"
+          <span class="k">InputTemplate:</span> '{"sourceVersion": "&lt;commit&gt;"}'</code></pre>
+				<div class="callout tip"><p>"Automatically run tests on every CodeCommit pull request and show the result on the pull request" is answered by <strong>EventBridge + CodeBuild + Lambda</strong> (to comment or approve). It isn't a CodePipeline source action, which watches a single branch.</p></div>
+			</div>
+
+			<!-- Skill 2 -->
+			<h2 id="s2">Running load and stress tests, performance benchmarks and application tests at scale</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<h3>Kinds of performance test</h3>
+				<ul>
+					<li><strong>Load test:</strong> expected peak traffic. Does the app meet its latency and error targets?</li>
+					<li><strong>Stress test:</strong> traffic beyond the peak, to find the breaking point and see how the app fails.</li>
+					<li><strong>Soak (endurance) test:</strong> steady load for hours, to find memory leaks and slow resource exhaustion.</li>
+					<li><strong>Spike test:</strong> a sudden jump in traffic. Does auto scaling react fast enough?</li>
+					<li><strong>Performance benchmark:</strong> the same test on every release, compared with a baseline to catch regressions.</li>
+				</ul>
+
+				<h3>Generating load at scale</h3>
+				<p>One build container can't generate much traffic. To test at scale, run many load generators in parallel:</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Option</th><th>How it works</th><th>When to choose it</th></tr></thead>
+						<tbody>
+							<tr><td>Distributed Load Testing on AWS</td><td>An AWS Solutions template that runs load test containers (JMeter and similar tools) as Fargate tasks across Regions, with a results dashboard and an API</td><td>Large tests with little setup. The pipeline starts a test through its API</td></tr>
+							<tr><td>CodeBuild batch builds</td><td>A build fan-out or build list runs many copies of the same load script in parallel</td><td>Moderate load from inside the pipeline</td></tr>
+							<tr><td>ECS tasks orchestrated by Step Functions</td><td>Step Functions starts N Fargate tasks, waits for them, then collects results</td><td>Custom, repeatable tests with your own tools</td></tr>
+							<tr><td>AWS Device Farm</td><td>Runs UI tests on many real mobile devices and desktop browsers in parallel</td><td>Testing a mobile or web app at scale across devices</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Turning results into a pass or fail</h3>
+				<p>A load test is useful in a pipeline only if it can fail the stage. Define thresholds in the test tool and exit non-zero when they're broken.</p>
+				<span class="file">k6 load test (load-test.js)</span>
+<pre><code>export const options = {
+  stages: [
+    { duration: "2m", target: 500 },     <span class="c">// ramp up to 500 virtual users</span>
+    { duration: "10m", target: 500 },    <span class="c">// hold the load</span>
+    { duration: "1m", target: 0 },
+  ],
+  thresholds: {
+    http_req_duration: ["p(99)&lt;800"],  <span class="c">// 99% of requests under 800 ms</span>
+    http_req_failed: ["rate&lt;0.01"],     <span class="c">// under 1% errors, otherwise k6 exits non-zero</span>
+  },
+};</code></pre>
+				<ul>
+					<li><strong>Watch the system too:</strong> during the test, use CloudWatch metrics and dashboards (CPU, latency, throttling, queue depth) and X-Ray traces to find the bottleneck.</li>
+					<li><strong>Find slow code:</strong> Amazon CodeGuru Profiler shows the most expensive code paths for benchmarking and optimization.</li>
+				</ul>
+
+				<h3>Resilience tests with AWS Fault Injection Service</h3>
+				<p>FIS runs <strong>experiments</strong> that inject failures: stop or terminate EC2 instances, stop ECS tasks, add CPU or memory stress, add network latency, throttle API calls or fail over an Aurora cluster. Each experiment template has <strong>stop conditions</strong>: CloudWatch alarms that end the experiment automatically if the impact gets too big.</p>
+				<div class="callout tip"><p>"Verify that the application keeps serving traffic when an Availability Zone's instances fail, and stop the test if errors exceed a limit" points to an <strong>FIS experiment with a CloudWatch alarm stop condition</strong>, started from the pipeline (for example, by a Step Functions or Lambda action).</p></div>
+			</div>
+
+			<!-- Skill 3 -->
+			<h2 id="s3">Measuring application health based on application exit codes</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<p>Almost every AWS test integration decides pass or fail from an exit code or an explicit result call. <strong>Exit code 0 means success; anything else means failure.</strong> If a test step hides its failure, the pipeline happily promotes broken code.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Where</th><th>How success or failure is decided</th></tr></thead>
+						<tbody>
+							<tr><td>CodeBuild</td><td>Any command that exits non-zero fails its phase, and the build fails</td></tr>
+							<tr><td>CodeDeploy hook scripts (EC2)</td><td>A non-zero exit from a hook script, such as <code>ValidateService</code>, fails the deployment and can trigger rollback</td></tr>
+							<tr><td>CodeDeploy hooks (Lambda, ECS)</td><td>The hook function calls <code>PutLifecycleEventHookExecutionStatus</code> with <code>Succeeded</code> or <code>Failed</code></td></tr>
+							<tr><td>CodePipeline Lambda invoke action</td><td>The function calls <code>PutJobSuccessResult</code> or <code>PutJobFailureResult</code></td></tr>
+							<tr><td>ECS container health check</td><td>The health check command exits 0 (healthy) or non-zero (unhealthy); unhealthy tasks are replaced</td></tr>
+							<tr><td>ECS task in a Step Functions test</td><td>A container exit code other than 0 marks the task, and the step, as failed</td></tr>
+							<tr><td>Load balancer health check</td><td>HTTP status codes; by default 200 counts as healthy for an ALB target group</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Exit codes that get lost</h3>
+				<p>The usual failure: a test step fails, but the exit code is swallowed and the step "passes".</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">env:</span>
+  <span class="k">shell:</span> bash
+<span class="k">phases:</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      <span class="c"># Wrong: tee always exits 0, so a failing test run is hidden</span>
+      <span class="c"># - npm test | tee test-output.log</span>
+
+      <span class="c"># Wrong: "|| true" turns every failure into success</span>
+      <span class="c"># - ./run-integration-tests.sh || true</span>
+
+      <span class="c"># Right: pipefail returns the first failing command's exit code</span>
+      - |
+        set -eo pipefail
+        npm test | tee test-output.log
+        ./run-integration-tests.sh</code></pre>
+				<ul>
+					<li><strong>Multi-line scripts:</strong> use <code>set -e</code> so the script stops at the first failing command, and <code>set -o pipefail</code> so a pipe returns a failure from any stage.</li>
+					<li><strong>Background processes:</strong> a command started with <code>&amp;</code> doesn't report its exit code. Use <code>wait</code> on its process ID and check the result.</li>
+					<li><strong>Wrapper scripts:</strong> make sure they end with <code>exit $?</code> or the test tool's own exit code, not a final <code>echo</code>.</li>
+				</ul>
+				<div class="callout trap"><p>"Tests fail in the logs but the build shows <em>Succeeded</em>" is almost always a <strong>swallowed exit code</strong>: a pipe without <code>pipefail</code>, <code>|| true</code>, or a script that doesn't return the test result.</p></div>
+			</div>
+
+			<!-- Skill 4 -->
+			<h2 id="s4">Automating unit tests and code coverage</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<p>CodeBuild <strong>reports</strong> turn test and coverage files into results you can browse in the console. They show pass and fail counts, duration and trends across builds.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Report type</th><th>Supported formats</th></tr></thead>
+						<tbody>
+							<tr><td>Test reports</td><td>JUnit XML, NUnit XML, NUnit3 XML, TestNG XML, Visual Studio TRX, Cucumber JSON</td></tr>
+							<tr><td>Code coverage reports</td><td>JaCoCo XML, Clover XML, Cobertura XML, SimpleCov JSON, LCOV</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">runtime-versions:</span>
+      java: corretto21
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      <span class="c"># jacoco:check fails the build (non-zero exit) if coverage is below the threshold in pom.xml</span>
+      - mvn -B verify jacoco:report jacoco:check
+<span class="k">reports:</span>
+  <span class="k">unit-tests:</span>                                <span class="c"># report group name</span>
+    <span class="k">files:</span> ["**/*.xml"]
+    <span class="k">base-directory:</span> target/surefire-reports
+    <span class="k">file-format:</span> JUNITXML
+  <span class="k">coverage:</span>
+    <span class="k">files:</span> ["target/site/jacoco/jacoco.xml"]
+    <span class="k">file-format:</span> JACOCOXML</code></pre>
+				<ul>
+					<li><strong>Report groups:</strong> each name under <code>reports</code> is a report group. CodeBuild creates it on first use if the build role has <code>codebuild:CreateReportGroup</code>, <code>CreateReport</code>, <code>UpdateReport</code>, <code>BatchPutTestCases</code> and <code>BatchPutCodeCoverages</code>.</li>
+					<li><strong>Retention:</strong> report results are kept for 30 days. To keep them longer, export the raw files to S3 from the report group.</li>
+					<li><strong>Failing on failed tests:</strong> the test runner's exit code fails the build. The report only displays the results.</li>
+				</ul>
+				<div class="callout trap"><p>CodeBuild <strong>doesn't enforce a coverage threshold</strong> on its own. A coverage report showing 40% doesn't fail anything. Enforce the threshold in the build tool (for example, <code>jacoco:check</code>, Jest <code>coverageThreshold</code> or pytest <code>--cov-fail-under=80</code>) so the build exits non-zero.</p></div>
+			</div>
+
+			<!-- Skill 5 -->
+			<h2 id="s5">Invoking AWS services in a pipeline for testing</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<p>Besides CodeBuild, CodePipeline can call other services as test steps:</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Action</th><th>Use it for</th></tr></thead>
+						<tbody>
+							<tr><td>CodeBuild (Test category)</td><td>Any scripted test suite, including integration, UI and security scans</td></tr>
+							<tr><td>Lambda (Invoke category)</td><td>Short custom checks: call an endpoint, check a value, verify a deployment</td></tr>
+							<tr><td>Step Functions (Invoke category)</td><td>Multi-step or long-running test workflows: start load generators, wait, collect results, clean up</td></tr>
+							<tr><td>AWS Device Farm (Test category)</td><td>Mobile and browser UI tests on real devices</td></tr>
+							<tr><td>CloudFormation (Deploy category)</td><td>Create a temporary test environment, then delete it</td></tr>
+							<tr><td>Manual approval</td><td>Exploratory or user acceptance testing by people</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<div class="item" id="lambda-invoke">
+				<span class="kicker">Skill</span>
+				<h3>Lambda invoke action</h3>
+				<p>CodePipeline invokes the function with a <strong>job</strong>. The function must report the result back. Returning normally isn't enough.</p>
+				<span class="file">pipeline stage</span>
+<pre><code>- <span class="k">Name:</span> Test
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> SmokeTest
+      <span class="k">ActionTypeId:</span> { Category: Invoke, Owner: AWS, Provider: Lambda, Version: "1" }
+      <span class="k">Configuration:</span>
+        <span class="k">FunctionName:</span> orders-smoke-test
+        <span class="k">UserParameters:</span> "https://test.orders.example.com/health"   <span class="c"># passed to the function</span></code></pre>
+				<span class="file">smoke_test.py</span>
+<pre><code>import urllib.request
+import boto3
+
+codepipeline = boto3.client("codepipeline")
+
+def handler(event, context):
+    job = event["CodePipeline.job"]
+    url = job["data"]["actionConfiguration"]["configuration"]["UserParameters"]
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            if response.status != 200:
+                raise Exception(f"Health check returned {response.status}")
+        codepipeline.put_job_success_result(jobId=job["id"])          <span class="c"># action succeeds</span>
+    except Exception as error:
+        codepipeline.put_job_failure_result(                          <span class="c"># action fails, stage stops</span>
+            jobId=job["id"],
+            failureDetails={"type": "JobFailed", "message": str(error)},
+        )</code></pre>
+				<ul>
+					<li><strong>Permissions:</strong> the function's execution role needs <code>codepipeline:PutJobSuccessResult</code> and <code>codepipeline:PutJobFailureResult</code>.</li>
+					<li><strong>Long-running checks:</strong> a Lambda invocation lasts at most 15 minutes. For longer checks, report a <em>continuation token</em> to be invoked again, or use a Step Functions action instead.</li>
+				</ul>
+				<div class="callout trap"><p>"The Lambda test action runs successfully, but the pipeline stays <em>In progress</em> until it times out" means the function <strong>never called <code>PutJobSuccessResult</code></strong>, or its role lacks permission to.</p></div>
+			</div>
+
+			<div class="item" id="ephemeral">
+				<span class="kicker">Skill</span>
+				<h3>Ephemeral test environments with CloudFormation</h3>
+				<p>Integration tests need real resources. Create a fresh stack for the test run, test against it, then delete it. Every run then starts clean, and you pay only while tests run.</p>
+				<span class="file">pipeline stage</span>
+<pre><code>- <span class="k">Name:</span> IntegrationTest
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> CreateTestStack
+      <span class="k">RunOrder:</span> 1
+      <span class="k">Namespace:</span> TestStackVars                      <span class="c"># stack outputs become #{TestStackVars.&lt;OutputName&gt;}</span>
+      <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+      <span class="k">InputArtifacts:</span> [{ Name: BuildOutput }]
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> CREATE_UPDATE
+        <span class="k">StackName:</span> orders-test
+        <span class="k">TemplatePath:</span> BuildOutput::template.yml
+        <span class="k">RoleArn:</span> arn:aws:iam::111111111111:role/CfnExecutionRole
+    - <span class="k">Name:</span> RunIntegrationTests
+      <span class="k">RunOrder:</span> 2                                    <span class="c"># runs after the stack exists</span>
+      <span class="k">ActionTypeId:</span> { Category: Test, Owner: AWS, Provider: CodeBuild, Version: "1" }
+      <span class="k">InputArtifacts:</span> [{ Name: SourceOutput }]
+      <span class="k">Configuration:</span>
+        <span class="k">ProjectName:</span> orders-integration-tests
+    - <span class="k">Name:</span> DeleteTestStack
+      <span class="k">RunOrder:</span> 3
+      <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> DELETE_ONLY
+        <span class="k">StackName:</span> orders-test
+        <span class="k">RoleArn:</span> arn:aws:iam::111111111111:role/CfnExecutionRole</code></pre>
+				<ul>
+					<li><strong>Finding the test environment:</strong> the test build needs the new stack's endpoint. Have the CloudFormation action write stack outputs to an output artifact (<code>OutputFileName</code>), or use its output variables (for example, <code>#{TestStackVars.ApiUrl}</code>) in the next action.</li>
+					<li><strong>Change sets:</strong> <code>CHANGE_SET_REPLACE</code> followed by <code>CHANGE_SET_EXECUTE</code> lets you review or approve infrastructure changes before they're applied.</li>
+				</ul>
+				<div class="callout trap"><p>If the tests at <code>RunOrder</code> 2 fail, the stage stops and the <strong>delete action never runs</strong>, so the test stack stays behind. Plan for it: let the next run's <code>CREATE_UPDATE</code> reuse the stack, or clean up with a scheduled job or a Step Functions workflow that deletes the stack whatever the result.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Fail fast and cheap: lint, unit tests and static scans first; integration and acceptance tests against a deployed test stage; load, DAST and chaos tests in production-like staging.</li>
+				<li>Scan in the pipeline before deployment: dependencies, container images (ECR or Inspector) and IaC templates (CloudFormation Guard, cfn-lint). AWS Config only catches problems after deployment.</li>
+				<li>Pull request builds: CodeBuild webhooks with filter groups for GitHub, GitLab and Bitbucket; EventBridge + CodeBuild + Lambda for CodeCommit.</li>
+				<li>Test at scale with Distributed Load Testing on AWS, CodeBuild batch builds or Fargate tasks, and fail the stage with thresholds such as p99 latency and error rate.</li>
+				<li>FIS experiments test resilience, with CloudWatch alarms as stop conditions.</li>
+				<li>Exit code 0 means pass. Watch for swallowed exit codes: pipes without <code>pipefail</code>, <code>|| true</code>, wrapper scripts.</li>
+				<li>CodeBuild reports display test and coverage results but don't enforce a threshold. The build tool must exit non-zero below the threshold.</li>
+				<li>A Lambda invoke action must call <code>PutJobSuccessResult</code> or <code>PutJobFailureResult</code>, or the pipeline waits until it times out.</li>
+				<li>Ephemeral CloudFormation test stacks give clean environments, but plan for cleanup when tests fail.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-1.html"><small>Previous</small>Task 1.1: Implement CI/CD pipelines</a>
+				<a class="next" href="d1-task-1-3.html"><small>Next</small>Task 1.3: Build and manage artifacts</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>
