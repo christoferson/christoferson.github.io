@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.3: Automated Recovery to Meet RTO and RPO | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 Task 3.3 study guide: RTO and RPO, disaster recovery strategies from backup and restore to multi-site, AWS Backup and Elastic Disaster Recovery, recovery procedures, failover testing with Fault Injection Service, cross-Region backups, and load balancer recovery from backend failure.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DOP-C02</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Resilient Cloud Solutions &middot; 15%</span>
+		<h1>Task 3.3: Implement automated recovery processes to meet RTO and RPO requirements</h1>
+		<p>Choosing a disaster recovery strategy that fits the RTO and RPO, protecting data with backups that survive accidents and attacks, and proving recovery works by testing failover regularly.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">AWS Backup</span><span class="tag">Elastic Disaster Recovery</span><span class="tag">Aurora</span><span class="tag">Route 53</span><span class="tag">Fault Injection Service</span><span class="tag">Elastic Load Balancing</span><span class="tag">Systems Manager</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#k1">RTO, RPO and disaster recovery</a></li>
+				<li><a href="#k2">Recovery strategies</a></li>
+				<li class="sub"><a href="#strategies">The four DR strategies</a></li>
+				<li class="sub"><a href="#aws-backup">AWS Backup</a></li>
+				<li class="sub"><a href="#drs">Elastic Disaster Recovery</a></li>
+				<li><a href="#k3">Recovery procedures</a></li>
+				<li><a href="#s1">Testing failover</a></li>
+				<li><a href="#s2">Cross-Region backup and recovery</a></li>
+				<li><a href="#s3">Load balancer recovery from backend failure</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task statement 3.3</span>
+				<p><strong>Implement automated recovery processes to meet RTO and RPO requirements.</strong></p>
+			</div>
+			<p>High availability handles everyday failures. <strong>Disaster recovery</strong> (DR) handles the big ones: a Region outage, a deleted database, ransomware, a bad deployment that corrupts data. This task tests whether you can pick the cheapest strategy that still meets the recovery targets, automate the recovery, and test it before you need it. Typical scenarios: "RPO 15 minutes and RTO 1 hour at the lowest cost", "backups must be copied to another Region and account and must not be deletable", or "prove the database failover works".</p>
+			<div class="table-wrap">
+				<table>
+					<thead><tr><th>Exam guide item</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>Knowledge: RTO and RPO</td><td>Explain them and map them to a strategy</td></tr>
+						<tr><td>Knowledge: AWS Backup and recovery strategies</td><td>Choose between backup and restore, pilot light, warm standby and multi-site</td></tr>
+						<tr><td>Knowledge: recovery procedures</td><td>Write and automate the steps to recover, validate and fail back</td></tr>
+						<tr><td>Skill: testing failover</td><td>Test RDS, Aurora, Route 53 and CloudFront failover safely</td></tr>
+						<tr><td>Skill: cross-Region backup and recovery</td><td>Copy backups across Regions and accounts with AWS Backup, S3 and Systems Manager</td></tr>
+						<tr><td>Skill: load balancer recovery</td><td>Configure load balancers to route around failed backends</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Knowledge 1 -->
+			<h2 id="k1">Disaster recovery concepts: RTO and RPO</h2>
+			<div class="item">
+				<span class="kicker">Knowledge</span>
+				<p>Assume a database fails at 10:00. The last backup that can be restored was taken at 09:45, and service is back at 11:00.</p>
+				<ul>
+					<li><strong>RPO (recovery point objective):</strong> the maximum acceptable <em>data loss</em>, measured backwards from the failure. Here, 15 minutes of data (09:45 to 10:00) was lost. To lower RPO, replicate or back up more often.</li>
+					<li><strong>RTO (recovery time objective):</strong> the maximum acceptable <em>downtime</em>, measured forwards from the failure. Here it took 1 hour (10:00 to 11:00). To lower RTO, keep more of the environment ready to run.</li>
+				</ul>
+				<p>Lower RTO and RPO always cost more, so they come from a <strong>business impact analysis</strong>: what does an hour of downtime, or an hour of lost orders, actually cost?</p>
+
+				<h3>Replication is not a backup</h3>
+				<p>Replication (Multi-AZ, global tables, S3 replication) copies <em>every</em> change, including deletions, corruption and encryption by ransomware. It protects against infrastructure failure, not against bad data. You still need <strong>point-in-time backups</strong>, ideally immutable and in another account.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Disaster</th><th>What protects you</th></tr></thead>
+						<tbody>
+							<tr><td>Instance, disk or AZ failure</td><td>High availability: Multi-AZ, Auto Scaling, health checks</td></tr>
+							<tr><td>Region outage</td><td>Cross-Region replication or backups plus a DR strategy</td></tr>
+							<tr><td>Accidental deletion or bad deployment that corrupts data</td><td>Point-in-time recovery, versioning, backups</td></tr>
+							<tr><td>Ransomware or a compromised account</td><td>Immutable backups (Vault Lock, Object Lock) in a separate account</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- Knowledge 2 -->
+			<h2 id="k2">AWS Backup and recovery strategies</h2>
+			<div class="item" id="strategies">
+				<span class="kicker">Knowledge</span>
+				<h3>The four DR strategies</h3>
+				<p>They range from cheap and slow to expensive and instant. Pick the <strong>cheapest one that meets both RTO and RPO</strong>.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Strategy</th><th>Running in the DR Region</th><th>RPO</th><th>RTO</th><th>Cost</th></tr></thead>
+						<tbody>
+							<tr><td>Backup and restore</td><td>Nothing; only backups</td><td>Hours (time since the last backup)</td><td>Hours (restore and rebuild)</td><td>Lowest</td></tr>
+							<tr><td>Pilot light</td><td>Data replicated live; other infrastructure defined but switched off</td><td>Seconds to minutes</td><td>Tens of minutes (start and scale everything else)</td><td>Low</td></tr>
+							<tr><td>Warm standby</td><td>A complete, working copy at reduced size</td><td>Seconds</td><td>Minutes (scale up and switch traffic)</td><td>Medium</td></tr>
+							<tr><td>Multi-site active/active</td><td>Full production capacity, serving traffic</td><td>Near zero</td><td>Near zero</td><td>Highest</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h4>Backup and restore</h4>
+				<ul>
+					<li><strong>Data:</strong> AWS Backup copies to the DR Region; S3 replication or versioned copies.</li>
+					<li><strong>Infrastructure:</strong> CloudFormation or CDK templates ready to deploy; AMIs and images copied.</li>
+					<li><strong>Recovery:</strong> deploy the stacks, restore the data, switch DNS.</li>
+				</ul>
+				<h4>Pilot light</h4>
+				<ul>
+					<li><strong>Data:</strong> replicated continuously (Aurora Global Database, an RDS cross-Region read replica, DynamoDB global tables).</li>
+					<li><strong>Infrastructure:</strong> deployed but idle: Auto Scaling groups with a desired capacity of 0, load balancers and networking ready.</li>
+					<li><strong>Recovery:</strong> promote the database, scale compute from zero, switch DNS.</li>
+				</ul>
+				<h4>Warm standby</h4>
+				<ul>
+					<li><strong>Everything running, smaller:</strong> for example, 2 instances instead of 20, already passing health checks.</li>
+					<li><strong>Recovery:</strong> promote the database, scale out to full size, switch traffic. Because it already works, you can test it continuously.</li>
+				</ul>
+				<h4>Multi-site active/active</h4>
+				<ul>
+					<li><strong>Both Regions serve users</strong>, usually with DynamoDB global tables and Route 53 latency routing or Global Accelerator.</li>
+					<li><strong>Recovery:</strong> stop sending traffic to the failed Region. Remaining Regions must have enough capacity (or scale fast enough) to take it all.</li>
+				</ul>
+				<div class="callout tip"><ul>
+					<li><strong>"Lowest cost" with an RTO of a day:</strong> backup and restore.</li>
+					<li><strong>"Core database must be current, the rest can start within an hour":</strong> pilot light.</li>
+					<li><strong>"Minutes of downtime, and the DR site must be tested regularly":</strong> warm standby.</li>
+					<li><strong>"No downtime even if a Region fails":</strong> active/active.</li>
+				</ul></div>
+				<div class="callout trap"><p>In a pilot light or warm standby design, the DR Region's <strong>scale-up</strong> depends on the EC2 and Auto Scaling control plane working during the event. To be safe, check capacity and quotas in the DR Region in advance, and prefer warm standby when RTO is tight.</p></div>
+			</div>
+
+			<div class="item" id="aws-backup">
+				<span class="kicker">Knowledge</span>
+				<h3>AWS Backup</h3>
+				<p>AWS Backup centralizes backups for EC2, EBS, RDS, Aurora, DynamoDB, EFS, FSx, S3, Storage Gateway, DocumentDB, Neptune, Redshift, Timestream and more, across accounts and Regions.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Concept</th><th>Meaning</th></tr></thead>
+						<tbody>
+							<tr><td>Backup plan</td><td>Rules: schedule, start window, lifecycle (move to cold storage, then delete), and <strong>copy actions</strong> to vaults in other Regions or accounts</td></tr>
+							<tr><td>Resource assignment</td><td>Which resources a plan covers, usually by tag (for example, <code>backup: daily</code>)</td></tr>
+							<tr><td>Backup vault</td><td>Where recovery points are stored, encrypted with a KMS key, with an access policy</td></tr>
+							<tr><td>Vault Lock</td><td>Write-once protection: in <strong>compliance mode</strong>, no one (not even the root user) can delete recovery points before their retention ends or change the lock</td></tr>
+							<tr><td>Logically air-gapped vault</td><td>A vault isolated from your account's own credentials, shareable to a recovery account for ransomware recovery</td></tr>
+							<tr><td>Continuous backup</td><td>Point-in-time recovery (to the second, within 35 days) for RDS, Aurora, S3 and SAP HANA</td></tr>
+							<tr><td>Backup policies</td><td>Organizations policies that apply backup plans to every account in an OU</td></tr>
+							<tr><td>Restore testing</td><td>Scheduled automatic restores that check recovery points actually work, and measure restore time</td></tr>
+							<tr><td>Backup Audit Manager</td><td>Frameworks of controls (for example, "backups copied cross-Region") with compliance reports</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p>Recovery points moved to <strong>cold storage</strong> must stay there for at least 90 days. A lifecycle rule must keep total retention at least 90 days longer than the time before the move to cold storage.</p></div>
+			</div>
+
+			<div class="item" id="drs">
+				<span class="kicker">Knowledge</span>
+				<h3>AWS Elastic Disaster Recovery</h3>
+				<p>Elastic Disaster Recovery (AWS DRS) protects <strong>servers</strong> (on-premises, in other clouds, or EC2 in another Region) with continuous block-level replication:</p>
+				<ol class="flow">
+					<li><span class="name">Install the replication agent</span><span class="desc">On each source server.</span></li>
+					<li><span class="name">Replicate to a staging area</span><span class="desc">Data flows continuously to low-cost staging resources (small replication servers and EBS volumes) in the recovery Region.</span></li>
+					<li><span class="name">Drill without disruption</span><span class="desc">Launch recovery instances for a test at any time, while replication continues.</span></li>
+					<li><span class="name">Recover</span><span class="desc">Launch full-size recovery instances from the latest state (RPO of seconds) or a chosen earlier point, typically within minutes.</span></li>
+					<li><span class="name">Fail back</span><span class="desc">Replicate the recovered instances back to the original location when it's healthy again.</span></li>
+				</ol>
+				<div class="callout tip"><p>"Lift-and-shift servers that can't be redesigned need an RPO of seconds and an RTO of minutes, at low standby cost" points to <strong>AWS Elastic Disaster Recovery</strong>.</p></div>
+			</div>
+
+			<!-- Knowledge 3 -->
+			<h2 id="k3">Recovery procedures</h2>
+			<div class="item">
+				<span class="kicker">Knowledge</span>
+				<p>A recovery procedure (runbook) must be written down, automated as far as possible, and practised. A complete one covers:</p>
+				<ol class="flow">
+					<li><span class="name">Detect and declare</span><span class="desc">Alarms and health checks detect the failure. A named person decides to invoke DR, so the team doesn't argue during an outage.</span></li>
+					<li><span class="name">Recover data</span><span class="desc">Promote replicas, fail over global databases, or restore from backup to a chosen point in time.</span></li>
+					<li><span class="name">Recover compute</span><span class="desc">Deploy or scale up the stacks in the recovery location.</span></li>
+					<li><span class="name">Redirect traffic</span><span class="desc">Route 53 failover, ARC routing controls or Global Accelerator weights.</span></li>
+					<li><span class="name">Validate</span><span class="desc">Synthetic canaries, smoke tests and business checks confirm it works.</span></li>
+					<li><span class="name">Fail back</span><span class="desc">Resynchronize data to the original location and move traffic back in a planned window.</span></li>
+					<li><span class="name">Review</span><span class="desc">Record the real RTO and RPO achieved and fix whatever slowed recovery.</span></li>
+				</ol>
+				<ul>
+					<li><strong>Automate it:</strong> as a Systems Manager Automation runbook or a Step Functions workflow, so recovery is fast and repeatable.</li>
+					<li><strong>Keep configuration ready:</strong> DR-Region values in Parameter Store and Secrets Manager replicas.</li>
+				</ul>
+
+				<h3>Point-in-time recovery for bad data</h3>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Service</th><th>Recovery from accidental change or deletion</th></tr></thead>
+						<tbody>
+							<tr><td>RDS and Aurora</td><td>Point-in-time restore to any second within the backup retention (up to 35 days), as a <strong>new</strong> instance or cluster; the latest restorable time is usually within 5 minutes</td></tr>
+							<tr><td>Aurora MySQL</td><td><strong>Backtrack</strong>: rewind the existing cluster in place to an earlier time, in minutes, without a restore</td></tr>
+							<tr><td>DynamoDB</td><td>Point-in-time recovery to any second in the last 35 days (configurable), restored to a <strong>new</strong> table; on-demand backups for long-term retention</td></tr>
+							<tr><td>S3</td><td>Versioning (restore a previous version or remove a delete marker); Object Lock to prevent deletion</td></tr>
+							<tr><td>EBS</td><td>Snapshots; the Recycle Bin recovers deleted snapshots and AMIs within its retention period</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p>RDS and DynamoDB point-in-time restores create a <strong>new</strong> resource with a new endpoint or table name. The recovery procedure must repoint the application (or rename), which adds to RTO.</p></div>
+			</div>
+
+			<!-- Skill 1 -->
+			<h2 id="s1">Testing failover of Multi-AZ and multi-Region workloads</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<p>An untested DR plan is only a hope. Test each failover mechanism on its own, then run whole-workload <strong>game days</strong>, and measure the RTO and RPO you actually achieve.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>What to test</th><th>How</th></tr></thead>
+						<tbody>
+							<tr><td>RDS Multi-AZ</td><td><code>aws rds reboot-db-instance --db-instance-identifier orders --force-failover</code></td></tr>
+							<tr><td>Aurora (within a Region)</td><td><code>aws rds failover-db-cluster --db-cluster-identifier orders --target-db-instance-identifier orders-reader-2</code></td></tr>
+							<tr><td>Aurora Global Database</td><td><code>switchover-global-cluster</code> for a planned move with no data loss; <code>failover-global-cluster</code> to rehearse an unplanned failover</td></tr>
+							<tr><td>ElastiCache</td><td>The <code>test-failover</code> API promotes a replica</td></tr>
+							<tr><td>Route 53 failover</td><td>Make the primary's health check fail: stop the test endpoint, block the health check path, or use the health check's <em>invert</em> setting temporarily. Confirm with <code>dig</code> after the TTL. With ARC, flip the routing control</td></tr>
+							<tr><td>CloudFront origin failover</td><td>In a test distribution, make the primary origin return one of the failover status codes (for example, by denying access to the primary bucket) and check that responses come from the secondary</td></tr>
+							<tr><td>Whole AZ or Region</td><td>AWS Fault Injection Service scenarios, such as the AZ power interruption or cross-Region connectivity scenarios</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Repeatable tests with AWS Fault Injection Service</h3>
+				<p>FIS experiments make failover tests repeatable and safe. This template fails over the Aurora cluster tagged <code>app: orders</code> and stops automatically if the error-rate alarm fires:</p>
+				<span class="file">fis-aurora-failover.yml</span>
+<pre><code><span class="k">AuroraFailoverExperiment:</span>
+  <span class="k">Type:</span> AWS::FIS::ExperimentTemplate
+  <span class="k">Properties:</span>
+    <span class="k">Description:</span> Fail over the orders Aurora cluster and measure recovery
+    <span class="k">RoleArn:</span> !GetAtt FisExperimentRole.Arn            <span class="c"># allows rds:FailoverDBCluster</span>
+    <span class="k">Targets:</span>
+      <span class="k">OrdersCluster:</span>
+        <span class="k">ResourceType:</span> aws:rds:cluster
+        <span class="k">ResourceTags:</span> { app: orders }
+        <span class="k">SelectionMode:</span> ALL
+    <span class="k">Actions:</span>
+      <span class="k">FailoverWriter:</span>
+        <span class="k">ActionId:</span> aws:rds:failover-db-cluster
+        <span class="k">Targets:</span> { Clusters: OrdersCluster }
+    <span class="k">StopConditions:</span>
+      - <span class="k">Source:</span> aws:cloudwatch:alarm                 <span class="c"># abort if customers are hurt</span>
+        <span class="k">Value:</span> !GetAtt OrdersErrorRateAlarm.Arn
+    <span class="k">Tags:</span>
+      <span class="k">Name:</span> aurora-failover-test</code></pre>
+				<ul>
+					<li><strong>Other useful actions:</strong> <code>aws:rds:reboot-db-instances</code> (with forced failover), <code>aws:ec2:stop-instances</code>, <code>aws:ec2:terminate-instances</code>, <code>aws:ecs:stop-task</code>, <code>aws:eks:pod-delete</code>, <code>aws:network:disrupt-connectivity</code> (cut a subnet off) and <code>aws:ssm:send-command</code> (CPU or memory stress inside an instance).</li>
+					<li><strong>Measure during the test:</strong> application error rate, time until writes succeed again (RTO), and the last transaction preserved (RPO).</li>
+				</ul>
+				<div class="callout tip"><p>"Regularly verify that failover meets the RTO, with automatic abort if customers are affected" points to <strong>scheduled FIS experiments with CloudWatch alarm stop conditions</strong>, combined with Resilience Hub assessments.</p></div>
+			</div>
+
+			<!-- Skill 2 -->
+			<h2 id="s2">Implementing cross-Region backup and recovery strategies</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<h3>AWS Backup with cross-Region and cross-account copies</h3>
+				<p>Assume production runs in eu-west-1 in account <code>222222222222</code>. Backups must also be kept in eu-central-1, and in a separate backup account <code>555555555555</code> where production credentials can't delete them.</p>
+				<span class="file">backup-plan.yml (production account)</span>
+<pre><code><span class="k">ProdBackupPlan:</span>
+  <span class="k">Type:</span> AWS::Backup::BackupPlan
+  <span class="k">Properties:</span>
+    <span class="k">BackupPlan:</span>
+      <span class="k">BackupPlanName:</span> prod-daily
+      <span class="k">BackupPlanRule:</span>
+        - <span class="k">RuleName:</span> daily-with-copies
+          <span class="k">TargetBackupVault:</span> prod-vault
+          <span class="k">ScheduleExpression:</span> cron(0 3 * * ? *)              <span class="c"># 03:00 UTC daily</span>
+          <span class="k">StartWindowMinutes:</span> 60
+          <span class="k">EnableContinuousBackup:</span> true                     <span class="c"># point-in-time recovery where supported</span>
+          <span class="k">Lifecycle:</span>
+            <span class="k">DeleteAfterDays:</span> 35
+          <span class="k">CopyActions:</span>
+            - <span class="k">DestinationBackupVaultArn:</span> arn:aws:backup:eu-central-1:222222222222:backup-vault:dr-vault        <span class="c"># other Region</span>
+              <span class="k">Lifecycle:</span> { DeleteAfterDays: 35 }
+            - <span class="k">DestinationBackupVaultArn:</span> arn:aws:backup:eu-west-1:555555555555:backup-vault:locked-vault    <span class="c"># other account</span>
+              <span class="k">Lifecycle:</span> { MoveToColdStorageAfterDays: 30, DeleteAfterDays: 365 }
+
+<span class="k">ProdBackupSelection:</span>
+  <span class="k">Type:</span> AWS::Backup::BackupSelection
+  <span class="k">Properties:</span>
+    <span class="k">BackupPlanId:</span> !Ref ProdBackupPlan
+    <span class="k">BackupSelection:</span>
+      <span class="k">SelectionName:</span> tagged-resources
+      <span class="k">IamRoleArn:</span> !Sub arn:aws:iam::${AWS::AccountId}:role/service-role/AWSBackupDefaultServiceRole
+      <span class="k">ListOfTags:</span>
+        - { ConditionType: STRINGEQUALS, ConditionKey: backup, ConditionValue: daily }</code></pre>
+				<ul>
+					<li><strong>Cross-account copies:</strong> both accounts must be in the same organization with cross-account backup enabled. The destination vault's access policy must allow the source account to copy into it.</li>
+					<li><strong>Encryption:</strong> copied recovery points are re-encrypted with the destination vault's KMS key.</li>
+					<li><strong>Immutability:</strong> apply Vault Lock in compliance mode to <code>locked-vault</code>, so the backups can't be deleted early even if the backup account itself is compromised.</li>
+					<li><strong>Organization-wide:</strong> apply the same plan to every account in an OU with an Organizations <strong>backup policy</strong>.</li>
+				</ul>
+
+				<h3>Cross-Region options by service</h3>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Data</th><th>Cross-Region protection</th></tr></thead>
+						<tbody>
+							<tr><td>Most AWS resources</td><td>AWS Backup copy actions</td></tr>
+							<tr><td>S3</td><td>Cross-Region replication (versioning required; Batch Replication for existing objects), plus versioning and Object Lock against deletion</td></tr>
+							<tr><td>EBS snapshots</td><td>Data Lifecycle Manager policies with cross-Region copy rules, or AWS Backup</td></tr>
+							<tr><td>AMIs</td><td><code>aws ec2 copy-image</code>, or EC2 Image Builder distribution to several Regions</td></tr>
+							<tr><td>RDS</td><td>Cross-Region automated backup replication, snapshot copies, or a cross-Region read replica</td></tr>
+							<tr><td>Aurora</td><td>Aurora Global Database, or snapshot copies</td></tr>
+							<tr><td>DynamoDB</td><td>Global tables for live data; AWS Backup copies for point-in-time backups</td></tr>
+							<tr><td>EFS</td><td>EFS replication, or AWS Backup copies</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Systems Manager in recovery</h3>
+				<ul>
+					<li><strong>Automation runbooks:</strong> run the recovery steps (promote, restore, scale, switch DNS) in the right order, with approvals and logging. Resilience Hub can generate standard operating procedure runbooks for an application.</li>
+					<li><strong>Parameter Store:</strong> holds DR-Region configuration (endpoints, AMI IDs) that the recovered stack reads.</li>
+					<li><strong>Run Command and State Manager:</strong> reconfigure restored instances (new endpoints, agents) after recovery.</li>
+				</ul>
+				<div class="callout tip"><p>"Backups must survive a compromise of the production account" points to <strong>AWS Backup copies to a separate account's vault with Vault Lock</strong> (compliance mode), or a logically air-gapped vault. Snapshots in the same account can be deleted by whoever compromises it.</p></div>
+			</div>
+
+			<!-- Skill 3 -->
+			<h2 id="s3">Configuring a load balancer to recover from backend failure</h2>
+			<div class="item">
+				<span class="kicker">Skill</span>
+				<p>A load balancer recovers from backend failure by noticing it quickly, routing around it, and letting something else replace it. What happens as a backend fails:</p>
+				<ol class="flow">
+					<li><span class="name">The target fails its health checks</span><span class="desc">After <code>UnhealthyThresholdCount</code> consecutive failures (for example, 2 × 10 seconds), it's marked unhealthy.</span></li>
+					<li><span class="name">Traffic goes to the healthy targets</span><span class="desc">The load balancer stops routing new requests to it. In-flight requests finish within the deregistration delay.</span></li>
+					<li><span class="name">The target is replaced</span><span class="desc">The Auto Scaling group (with <code>HealthCheckType: ELB</code>) terminates it and launches a replacement; ECS and Kubernetes replace unhealthy tasks or pods the same way.</span></li>
+					<li><span class="name">The new target joins</span><span class="desc">After passing <code>HealthyThresholdCount</code> checks it gets traffic, ramped up gradually if slow start is on.</span></li>
+					<li><span class="name">If a whole AZ or the whole load balancer is unhealthy</span><span class="desc">Target group health thresholds trigger DNS failover away from the unhealthy AZ, and a Route 53 record with <em>evaluate target health</em> fails over to another Region.</span></li>
+				</ol>
+				<span class="file">resilient-target-group.yml</span>
+<pre><code><span class="k">OrdersTargetGroup:</span>
+  <span class="k">Type:</span> AWS::ElasticLoadBalancingV2::TargetGroup
+  <span class="k">Properties:</span>
+    <span class="k">VpcId:</span> !Ref Vpc
+    <span class="k">Protocol:</span> HTTP
+    <span class="k">Port:</span> 8080
+    <span class="k">HealthCheckPath:</span> /health/deep                      <span class="c"># checks dependencies, not just "process is up"</span>
+    <span class="k">HealthCheckIntervalSeconds:</span> 10
+    <span class="k">HealthCheckTimeoutSeconds:</span> 5
+    <span class="k">UnhealthyThresholdCount:</span> 2                          <span class="c"># unhealthy after about 20 seconds</span>
+    <span class="k">HealthyThresholdCount:</span> 3
+    <span class="k">TargetGroupAttributes:</span>
+      - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      - { Key: load_balancing.algorithm.type, Value: weighted_random }
+      - { Key: load_balancing.algorithm.anomaly_mitigation, Value: "on" }               <span class="c"># shift traffic away from targets returning errors</span>
+      - { Key: target_group_health.dns_failover.minimum_healthy_targets.count, Value: "2" }   <span class="c"># fewer healthy targets in an AZ: fail that AZ out of DNS</span></code></pre>
+				<ul>
+					<li><strong>Automatic target weights:</strong> with the <code>weighted_random</code> algorithm and anomaly mitigation on, an ALB detects targets with unusually high error rates and sends them less traffic, even before they fail health checks.</li>
+					<li><strong>Fail open:</strong> if <em>every</em> target is unhealthy, an ALB routes to all of them anyway, on the basis that some may still work. Route 53 failover (evaluate target health) is what moves traffic to another Region.</li>
+					<li><strong>Graceful errors:</strong> a listener rule can return a fixed maintenance response, and CloudFront can serve a custom error page from S3 when the origin is down.</li>
+					<li><strong>Shifting between backends:</strong> a listener rule with <strong>weighted target groups</strong> moves traffic between two backends (for example, a standby Auto Scaling group) in one change.</li>
+				</ul>
+				<div class="callout trap"><p>A health check that only returns "200 OK" when the web server process is running misses broken dependencies. A check that tests <em>every</em> dependency can take all targets out at once when one shared dependency fails. Check what the instance itself needs, and handle shared dependencies with graceful degradation.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>RPO = acceptable data loss (backwards from the failure); RTO = acceptable downtime (forwards). Lower targets cost more.</li>
+				<li>Replication copies deletions and corruption; you still need point-in-time, immutable backups in another account.</li>
+				<li>Backup and restore (hours, cheapest), pilot light (data live, compute off), warm standby (small working copy), multi-site active/active (near zero). Pick the cheapest that meets both targets.</li>
+				<li>AWS Backup: plans with copy actions to other Regions and accounts, tag-based selection, Vault Lock compliance mode, backup policies across the organization, restore testing, Audit Manager. Cold storage needs 90 days minimum.</li>
+				<li>Elastic Disaster Recovery: continuous block-level server replication, low-cost staging, recovery in minutes with RPO of seconds, non-disruptive drills.</li>
+				<li>Point-in-time restores (RDS, DynamoDB) create new resources; Aurora Backtrack rewinds in place; S3 versioning undoes deletes.</li>
+				<li>Test failover: <code>--force-failover</code> for RDS Multi-AZ, <code>failover-db-cluster</code> for Aurora, switchover or failover for global databases, failing health checks for Route 53, and FIS experiments with alarm stop conditions.</li>
+				<li>Load balancers recover with fast health checks, Auto Scaling ELB health checks, anomaly mitigation, target group health thresholds for DNS failover, and Route 53 evaluate target health across Regions.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-2.html"><small>Previous</small>Task 3.2: Scalable solutions</a>
+				<span class="next"><small>Next (coming soon)</small>Task 4.1: Logs and metrics collection</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>
