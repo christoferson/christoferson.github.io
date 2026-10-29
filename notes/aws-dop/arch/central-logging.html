@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Organization-Wide Centralized Logging | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: an organization CloudTrail trail, AWS Config, VPC Flow Logs and application logs from every account delivered to a locked log archive account, kept for seven years, searchable with Athena and alerting in near real time.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Centralized logging</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Organization-wide centralized logging</h1>
+		<p>Every API call, configuration change, network flow and application log from every account and Region lands in one log archive account that nobody can tamper with. Logs are kept for seven years at the lowest storage cost, can be searched with SQL, and suspicious activity raises an alert within minutes. New accounts are covered the day they're created.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">Domain 6</span><span class="tag">CloudTrail</span><span class="tag">CloudWatch Logs</span><span class="tag">Data Firehose</span><span class="tag">S3 Object Lock</span><span class="tag">Athena</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Log archive buckets and key</a></li>
+				<li class="sub"><a href="#b2">2. Organization trail</a></li>
+				<li class="sub"><a href="#b3">3. Config and flow logs</a></li>
+				<li class="sub"><a href="#b4">4. Application log pipeline</a></li>
+				<li class="sub"><a href="#b5">5. Subscriptions in every account</a></li>
+				<li class="sub"><a href="#b6">6. Query and alert</a></li>
+				<li class="sub"><a href="#b7">7. Guardrails</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>A company has dozens of accounts in AWS Organizations and is audited every year. Auditors want proof that logs are complete and unaltered; the security team wants to search them and be alerted quickly; finance wants storage to stay cheap.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>All accounts and all Regions</td><td data-label="Design choice">One organization trail (multi-Region); Config, flow logs and log subscriptions rolled out with StackSets</td></tr>
+						<tr><td>Tamper-proof</td><td data-label="Design choice">Separate log archive account; S3 Object Lock in compliance mode; log file integrity validation; SCPs protecting trails and buckets</td></tr>
+						<tr><td>Kept for 7 years</td><td data-label="Design choice">Object Lock default retention of 7 years; lifecycle expiry after 7 years</td></tr>
+						<tr><td>Searchable</td><td data-label="Design choice">Athena tables with partition projection over the S3 logs</td></tr>
+						<tr><td>Near real-time alerting</td><td data-label="Design choice">Trail events in CloudWatch Logs with metric filters and alarms; EventBridge rules for specific API calls</td></tr>
+						<tr><td>New accounts covered automatically</td><td data-label="Design choice">Organization trail covers them at once; service-managed StackSets with automatic deployment for everything else</td></tr>
+						<tr><td>Least cost</td><td data-label="Design choice">S3 instead of long CloudWatch Logs retention; lifecycle transitions to Glacier storage classes; short retention in source accounts</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, with us-east-1 as the home Region:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Management</td><td data-label="ID"><code>000000000000</code></td><td data-label="What lives there">Organizations, the organization trail, SCPs, the StackSets</td></tr>
+						<tr><td>Log archive</td><td data-label="ID"><code>666666666666</code></td><td data-label="What lives there">The log buckets, their KMS key, the CloudWatch Logs destination and Firehose stream. Almost nobody can sign in.</td></tr>
+						<tr><td>Security (audit)</td><td data-label="ID"><code>555555555555</code></td><td data-label="What lives there">Config aggregator, Athena workgroup, read-only access to the logs, alerting</td></tr>
+						<tr><td>Workload</td><td data-label="ID"><code>222222222222</code> (and every other workload account)</td><td data-label="What lives there">Applications writing to CloudWatch Logs, VPCs with flow logs</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; steps marked <span class="who">You</span> are what you build or run.</p>
+			<ol class="flow">
+				<li class="group">Audit logs: CloudTrail and Config</li>
+				<li class="auto"><span class="name">CloudTrail records every API call<span class="who auto">AWS</span></span><span class="desc">The organization trail in <code>000000000000</code> logs management events from every account and Region, plus selected data events.</span></li>
+				<li class="auto"><span class="name">Log files land in the audit bucket<span class="who auto">AWS</span></span><span class="desc">About every 5 minutes, under <code>AWSLogs/o-a1b2c3d4e5/&lt;account&gt;/CloudTrail/&lt;region&gt;/</code>, encrypted with the log archive's KMS key. Hourly digest files allow integrity validation.</span></li>
+				<li class="auto"><span class="name">Object Lock makes them immutable<span class="who auto">AWS</span></span><span class="desc">Each object version is locked in compliance mode for 7 years. Nobody, including the root user, can delete or overwrite it.</span></li>
+				<li class="auto"><span class="name">A copy goes to CloudWatch Logs<span class="who auto">AWS</span></span><span class="desc">The trail also sends events to a log group, where metric filters and alarms watch for root sign-ins, failed console logins and policy changes.</span></li>
+				<li class="auto"><span class="name">Config snapshots and history arrive<span class="who auto">AWS</span></span><span class="desc">Each account's Config delivery channel writes to the operational bucket; the security account's aggregator shows compliance for every account.</span></li>
+				<li class="group">Operational logs: flow logs and applications</li>
+				<li class="auto"><span class="name">Flow logs write straight to S3<span class="who auto">AWS</span></span><span class="desc">Each VPC's flow log delivers to the operational bucket in <code>666666666666</code>, in a custom format.</span></li>
+				<li class="auto"><span class="name">Applications log to CloudWatch Logs locally<span class="who auto">AWS</span></span><span class="desc">Lambda, ECS, API Gateway and the CloudWatch agent write to log groups in their own account, with short retention (for example 30 days).</span></li>
+				<li class="auto"><span class="name">A subscription forwards each event<span class="who auto">AWS</span></span><span class="desc">An account-level subscription filter (or one per log group) sends events to the CloudWatch Logs destination in <code>666666666666</code>.</span></li>
+				<li class="auto"><span class="name">Firehose writes them to S3<span class="who auto">AWS</span></span><span class="desc">The destination feeds a Data Firehose stream that decompresses the records, partitions them by source account and date, and buffers them into S3 objects.</span></li>
+				<li class="auto"><span class="name">Lifecycle rules cut cost<span class="who auto">AWS</span></span><span class="desc">Objects move to Glacier storage classes after 90 days and expire after 7 years.</span></li>
+				<li class="group">Use</li>
+				<li><span class="name">Search with Athena<span class="who">You</span></span><span class="desc">From the security account, SQL over any account, Region and date range, scanning only the matching partitions.</span></li>
+				<li><span class="name">Respond to alarms<span class="who">You</span></span><span class="desc">Alarms and EventBridge rules notify the security team through SNS.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Log archive buckets and key (in 666666666666)</h3>
+				<p>Two buckets: an <strong>audit</strong> bucket for CloudTrail with Object Lock, and an <strong>operational</strong> bucket for Config, flow logs and application logs with versioning and lifecycle rules. One customer managed key encrypts both.</p>
+				<span class="file">log-archive.yaml</span>
+<pre><code><span class="k">LogKey:</span>
+  <span class="k">Type:</span> AWS::KMS::Key
+  <span class="k">Properties:</span>
+    <span class="k">EnableKeyRotation:</span> true
+    <span class="k">KeyPolicy:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Sid:</span> AccountAdmin
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { AWS: arn:aws:iam::666666666666:root }
+          <span class="k">Action:</span> kms:*
+          <span class="k">Resource:</span> "*"
+        - <span class="k">Sid:</span> CloudTrailEncrypt                        <span class="c"># without this, the trail can't deliver</span>
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { Service: cloudtrail.amazonaws.com }
+          <span class="k">Action:</span> [ kms:GenerateDataKey*, kms:DescribeKey ]
+          <span class="k">Resource:</span> "*"
+          <span class="k">Condition:</span>
+            <span class="k">StringEquals:</span> { aws:SourceArn: arn:aws:cloudtrail:us-east-1:000000000000:trail/org-trail }
+        - <span class="k">Sid:</span> LogDeliveryAndFirehose                   <span class="c"># Config, flow logs and Firehose writing SSE-KMS objects</span>
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { Service: [ config.amazonaws.com, delivery.logs.amazonaws.com ] }
+          <span class="k">Action:</span> [ kms:GenerateDataKey*, kms:Decrypt ]
+          <span class="k">Resource:</span> "*"                                  <span class="c"># add aws:SourceAccount / aws:SourceArn conditions for your accounts</span>
+        - <span class="k">Sid:</span> SecurityReaders                          <span class="c"># Athena in the security account must decrypt</span>
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { AWS: arn:aws:iam::555555555555:role/LogAnalyst }
+          <span class="k">Action:</span> kms:Decrypt
+          <span class="k">Resource:</span> "*"
+
+<span class="k">AuditBucket:</span>
+  <span class="k">Type:</span> AWS::S3::Bucket
+  <span class="k">Properties:</span>
+    <span class="k">BucketName:</span> org-audit-666666666666
+    <span class="k">VersioningConfiguration:</span> { Status: Enabled }      <span class="c"># required by Object Lock</span>
+    <span class="k">ObjectLockEnabled:</span> true
+    <span class="k">ObjectLockConfiguration:</span>
+      <span class="k">ObjectLockEnabled:</span> Enabled
+      <span class="k">Rule:</span>
+        <span class="k">DefaultRetention:</span> { Mode: COMPLIANCE, Years: 7 }   <span class="c"># can be extended, never shortened</span>
+    <span class="k">BucketEncryption:</span>
+      <span class="k">ServerSideEncryptionConfiguration:</span>
+        - <span class="k">ServerSideEncryptionByDefault:</span> { SSEAlgorithm: aws:kms, KMSMasterKeyID: !Ref LogKey }
+          <span class="k">BucketKeyEnabled:</span> true                       <span class="c"># far fewer KMS calls</span>
+    <span class="k">PublicAccessBlockConfiguration:</span>
+      { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+    <span class="k">LifecycleConfiguration:</span>
+      <span class="k">Rules:</span>
+        - <span class="k">Id:</span> archive-then-expire
+          <span class="k">Status:</span> Enabled
+          <span class="k">Transitions:</span>
+            - { StorageClass: GLACIER_IR, TransitionInDays: 90 }       <span class="c"># still millisecond reads</span>
+            - { StorageClass: DEEP_ARCHIVE, TransitionInDays: 365 }
+          <span class="k">ExpirationInDays:</span> 2557                       <span class="c"># 7 years</span>
+          <span class="k">NoncurrentVersionExpiration:</span> { NoncurrentDays: 2557 }
+
+<span class="c"># OperationalBucket (org-logs-666666666666): same encryption, versioning and lifecycle, no Object Lock</span></code></pre>
+				<p>The audit bucket policy lets only the organization trail write, using the trail's ARN as <code>aws:SourceArn</code>:</p>
+				<span class="file">audit-bucket-policy.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudTrailAclCheck",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:GetBucketAcl",
+      "Resource": "arn:aws:s3:::org-audit-666666666666",
+      "Condition": { "StringEquals": { "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:000000000000:trail/org-trail" } }
+    },
+    {
+      "Sid": "CloudTrailOrgWrite",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::org-audit-666666666666/AWSLogs/000000000000/*",
+        "arn:aws:s3:::org-audit-666666666666/AWSLogs/o-a1b2c3d4e5/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:000000000000:trail/org-trail"
+        }
+      }
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [ "arn:aws:s3:::org-audit-666666666666", "arn:aws:s3:::org-audit-666666666666/*" ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}</code></pre>
+				<div class="callout trap"><p>Object Lock needs versioning, and once enabled it can't be turned off. It can now be enabled on an existing bucket, but it only protects objects written afterwards. In <strong>compliance mode</strong> the retention can be extended but never shortened, and the only way to delete a locked object early is to close the account, so test with governance mode first.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Organization trail (in 000000000000)</h3>
+				<span class="file">org-trail.yaml</span>
+<pre><code><span class="k">OrgTrail:</span>
+  <span class="k">Type:</span> AWS::CloudTrail::Trail
+  <span class="k">Properties:</span>
+    <span class="k">TrailName:</span> org-trail
+    <span class="k">IsOrganizationTrail:</span> true                    <span class="c"># every account, now and in future</span>
+    <span class="k">IsMultiRegionTrail:</span> true                     <span class="c"># every Region</span>
+    <span class="k">IncludeGlobalServiceEvents:</span> true
+    <span class="k">EnableLogFileValidation:</span> true                <span class="c"># signed hourly digest files</span>
+    <span class="k">IsLogging:</span> true
+    <span class="k">S3BucketName:</span> org-audit-666666666666
+    <span class="k">KMSKeyId:</span> arn:aws:kms:us-east-1:666666666666:key/1234abcd-12ab-34cd-56ef-1234567890ab
+    <span class="k">CloudWatchLogsLogGroupArn:</span> !GetAtt TrailLogGroup.Arn   <span class="c"># for metric filters and alarms</span>
+    <span class="k">CloudWatchLogsRoleArn:</span> !GetAtt TrailToLogsRole.Arn</code></pre>
+				<div class="callout note"><p>CloudTrail Lake <span class="badge retired">closed to new customers since May 31, 2026</span> was an alternative to S3 plus Athena for querying. New setups use the S3 and Athena approach shown here.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Config and VPC Flow Logs (StackSet to every account)</h3>
+				<p>A <strong>service-managed StackSet</strong> from the management account, targeting the Workloads OU with automatic deployment, so new accounts get it. (Control Tower sets up Config delivery to its log archive for you.)</p>
+				<span class="file">account-logging-baseline.yaml</span>
+<pre><code><span class="k">ConfigDelivery:</span>
+  <span class="k">Type:</span> AWS::Config::DeliveryChannel
+  <span class="k">Properties:</span>
+    <span class="k">S3BucketName:</span> org-logs-666666666666            <span class="c"># bucket in the log archive account</span>
+    <span class="k">S3KeyPrefix:</span> config
+    <span class="k">S3KmsKeyArn:</span> arn:aws:kms:us-east-1:666666666666:key/1234abcd-12ab-34cd-56ef-1234567890ab
+
+<span class="k">VpcFlowLog:</span>
+  <span class="k">Type:</span> AWS::EC2::FlowLog
+  <span class="k">Properties:</span>
+    <span class="k">ResourceType:</span> VPC
+    <span class="k">ResourceId:</span> !Ref VpcId
+    <span class="k">TrafficType:</span> ALL
+    <span class="k">LogDestinationType:</span> s3
+    <span class="k">LogDestination:</span> arn:aws:s3:::org-logs-666666666666/flowlogs/
+    <span class="k">DestinationOptions:</span> { FileFormat: parquet, HiveCompatiblePartitions: true, PerHourPartition: true }
+    <span class="k">LogFormat:</span> '${account-id} ${vpc-id} ${interface-id} ${pkt-srcaddr} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${action} ${flow-direction}'</code></pre>
+				<p>The operational bucket's policy must allow <code>config.amazonaws.com</code> and <code>delivery.logs.amazonaws.com</code> to write under their prefixes, with <code>aws:SourceAccount</code> conditions for the accounts in the organization. In the security account, an organization aggregator collects Config data from every account:</p>
+<pre><code><span class="k">OrgAggregator:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigurationAggregator
+  <span class="k">Properties:</span>
+    <span class="k">ConfigurationAggregatorName:</span> org
+    <span class="k">OrganizationAggregationSource:</span>
+      <span class="k">AllAwsRegions:</span> true
+      <span class="k">RoleArn:</span> !GetAtt AggregatorRole.Arn         <span class="c"># Config needs organizations:List* through this role</span></code></pre>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Application log pipeline (in 666666666666)</h3>
+				<p>A <strong>CloudWatch Logs destination</strong> is the cross-account entry point. Its access policy admits every account in the organization; behind it, a Firehose stream writes to the operational bucket.</p>
+				<span class="file">app-log-pipeline.yaml</span>
+<pre><code><span class="k">AppLogsToS3:</span>
+  <span class="k">Type:</span> AWS::KinesisFirehose::DeliveryStream
+  <span class="k">Properties:</span>
+    <span class="k">ExtendedS3DestinationConfiguration:</span>
+      <span class="k">BucketARN:</span> arn:aws:s3:::org-logs-666666666666
+      <span class="k">RoleARN:</span> !GetAtt FirehoseRole.Arn
+      <span class="k">Prefix:</span> 'applogs/account=!{partitionKeyFromQuery:account}/!{timestamp:yyyy/MM/dd}/'
+      <span class="k">ErrorOutputPrefix:</span> 'applogs-errors/!{firehose:error-output-type}/'
+      <span class="k">BufferingHints:</span> { IntervalInSeconds: 300, SizeInMBs: 128 }
+      <span class="k">DynamicPartitioningConfiguration:</span> { Enabled: true }
+      <span class="k">ProcessingConfiguration:</span>
+        <span class="k">Enabled:</span> true
+        <span class="k">Processors:</span>
+          - <span class="k">Type:</span> Decompression                   <span class="c"># CloudWatch Logs sends gzip records</span>
+            <span class="k">Parameters:</span> [ { ParameterName: CompressionFormat, ParameterValue: GZIP } ]
+          - <span class="k">Type:</span> MetadataExtraction              <span class="c"># partition key from the record's "owner" (source account)</span>
+            <span class="k">Parameters:</span>
+              - { ParameterName: MetadataExtractionQuery, ParameterValue: '{account: .owner}' }
+              - { ParameterName: JsonParsingEngine, ParameterValue: JQ-1.6 }
+
+<span class="k">AppLogsDestination:</span>
+  <span class="k">Type:</span> AWS::Logs::Destination
+  <span class="k">Properties:</span>
+    <span class="k">DestinationName:</span> org-app-logs
+    <span class="k">TargetArn:</span> !GetAtt AppLogsToS3.Arn
+    <span class="k">RoleArn:</span> !GetAtt LogsToFirehoseRole.Arn       <span class="c"># trusts logs.amazonaws.com; firehose:PutRecord*</span>
+    <span class="k">DestinationPolicy:</span> >
+      {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+        "Action":"logs:PutSubscriptionFilter",
+        "Resource":"arn:aws:logs:us-east-1:666666666666:destination:org-app-logs",
+        "Condition":{"StringEquals":{"aws:PrincipalOrgID":["o-a1b2c3d4e5"]}}}]}</code></pre>
+				<div class="callout trap"><p>A CloudWatch Logs destination is <strong>Regional</strong>: log groups can only subscribe to a destination in their own Region. A multi-Region organization needs a destination (and Firehose stream) in each Region, all writing to the same bucket.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Subscriptions in every account (StackSet)</h3>
+				<p>Either one <strong>account-level subscription filter policy</strong> that covers all log groups (excluding the ones that would loop), or a subscription filter on each important log group. With an organization-wide destination policy, each source account also needs a role that CloudWatch Logs uses to send to the destination.</p>
+<pre><code><span class="c"># in each workload account: account-level policy covering every log group</span>
+aws logs put-account-policy \
+  --policy-name org-central-logging \
+  --policy-type SUBSCRIPTION_FILTER_POLICY \
+  --scope ALL \
+  --policy-document '{"DestinationArn":"arn:aws:logs:us-east-1:666666666666:destination:org-app-logs","RoleArn":"arn:aws:iam::222222222222:role/CWLtoOrgDestination","FilterPattern":"","Distribution":"Random"}' \
+  --selection-criteria 'LogGroupName NOT IN ["/aws/lambda/log-forwarder"]'</code></pre>
+				<ul>
+					<li>An empty <code>FilterPattern</code> forwards every event; a pattern such as <code>?ERROR ?WARN</code> forwards fewer and costs less.</li>
+					<li>Each log group can have up to 5 subscription filters, so existing per-team subscriptions keep working.</li>
+				</ul>
+				<div class="callout trap"><p>A subscription that captures the logs of the pipeline itself (a forwarding Lambda function, for example) creates an <strong>infinite loop</strong> and a large bill. Exclude those log groups with the selection criteria.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Query and alert (security account)</h3>
+				<p>An Athena table with <strong>partition projection</strong> computes partitions from the S3 path, so there's no crawler or <code>MSCK REPAIR</code> to run and queries scan only the days and accounts asked for.</p>
+				<span class="file">cloudtrail-table.sql</span>
+<pre><code>CREATE EXTERNAL TABLE cloudtrail_org (
+  eventversion STRING, useridentity STRUCT&lt;type:STRING, arn:STRING, accountid:STRING, accesskeyid:STRING&gt;,
+  eventtime STRING, eventsource STRING, eventname STRING, awsregion STRING,
+  sourceipaddress STRING, errorcode STRING, requestparameters STRING
+)
+PARTITIONED BY (account STRING, region STRING, day STRING)
+ROW FORMAT SERDE 'com.amazon.emr.hive.serde.CloudTrailSerde'
+STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://org-audit-666666666666/AWSLogs/o-a1b2c3d4e5/'
+TBLPROPERTIES (
+  'projection.enabled'='true',
+  'projection.account.type'='enum',
+  'projection.account.values'='222222222222,555555555555,666666666666',
+  'projection.region.type'='enum',
+  'projection.region.values'='us-east-1,eu-west-1',
+  'projection.day.type'='date',
+  'projection.day.format'='yyyy/MM/dd',
+  'projection.day.range'='2026/01/01,NOW',
+  'storage.location.template'='s3://org-audit-666666666666/AWSLogs/o-a1b2c3d4e5/${account}/CloudTrail/${region}/${day}'
+);
+
+-- who deleted security groups last week, in any account?
+SELECT eventtime, account, useridentity.arn, sourceipaddress
+FROM cloudtrail_org
+WHERE eventname = 'DeleteSecurityGroup' AND day &gt;= '2026/10/22';</code></pre>
+				<p>For alerting, metric filters on the trail's log group turn matching events into metrics with alarms:</p>
+<pre><code><span class="k">ConsoleLoginWithoutMfa:</span>
+  <span class="k">Type:</span> AWS::Logs::MetricFilter
+  <span class="k">Properties:</span>
+    <span class="k">LogGroupName:</span> !Ref TrailLogGroup
+    <span class="k">FilterPattern:</span> '{ ($.eventName = "ConsoleLogin") &amp;&amp; ($.additionalEventData.MFAUsed != "Yes") &amp;&amp; ($.responseElements.ConsoleLogin = "Success") }'
+    <span class="k">MetricTransformations:</span>
+      - { MetricNamespace: Security, MetricName: ConsoleLoginNoMfa, MetricValue: "1" }
+<span class="c"># + an AWS::CloudWatch::Alarm on Security/ConsoleLoginNoMfa >= 1 that notifies SNS</span></code></pre>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Guardrails (SCP on all OUs except the log archive admins)</h3>
+				<span class="file">scp-protect-logging.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectTrail",
+      "Effect": "Deny",
+      "Action": [ "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail", "cloudtrail:PutEventSelectors" ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProtectLogBuckets",
+      "Effect": "Deny",
+      "Action": [ "s3:DeleteBucket", "s3:PutBucketPolicy", "s3:PutLifecycleConfiguration", "s3:PutBucketVersioning" ],
+      "Resource": [ "arn:aws:s3:::org-audit-666666666666", "arn:aws:s3:::org-logs-666666666666" ],
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/LogArchiveAdmin" } }
+    },
+    {
+      "Sid": "ProtectSubscriptions",
+      "Effect": "Deny",
+      "Action": [ "logs:DeleteAccountPolicy", "logs:DeleteSubscriptionFilter", "ec2:DeleteFlowLogs", "config:StopConfigurationRecorder" ],
+      "Resource": "*",
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/stacksets-exec-*" } }
+    }
+  ]
+}</code></pre>
+				<p>SCPs don't apply to the management account, which owns the trail, so access to the management account itself must be tightly limited.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>A separate log archive account</td><td data-label="Why">Administrators of workload accounts, and an attacker who compromises one, can't reach the evidence.</td></tr>
+						<tr><td>Two buckets</td><td data-label="Why">Compliance-mode Object Lock is irreversible, so it's applied only where auditors need it (CloudTrail). Operational logs keep lifecycle flexibility.</td></tr>
+						<tr><td>Organization trail, not per-account trails</td><td data-label="Why">Covers new accounts instantly, and member accounts can't change or stop it.</td></tr>
+						<tr><td>Store in S3, not long CloudWatch Logs retention</td><td data-label="Why">S3 with Glacier classes is far cheaper for years of data; CloudWatch Logs keeps only recent data for live troubleshooting.</td></tr>
+						<tr><td>Firehose behind the destination</td><td data-label="Why">Fully managed buffering, decompression, partitioning and delivery; no consumer code to run or scale.</td></tr>
+						<tr><td>Partition projection</td><td data-label="Why">New accounts, Regions and days need no table maintenance, and queries scan only matching prefixes.</td></tr>
+						<tr><td>One KMS key with service-specific statements</td><td data-label="Why">Central control and audit of who can read logs; readers need both bucket access and <code>kms:Decrypt</code>.</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>Most "logs stopped arriving" problems are <strong>key policy</strong> problems. CloudTrail, Config, log delivery, Firehose and CloudWatch Logs each need permission on the KMS key (and a matching bucket policy). Check the key policy before the bucket policy.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>CloudWatch Logs centralization rules</td><td data-label="When it fits better">You want application logs copied into CloudWatch Logs in a central account (and optionally a backup Region) for querying there, managed by rules from the management or delegated administrator account. Only new log data is copied.</td></tr>
+						<tr><td>CloudWatch cross-account observability</td><td data-label="When it fits better">A monitoring account needs to view and query logs, metrics and traces in place, without copying or long-term retention.</td></tr>
+						<tr><td>Amazon Security Lake</td><td data-label="When it fits better">Security tools (SIEM) should consume CloudTrail, flow logs, Route 53 resolver logs and findings in the standard OCSF format from a managed data lake.</td></tr>
+						<tr><td>Amazon OpenSearch Service</td><td data-label="When it fits better">Analysts need full-text search and interactive dashboards over recent logs (Firehose can deliver to it as well as S3).</td></tr>
+						<tr><td>Control Tower</td><td data-label="When it fits better">Starting fresh: it creates the log archive and audit accounts, the organization trail and Config delivery for you.</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check delivery from a new account</span><span class="desc">Create an account in the Workloads OU; within minutes its CloudTrail prefix appears in the audit bucket and the StackSet instance reaches <code>CURRENT</code>.</span></li>
+				<li><span class="name">Check the application pipeline</span><span class="desc">Write a test event with <code>aws logs put-log-events</code> in a workload account, then look for it under <code>applogs/account=222222222222/</code> after the Firehose buffer interval.</span></li>
+				<li><span class="name">Prove immutability</span><span class="desc">Try to delete a CloudTrail log object version as an administrator; it fails with access denied because of the retention period.</span></li>
+				<li><span class="name">Validate integrity</span><span class="desc"><code>aws cloudtrail validate-logs --trail-arn ... --start-time ...</code> reports every file as valid.</span></li>
+				<li><span class="name">Fire an alarm</span><span class="desc">Sign in to a sandbox account's console without MFA and confirm the alarm notifies SNS.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Multi-account automation</td><td data-label="What this architecture demonstrates">Service-managed StackSets with automatic deployment; SCP guardrails; a dedicated log archive account</td></tr>
+						<tr><td><a href="../d4-task-4-1.html">4.1</a> Log collection and storage</td><td data-label="What this architecture demonstrates">Subscription filters, cross-account destinations, Firehose to S3, retention and lifecycle, KMS encryption</td></tr>
+						<tr><td><a href="../d4-task-4-2.html">4.2</a> Audit and analyze logs</td><td data-label="What this architecture demonstrates">Athena with partition projection, metric filters and alarms</td></tr>
+						<tr><td><a href="../d6-task-6-3.html">6.3</a> Security monitoring and auditing</td><td data-label="What this architecture demonstrates">Organization trail, log file validation, Object Lock, Config aggregator</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Centralize logs from all accounts, make them immutable for 7 years, at the lowest cost" is an <strong>organization trail and subscription filters into S3 in a log archive account, with Object Lock in compliance mode and lifecycle transitions to Glacier</strong>. Keeping seven years in CloudWatch Logs works but costs far more, and governance mode can be bypassed, so neither is the best answer.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

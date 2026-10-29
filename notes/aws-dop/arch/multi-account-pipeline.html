@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Multi-Account CI/CD for a Containerized Service | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: a CodePipeline V2 pipeline in a tooling account builds a container image, deploys it to staging, waits for approval, and releases it to production ECS on Fargate with a CodeDeploy canary and automatic alarm rollback.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Multi-account CI/CD</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Multi-account CI/CD for a containerized service</h1>
+		<p>A push to <code>main</code> builds and tests a container image once, in a central tooling account. The same image goes to a staging account for integration tests, waits for a person to approve, and then reaches production ECS on Fargate as a canary that rolls back by itself if an alarm fires.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 6</span><span class="tag">CodePipeline</span><span class="tag">CodeBuild</span><span class="tag">CodeDeploy</span><span class="tag">Amazon ECR</span><span class="tag">Amazon ECS</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Connection and ECR repository</a></li>
+				<li class="sub"><a href="#b2">2. Artifact key and bucket</a></li>
+				<li class="sub"><a href="#b3">3. Deploy roles in target accounts</a></li>
+				<li class="sub"><a href="#b4">4. buildspec.yml</a></li>
+				<li class="sub"><a href="#b5">5. Production deployment files</a></li>
+				<li class="sub"><a href="#b6">6. The pipeline</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>A team runs an orders API on ECS. They want every change released the same way: built once, tested in staging, approved, and released to production gradually, without anyone holding production credentials.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Code lives in GitHub</td><td data-label="Design choice">A source action through AWS CodeConnections</td></tr>
+						<tr><td>Only changes to the service start a release</td><td data-label="Design choice">A CodePipeline V2 trigger with branch and file-path filters</td></tr>
+						<tr><td>Build once, deploy the same image everywhere</td><td data-label="Design choice">One image in the tooling account's ECR, tagged with the commit ID, pulled by every environment</td></tr>
+						<tr><td>No release with known critical vulnerabilities</td><td data-label="Design choice">Amazon Inspector enhanced scanning on push, checked by a build step</td></tr>
+						<tr><td>Teams can't deploy straight to production</td><td data-label="Design choice">Deploys run through roles in the target accounts that only the pipeline can assume</td></tr>
+						<tr><td>A person signs off before production</td><td data-label="Design choice">A manual approval action that notifies through SNS</td></tr>
+						<tr><td>Limit the impact of a bad release</td><td data-label="Design choice">CodeDeploy blue/green for ECS with a canary, a test listener and alarm-based rollback</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, all in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Tooling</td><td data-label="ID"><code>111111111111</code></td><td data-label="What lives there">CodePipeline (service role <code>PipelineServiceRole</code>), CodeBuild, the ECR repository <code>orders</code>, the artifact bucket <code>tooling-artifacts-111111111111</code> and its customer managed KMS key</td></tr>
+						<tr><td>Staging</td><td data-label="ID"><code>333333333333</code></td><td data-label="What lives there">ECS cluster and service <code>orders</code>, role <code>PipelineDeployRole</code></td></tr>
+						<tr><td>Production</td><td data-label="ID"><code>222222222222</code></td><td data-label="What lives there">ECS on Fargate behind an ALB, the CodeDeploy application and deployment group, role <code>PipelineDeployRole</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically inside AWS services; steps marked <span class="who">Pipeline</span> are actions you define; <span class="who">Person</span> needs a human.</p>
+			<ol class="flow">
+				<li class="group">Source</li>
+				<li class="auto"><span class="name">A developer pushes to <code>main</code><span class="who auto">AWS</span></span><span class="desc">The trigger checks the branch and changed file paths (<code>src/**</code>, <code>Dockerfile</code>); a README edit doesn't start a release.</span></li>
+				<li><span class="name">Fetch the source<span class="who">Pipeline</span></span><span class="desc">The CodeConnections source action stores the commit in the encrypted artifact bucket and exposes the commit ID as a variable.</span></li>
+				<li class="group">Build (tooling account)</li>
+				<li><span class="name">Unit tests and image build<span class="who">Pipeline</span></span><span class="desc">CodeBuild in privileged mode runs the tests, builds the image and pushes it to ECR tagged with the commit ID.</span></li>
+				<li class="auto"><span class="name">Scan the image<span class="who auto">AWS</span></span><span class="desc">Inspector enhanced scanning scans the image on push; the build waits for the result and fails on critical findings.</span></li>
+				<li class="group">Staging</li>
+				<li><span class="name">Deploy to staging<span class="who">Pipeline</span></span><span class="desc">The ECS deploy action runs as <code>PipelineDeployRole</code> in <code>333333333333</code> and updates the service with the new image (rolling update with the circuit breaker).</span></li>
+				<li><span class="name">Integration tests<span class="who">Pipeline</span></span><span class="desc">A second CodeBuild project calls the staging endpoint; failure stops the pipeline.</span></li>
+				<li class="group">Approval</li>
+				<li><span class="name">Approve the release<span class="who">Person</span></span><span class="desc">The approval action notifies an SNS topic; a release manager approves within 7 days or the action fails.</span></li>
+				<li class="group">Production</li>
+				<li><span class="name">Start a blue/green deployment<span class="who">Pipeline</span></span><span class="desc">The <code>CodeDeployToECS</code> action, as <code>PipelineDeployRole</code> in <code>222222222222</code>, registers a new task definition and asks CodeDeploy to deploy it.</span></li>
+				<li class="auto"><span class="name">Start the green task set<span class="who auto">AWS</span></span><span class="desc">CodeDeploy starts new tasks in the second target group, reachable on the ALB's test listener (port 8443).</span></li>
+				<li><span class="name">Smoke-test the green tasks<span class="who">Pipeline</span></span><span class="desc">The <code>AfterAllowTestTraffic</code> hook Lambda function calls the test listener and reports success or failure to CodeDeploy.</span></li>
+				<li class="auto"><span class="name">Shift 10% of traffic, then the rest<span class="who auto">AWS</span></span><span class="desc"><code>CodeDeployDefault.ECSCanary10Percent5Minutes</code>: 10% for 5 minutes, then 100%. If a CloudWatch alarm goes off, CodeDeploy moves all traffic back to blue.</span></li>
+				<li class="auto"><span class="name">Retire the blue tasks<span class="who auto">AWS</span></span><span class="desc">After the termination wait time, the old task set is removed.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Connection and ECR repository (tooling account)</h3>
+				<span class="file">tooling-shared.yaml (in 111111111111)</span>
+<pre><code><span class="k">GitHubConnection:</span>
+  <span class="k">Type:</span> AWS::CodeStarConnections::Connection
+  <span class="k">Properties:</span>
+    <span class="k">ConnectionName:</span> github-acme
+    <span class="k">ProviderType:</span> GitHub                <span class="c"># created as PENDING; authorize once in the console</span>
+
+<span class="k">OrdersRepository:</span>
+  <span class="k">Type:</span> AWS::ECR::Repository
+  <span class="k">Properties:</span>
+    <span class="k">RepositoryName:</span> orders
+    <span class="k">ImageTagMutability:</span> IMMUTABLE       <span class="c"># a commit tag can never point at a different image</span>
+    <span class="k">RepositoryPolicyText:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Sid:</span> PullFromWorkloadAccounts
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">AWS:</span> [ arn:aws:iam::333333333333:root, arn:aws:iam::222222222222:root ]
+          <span class="k">Action:</span> [ ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability ]
+    <span class="k">LifecyclePolicy:</span>
+      <span class="k">LifecyclePolicyText:</span> |
+        {"rules":[{"rulePriority":1,"description":"keep last 50 images",
+          "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":50},
+          "action":{"type":"expire"}}]}</code></pre>
+				<p>Turn on Inspector enhanced scanning for the registry (Inspector console or <code>aws ecr put-registry-scanning-configuration --scan-type ENHANCED</code>) so every pushed image is scanned, and re-scanned when new CVEs are published.</p>
+				<div class="callout trap"><p>A new connection stays in <strong><code>PENDING</code></strong> until someone completes the handshake with GitHub in the console. A pipeline using it fails at the source action until then; CloudFormation can't authorize it for you.</p></div>
+				<div class="callout trap"><p>Pulling a cross-account image needs <strong>both sides</strong>: this repository policy must allow the workload account, and the ECS <strong>task execution role</strong> in that account needs <code>ecr:GetAuthorizationToken</code> and the pull actions (the managed policy <code>AmazonECSTaskExecutionRolePolicy</code> covers them). Tasks stuck in <em>PENDING</em> with <code>CannotPullContainerError</code> usually mean one of the two is missing.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Artifact key and bucket (tooling account)</h3>
+				<p>Deploy actions in the other accounts read artifacts from this bucket, so both the key policy and the bucket policy must grant their deploy roles.</p>
+				<span class="file">tooling-artifacts.yaml (in 111111111111)</span>
+<pre><code><span class="k">ArtifactKey:</span>
+  <span class="k">Type:</span> AWS::KMS::Key
+  <span class="k">Properties:</span>
+    <span class="k">EnableKeyRotation:</span> true
+    <span class="k">KeyPolicy:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Sid:</span> ToolingAccountAdmin
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { AWS: arn:aws:iam::111111111111:root }
+          <span class="k">Action:</span> kms:*
+          <span class="k">Resource:</span> "*"
+        - <span class="k">Sid:</span> DeployRolesUseKey
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">AWS:</span>
+              - arn:aws:iam::333333333333:role/PipelineDeployRole
+              - arn:aws:iam::222222222222:role/PipelineDeployRole
+          <span class="k">Action:</span> [ kms:Decrypt, kms:DescribeKey ]
+          <span class="k">Resource:</span> "*"
+
+<span class="k">ArtifactBucket:</span>
+  <span class="k">Type:</span> AWS::S3::Bucket
+  <span class="k">Properties:</span>
+    <span class="k">BucketName:</span> tooling-artifacts-111111111111
+    <span class="k">BucketEncryption:</span>
+      <span class="k">ServerSideEncryptionConfiguration:</span>
+        - <span class="k">ServerSideEncryptionByDefault:</span> { SSEAlgorithm: aws:kms, KMSMasterKeyID: !GetAtt ArtifactKey.Arn }
+
+<span class="k">ArtifactBucketPolicy:</span>
+  <span class="k">Type:</span> AWS::S3::BucketPolicy
+  <span class="k">Properties:</span>
+    <span class="k">Bucket:</span> !Ref ArtifactBucket
+    <span class="k">PolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Sid:</span> DeployRolesReadArtifacts
+          <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">AWS:</span>
+              - arn:aws:iam::333333333333:role/PipelineDeployRole
+              - arn:aws:iam::222222222222:role/PipelineDeployRole
+          <span class="k">Action:</span> [ s3:GetObject, s3:GetObjectVersion ]
+          <span class="k">Resource:</span> !Sub ${ArtifactBucket.Arn}/*</code></pre>
+				<div class="callout trap"><p>The default <strong>AWS managed key <code>aws/s3</code> can't be shared across accounts</strong>, because you can't edit its key policy. A cross-account pipeline needs a customer managed key like this one. "Access denied reading the input artifact" in a staging or production action points to the key policy or bucket policy.</p></div>
+				<div class="callout tip"><p>Deploy the target accounts' roles (Step 3) <strong>before</strong> this stack. A key or bucket policy that names a role that doesn't exist yet is rejected.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Deploy roles in the target accounts (StackSet)</h3>
+				<p>Deploy this from the management account (or a delegated administrator) as a <strong>service-managed StackSet</strong> to the staging and production accounts, so every environment gets the same role.</p>
+				<span class="file">pipeline-deploy-role.yaml (in 333333333333 and 222222222222)</span>
+<pre><code><span class="k">PipelineDeployRole:</span>
+  <span class="k">Type:</span> AWS::IAM::Role
+  <span class="k">Properties:</span>
+    <span class="k">RoleName:</span> PipelineDeployRole
+    <span class="k">AssumeRolePolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span> { AWS: arn:aws:iam::111111111111:role/PipelineServiceRole }   <span class="c"># only the pipeline</span>
+          <span class="k">Action:</span> sts:AssumeRole
+    <span class="k">Policies:</span>
+      - <span class="k">PolicyName:</span> deploy-orders
+        <span class="k">PolicyDocument:</span>
+          <span class="k">Version:</span> "2012-10-17"
+          <span class="k">Statement:</span>
+            - <span class="k">Effect:</span> Allow                                 <span class="c"># ECS deploy action (staging)</span>
+              <span class="k">Action:</span> [ ecs:DescribeServices, ecs:DescribeTaskDefinition, ecs:RegisterTaskDefinition, ecs:UpdateService, ecs:TagResource ]
+              <span class="k">Resource:</span> "*"
+            - <span class="k">Effect:</span> Allow                                 <span class="c"># CodeDeployToECS action (production)</span>
+              <span class="k">Action:</span> [ codedeploy:CreateDeployment, codedeploy:GetDeployment, codedeploy:GetApplication, codedeploy:GetApplicationRevision, codedeploy:RegisterApplicationRevision, codedeploy:GetDeploymentConfig ]
+              <span class="k">Resource:</span> "*"
+            - <span class="k">Effect:</span> Allow
+              <span class="k">Action:</span> iam:PassRole                           <span class="c"># the task and execution roles</span>
+              <span class="k">Resource:</span> !Sub arn:aws:iam::${AWS::AccountId}:role/orders-*
+              <span class="k">Condition:</span>
+                <span class="k">StringEquals:</span> { iam:PassedToService: ecs-tasks.amazonaws.com }
+            - <span class="k">Effect:</span> Allow                                 <span class="c"># read artifacts from the tooling account</span>
+              <span class="k">Action:</span> [ s3:GetObject, s3:GetObjectVersion ]
+              <span class="k">Resource:</span> arn:aws:s3:::tooling-artifacts-111111111111/*
+            - <span class="k">Effect:</span> Allow
+              <span class="k">Action:</span> [ kms:Decrypt, kms:DescribeKey ]
+              <span class="k">Resource:</span> arn:aws:kms:us-east-1:111111111111:key/*</code></pre>
+				<p>In the tooling account, <code>PipelineServiceRole</code> needs <code>sts:AssumeRole</code> on <code>arn:aws:iam::*:role/PipelineDeployRole</code> in the two target accounts.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>buildspec.yml</h3>
+				<p>The build project uses a standard Linux image with <strong>privileged mode</strong> on, which Docker builds need. It produces one artifact with everything both deploy actions read.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">env:</span>
+  <span class="k">variables:</span>
+    <span class="k">REPO:</span> 111111111111.dkr.ecr.us-east-1.amazonaws.com/orders
+<span class="k">phases:</span>
+  <span class="k">pre_build:</span>
+    <span class="k">commands:</span>
+      - TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-12)      <span class="c"># commit ID</span>
+      - aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
+      - npm ci &amp;&amp; npm test                                               <span class="c"># unit tests</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - docker build -t $REPO:$TAG .
+  <span class="k">post_build:</span>
+    <span class="k">commands:</span>
+      - docker push $REPO:$TAG
+      - ./scripts/fail-on-critical.sh orders $TAG      <span class="c"># polls describe-image-scan-findings until findings are ready, exits 1 on CRITICAL</span>
+      - printf '[{"name":"orders","imageUri":"%s"}]' $REPO:$TAG &gt; imagedefinitions.json   <span class="c"># ECS deploy action (staging)</span>
+      - printf '{"ImageURI":"%s"}' $REPO:$TAG &gt; imageDetail.json                          <span class="c"># CodeDeployToECS (production)</span>
+<span class="k">reports:</span>
+  <span class="k">unit-tests:</span>
+    <span class="k">files:</span> [ "reports/junit.xml" ]
+    <span class="k">file-format:</span> JUNITXML
+<span class="k">artifacts:</span>
+  <span class="k">files:</span>
+    - imagedefinitions.json
+    - imageDetail.json
+    - deploy/taskdef-prod.json
+    - deploy/appspec.yaml</code></pre>
+				<div class="callout note"><p>The staging ECS deploy action uses <code>imagedefinitions.json</code> (container name and image). The production <code>CodeDeployToECS</code> action uses <code>imageDetail.json</code> (just the image URI) plus a task definition template and an AppSpec file. Mixing them up is a common cause of "file not found" deploy errors.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Production deployment files</h3>
+				<p>The pipeline fills in two placeholders: <code>&lt;IMAGE1_NAME&gt;</code> in the task definition becomes the image URI from <code>imageDetail.json</code>, and <code>&lt;TASK_DEFINITION&gt;</code> in the AppSpec becomes the ARN of the newly registered task definition.</p>
+				<span class="file">deploy/taskdef-prod.json (excerpt)</span>
+<pre><code>{
+  "family": "orders",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512", "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::222222222222:role/orders-execution-role",
+  "taskRoleArn": "arn:aws:iam::222222222222:role/orders-task-role",
+  "containerDefinitions": [{
+    "name": "orders",
+    "image": "&lt;IMAGE1_NAME&gt;",
+    "portMappings": [{ "containerPort": 8080 }]
+  }]
+}</code></pre>
+				<span class="file">deploy/appspec.yaml</span>
+<pre><code><span class="k">version:</span> 0.0
+<span class="k">Resources:</span>
+  - <span class="k">TargetService:</span>
+      <span class="k">Type:</span> AWS::ECS::Service
+      <span class="k">Properties:</span>
+        <span class="k">TaskDefinition:</span> &lt;TASK_DEFINITION&gt;
+        <span class="k">LoadBalancerInfo:</span>
+          <span class="k">ContainerName:</span> orders
+          <span class="k">ContainerPort:</span> 8080
+<span class="k">Hooks:</span>
+  - <span class="k">AfterAllowTestTraffic:</span> orders-smoke-test     <span class="c"># Lambda: call the test listener, report the result</span></code></pre>
+				<p>The CodeDeploy deployment group in <code>222222222222</code> (created with the ECS service, using the <code>CODE_DEPLOY</code> deployment controller) holds the rest:</p>
+				<ul>
+					<li>the ALB's production listener (443) and test listener (8443), and the blue and green target groups;</li>
+					<li>deployment configuration <code>CodeDeployDefault.ECSCanary10Percent5Minutes</code>;</li>
+					<li>automatic rollback on deployment failure and when alarms fire (5xx rate, p99 latency);</li>
+					<li>the wait time before the old tasks are terminated.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>The pipeline (tooling account)</h3>
+				<span class="file">pipeline.yaml (in 111111111111, abridged)</span>
+<pre><code><span class="k">OrdersPipeline:</span>
+  <span class="k">Type:</span> AWS::CodePipeline::Pipeline
+  <span class="k">Properties:</span>
+    <span class="k">PipelineType:</span> V2
+    <span class="k">ExecutionMode:</span> QUEUED                         <span class="c"># releases run in order, none skipped</span>
+    <span class="k">RoleArn:</span> arn:aws:iam::111111111111:role/PipelineServiceRole
+    <span class="k">ArtifactStore:</span>
+      <span class="k">Type:</span> S3
+      <span class="k">Location:</span> tooling-artifacts-111111111111
+      <span class="k">EncryptionKey:</span> { Type: KMS, Id: !GetAtt ArtifactKey.Arn }   <span class="c"># customer managed key</span>
+    <span class="k">Triggers:</span>
+      - <span class="k">ProviderType:</span> CodeStarSourceConnection
+        <span class="k">GitConfiguration:</span>
+          <span class="k">SourceActionName:</span> Source
+          <span class="k">Push:</span>
+            - <span class="k">Branches:</span> { Includes: [ main ] }
+              <span class="k">FilePaths:</span> { Includes: [ "src/**", "Dockerfile", "deploy/**" ] }
+    <span class="k">Stages:</span>
+      - <span class="k">Name:</span> Source
+        <span class="k">Actions:</span>
+          - <span class="k">Name:</span> Source
+            <span class="k">ActionTypeId:</span> { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+            <span class="k">Configuration:</span>
+              <span class="k">ConnectionArn:</span> !Ref GitHubConnection
+              <span class="k">FullRepositoryId:</span> acme/orders
+              <span class="k">BranchName:</span> main
+            <span class="k">OutputArtifacts:</span> [ { Name: SourceOutput } ]
+            <span class="k">Namespace:</span> SourceVariables                <span class="c"># exposes #{SourceVariables.CommitId}</span>
+
+      - <span class="k">Name:</span> Build
+        <span class="k">Actions:</span>
+          - <span class="k">Name:</span> TestAndBuildImage
+            <span class="k">ActionTypeId:</span> { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+            <span class="k">Configuration:</span> { ProjectName: orders-build }
+            <span class="k">InputArtifacts:</span> [ { Name: SourceOutput } ]
+            <span class="k">OutputArtifacts:</span> [ { Name: BuildOutput } ]
+
+      - <span class="k">Name:</span> Staging
+        <span class="k">Actions:</span>
+          - <span class="k">Name:</span> DeployStaging
+            <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: ECS, Version: "1" }
+            <span class="k">RoleArn:</span> arn:aws:iam::333333333333:role/PipelineDeployRole     <span class="c"># runs in staging</span>
+            <span class="k">Configuration:</span> { ClusterName: orders, ServiceName: orders, FileName: imagedefinitions.json }
+            <span class="k">InputArtifacts:</span> [ { Name: BuildOutput } ]
+            <span class="k">RunOrder:</span> 1
+          - <span class="k">Name:</span> IntegrationTests
+            <span class="k">ActionTypeId:</span> { Category: Test, Owner: AWS, Provider: CodeBuild, Version: "1" }
+            <span class="k">Configuration:</span> { ProjectName: orders-integration-tests }
+            <span class="k">InputArtifacts:</span> [ { Name: SourceOutput } ]
+            <span class="k">RunOrder:</span> 2
+
+      - <span class="k">Name:</span> Approval
+        <span class="k">Actions:</span>
+          - <span class="k">Name:</span> ReleaseManagerApproval
+            <span class="k">ActionTypeId:</span> { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+            <span class="k">Configuration:</span>
+              <span class="k">NotificationArn:</span> arn:aws:sns:us-east-1:111111111111:release-approvals
+              <span class="k">CustomData:</span> "Commit #{SourceVariables.CommitId} passed staging. Approve for production?"
+
+      - <span class="k">Name:</span> Production
+        <span class="k">Actions:</span>
+          - <span class="k">Name:</span> BlueGreenDeploy
+            <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: "1" }
+            <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/PipelineDeployRole     <span class="c"># runs in production</span>
+            <span class="k">Configuration:</span>
+              <span class="k">ApplicationName:</span> orders
+              <span class="k">DeploymentGroupName:</span> orders-prod
+              <span class="k">TaskDefinitionTemplateArtifact:</span> BuildOutput
+              <span class="k">TaskDefinitionTemplatePath:</span> deploy/taskdef-prod.json
+              <span class="k">AppSpecTemplateArtifact:</span> BuildOutput
+              <span class="k">AppSpecTemplatePath:</span> deploy/appspec.yaml
+              <span class="k">Image1ArtifactName:</span> BuildOutput            <span class="c"># contains imageDetail.json</span>
+              <span class="k">Image1ContainerName:</span> IMAGE1_NAME           <span class="c"># replaces &lt;IMAGE1_NAME&gt;</span>
+            <span class="k">InputArtifacts:</span> [ { Name: BuildOutput } ]</code></pre>
+				<p>Everything runs in one Region, so a single artifact store is enough. A cross-Region action would need an artifact store (and key) in each Region it deploys to.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Central tooling account</td><td data-label="Why">Build tools, credentials and pipeline history live apart from workloads; developers get no deploy rights in production.</td></tr>
+						<tr><td>Build once, promote the same image</td><td data-label="Why">What was tested in staging is exactly what reaches production; immutable tags guarantee it.</td></tr>
+						<tr><td>Rolling update in staging, blue/green in production</td><td data-label="Why">Staging only needs speed. Production gets a test listener, a canary and instant rollback by moving traffic back.</td></tr>
+						<tr><td>Hook on <code>AfterAllowTestTraffic</code></td><td data-label="Why">Tests the green tasks through the test listener before any customer traffic reaches them.</td></tr>
+						<tr><td>Alarm-based rollback</td><td data-label="Why">The canary is only useful if something watches it; CodeDeploy rolls back as soon as an alarm fires.</td></tr>
+						<tr><td>Roles deployed with StackSets</td><td data-label="Why">New environments get an identical, reviewed deploy role automatically.</td></tr>
+						<tr><td>Queued execution mode</td><td data-label="Why">Each approved commit is released in order instead of newer runs superseding older ones.</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>ECS built-in blue/green (deployment controller <code>ECS</code>)</td><td data-label="When it fits better">You want blue/green, canary or linear without a CodeDeploy application; the standard ECS deploy action can drive it.</td></tr>
+						<tr><td>ECS rolling update with the deployment circuit breaker</td><td data-label="When it fits better">Simple services where a short mixed-version period is acceptable</td></tr>
+						<tr><td>ECR source action (image push starts the pipeline)</td><td data-label="When it fits better">Images are built elsewhere and the pipeline only deploys</td></tr>
+						<tr><td>One pipeline per account</td><td data-label="When it fits better">Rarely better: harder to promote one artifact, and credentials spread across accounts</td></tr>
+						<tr><td>CDK Pipelines</td><td data-label="When it fits better">Infrastructure and application are both in CDK and the pipeline should update itself</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check the trigger</span><span class="desc">Push a README-only change and confirm no execution starts; push a change under <code>src/</code> and confirm it does.</span></li>
+				<li><span class="name">Check the scan gate</span><span class="desc">Build an image from a base image with a known critical CVE; the build should fail before staging.</span></li>
+				<li><span class="name">Check rollback</span><span class="desc">Release a version that returns 500 on part of the traffic; the alarm should fire during the 10% canary and CodeDeploy should move traffic back to blue.</span></li>
+				<li><span class="name">Check isolation</span><span class="desc">Try to assume <code>PipelineDeployRole</code> from a developer role; it should be denied.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-1.html">1.1</a> CI/CD pipelines</td><td data-label="What this architecture demonstrates">V2 triggers, CodeConnections, cross-account actions, approvals, artifact encryption</td></tr>
+						<tr><td><a href="../d1-task-1-2.html">1.2</a> Automated testing</td><td data-label="What this architecture demonstrates">Unit tests and reports in the build, integration tests after staging, smoke tests in a deployment hook</td></tr>
+						<tr><td><a href="../d1-task-1-3.html">1.3</a> Artifacts</td><td data-label="What this architecture demonstrates">ECR immutable tags, lifecycle policies, cross-account pulls, image scanning</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Deployment strategies</td><td data-label="What this architecture demonstrates">ECS rolling vs CodeDeploy blue/green with canary traffic shifting and alarm rollback</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Multi-account automation</td><td data-label="What this architecture demonstrates">Deploy roles rolled out with service-managed StackSets</td></tr>
+						<tr><td><a href="../d6-task-6-1.html">6.1</a> Identity at scale</td><td data-label="What this architecture demonstrates">Trust policies limited to the pipeline role, <code>iam:PassRole</code> scoped by service</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Deploy from a central account to several workload accounts" is <strong>one pipeline in a tooling account, a customer managed KMS key shared with the target accounts, and an action-level <code>RoleArn</code> pointing to a role in each target account</strong>. Answers that copy access keys into the pipeline or use the <code>aws/s3</code> key are wrong.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

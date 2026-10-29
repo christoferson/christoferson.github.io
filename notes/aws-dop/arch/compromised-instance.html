@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Automated Response to a Compromised EC2 Instance | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: GuardDuty detects a compromised EC2 instance in any account, EventBridge routes the finding, and a Step Functions workflow isolates the instance, preserves evidence, revokes credentials and notifies responders.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Compromised EC2 instance</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Automated response to a compromised EC2 instance</h1>
+		<p>GuardDuty spots an instance talking to a crypto-mining pool or leaking its credentials, in any account of the organization. Within a minute, without anyone logging in, the instance is cut off from the network, its disks are preserved for forensics, its stolen credentials stop working, Auto Scaling replaces it, and the on-call engineer is told what happened.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 4</span><span class="tag">Domain 5</span><span class="tag">Domain 6</span><span class="tag">GuardDuty</span><span class="tag">EventBridge</span><span class="tag">Step Functions</span><span class="tag">StackSets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. GuardDuty for the organization</a></li>
+				<li class="sub"><a href="#b2">2. Workload account resources</a></li>
+				<li class="sub"><a href="#b3">3. EventBridge rule</a></li>
+				<li class="sub"><a href="#b4">4. Response workflow</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>A company runs web servers in Auto Scaling groups across many workload accounts. Security wants compromised instances contained automatically, around the clock, with evidence kept for investigation and no impact on the application's capacity.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Detect compromise in every account and Region, including new accounts</td><td data-label="Design choice">GuardDuty with a delegated administrator and organization auto-enable</td></tr>
+						<tr><td>One place to respond from</td><td data-label="Design choice">Member findings arrive in the administrator (security) account's EventBridge</td></tr>
+						<tr><td>Act only on serious findings about instances</td><td data-label="Design choice">EventBridge pattern on <code>resourceType</code> and <code>severity &gt;= 7</code></td></tr>
+						<tr><td>Multi-step response with retries and an audit trail</td><td data-label="Design choice">Step Functions Standard workflow</td></tr>
+						<tr><td>Act inside the affected account</td><td data-label="Design choice">A response role in every workload account, deployed with StackSets</td></tr>
+						<tr><td>Keep evidence</td><td data-label="Design choice">Isolate instead of terminating; snapshot the volumes</td></tr>
+						<tr><td>No loss of capacity</td><td data-label="Design choice">Detach from the Auto Scaling group without lowering desired capacity, so a replacement launches</td></tr>
+						<tr><td>Stolen role credentials must stop working</td><td data-label="Design choice">Revoke the instance role's sessions issued before now</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, all in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Management</td><td data-label="ID"><code>000000000000</code></td><td data-label="What lives there">Organizations; designates the GuardDuty administrator; runs the StackSet</td></tr>
+						<tr><td>Security</td><td data-label="ID"><code>555555555555</code></td><td data-label="What lives there">GuardDuty administrator, EventBridge rule, Step Functions workflow, SNS topic</td></tr>
+						<tr><td>Workload</td><td data-label="ID"><code>222222222222</code> (and every other workload account)</td><td data-label="What lives there">The web servers, an isolation security group per VPC, <code>IncidentResponseRole</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically inside AWS services; steps marked <span class="who">Workflow</span> are states in the Step Functions workflow you build.</p>
+			<ol class="flow">
+				<li class="group">Detect</li>
+				<li class="auto"><span class="name">GuardDuty raises a finding<span class="who auto">AWS</span></span><span class="desc">For example <code>CryptoCurrency:EC2/BitcoinTool.B!DNS</code> on instance <code>i-0abc123</code> in <code>222222222222</code>, severity 8.</span></li>
+				<li class="auto"><span class="name">The finding reaches the security account<span class="who auto">AWS</span></span><span class="desc">GuardDuty sends member findings to the administrator account, which emits a <code>GuardDuty Finding</code> event on its default bus.</span></li>
+				<li class="group">Route</li>
+				<li class="auto"><span class="name">An EventBridge rule matches<span class="who auto">AWS</span></span><span class="desc">Instance findings with severity 7 or higher start the workflow, passing the account ID, Region and instance ID.</span></li>
+				<li class="group">Contain</li>
+				<li><span class="name">Gather context<span class="who">Workflow</span></span><span class="desc">Looks up the instance's VPC, Auto Scaling group, instance role and the VPC's isolation security group.</span></li>
+				<li><span class="name">Tag the instance<span class="who">Workflow</span></span><span class="desc"><code>quarantine=true</code> and the finding ID, so people and automation know not to touch it.</span></li>
+				<li><span class="name">Detach from the Auto Scaling group<span class="who">Workflow</span></span><span class="desc">Without decrementing desired capacity. The group launches a clean replacement and stops health-checking the bad one.</span></li>
+				<li><span class="name">Swap to the isolation security group<span class="who">Workflow</span></span><span class="desc">A group with no inbound rules and no usable outbound rule.</span></li>
+				<li><span class="name">Revoke the role's sessions<span class="who">Workflow</span></span><span class="desc">Adds a deny for sessions issued before now to the instance role, so credentials already stolen stop working.</span></li>
+				<li class="group">Preserve</li>
+				<li><span class="name">Snapshot every volume<span class="who">Workflow</span></span><span class="desc">One crash-consistent set of snapshots, tagged with the finding ID, for forensics.</span></li>
+				<li class="group">Notify</li>
+				<li><span class="name">Tell the responders<span class="who">Workflow</span></span><span class="desc">SNS message to the on-call topic with the finding, the actions taken and the snapshot IDs.</span></li>
+				<li class="group">Investigate and recover (people)</li>
+				<li><span class="name">Investigate<span class="who">Responder</span></span><span class="desc">Detective for scope, the snapshots for forensics, CloudTrail for what the stolen credentials did.</span></li>
+				<li><span class="name">Fix and clean up<span class="who">Responder</span></span><span class="desc">Patch the image, rotate secrets the instance could read, then terminate the quarantined instance.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>GuardDuty for the organization</h3>
+				<p>From the management account, make the security account the administrator, then from the security account turn on auto-enable. Repeat in every Region you use, because GuardDuty is Regional.</p>
+<pre><code><span class="c"># in 000000000000 (management)</span>
+aws guardduty enable-organization-admin-account --admin-account-id 555555555555
+
+<span class="c"># in 555555555555 (security)</span>
+DETECTOR=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+aws guardduty update-organization-configuration \
+  --detector-id "$DETECTOR" \
+  --auto-enable-organization-members ALL      <span class="c"># existing and new accounts</span></code></pre>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Workload account resources (StackSet)</h3>
+				<p>Deploy this template from the management account as a <strong>service-managed StackSet</strong> targeting the Workloads OU, with automatic deployment on, so every new account gets it. The isolation security group is per VPC, so its template takes the VPC ID (or deploy it with the VPC's own stack).</p>
+				<span class="file">incident-response-baseline.yaml</span>
+<pre><code><span class="k">Parameters:</span>
+  <span class="k">VpcId:</span> { Type: AWS::EC2::VPC::Id }
+
+<span class="k">Resources:</span>
+  <span class="k">IsolationSecurityGroup:</span>
+    <span class="k">Type:</span> AWS::EC2::SecurityGroup
+    <span class="k">Properties:</span>
+      <span class="k">GroupDescription:</span> Quarantine - no traffic in or out
+      <span class="k">VpcId:</span> !Ref VpcId
+      <span class="k">SecurityGroupEgress:</span>                     <span class="c"># replaces the default allow-all egress rule</span>
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32 }
+      <span class="k">Tags:</span>
+        - { Key: purpose, Value: isolation }      <span class="c"># how the workflow finds it</span>
+
+  <span class="k">IncidentResponseRole:</span>
+    <span class="k">Type:</span> AWS::IAM::Role
+    <span class="k">Properties:</span>
+      <span class="k">RoleName:</span> IncidentResponseRole
+      <span class="k">AssumeRolePolicyDocument:</span>
+        <span class="k">Version:</span> "2012-10-17"
+        <span class="k">Statement:</span>
+          - <span class="k">Effect:</span> Allow
+            <span class="k">Principal:</span> { AWS: arn:aws:iam::555555555555:role/IncidentResponseWorkflowRole }
+            <span class="k">Action:</span> sts:AssumeRole
+      <span class="k">Policies:</span>
+        - <span class="k">PolicyName:</span> contain-and-preserve
+          <span class="k">PolicyDocument:</span>
+            <span class="k">Version:</span> "2012-10-17"
+            <span class="k">Statement:</span>
+              - <span class="k">Effect:</span> Allow
+                <span class="k">Action:</span>
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateTags
+                  - ec2:ModifyInstanceAttribute         <span class="c"># swap security groups</span>
+                  - ec2:CreateSnapshots
+                  - autoscaling:DetachInstances
+                <span class="k">Resource:</span> "*"
+              - <span class="k">Effect:</span> Allow
+                <span class="k">Action:</span> iam:PutRolePolicy                  <span class="c"># revoke sessions</span>
+                <span class="k">Resource:</span> !Sub arn:aws:iam::${AWS::AccountId}:role/app-*   <span class="c"># application roles only</span></code></pre>
+				<div class="callout trap"><p>A CloudFormation security group with no <code>SecurityGroupEgress</code> gets the default <strong>allow all outbound</strong> rule. To remove it, you must specify at least one egress rule; the <code>127.0.0.1/32</code> rule is the usual placeholder that allows nothing useful.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>EventBridge rule (security account)</h3>
+				<span class="file">ir-rule.yaml (in 555555555555)</span>
+<pre><code><span class="k">CompromisedInstanceRule:</span>
+  <span class="k">Type:</span> AWS::Events::Rule
+  <span class="k">Properties:</span>
+    <span class="k">EventPattern:</span>
+      <span class="k">source:</span> [ aws.guardduty ]
+      <span class="k">detail-type:</span> [ GuardDuty Finding ]
+      <span class="k">detail:</span>
+        <span class="k">resource:</span>
+          <span class="k">resourceType:</span> [ Instance ]
+        <span class="k">severity:</span> [ { numeric: [ ">=", 7 ] } ]
+        <span class="k">type:</span> [ { prefix: "CryptoCurrency:EC2/" }, { prefix: "Backdoor:EC2/" }, { prefix: "Trojan:EC2/" }, { prefix: "UnauthorizedAccess:EC2/" } ]
+    <span class="k">Targets:</span>
+      - <span class="k">Id:</span> respond
+        <span class="k">Arn:</span> !Ref ResponseStateMachine
+        <span class="k">RoleArn:</span> !GetAtt EventsInvokeRole.Arn          <span class="c"># allows states:StartExecution</span>
+        <span class="k">InputTransformer:</span>
+          <span class="k">InputPathsMap:</span>
+            <span class="k">accountId:</span> $.detail.accountId
+            <span class="k">region:</span> $.detail.region
+            <span class="k">instanceId:</span> $.detail.resource.instanceDetails.instanceId
+            <span class="k">findingId:</span> $.detail.id
+            <span class="k">findingType:</span> $.detail.type
+          <span class="k">InputTemplate:</span> '{"accountId":"&lt;accountId&gt;","region":"&lt;region&gt;","instanceId":"&lt;instanceId&gt;","findingId":"&lt;findingId&gt;","findingType":"&lt;findingType&gt;"}'</code></pre>
+				<p>The input transformer passes the workflow only the five fields it needs, instead of the whole finding.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Response workflow (security account)</h3>
+				<p>Most steps are Step Functions <strong>AWS SDK integrations</strong>, so no Lambda code is needed. The <code>Credentials</code> field makes each call with <code>IncidentResponseRole</code> in the affected account. Two steps (gathering context and writing the revoke policy) use small Lambda functions, because they need logic that's awkward in JSONPath.</p>
+				<span class="file">ir-state-machine.yaml (in 555555555555, Definition only)</span>
+<pre><code><span class="k">StartAt:</span> GatherContext
+<span class="k">States:</span>
+  <span class="k">GatherContext:</span>                               <span class="c"># Lambda: VPC, ASG name, role name, isolation SG ID</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::lambda:invoke
+    <span class="k">Parameters:</span> { FunctionName: ir-gather-context, Payload.$: $ }
+    <span class="k">ResultSelector:</span> { ctx.$: $.Payload }
+    <span class="k">ResultPath:</span> $.context
+    <span class="k">Retry:</span> [ { ErrorEquals: [ States.ALL ], MaxAttempts: 3, BackoffRate: 2 } ]
+    <span class="k">Next:</span> TagInstance
+
+  <span class="k">TagInstance:</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::aws-sdk:ec2:createTags
+    <span class="k">Credentials:</span>
+      <span class="k">RoleArn.$:</span> States.Format('arn:aws:iam::{}:role/IncidentResponseRole', $.accountId)
+    <span class="k">Parameters:</span>
+      <span class="k">Resources.$:</span> States.Array($.instanceId)
+      <span class="k">Tags:</span>
+        - { Key: quarantine, Value: "true" }
+        - { Key: guardduty-finding, Value.$: $.findingId }
+    <span class="k">ResultPath:</span> null
+    <span class="k">Next:</span> InAutoScalingGroup?
+
+  <span class="k">InAutoScalingGroup?:</span>
+    <span class="k">Type:</span> Choice
+    <span class="k">Choices:</span>
+      - { Variable: $.context.ctx.asgName, IsPresent: true, Next: DetachFromAsg }
+    <span class="k">Default:</span> Isolate
+
+  <span class="k">DetachFromAsg:</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::aws-sdk:autoscaling:detachInstances
+    <span class="k">Credentials:</span>
+      <span class="k">RoleArn.$:</span> States.Format('arn:aws:iam::{}:role/IncidentResponseRole', $.accountId)
+    <span class="k">Parameters:</span>
+      <span class="k">AutoScalingGroupName.$:</span> $.context.ctx.asgName
+      <span class="k">InstanceIds.$:</span> States.Array($.instanceId)
+      <span class="k">ShouldDecrementDesiredCapacity:</span> false       <span class="c"># launch a replacement</span>
+    <span class="k">ResultPath:</span> null
+    <span class="k">Next:</span> Isolate
+
+  <span class="k">Isolate:</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::aws-sdk:ec2:modifyInstanceAttribute
+    <span class="k">Credentials:</span>
+      <span class="k">RoleArn.$:</span> States.Format('arn:aws:iam::{}:role/IncidentResponseRole', $.accountId)
+    <span class="k">Parameters:</span>
+      <span class="k">InstanceId.$:</span> $.instanceId
+      <span class="k">Groups.$:</span> States.Array($.context.ctx.isolationSgId)   <span class="c"># replaces all current groups</span>
+    <span class="k">ResultPath:</span> null
+    <span class="k">Next:</span> RevokeSessions
+
+  <span class="k">RevokeSessions:</span>                              <span class="c"># Lambda: PutRolePolicy deny where aws:TokenIssueTime &lt; now</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::lambda:invoke
+    <span class="k">Parameters:</span> { FunctionName: ir-revoke-sessions, Payload.$: $ }
+    <span class="k">ResultPath:</span> null
+    <span class="k">Next:</span> Snapshot
+
+  <span class="k">Snapshot:</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::aws-sdk:ec2:createSnapshots
+    <span class="k">Credentials:</span>
+      <span class="k">RoleArn.$:</span> States.Format('arn:aws:iam::{}:role/IncidentResponseRole', $.accountId)
+    <span class="k">Parameters:</span>
+      <span class="k">InstanceSpecification:</span> { InstanceId.$: $.instanceId }
+      <span class="k">Description.$:</span> States.Format('Forensics for {}', $.findingId)
+      <span class="k">CopyTagsFromSource:</span> volume
+    <span class="k">ResultSelector:</span> { ids.$: $.Snapshots[*].SnapshotId }
+    <span class="k">ResultPath:</span> $.snapshots
+    <span class="k">Next:</span> Notify
+
+  <span class="k">Notify:</span>
+    <span class="k">Type:</span> Task
+    <span class="k">Resource:</span> arn:aws:states:::sns:publish
+    <span class="k">Parameters:</span>
+      <span class="k">TopicArn:</span> arn:aws:sns:us-east-1:555555555555:security-oncall
+      <span class="k">Subject.$:</span> States.Format('Quarantined {} in {}', $.instanceId, $.accountId)
+      <span class="k">Message.$:</span> $
+    <span class="k">End:</span> true</code></pre>
+				<p>Every Task state also gets a <code>Catch</code> that routes to a failure notification, so a half-finished containment is never silent. The workflow's own role (<code>IncidentResponseWorkflowRole</code>) needs <code>sts:AssumeRole</code> on <code>arn:aws:iam::*:role/IncidentResponseRole</code>, permission to invoke the two functions, and <code>sns:Publish</code> on the topic.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Isolate, don't terminate</td><td data-label="Why">Terminating destroys memory and disk evidence. A quarantined instance costs little and can be examined.</td></tr>
+						<tr><td>Detach before isolating</td><td data-label="Why">Otherwise the ELB health check fails after isolation and Auto Scaling terminates the instance, destroying the evidence.</td></tr>
+						<tr><td>Step Functions, not one Lambda function</td><td data-label="Why">Each step retries independently, the execution history is an audit record of what was done, and SDK integrations need no code.</td></tr>
+						<tr><td>Respond from the security account</td><td data-label="Why">One copy of the workflow for all accounts; workload account admins can't change it. A narrow cross-account role does the work.</td></tr>
+						<tr><td>Revoke sessions, not delete the role</td><td data-label="Why">Deleting the role would break the replacement instances. A deny on old sessions stops only the stolen credentials.</td></tr>
+						<tr><td>Severity and type filter</td><td data-label="Why">Low-severity or non-instance findings would quarantine healthy servers. Start narrow and widen with experience.</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>Changing an instance's security group <strong>doesn't cut connections that are already tracked</strong>; an attacker's existing session can continue. For an immediate cut, also add a network ACL deny for the attacker's IP, or first switch to a group that allows all traffic (which makes connections untracked) and then to the isolation group.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Systems Manager Automation runbook as the target</td><td data-label="When it fits better">The team already standardizes on runbooks, or wants approval steps through Change Manager</td></tr>
+						<tr><td>Security Hub custom action</td><td data-label="When it fits better">A human should decide, by clicking an action on the finding, before containment runs</td></tr>
+						<tr><td>A single Lambda function</td><td data-label="When it fits better">Very simple response (tag and notify) in one account</td></tr>
+						<tr><td>Forwarding findings to a central bus with <code>PutEvents</code></td><td data-label="When it fits better">Not needed here: GuardDuty already aggregates member findings in the administrator account</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Test the rule</span><span class="desc"><code>aws guardduty create-sample-findings --finding-types CryptoCurrency:EC2/BitcoinTool.B!DNS</code> produces a real event (with fake resource IDs), so you can check that the rule matches and the workflow starts.</span></li>
+				<li><span class="name">Test the workflow</span><span class="desc">Start an execution by hand with the input of a real test instance in a sandbox account, and check each step's result in the execution history.</span></li>
+				<li><span class="name">Test end to end</span><span class="desc">Generate real findings from a test instance (for example, with the GuardDuty tester scripts) in a sandbox account.</span></li>
+			</ol>
+			<div class="callout note"><p>You can't send a test event with <code>source: aws.guardduty</code> through <code>PutEvents</code>: sources starting with <code>aws.</code> are reserved for AWS services. That's why sample findings are the way to test the rule.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d5-task-5-1.html">5.1</a> Event sources</td><td data-label="What this architecture demonstrates">Routing service findings with EventBridge patterns, input transformers and Step Functions targets</td></tr>
+						<tr><td><a href="../d5-task-5-2.html">5.2</a> Configuration changes in response to events</td><td data-label="What this architecture demonstrates">Changing security groups and Auto Scaling membership automatically</td></tr>
+						<tr><td><a href="../d6-task-6-1.html">6.1</a> Identity at scale</td><td data-label="What this architecture demonstrates">Cross-account roles, session revocation by token issue time</td></tr>
+						<tr><td><a href="../d6-task-6-2.html">6.2</a> Security controls</td><td data-label="What this architecture demonstrates">Organization-wide GuardDuty with a delegated administrator; StackSets for the baseline</td></tr>
+						<tr><td><a href="../d6-task-6-3.html">6.3</a> Security monitoring</td><td data-label="What this architecture demonstrates">Alerting on high-severity findings; evidence for investigation</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Automatically isolate a compromised instance and preserve it for forensics" is <strong>GuardDuty, EventBridge and an automation (Step Functions, Lambda or Systems Manager) that swaps the security group and snapshots the volumes</strong>. Terminating the instance is the classic wrong answer because it destroys the evidence.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

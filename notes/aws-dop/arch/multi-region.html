@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Multi-Region Active/Active Web Application | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: a web application serving traffic from two AWS Regions at once, with Route 53 latency routing and health checks, DynamoDB global tables, S3 replication, replicated secrets, keys and images, and ARC for controlled Region evacuation.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Multi-Region active/active</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Multi-Region active/active web application</h1>
+		<p>An online shop serves customers from two Regions at the same time. Each user goes to the nearest Region; if a Region fails, Route 53 stops sending traffic there within a minute or two, and the other Region, which already has the data and enough capacity, carries everything.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 3</span><span class="tag">Domain 1</span><span class="tag">Route 53</span><span class="tag">DynamoDB global tables</span><span class="tag">S3 replication</span><span class="tag">ARC</span><span class="tag">StackSets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Regional stack</a></li>
+				<li class="sub"><a href="#b2">2. DynamoDB global table</a></li>
+				<li class="sub"><a href="#b3">3. Assets, secrets, keys, images</a></li>
+				<li class="sub"><a href="#b4">4. Route 53 routing</a></li>
+				<li class="sub"><a href="#b5">5. Controlled evacuation</a></li>
+				<li class="sub"><a href="#b6">6. Monitoring both Regions</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The shop's checkout must keep working through the loss of a whole Region, and customers in Europe and North America should get low latency.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>RTO under 5 minutes</td><td data-label="Design choice">Both Regions serve traffic all the time; failover is only a DNS change driven by health checks</td></tr>
+						<tr><td>RPO of about 1 second</td><td data-label="Design choice">DynamoDB global table (replication typically under a second); S3 Replication Time Control for assets</td></tr>
+						<tr><td>Low latency for users on both continents</td><td data-label="Design choice">Route 53 latency-based records</td></tr>
+						<tr><td>Identical infrastructure in both Regions</td><td data-label="Design choice">One template deployed to both Regions by the pipeline (cross-Region actions) or a StackSet</td></tr>
+						<tr><td>The surviving Region must carry all traffic</td><td data-label="Design choice">Each Region runs with minimum capacity for the full load (or pre-scaled), and quotas raised in both</td></tr>
+						<tr><td>Operators can move traffic deliberately</td><td data-label="Design choice">ARC routing controls (or Region switch) to evacuate a Region</td></tr>
+						<tr><td>Nothing in one Region depends on the other</td><td data-label="Design choice">Replicated secrets, multi-Region KMS keys, ECR replication, per-Region endpoints</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Item</th><th>Value</th></tr></thead>
+					<tbody>
+						<tr><td>Production account</td><td data-label="Value"><code>222222222222</code></td></tr>
+						<tr><td>Regions</td><td data-label="Value"><code>us-east-1</code> (also where global services such as IAM and Route 53 are managed) and <code>eu-west-1</code></td></tr>
+						<tr><td>Domain</td><td data-label="Value"><code>shop.example.com</code> in a Route 53 public hosted zone</td></tr>
+						<tr><td>Application</td><td data-label="Value">Stateless containers on ECS Fargate behind an ALB in each Region; orders and sessions in DynamoDB; images in S3</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically; steps marked <span class="who">Operator</span> are deliberate human actions.</p>
+			<ol class="flow">
+				<li class="group">Normal request</li>
+				<li class="auto"><span class="name">DNS lookup<span class="who auto">AWS</span></span><span class="desc">Route 53 answers <code>shop.example.com</code> with the healthy Region that has the lowest latency for the user: Paris users get <code>eu-west-1</code>, Boston users get <code>us-east-1</code>.</span></li>
+				<li class="auto"><span class="name">Regional load balancer<span class="who auto">AWS</span></span><span class="desc">The ALB spreads requests over tasks in three Availability Zones.</span></li>
+				<li class="auto"><span class="name">Local reads and writes<span class="who auto">AWS</span></span><span class="desc">The application uses the DynamoDB replica, the S3 bucket, the secret and the KMS key in its own Region.</span></li>
+				<li class="auto"><span class="name">Replication<span class="who auto">AWS</span></span><span class="desc">DynamoDB copies each write to the other Region, typically within a second; S3 replicates new objects.</span></li>
+				<li class="group">Region failure</li>
+				<li class="auto"><span class="name">The deep health check fails<span class="who auto">AWS</span></span><span class="desc">Route 53 health checkers can't get a good answer from <code>us-east-1</code>'s <code>/health</code> endpoint, which tests the database as well as the web tier.</span></li>
+				<li class="auto"><span class="name">Route 53 stops answering with that Region<span class="who auto">AWS</span></span><span class="desc">After the failure threshold (for example 3 checks at 10-second intervals), only <code>eu-west-1</code> is returned.</span></li>
+				<li class="auto"><span class="name">Clients move as their DNS cache expires<span class="who auto">AWS</span></span><span class="desc">With a 60-second TTL, most traffic moves within a couple of minutes. Some clients cache longer.</span></li>
+				<li class="auto"><span class="name">The surviving Region absorbs the load<span class="who auto">AWS</span></span><span class="desc">It already runs enough tasks for the full load; target tracking adds more if needed.</span></li>
+				<li class="group">Controlled evacuation and recovery</li>
+				<li><span class="name">Pin traffic away from the Region<span class="who">Operator</span></span><span class="desc">Turn the Region's ARC routing control off, so traffic stays away even if its health check flaps back and forth.</span></li>
+				<li><span class="name">Check replication has caught up<span class="who">Operator</span></span><span class="desc">After the Region recovers, watch DynamoDB <code>ReplicationLatency</code> and S3 replication metrics return to normal.</span></li>
+				<li><span class="name">Return traffic<span class="who">Operator</span></span><span class="desc">Turn the routing control back on; latency routing sends nearby users to the Region again.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The Regional stack, deployed to both Regions</h3>
+				<p>One template contains the VPC, ALB, ECS service and alarms. The pipeline deploys it to each Region with a cross-Region CloudFormation action (each Region needs its own artifact bucket), one Region at a time, so a bad change can be stopped before it reaches the second Region.</p>
+				<span class="file">pipeline deploy stage (excerpt)</span>
+<pre><code>- <span class="k">Name:</span> DeployProd
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> Deploy-us-east-1
+      <span class="k">Region:</span> us-east-1
+      <span class="k">RunOrder:</span> 1                                   <span class="c"># first Region</span>
+      <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> CREATE_UPDATE
+        <span class="k">StackName:</span> shop-regional
+        <span class="k">TemplatePath:</span> BuildOutput::regional.yaml
+        <span class="k">TemplateConfiguration:</span> BuildOutput::config-us-east-1.json
+        <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/CfnExecutionRole
+      <span class="k">InputArtifacts:</span> [ { Name: BuildOutput } ]
+    - <span class="k">Name:</span> Deploy-eu-west-1
+      <span class="k">Region:</span> eu-west-1
+      <span class="k">RunOrder:</span> 2                                   <span class="c"># only after the first Region succeeds</span>
+      <span class="k">ActionTypeId:</span> { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> CREATE_UPDATE
+        <span class="k">StackName:</span> shop-regional
+        <span class="k">TemplatePath:</span> BuildOutput::regional.yaml
+        <span class="k">TemplateConfiguration:</span> BuildOutput::config-eu-west-1.json
+        <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/CfnExecutionRole
+      <span class="k">InputArtifacts:</span> [ { Name: BuildOutput } ]</code></pre>
+				<p>Inside the template, the ECS service keeps enough tasks to carry <strong>both Regions' traffic</strong> on its own:</p>
+				<span class="file">regional.yaml (excerpt)</span>
+<pre><code><span class="k">ServiceScalingTarget:</span>
+  <span class="k">Type:</span> AWS::ApplicationAutoScaling::ScalableTarget
+  <span class="k">Properties:</span>
+    <span class="k">ServiceNamespace:</span> ecs
+    <span class="k">ScalableDimension:</span> ecs:service:DesiredCount
+    <span class="k">ResourceId:</span> !Sub service/${Cluster}/${Service.Name}
+    <span class="k">MinCapacity:</span> 12          <span class="c"># peak global load, not just this Region's share</span>
+    <span class="k">MaxCapacity:</span> 40</code></pre>
+				<div class="callout trap"><p>Active/active only works if the surviving Region can take <strong>all</strong> the traffic immediately. Scaling out from half capacity takes minutes, and Fargate, EC2 and other <strong>service quotas</strong> in that Region may block it. Size the minimum for the full load (or accept a short degradation) and raise quotas in both Regions in advance.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>DynamoDB global table</h3>
+				<p>Create the table once (in <code>us-east-1</code>) with a replica in each Region. Every replica accepts reads and writes.</p>
+				<span class="file">global-table.yaml (deployed once, in us-east-1)</span>
+<pre><code><span class="k">OrdersTable:</span>
+  <span class="k">Type:</span> AWS::DynamoDB::GlobalTable
+  <span class="k">Properties:</span>
+    <span class="k">TableName:</span> orders
+    <span class="k">BillingMode:</span> PAY_PER_REQUEST                 <span class="c"># synchronized across replicas</span>
+    <span class="k">AttributeDefinitions:</span>
+      - { AttributeName: orderId, AttributeType: S }
+    <span class="k">KeySchema:</span>
+      - { AttributeName: orderId, KeyType: HASH }
+    <span class="k">StreamSpecification:</span>
+      <span class="k">StreamViewType:</span> NEW_AND_OLD_IMAGES         <span class="c"># required for replication</span>
+    <span class="k">SSESpecification:</span>
+      <span class="k">SSEEnabled:</span> true
+      <span class="k">SSEType:</span> KMS
+    <span class="k">Replicas:</span>
+      - <span class="k">Region:</span> us-east-1
+        <span class="k">PointInTimeRecoverySpecification:</span> { PointInTimeRecoveryEnabled: true }   <span class="c"># set per replica</span>
+        <span class="k">SSESpecification:</span> { KMSMasterKeyId: alias/shop-data }
+      - <span class="k">Region:</span> eu-west-1
+        <span class="k">PointInTimeRecoverySpecification:</span> { PointInTimeRecoveryEnabled: true }
+        <span class="k">SSESpecification:</span> { KMSMasterKeyId: alias/shop-data }</code></pre>
+				<ul>
+					<li><strong>Conflicts:</strong> in the default multi-Region eventual consistency mode, if the same item is written in both Regions at once, the write with the latest timestamp wins ("last writer wins"). Design so each item is usually written in one Region, for example by routing a user's session to one Region.</li>
+					<li><strong>Synchronized settings:</strong> capacity mode, write capacity, key schema, GSIs, encryption type and TTL are kept identical across replicas. Point-in-time recovery, deletion protection and tags are <strong>not</strong>: set them on each replica.</li>
+					<li><strong>Zero RPO:</strong> multi-Region <strong>strong</strong> consistency replicates each write synchronously, but needs exactly three Regions (or two replicas and a witness), must be chosen at creation, and doesn't support TTL or transactions.</li>
+				</ul>
+				<div class="callout note"><p>Transactions in a global table are atomic only in the Region where they run; the other Region can briefly see part of a transaction. Keep multi-item invariants within one Region's flow.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Assets, secrets, keys and images in both Regions</h3>
+				<p>Each Region must be able to run alone, so nothing it needs can live only in the other Region.</p>
+				<span class="file">replication.yaml (us-east-1 excerpt)</span>
+<pre><code><span class="k">AssetsBucket:</span>
+  <span class="k">Type:</span> AWS::S3::Bucket
+  <span class="k">Properties:</span>
+    <span class="k">BucketName:</span> shop-assets-use1
+    <span class="k">VersioningConfiguration:</span> { Status: Enabled }   <span class="c"># required on both buckets</span>
+    <span class="k">ReplicationConfiguration:</span>
+      <span class="k">Role:</span> !GetAtt ReplicationRole.Arn
+      <span class="k">Rules:</span>
+        - <span class="k">Status:</span> Enabled
+          <span class="k">Priority:</span> 1
+          <span class="k">Filter:</span> {}
+          <span class="k">DeleteMarkerReplication:</span> { Status: Enabled }
+          <span class="k">Destination:</span>
+            <span class="k">Bucket:</span> arn:aws:s3:::shop-assets-euw1
+            <span class="k">ReplicationTime:</span> { Status: Enabled, Time: { Minutes: 15 } }   <span class="c"># RTC: 99.99% within 15 minutes</span>
+            <span class="k">Metrics:</span> { Status: Enabled, EventThreshold: { Minutes: 15 } }
+
+<span class="k">PaymentApiSecret:</span>
+  <span class="k">Type:</span> AWS::SecretsManager::Secret
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> prod/shop/payment-api
+    <span class="k">KmsKeyId:</span> alias/shop-data
+    <span class="k">ReplicaRegions:</span>
+      - { Region: eu-west-1, KmsKeyId: alias/shop-data }   <span class="c"># read-only replica, same name</span>
+
+<span class="k">DataKey:</span>
+  <span class="k">Type:</span> AWS::KMS::Key
+  <span class="k">Properties:</span>
+    <span class="k">MultiRegion:</span> true                            <span class="c"># primary; add an AWS::KMS::ReplicaKey in eu-west-1</span>
+    <span class="k">EnableKeyRotation:</span> true
+    <span class="k">KeyPolicy:</span> ...</code></pre>
+				<ul>
+					<li><strong>S3:</strong> for active/active writes to both buckets, add a rule in each direction (two-way replication). Replication covers <strong>new</strong> objects only; copy existing ones with S3 Batch Replication.</li>
+					<li><strong>Secrets:</strong> the replica secret has the same name and value; rotation runs in the primary Region and replicates.</li>
+					<li><strong>KMS:</strong> a multi-Region replica key has the same key material, so data encrypted in one Region decrypts in the other.</li>
+					<li><strong>Images:</strong> ECR replication rules copy every pushed image to <code>eu-west-1</code>, so tasks there don't pull across Regions.</li>
+					<li><strong>CloudFront (optional):</strong> in front of both ALBs, an origin group with failover retries the second origin on 5xx errors, but only for <code>GET</code>, <code>HEAD</code> and <code>OPTIONS</code> requests. Checkout <code>POST</code>s still rely on DNS failover.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Route 53 latency records with health checks</h3>
+				<p>One latency record per Region, each tied to a health check on a <strong>deep</strong> <code>/health</code> endpoint that tests DynamoDB access as well as the web tier.</p>
+				<span class="file">dns.yaml (global, deployed once)</span>
+<pre><code><span class="k">HealthUse1:</span>
+  <span class="k">Type:</span> AWS::Route53::HealthCheck
+  <span class="k">Properties:</span>
+    <span class="k">HealthCheckConfig:</span>
+      <span class="k">Type:</span> HTTPS
+      <span class="k">FullyQualifiedDomainName:</span> use1.shop.example.com   <span class="c"># points at the us-east-1 ALB</span>
+      <span class="k">ResourcePath:</span> /health
+      <span class="k">RequestInterval:</span> 10
+      <span class="k">FailureThreshold:</span> 3
+
+<span class="k">ShopUse1:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneName:</span> example.com.
+    <span class="k">Name:</span> shop.example.com.
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> us-east-1
+    <span class="k">Region:</span> us-east-1                          <span class="c"># latency-based routing</span>
+    <span class="k">HealthCheckId:</span> !Ref HealthUse1
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> dualstack.shop-alb-use1-123456.us-east-1.elb.amazonaws.com
+      <span class="k">HostedZoneId:</span> Z35SXDOTRQ7X7K               <span class="c"># the ALB's hosted zone ID</span>
+      <span class="k">EvaluateTargetHealth:</span> true              <span class="c"># also fail if the ALB has no healthy targets</span>
+
+<span class="c"># ShopEuw1: the same, with SetIdentifier and Region eu-west-1 and HealthEuw1</span></code></pre>
+				<div class="callout trap"><p>A health check on the load balancer's root page, or <code>EvaluateTargetHealth</code> alone, can stay <strong>green while the database is unreachable</strong>, so Route 53 keeps sending users to a broken Region. Point the health check at an endpoint that exercises the critical dependencies, but keep it cheap so health checkers don't overload it.</p></div>
+				<div class="callout trap"><p>DNS failover is limited by caching. Use a short TTL for non-alias records (60 seconds), and remember some clients and resolvers ignore TTLs. Alias records use the target's TTL.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Controlled evacuation with ARC</h3>
+				<p>Health checks react to failures they can see. Operators also need a reliable switch to move traffic for failures they can't (a bad deployment, degraded but "healthy" responses, planned maintenance). Amazon Application Recovery Controller (ARC) provides:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>ARC capability</th><th>What it does here</th></tr></thead>
+						<tbody>
+							<tr><td>Routing control</td><td data-label="What it does here">An on/off switch per Region, backed by a highly available cluster. Each routing control has a Route 53 health check of type <code>RECOVERY_CONTROL</code>, attached to the Region's record next to the deep health check. Safety rules can stop both Regions being turned off at once.</td></tr>
+							<tr><td>Region switch</td><td data-label="What it does here">A plan that orchestrates a full Region failover or switchover across resources and accounts, with steps you define (scale up, change DNS, run runbooks).</td></tr>
+							<tr><td>Readiness check</td><td data-label="What it does here">Continuously compares quotas, capacity and configuration between the two Regions so you know the other Region can take over. Not meant for the failover path itself.</td></tr>
+							<tr><td>Zonal shift and autoshift</td><td data-label="What it does here">Move traffic away from one impaired Availability Zone inside a Region, before a Region-level failover is needed.</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">evacuate us-east-1</span>
+<pre><code>aws route53-recovery-cluster update-routing-control-state \
+  --routing-control-arn arn:aws:route53-recovery-control::222222222222:controlpanel/abc/routingcontrol/use1 \
+  --routing-control-state Off \
+  --endpoint-url https://host-aaaaaa.us-west-2.example.route53-recovery-cluster.amazonaws.com/v1
+<span class="c"># call one of the cluster's Regional endpoints (try each in turn): this data plane stays available</span>
+<span class="c"># when the Route 53 console and control plane are not</span></code></pre>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Monitoring both Regions</h3>
+				<ul>
+					<li><strong>One dashboard:</strong> CloudWatch dashboards can show metrics from several Regions; put both ALBs' latency and 5xx rates, ECS task counts and DynamoDB metrics side by side.</li>
+					<li><strong>Replication:</strong> alarm on DynamoDB <code>ReplicationLatency</code> and on S3 replication metrics (<code>ReplicationLatency</code>, <code>OperationsFailedReplication</code>).</li>
+					<li><strong>Health checks:</strong> Route 53 health check status is a CloudWatch metric in <code>us-east-1</code>; alarm when a Region goes unhealthy.</li>
+					<li><strong>Users:</strong> Synthetics canaries in each Region run the checkout journey against both Regional endpoints.</li>
+				</ul>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>DynamoDB global tables, not a relational database</td><td data-label="Why">Both Regions can write; failover needs no promotion step, which is what makes an RTO of minutes realistic.</td></tr>
+						<tr><td>Latency routing plus health checks</td><td data-label="Why">Gives users the nearest Region normally and removes a failed Region automatically.</td></tr>
+						<tr><td>Deploy one Region at a time</td><td data-label="Why">A bad release is caught in the first Region while the second keeps serving, so one change can't take down both.</td></tr>
+						<tr><td>Deep health check</td><td data-label="Why">A Region that serves pages but can't reach its data must count as unhealthy.</td></tr>
+						<tr><td>Full capacity in each Region</td><td data-label="Why">Costs more, but avoids a capacity crunch at the exact moment of failover.</td></tr>
+						<tr><td>ARC routing controls in addition to health checks</td><td data-label="Why">Operators can evacuate a Region deliberately using a data plane that doesn't depend on the impaired Region or the Route 53 control plane.</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>Trade-off</th></tr></thead>
+					<tbody>
+						<tr><td>Warm standby (second Region scaled down, not serving)</td><td data-label="Trade-off">Cheaper; RTO is the time to scale up and switch DNS (minutes to tens of minutes). Use failover routing instead of latency routing.</td></tr>
+						<tr><td>Pilot light (data replicated, compute off)</td><td data-label="Trade-off">Cheaper still; RTO of tens of minutes or more while the application tier is created and scaled.</td></tr>
+						<tr><td>Aurora Global Database instead of DynamoDB</td><td data-label="Trade-off">Keeps SQL; only one Region writes (the other is read-only until a switchover or failover promotes it), so writes need a failover step. Write forwarding lets secondary Regions send writes to the primary.</td></tr>
+						<tr><td>DynamoDB multi-Region strong consistency</td><td data-label="Trade-off">RPO of zero and no conflicts, but needs three Regions (or a witness), adds write latency, and loses TTL and transactions.</td></tr>
+						<tr><td>AWS Global Accelerator instead of DNS routing</td><td data-label="Trade-off">Static anycast IPs and failover in seconds without DNS caching; adds cost.</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Fail the health check on purpose</span><span class="desc">Make <code>/health</code> in one Region return errors (a feature flag or a test header) and measure how long until all synthetic traffic arrives in the other Region.</span></li>
+				<li><span class="name">Pause replication with FIS</span><span class="desc">AWS Fault Injection Service can pause DynamoDB global table replication for a replica to simulate Region isolation, and test how the application handles stale data.</span></li>
+				<li><span class="name">Evacuate a Region in a game day</span><span class="desc">Turn the Region's routing control off during business hours, confirm the other Region carries the full load and that alarms and runbooks work, then turn it back on.</span></li>
+				<li><span class="name">Shift away from one AZ</span><span class="desc">Start a zonal shift on the ALB to prove each Region also survives the loss of an Availability Zone.</span></li>
+				<li><span class="name">Check readiness continuously</span><span class="desc">Readiness checks and AWS Resilience Hub assessments catch drift between Regions (a quota raised in one Region only, a missing replica).</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d3-task-3-1.html">3.1</a> Highly available solutions</td><td data-label="What this architecture demonstrates">Multi-Region active/active, Route 53 routing and health checks, global tables</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Scalable solutions</td><td data-label="What this architecture demonstrates">Capacity planning for failover, auto scaling minimums, quotas</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Automated recovery for RTO and RPO</td><td data-label="What this architecture demonstrates">Choosing a DR strategy from RTO and RPO; ARC; recovery testing with FIS</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Deployment strategies</td><td data-label="What this architecture demonstrates">Rolling a release across Regions one at a time</td></tr>
+						<tr><td><a href="../d1-task-1-1.html">1.1</a> CI/CD pipelines</td><td data-label="What this architecture demonstrates">Cross-Region CloudFormation actions with Regional artifact buckets</td></tr>
+						<tr><td><a href="../d6-task-6-2.html">6.2</a> Data protection</td><td data-label="What this architecture demonstrates">Multi-Region KMS keys, replicated secrets, encrypted replicas</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"RTO and RPO near zero, users in several Regions, writes in every Region" is <strong>active/active with DynamoDB global tables and Route 53 latency (or Global Accelerator) routing with health checks</strong>. If the database must be relational, the answer shifts to <strong>Aurora Global Database</strong> with a short failover, which is warm standby or active/passive for writes.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>
