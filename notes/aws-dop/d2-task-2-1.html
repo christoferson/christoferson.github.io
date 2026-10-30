@@ -757,48 +757,298 @@ Tags.of(app).add("CostCenter", "1234");   <span class="c">// tagging is itself b
 				<div class="callout tip"><p>"Ensure every CDK app in the company meets security standards before deployment" is <strong>Aspects (often cdk-nag) that fail synthesis</strong>, run in the pipeline's build step. "Give teams pre-approved building blocks" is a <strong>shared construct library</strong> in CodeArtifact. In plain CloudFormation, the same pair is <strong>modules</strong> for building blocks and <strong>CloudFormation Guard or hooks</strong> for enforcement.</p></div>
 
 				<h3>AWS Service Catalog</h3>
-				<p>Service Catalog lets administrators publish <strong>approved products</strong> (CloudFormation templates, or Terraform configurations) that users launch themselves, <em>without</em> needing permissions to create the underlying resources.</p>
+				<p>Service Catalog turns approved templates into <strong>products</strong> that users launch themselves. The platform team decides what a product creates and which choices users may make; users launch it without having permission to create the underlying resources. A launch creates a CloudFormation stack (or a Terraform run) behind the scenes, so everything stays infrastructure as code.</p>
+				<p>The examples below assume a hub account <code>555555555555</code> where the platform team manages the catalog, and workload accounts in the <code>Workloads</code> OU where developers launch products.</p>
+
+				<h4>Building blocks</h4>
 				<div class="table-wrap">
-					<table>
-						<thead><tr><th>Concept</th><th>Meaning</th></tr></thead>
+					<table class="stack labeled">
+						<thead><tr><th>Concept</th><th>What it is</th></tr></thead>
 						<tbody>
-							<tr><td>Product</td><td>A versioned template, such as "standard VPC" or "approved RDS database"</td></tr>
-							<tr><td>Portfolio</td><td>A collection of products, granted to IAM users, groups or roles</td></tr>
-							<tr><td>Launch constraint</td><td>An IAM role that Service Catalog uses to launch the product, so end users need only Service Catalog permissions</td></tr>
-							<tr><td>Template constraint</td><td>Restricts parameter values, for example only <code>t3.small</code> or <code>t3.medium</code></td></tr>
-							<tr><td>Tag options</td><td>Required or allowed tags applied to provisioned products</td></tr>
-							<tr><td>Sharing</td><td>Share a portfolio with other accounts or a whole organization or OU from a hub account</td></tr>
+							<tr><td>Product</td><td data-label="What it is">An approved template with versions (called <em>provisioning artifacts</em>), for example "PostgreSQL database" v1 and v2. CloudFormation and Terraform product types exist.</td></tr>
+							<tr><td>Portfolio</td><td data-label="What it is">A collection of products, plus who may use them and under which constraints</td></tr>
+							<tr><td>Principal association</td><td data-label="What it is">Grants IAM roles, users or groups access to a portfolio's products</td></tr>
+							<tr><td>Launch constraint</td><td data-label="What it is">The IAM role Service Catalog assumes to create the product's resources</td></tr>
+							<tr><td>Template constraint</td><td data-label="What it is">Rules that limit parameter values, such as allowed instance classes</td></tr>
+							<tr><td>Other constraints</td><td data-label="What it is">Notification (stack events to SNS), StackSet (deploy the product to several accounts and Regions), tag update (whether users may change tags)</td></tr>
+							<tr><td>TagOptions</td><td data-label="What it is">Allowed tag keys and values; a single-value TagOption is applied automatically</td></tr>
+							<tr><td>Service actions</td><td data-label="What it is">Systems Manager documents users may run on a provisioned product, such as "restart" or "take snapshot"</td></tr>
+							<tr><td>Provisioned product</td><td data-label="What it is">One launched instance of a product; it's a CloudFormation stack named <code>SC-&lt;account&gt;-pp-&lt;id&gt;</code></td></tr>
 						</tbody>
 					</table>
 				</div>
-				<div class="callout tip"><p>"Developers must create databases themselves but only in an approved configuration, and must not have direct RDS permissions" points to <strong>Service Catalog with a launch constraint</strong>.</p></div>
+
+				<h4>Defining the catalog as code</h4>
+				<p>The portfolio, product and constraints are themselves CloudFormation resources, so the catalog is reviewed and deployed like any other stack:</p>
+				<span class="file">catalog.yaml (in 555555555555)</span>
+<pre><code><span class="k">Resources:</span>
+  <span class="k">DataPortfolio:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::Portfolio
+    <span class="k">Properties:</span>
+      <span class="k">DisplayName:</span> Approved data stores
+      <span class="k">ProviderName:</span> Platform team
+
+  <span class="k">PostgresProduct:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::CloudFormationProduct
+    <span class="k">Properties:</span>
+      <span class="k">Name:</span> PostgreSQL database
+      <span class="k">Owner:</span> Platform team
+      <span class="k">ProvisioningArtifactParameters:</span>
+        - <span class="k">Name:</span> v1
+          <span class="k">Info:</span>
+            <span class="k">LoadTemplateFromURL:</span> https://examplecorp-catalog.s3.amazonaws.com/postgres-v1.yaml
+
+  <span class="k">ProductInPortfolio:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::PortfolioProductAssociation
+    <span class="k">Properties:</span>
+      <span class="k">PortfolioId:</span> !Ref DataPortfolio
+      <span class="k">ProductId:</span> !Ref PostgresProduct
+
+  <span class="k">DevelopersCanUse:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::PortfolioPrincipalAssociation
+    <span class="k">Properties:</span>
+      <span class="k">PortfolioId:</span> !Ref DataPortfolio
+      <span class="k">PrincipalType:</span> IAM_PATTERN   <span class="c"># matches by name in every shared account</span>
+      <span class="k">PrincipalARN:</span> arn:aws:iam:::role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_Developer*
+
+  <span class="k">LaunchAs:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::LaunchRoleConstraint
+    <span class="k">DependsOn:</span> ProductInPortfolio
+    <span class="k">Properties:</span>
+      <span class="k">PortfolioId:</span> !Ref DataPortfolio
+      <span class="k">ProductId:</span> !Ref PostgresProduct
+      <span class="k">LocalRoleName:</span> SCLaunchRole-Data   <span class="c"># resolved in the account that launches</span>
+
+  <span class="k">AllowedSizes:</span>
+    <span class="k">Type:</span> AWS::ServiceCatalog::LaunchTemplateConstraint
+    <span class="k">DependsOn:</span> ProductInPortfolio
+    <span class="k">Properties:</span>
+      <span class="k">PortfolioId:</span> !Ref DataPortfolio
+      <span class="k">ProductId:</span> !Ref PostgresProduct
+      <span class="k">Rules:</span> |
+        {
+          "prodSize": {
+            "RuleCondition": {
+              "Fn::Equals": [ { "Ref": "Environment" }, "prod" ]
+            },
+            "Assertions": [ {
+              "Assert": {
+                "Fn::Contains": [ [ "db.r6g.large", "db.r6g.xlarge" ], { "Ref": "InstanceClass" } ]
+              },
+              "AssertDescription": "Production databases must be db.r6g.large or db.r6g.xlarge"
+            } ]
+          }
+        }</code></pre>
+				<ul>
+					<li><strong>Versions:</strong> adding a provisioning artifact (<code>v2</code>) publishes a new version. Existing provisioned products keep their version until users update them; old versions can be deprecated so nobody launches them again.</li>
+					<li><strong>Template constraint rules</strong> use the CloudFormation rule functions (<code>Fn::Contains</code>, <code>Fn::Equals</code>, <code>Fn::EachMemberIn</code> and others) against the product template's parameters. A rule without <code>RuleCondition</code> always applies.</li>
+				</ul>
+
+				<h4>The launch role</h4>
+				<p>The launch role holds the real permissions. Service Catalog assumes it when a user launches, updates or terminates the product, so the user needs only Service Catalog permissions. It needs three things: CloudFormation access, read access to the product template that Service Catalog stores, and permissions for the resources the template creates.</p>
+				<span class="file">launch-role.yaml (deployed to every workload account)</span>
+<pre><code><span class="k">SCLaunchRoleData:</span>
+  <span class="k">Type:</span> AWS::IAM::Role
+  <span class="k">Properties:</span>
+    <span class="k">RoleName:</span> SCLaunchRole-Data   <span class="c"># same name everywhere for LocalRoleName</span>
+    <span class="k">AssumeRolePolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">Service:</span> servicecatalog.amazonaws.com
+          <span class="k">Action:</span> sts:AssumeRole
+          <span class="k">Condition:</span>
+            <span class="k">StringEquals:</span>
+              aws:SourceAccount: !Ref AWS::AccountId   <span class="c"># confused-deputy protection</span>
+    <span class="k">ManagedPolicyArns:</span>
+      - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+    <span class="k">Policies:</span>
+      - <span class="k">PolicyName:</span> provision-postgres
+        <span class="k">PolicyDocument:</span>
+          <span class="k">Version:</span> "2012-10-17"
+          <span class="k">Statement:</span>
+            - <span class="k">Effect:</span> Allow   <span class="c"># read the template Service Catalog stores</span>
+              <span class="k">Action:</span> s3:GetObject
+              <span class="k">Resource:</span> "*"
+              <span class="k">Condition:</span>
+                <span class="k">StringEquals:</span>
+                  s3:ExistingObjectTag/servicecatalog:provisioning: "true"
+            - <span class="k">Effect:</span> Allow   <span class="c"># what the product template creates</span>
+              <span class="k">Action:</span>
+                - rds:*
+                - ec2:Describe*
+                - secretsmanager:CreateSecret
+                - secretsmanager:TagResource
+              <span class="k">Resource:</span> "*"</code></pre>
+				<p>With <code>LocalRoleName</code>, the constraint names the role instead of pointing at one account's ARN, so one shared portfolio works in every account. The role must exist under that name in each account that launches the product; deploy it with a StackSet to the same OU the portfolio is shared with.</p>
+
+				<h4>Sharing the portfolio with the organization</h4>
+<pre><code><span class="c"># In the management account: allow Service Catalog to use Organizations,</span>
+<span class="c"># then let the hub account manage shares</span>
+aws servicecatalog enable-aws-organizations-access
+aws organizations register-delegated-administrator \
+  --account-id 555555555555 \
+  --service-principal servicecatalog.amazonaws.com
+
+<span class="c"># In 555555555555: share with the Workloads OU,</span>
+<span class="c"># including TagOptions and principal names</span>
+aws servicecatalog create-portfolio-share \
+  --portfolio-id port-abcd1234efgh5 \
+  --organization-node Type=ORGANIZATIONAL_UNIT,Value=ou-ab12-cdef3456 \
+  --share-tag-options \
+  --share-principals</code></pre>
+				<ul>
+					<li><strong>No import step:</strong> accounts in the OU see the portfolio automatically. Account-to-account shares, by contrast, must be imported by the recipient.</li>
+					<li><strong>Stays in sync:</strong> recipients get a reference, so new product versions and changed constraints appear everywhere. Recipients can't change products or constraints, but they can grant extra local IAM principals access.</li>
+					<li><strong>Principal names:</strong> with <code>--share-principals</code>, the <code>IAM_PATTERN</code> association above grants access to matching roles in each account. Use <code>PrincipalType: IAM</code> instead if someone in a recipient account could create a role with a matching name to gain access.</li>
+				</ul>
+
+				<h4>What the end user does</h4>
+				<p>A developer with only Service Catalog end-user permissions (for example, the <code>AWSServiceCatalogEndUserFullAccess</code> managed policy) opens the Service Catalog console, picks the product and fills in its parameters. The same from the CLI:</p>
+<pre><code>aws servicecatalog provision-product \
+  --product-name "PostgreSQL database" \
+  --provisioning-artifact-name v1 \
+  --provisioned-product-name orders-db \
+  --provisioning-parameters Key=Environment,Value=prod Key=InstanceClass,Value=db.r6g.large
+
+<span class="c"># later: move to the new version the platform team published</span>
+aws servicecatalog update-provisioned-product \
+  --provisioned-product-name orders-db \
+  --product-name "PostgreSQL database" \
+  --provisioning-artifact-name v2</code></pre>
+				<p>Service Catalog checks the template constraint, assumes <code>SCLaunchRole-Data</code> in the developer's account, and creates the stack. A request for <code>db.t3.micro</code> in prod fails before any resource is created, with the rule's <code>AssertDescription</code> as the message.</p>
+				<div class="callout tip"><p>"Developers must create databases themselves, only in an approved configuration, and must not have direct RDS permissions" points to <strong>Service Catalog with a launch constraint</strong> (the permissions) and a <strong>template constraint</strong> (the approved configuration).</p></div>
+				<div class="callout trap"><p>A launch constraint applies to <strong>one product in one portfolio</strong>, not to the whole portfolio; each product needs its own. And without a launch constraint, Service Catalog launches with the <strong>user's own credentials</strong>, so the user would need CloudFormation and RDS permissions after all.</p></div>
 
 				<h3>Policy as code before deployment</h3>
-				<p><strong>CloudFormation Guard</strong> rules check templates in the pipeline (or in a Hook) and fail the build on violations:</p>
-				<span class="file">s3-rules.guard</span>
-<pre><code>let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+				<p>Policy as code means writing the rules (encryption on, no public buckets, approved instance types) as files that a machine checks, instead of a checklist someone reads. The same rules can run at several points, and the earlier a check runs, the cheaper the mistake is to fix:</p>
+				<ol class="flow">
+					<li><span class="name">While writing</span><span class="desc"><strong>cfn-lint</strong> in the editor or a pre-commit hook: syntax, invalid property values, resource-specific best practices.</span></li>
+					<li><span class="name">In the pipeline</span><span class="desc"><strong>CloudFormation Guard</strong> (and cfn-lint) in a CodeBuild step: company rules; the build fails before anything is deployed.</span></li>
+					<li><span class="name">During every stack operation</span><span class="desc"><strong>CloudFormation Hooks</strong>: the same Guard rules run inside CloudFormation for every stack in the account, including ones that never went through the pipeline.</span></li>
+					<li><span class="name">On every API call</span><span class="desc"><strong>SCPs</strong>: deny actions outright, across accounts, regardless of tool.</span></li>
+					<li><span class="name">After deployment</span><span class="desc"><strong>AWS Config rules</strong>: detect drift or manual changes, with optional automatic remediation.</span></li>
+				</ol>
 
-rule s3_buckets_encrypted when %buckets !empty {
+				<h4>Writing Guard rules</h4>
+				<p>A Guard rule selects parts of a template with a query, then states what must be true about them. Rules work on any JSON or YAML, so the same tool also checks Terraform plans (as JSON) and Kubernetes manifests.</p>
+				<span class="file">rules/s3.guard</span>
+<pre><code><span class="c"># Select every S3 bucket in the template</span>
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+
+<span class="c"># "when" skips the rule if there are no buckets</span>
+rule s3_encrypted when %buckets !empty {
     %buckets.Properties.BucketEncryption exists
-        &lt;&lt; Every S3 bucket must declare encryption &gt;&gt;
+        &lt;&lt; Every S3 bucket must declare default encryption &gt;&gt;
 }
 
-rule s3_buckets_versioned when %buckets !empty {
+rule s3_versioned when %buckets !empty {
     %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
+        &lt;&lt; Every S3 bucket must have versioning enabled &gt;&gt;
+}
+
+rule s3_no_public_access when %buckets !empty {
+    %buckets.Properties.PublicAccessBlockConfiguration {
+        BlockPublicAcls == true
+        BlockPublicPolicy == true
+        IgnorePublicAcls == true
+        RestrictPublicBuckets == true
+    }
+}
+
+<span class="c"># A rule can depend on another rule</span>
+rule s3_logging when s3_encrypted {
+    %buckets.Properties.LoggingConfiguration exists
 }</code></pre>
-<pre><code>cfn-guard validate --data template.yml --rules s3-rules.guard   <span class="c"># non-zero exit on failure</span></code></pre>
-				<div class="table-wrap">
-					<table>
-						<thead><tr><th>Control</th><th>When it acts</th></tr></thead>
-						<tbody>
-							<tr><td>cfn-lint, CloudFormation Guard in CodeBuild</td><td>In the pipeline, before deployment</td></tr>
-							<tr><td>CloudFormation Hooks</td><td>During every stack operation in the account, before resources change</td></tr>
-							<tr><td>Service Catalog constraints</td><td>When a user launches a product</td></tr>
-							<tr><td>SCPs</td><td>On every API call, preventive, across accounts</td></tr>
-							<tr><td>AWS Config rules</td><td>After deployment: detective, with optional remediation</td></tr>
-						</tbody>
-					</table>
-				</div>
+				<ul>
+					<li><code>Resources.*[ Type == '...' ]</code> selects resources by type; <code>let</code> names the selection so rules can reuse it as <code>%buckets</code>.</li>
+					<li>Every clause in a block must hold (AND); <code>some</code> means at least one element must match; <code>&lt;&lt; ... &gt;&gt;</code> is the message shown on failure.</li>
+					<li>A rule evaluates to <code>PASS</code>, <code>FAIL</code>, or <code>SKIP</code> when its <code>when</code> condition is false.</li>
+				</ul>
+
+				<h4>Testing the rules</h4>
+				<p>Rules are code, so they get unit tests. A test file lists sample inputs and the result each rule should give:</p>
+				<span class="file">rules/s3_tests.yaml</span>
+<pre><code>- <span class="k">name:</span> no buckets, rule is skipped
+  <span class="k">input:</span>
+    <span class="k">Resources:</span> {}
+  <span class="k">expectations:</span>
+    <span class="k">rules:</span>
+      <span class="k">s3_encrypted:</span> SKIP
+- <span class="k">name:</span> unencrypted bucket fails
+  <span class="k">input:</span>
+    <span class="k">Resources:</span>
+      <span class="k">Logs:</span>
+        <span class="k">Type:</span> AWS::S3::Bucket
+  <span class="k">expectations:</span>
+    <span class="k">rules:</span>
+      <span class="k">s3_encrypted:</span> FAIL</code></pre>
+<pre><code>cfn-guard test --rules-file rules/s3.guard --test-data rules/s3_tests.yaml</code></pre>
+
+				<h4>Running the checks in the pipeline</h4>
+				<p>A CodeBuild step lints and checks every template before the deploy stage. A failed check exits non-zero, which fails the build, and the JUnit output appears as a test report in CodeBuild:</p>
+				<span class="file">buildspec-policy.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">commands:</span>
+      - pip install cfn-lint
+      <span class="c"># install cfn-guard from its prebuilt release binary</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - cfn-lint templates/*.yaml
+      - cfn-guard test --rules-file rules/s3.guard --test-data rules/s3_tests.yaml
+      - mkdir -p reports
+      - cfn-guard validate --data templates/ --rules rules/ --structured --output-format junit > reports/guard.xml
+<span class="k">reports:</span>
+  <span class="k">policy-checks:</span>
+    <span class="k">files:</span> [ reports/guard.xml ]
+    <span class="k">file-format:</span> JUNITXML</code></pre>
+				<p>For CDK apps, run the same checks on the synthesized templates in <code>cdk.out/</code> after <code>cdk synth</code>, or use cdk-nag during synthesis.</p>
+
+				<h4>Enforcing the rules in every stack operation</h4>
+				<p>Pipeline checks only cover templates that go through the pipeline. A <strong>Guard hook</strong> runs the same rules inside CloudFormation for every stack operation in the account and Region, including stacks created from the console. The rules are read from S3:</p>
+				<span class="file">guard-hook.yaml</span>
+<pre><code><span class="k">GuardHookRole:</span>
+  <span class="k">Type:</span> AWS::IAM::Role
+  <span class="k">Properties:</span>
+    <span class="k">AssumeRolePolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">Service:</span> hooks.cloudformation.amazonaws.com
+          <span class="k">Action:</span> sts:AssumeRole
+    <span class="k">Policies:</span>
+      - <span class="k">PolicyName:</span> read-rules
+        <span class="k">PolicyDocument:</span>
+          <span class="k">Version:</span> "2012-10-17"
+          <span class="k">Statement:</span>
+            - <span class="k">Effect:</span> Allow
+              <span class="k">Action:</span> [ s3:GetObject, s3:GetObjectVersion, s3:ListBucket ]
+              <span class="k">Resource:</span>
+                - arn:aws:s3:::examplecorp-guard-rules
+                - arn:aws:s3:::examplecorp-guard-rules/*
+
+<span class="k">S3RulesHook:</span>
+  <span class="k">Type:</span> AWS::CloudFormation::GuardHook
+  <span class="k">Properties:</span>
+    <span class="k">Alias:</span> ExampleCorp::Guard::S3Rules   <span class="c"># may not start with AWS</span>
+    <span class="k">ExecutionRole:</span> !GetAtt GuardHookRole.Arn
+    <span class="k">RuleLocation:</span>
+      <span class="k">Uri:</span> s3://examplecorp-guard-rules/s3.guard
+    <span class="k">TargetOperations:</span> [ RESOURCE ]   <span class="c"># also STACK, CHANGE_SET, CLOUD_CONTROL</span>
+    <span class="k">TargetFilters:</span>
+      <span class="k">Actions:</span> [ CREATE, UPDATE ]
+    <span class="k">FailureMode:</span> WARN   <span class="c"># start with WARN, switch to FAIL</span>
+    <span class="k">HookStatus:</span> ENABLED</code></pre>
+				<ul>
+					<li><strong>FailureMode:</strong> <code>WARN</code> lets the operation continue and records the finding; <code>FAIL</code> stops it. Rolling out in <code>WARN</code> first shows what would break.</li>
+					<li><strong>Other hook types:</strong> a <strong>Lambda hook</strong> (<code>AWS::CloudFormation::LambdaHook</code>) runs your own function for checks Guard can't express, such as looking something up in another system.</li>
+					<li><strong>At scale:</strong> deploy hooks to every account with StackSets. AWS Control Tower <strong>proactive controls</strong> are managed hooks of this kind.</li>
+				</ul>
+				<div class="callout tip"><p>"Block noncompliant resources even when someone deploys a template from the console" is a <strong>CloudFormation hook</strong>. "Catch problems before the change is merged" is <strong>cfn-lint and Guard in the pipeline</strong>. "Find resources that were changed by hand after deployment" is <strong>AWS Config</strong>. A strong answer often combines them.</p></div>
 			</div>
 
 			<!-- Summary -->
