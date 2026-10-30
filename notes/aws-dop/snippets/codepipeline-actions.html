@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: CodePipeline actions | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated CodePipeline V2 CloudFormation fragments for Git triggers with CodeConnections, manual approvals, cross-account and cross-Region deploys, variables, ECS deploys, Lambda invoke actions and stage conditions with rollback.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">CodePipeline actions</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>CodePipeline actions</h1>
+		<p>The pipeline pieces exam scenarios are built from: Git triggers, approvals, cross-account and cross-Region deploys, variables, ECS deploys, Lambda actions and automatic rollback. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CodePipeline</span><span class="tag">CloudFormation</span><span class="tag">YAML</span><span class="tag">8 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#git-source-with-trigger-filters">Git source with trigger filters</a></li>
+				<li><a href="#manual-approval">Manual approval</a></li>
+				<li><a href="#cross-account-cloudformation-deploy">Cross-account CloudFormation deploy</a></li>
+				<li><a href="#cross-region-action">Cross-Region action</a></li>
+				<li><a href="#passing-values-with-variables">Passing values with variables</a></li>
+				<li><a href="#deploying-to-ecs-rolling-or-blue-green">Deploying to ECS: rolling or blue/green</a></li>
+				<li><a href="#lambda-invoke-action">Lambda invoke action</a></li>
+				<li><a href="#stage-conditions-and-automatic-rollback">Stage conditions and automatic rollback</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>Fragments of an <code>AWS::CodePipeline::Pipeline</code> resource in CloudFormation. Every action has an <code>ActionTypeId</code> (category, owner, provider, version) and a provider-specific <code>Configuration</code>; actions in a stage with the same <code>RunOrder</code> run in parallel.</p>
+
+			<div class="snippet" id="git-source-with-trigger-filters">
+				<h3>Git source with trigger filters</h3>
+				<p class="use"><b>Use when</b>A V2 pipeline should start only for pushes to <code>main</code> that touch the service's folder, or for pull requests.</p>
+<pre><code><span class="k">PipelineType:</span> V2
+<span class="k">Triggers:</span>
+  - <span class="k">ProviderType:</span> CodeStarSourceConnection
+    <span class="k">GitConfiguration:</span>
+      <span class="k">SourceActionName:</span> Source            <span class="c"># must match the action name below</span>
+      <span class="k">Push:</span>
+        - <span class="k">Branches:</span>
+            <span class="k">Includes:</span> [ main ]
+          <span class="k">FilePaths:</span>
+            <span class="k">Includes:</span> [ "services/orders/**" ]
+      <span class="k">PullRequest:</span>
+        - <span class="k">Events:</span> [ OPEN, UPDATED ]
+          <span class="k">Branches:</span>
+            <span class="k">Includes:</span> [ main ]
+<span class="k">Stages:</span>
+  - <span class="k">Name:</span> Source
+    <span class="k">Actions:</span>
+      - <span class="k">Name:</span> Source
+        <span class="k">ActionTypeId:</span>
+          <span class="k">Category:</span> Source
+          <span class="k">Owner:</span> AWS
+          <span class="k">Provider:</span> CodeStarSourceConnection   <span class="c"># CodeConnections</span>
+          <span class="k">Version:</span> "1"
+        <span class="k">Configuration:</span>
+          <span class="k">ConnectionArn:</span> !Ref GitHubConnection
+          <span class="k">FullRepositoryId:</span> acme/orders
+          <span class="k">BranchName:</span> main
+          <span class="k">OutputArtifactFormat:</span> CODE_ZIP        <span class="c"># or CODEBUILD_CLONE_REF</span>
+        <span class="k">OutputArtifacts:</span>
+          - <span class="k">Name:</span> SourceOutput</code></pre>
+				<p class="watch"><b>Watch for</b>A new connection stays <code>PENDING</code> until someone authorizes it once in the console. <code>CODEBUILD_CLONE_REF</code> passes a Git clone reference instead of a zip, so CodeBuild can run Git commands (history, tags); CodeBuild's role then needs <code>codeconnections:UseConnection</code>. Trigger filters are V2 only.</p>
+			</div>
+
+			<div class="snippet" id="manual-approval">
+				<h3>Manual approval</h3>
+				<p class="use"><b>Use when</b>A person must sign off before production (continuous delivery).</p>
+<pre><code>- <span class="k">Name:</span> ApproveRelease
+  <span class="k">ActionTypeId:</span>
+    <span class="k">Category:</span> Approval
+    <span class="k">Owner:</span> AWS
+    <span class="k">Provider:</span> Manual
+    <span class="k">Version:</span> "1"
+  <span class="k">Configuration:</span>
+    <span class="k">NotificationArn:</span> !Ref ReleaseApproversTopic    <span class="c"># SNS topic for approvers</span>
+    <span class="k">CustomData:</span> "Check the staging test report before approving."
+    <span class="k">ExternalEntityLink:</span> https://staging.example.com
+  <span class="k">RunOrder:</span> 1</code></pre>
+				<p class="watch"><b>Watch for</b>An approval waits up to <strong>7 days</strong>, then fails. Approvers need <code>codepipeline:PutApprovalResult</code> on the pipeline. "Changes must be reviewed before production" means an approval action; "no manual intervention" means alarms and automated tests instead.</p>
+			</div>
+
+			<div class="snippet" id="cross-account-cloudformation-deploy">
+				<h3>Cross-account CloudFormation deploy</h3>
+				<p class="use"><b>Use when</b>A pipeline in the tooling account <code>111111111111</code> deploys a stack into production <code>222222222222</code>.</p>
+<pre><code>- <span class="k">Name:</span> DeployProd
+  <span class="k">ActionTypeId:</span>
+    <span class="k">Category:</span> Deploy
+    <span class="k">Owner:</span> AWS
+    <span class="k">Provider:</span> CloudFormation
+    <span class="k">Version:</span> "1"
+  <span class="c"># 1. CodePipeline assumes this role in production to run the action</span>
+  <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/CrossAccountDeployRole
+  <span class="k">Configuration:</span>
+    <span class="k">ActionMode:</span> CREATE_UPDATE                <span class="c"># or CHANGE_SET_REPLACE + CHANGE_SET_EXECUTE</span>
+    <span class="k">StackName:</span> orders-prod
+    <span class="k">TemplatePath:</span> BuildOutput::template.yaml  <span class="c"># ArtifactName::path</span>
+    <span class="k">Capabilities:</span> CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+    <span class="c"># 2. CloudFormation uses this role to create the resources</span>
+    <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/CfnExecutionRole
+    <span class="k">ParameterOverrides:</span> '{"Environment": "prod"}'
+  <span class="k">InputArtifacts:</span>
+    - <span class="k">Name:</span> BuildOutput</code></pre>
+				<p class="watch"><b>Watch for</b>Two different roles: the action-level <code>RoleArn</code> (assumed by CodePipeline) and <code>Configuration.RoleArn</code> (passed to CloudFormation). The artifact bucket must use a <strong>customer managed KMS key</strong> whose key policy, plus the bucket policy, allow the production deploy role.</p>
+			</div>
+
+			<div class="snippet" id="cross-region-action">
+				<h3>Cross-Region action</h3>
+				<p class="use"><b>Use when</b>One pipeline in us-east-1 also deploys to eu-west-1.</p>
+<pre><code><span class="k">ArtifactStores:</span>                               <span class="c"># replaces ArtifactStore</span>
+  - <span class="k">Region:</span> us-east-1
+    <span class="k">ArtifactStore:</span>
+      <span class="k">Type:</span> S3
+      <span class="k">Location:</span> artifacts-111111111111-us-east-1
+      <span class="k">EncryptionKey:</span>
+        <span class="k">Id:</span> !GetAtt ArtifactKeyUsEast1.Arn
+        <span class="k">Type:</span> KMS
+  - <span class="k">Region:</span> eu-west-1
+    <span class="k">ArtifactStore:</span>
+      <span class="k">Type:</span> S3
+      <span class="k">Location:</span> artifacts-111111111111-eu-west-1
+      <span class="k">EncryptionKey:</span>
+        <span class="k">Id:</span> arn:aws:kms:eu-west-1:111111111111:alias/artifacts
+        <span class="k">Type:</span> KMS
+...
+      - <span class="k">Name:</span> DeployEu
+        <span class="k">Region:</span> eu-west-1                       <span class="c"># run this action in eu-west-1</span>
+        <span class="k">ActionTypeId:</span>
+          <span class="k">Category:</span> Deploy
+          <span class="k">Owner:</span> AWS
+          <span class="k">Provider:</span> CloudFormation
+          <span class="k">Version:</span> "1"</code></pre>
+				<p class="watch"><b>Watch for</b>Each Region with an action needs its own artifact bucket (and KMS key) in that Region; CodePipeline copies artifacts there. You can't specify both <code>ArtifactStore</code> and <code>ArtifactStores</code>.</p>
+			</div>
+
+			<div class="snippet" id="passing-values-with-variables">
+				<h3>Passing values with variables</h3>
+				<p class="use"><b>Use when</b>A later action needs a value produced earlier, such as the commit ID or a stack output, or a value supplied when the pipeline starts.</p>
+<pre><code><span class="k">Variables:</span>                                    <span class="c"># pipeline-level variables (V2)</span>
+  - <span class="k">Name:</span> DeployEnv
+    <span class="k">DefaultValue:</span> staging
+<span class="k">Stages:</span>
+  - <span class="k">Name:</span> Source
+    <span class="k">Actions:</span>
+      - <span class="k">Name:</span> Source
+        <span class="k">Namespace:</span> SourceVariables           <span class="c"># exposes CommitId, BranchName...</span>
+        ...
+  - <span class="k">Name:</span> Build
+    <span class="k">Actions:</span>
+      - <span class="k">Name:</span> Build
+        <span class="k">Namespace:</span> BuildVariables            <span class="c"># exported-variables from the buildspec</span>
+        <span class="k">Configuration:</span>
+          <span class="k">ProjectName:</span> orders-build
+          <span class="k">EnvironmentVariables:</span> '[{"name":"COMMIT","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"},{"name":"ENV","value":"#{variables.DeployEnv}","type":"PLAINTEXT"}]'
+  - <span class="k">Name:</span> Approve
+    <span class="k">Actions:</span>
+      - <span class="k">Name:</span> Approve
+        <span class="k">Configuration:</span>
+          <span class="k">CustomData:</span> "Deploy image #{BuildVariables.IMAGE_TAG}?"</code></pre>
+				<p class="watch"><b>Watch for</b>Action variables use <code>#{Namespace.Name}</code> and require the producing action to have a <code>Namespace</code>. Pipeline-level variables use <code>#{variables.Name}</code> and can be overridden at start. A CloudFormation action's stack outputs become variables in its namespace.</p>
+			</div>
+
+			<div class="snippet" id="deploying-to-ecs-rolling-or-blue-green">
+				<h3>Deploying to ECS: rolling or blue/green</h3>
+				<p class="use"><b>Use when</b>Choosing between the ECS standard deploy action and CodeDeploy blue/green.</p>
+<pre><code><span class="c"># Rolling update by the ECS service; reads imagedefinitions.json</span>
+- <span class="k">Name:</span> DeployStaging
+  <span class="k">ActionTypeId:</span>
+    <span class="k">Category:</span> Deploy
+    <span class="k">Owner:</span> AWS
+    <span class="k">Provider:</span> ECS
+    <span class="k">Version:</span> "1"
+  <span class="k">Configuration:</span>
+    <span class="k">ClusterName:</span> staging
+    <span class="k">ServiceName:</span> orders
+    <span class="k">FileName:</span> imagedefinitions.json
+  <span class="k">InputArtifacts:</span>
+    - <span class="k">Name:</span> BuildOutput
+
+<span class="c"># Blue/green through CodeDeploy; needs taskdef.json, appspec.yaml, imageDetail.json</span>
+- <span class="k">Name:</span> DeployProd
+  <span class="k">ActionTypeId:</span>
+    <span class="k">Category:</span> Deploy
+    <span class="k">Owner:</span> AWS
+    <span class="k">Provider:</span> CodeDeployToECS
+    <span class="k">Version:</span> "1"
+  <span class="k">Configuration:</span>
+    <span class="k">ApplicationName:</span> orders
+    <span class="k">DeploymentGroupName:</span> orders-prod
+    <span class="k">TaskDefinitionTemplateArtifact:</span> BuildOutput
+    <span class="k">TaskDefinitionTemplatePath:</span> taskdef.json
+    <span class="k">AppSpecTemplateArtifact:</span> BuildOutput
+    <span class="k">AppSpecTemplatePath:</span> appspec.yaml
+    <span class="k">Image1ArtifactName:</span> BuildOutput          <span class="c"># contains imageDetail.json</span>
+    <span class="k">Image1ContainerName:</span> IMAGE1_NAME         <span class="c"># placeholder in taskdef.json</span>
+  <span class="k">InputArtifacts:</span>
+    - <span class="k">Name:</span> BuildOutput</code></pre>
+				<p class="watch"><b>Watch for</b><code>imagedefinitions.json</code> is for the <code>ECS</code> provider; <code>imageDetail.json</code> is for <code>CodeDeployToECS</code>. Canary or linear traffic shifting and test listeners need the CodeDeploy route (or ECS built-in blue/green on the service itself).</p>
+			</div>
+
+			<div class="snippet" id="lambda-invoke-action">
+				<h3>Lambda invoke action</h3>
+				<p class="use"><b>Use when</b>A custom step, such as a smoke test or a ticket update, needs to run inside the pipeline.</p>
+<pre><code>- <span class="k">Name:</span> SmokeTest
+  <span class="k">ActionTypeId:</span>
+    <span class="k">Category:</span> Invoke
+    <span class="k">Owner:</span> AWS
+    <span class="k">Provider:</span> Lambda
+    <span class="k">Version:</span> "1"
+  <span class="k">Configuration:</span>
+    <span class="k">FunctionName:</span> orders-smoke-test
+    <span class="k">UserParameters:</span> https://staging.example.com/health</code></pre>
+				<span class="file">smoke_test.py</span>
+<pre><code>import boto3, urllib.request
+cp = boto3.client("codepipeline")
+
+def handler(event, context):
+    job = event["CodePipeline.job"]
+    url = job["data"]["actionConfiguration"]["configuration"]["UserParameters"]
+    try:
+        urllib.request.urlopen(url, timeout=10)
+        cp.put_job_success_result(jobId=job["id"])
+    except Exception as e:
+        cp.put_job_failure_result(
+            jobId=job["id"],
+            failureDetails={"type": "JobFailed", "message": str(e)[:500]},
+        )</code></pre>
+				<p class="watch"><b>Watch for</b>The function <strong>must</strong> call <code>PutJobSuccessResult</code> or <code>PutJobFailureResult</code>; otherwise the action keeps running until it times out. Its role needs those two permissions. It can also return output variables for later actions.</p>
+			</div>
+
+			<div class="snippet" id="stage-conditions-and-automatic-rollback">
+				<h3>Stage conditions and automatic rollback</h3>
+				<p class="use"><b>Use when</b>Production must not be deployed while an alarm is firing, and a failed deployment should roll back to the last successful version.</p>
+<pre><code>- <span class="k">Name:</span> Production
+  <span class="k">BeforeEntry:</span>                                 <span class="c"># entry condition: FAIL or SKIP</span>
+    <span class="k">Conditions:</span>
+      - <span class="k">Result:</span> FAIL
+        <span class="k">Rules:</span>
+          - <span class="k">Name:</span> ProdHealthy
+            <span class="k">RuleTypeId:</span>
+              <span class="k">Category:</span> Rule
+              <span class="k">Owner:</span> AWS
+              <span class="k">Provider:</span> CloudWatchAlarm
+              <span class="k">Version:</span> "1"
+            <span class="k">Configuration:</span>
+              <span class="k">AlarmName:</span> orders-prod-5xx
+              <span class="k">WaitTime:</span> "10"                     <span class="c"># minutes to wait for OK</span>
+  <span class="k">OnFailure:</span>
+    <span class="k">Result:</span> ROLLBACK                           <span class="c"># redeploy the last successful run</span>
+  <span class="k">Actions:</span>
+    - ...</code></pre>
+				<p class="watch"><b>Watch for</b>Entry conditions can <strong>fail</strong> or <strong>skip</strong> the stage; success conditions can fail or roll back; failure conditions roll back. Rollback only targets a previous execution started with the current pipeline structure. Conditions and stage rollback are V2 features.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

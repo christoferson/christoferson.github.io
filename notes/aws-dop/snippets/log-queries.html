@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Logs Insights and Athena queries | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated CloudWatch Logs Insights queries for errors, latency percentiles, Lambda cold starts, parsing, CloudTrail and VPC Flow Logs, plus Athena tables and queries for CloudTrail, ALB and VPC Flow Logs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Logs Insights and Athena queries</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Logs Insights and Athena queries</h1>
+		<p>Queries for troubleshooting and investigation: Logs Insights over recent logs in CloudWatch Logs, Athena over long histories in S3. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CloudWatch Logs</span><span class="tag">Athena</span><span class="tag">SQL</span><span class="tag">10 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#logs-insights">CloudWatch Logs Insights</a></li>
+				<li class="sub"><a href="#top-errors-by-message">Top errors by message</a></li>
+				<li class="sub"><a href="#latency-percentiles-per-route">Latency percentiles per route</a></li>
+				<li class="sub"><a href="#lambda-cold-starts-and-memory">Lambda cold starts and memory</a></li>
+				<li class="sub"><a href="#parse-a-plain-text-log-line">Parse a plain-text log line</a></li>
+				<li class="sub"><a href="#cloudtrail-access-denied-by-principal">CloudTrail: access denied by principal</a></li>
+				<li class="sub"><a href="#vpc-flow-logs-top-rejected-sources">VPC Flow Logs: top rejected sources</a></li>
+				<li><a href="#athena">Athena</a></li>
+				<li class="sub"><a href="#cloudtrail-table-with-partition-projection">CloudTrail table with partition projection</a></li>
+				<li class="sub"><a href="#everything-one-access-key-did">Everything one access key did</a></li>
+				<li class="sub"><a href="#alb-5xx-errors-by-target">ALB 5xx errors by target</a></li>
+				<li class="sub"><a href="#vpc-flow-logs-rejects-by-port">VPC Flow Logs: rejects by port</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>Use <strong>Logs Insights</strong> for interactive queries over recent data already in CloudWatch Logs; you pay per GB scanned in the chosen time range. Use <strong>Athena</strong> for SQL over logs stored in S3 (CloudTrail, ALB, VPC Flow Logs) across months or years; partitions keep the scanned data, and the cost, small.</p>
+
+			<h2 id="logs-insights">CloudWatch Logs Insights</h2>
+
+			<div class="snippet" id="top-errors-by-message">
+				<h3>Top errors by message</h3>
+				<p class="use"><b>Use when</b>An alarm fired and you want the most frequent errors in the time window.</p>
+<pre><code>fields @timestamp, @message
+| filter @message like /ERROR/
+| stats count(*) as errors by @message
+| sort errors desc
+| limit 20</code></pre>
+				<p class="watch"><b>Watch for</b>Messages that contain IDs or timestamps are all unique, so each counts once. Group by a stable field instead (for example <code>errorType</code> in JSON logs, or a value extracted with <code>parse</code>).</p>
+			</div>
+
+			<div class="snippet" id="latency-percentiles-per-route">
+				<h3>Latency percentiles per route</h3>
+				<p class="use"><b>Use when</b>Finding which API route is slow, from JSON logs with <code>route</code> and <code>latencyMs</code> fields.</p>
+<pre><code><span class="c"># JSON fields are discovered automatically</span>
+filter ispresent(latencyMs)
+| stats pct(latencyMs, 50) as p50,
+        pct(latencyMs, 99) as p99,
+        count(*) as requests
+        by route, bin(5m)
+| sort p99 desc</code></pre>
+				<p class="watch"><b>Watch for</b>Averages hide slow outliers; use p99 (or p95) for latency questions. <code>bin(5m)</code> buckets results into 5-minute intervals so you can see when it started.</p>
+			</div>
+
+			<div class="snippet" id="lambda-cold-starts-and-memory">
+				<h3>Lambda cold starts and memory</h3>
+				<p class="use"><b>Use when</b>Deciding whether a function needs provisioned concurrency or more memory.</p>
+<pre><code><span class="c"># every invocation writes one REPORT line</span>
+filter @type = "REPORT"
+| stats count(*) as invocations,
+        count(@initDuration) as coldStarts,
+        max(@initDuration) as maxInitMs,
+        max(@maxMemoryUsed / 1000 / 1000) as maxUsedMB,
+        max(@memorySize / 1000 / 1000) as allocatedMB
+        by bin(1h)</code></pre>
+				<p class="watch"><b>Watch for</b><code>@initDuration</code> appears only on cold starts, so counting it counts cold starts. Many cold starts with long init times point to <strong>provisioned concurrency</strong> (or SnapStart); used memory near the allocation points to more memory.</p>
+			</div>
+
+			<div class="snippet" id="parse-a-plain-text-log-line">
+				<h3>Parse a plain-text log line</h3>
+				<p class="use"><b>Use when</b>Logs aren't JSON, for example <code>2026-10-30T08:00:01Z level=WARN user=alice action=checkout</code>.</p>
+<pre><code><span class="c"># glob: each * becomes a field, in order</span>
+parse @message "level=* user=* action=*" as level, user, action
+| filter level = "WARN"
+| stats count(*) as warnings by user, action
+| sort warnings desc
+
+<span class="c"># or a regular expression with named groups</span>
+<span class="c"># parse @message /level=(?&lt;level&gt;\w+) user=(?&lt;user&gt;\S+)/</span></code></pre>
+				<p class="watch"><b>Watch for</b>Fields created by <code>parse</code> exist only for this query. To alarm on them, use a <strong>metric filter</strong> instead; Logs Insights is for investigation, not alerting.</p>
+			</div>
+
+			<div class="snippet" id="cloudtrail-access-denied-by-principal">
+				<h3>CloudTrail: access denied by principal</h3>
+				<p class="use"><b>Use when</b>A trail delivers to CloudWatch Logs and you want to know who is hitting permission errors.</p>
+<pre><code>fields userIdentity.arn, eventSource, eventName, errorCode
+| filter errorCode like /AccessDenied|UnauthorizedOperation/
+| stats count(*) as denied by userIdentity.arn, eventName
+| sort denied desc
+| limit 20</code></pre>
+				<p class="watch"><b>Watch for</b>Error codes vary by service (<code>AccessDenied</code>, <code>AccessDeniedException</code>, <code>Client.UnauthorizedOperation</code>), so match a pattern, not one exact value. A sudden burst from one principal can mean stolen credentials probing permissions.</p>
+			</div>
+
+			<div class="snippet" id="vpc-flow-logs-top-rejected-sources">
+				<h3>VPC Flow Logs: top rejected sources</h3>
+				<p class="use"><b>Use when</b>Checking whether a connection problem is a security group or network ACL, or who is scanning you.</p>
+<pre><code><span class="c"># default-format flow logs: fields are discovered automatically</span>
+filter action = "REJECT"
+| stats count(*) as rejects by srcAddr, dstAddr, dstPort
+| sort rejects desc
+| limit 20</code></pre>
+				<p class="watch"><b>Watch for</b>Rejected inbound traffic but accepted replies (or the reverse) points to a <strong>network ACL</strong>, which is stateless. Flow logs record metadata only, never packet contents.</p>
+			</div>
+
+			<h2 id="athena">Athena</h2>
+
+			<div class="snippet" id="cloudtrail-table-with-partition-projection">
+				<h3>CloudTrail table with partition projection</h3>
+				<p class="use"><b>Use when</b>Querying a trail's S3 logs for one account and Region without adding partitions by hand.</p>
+<pre><code><span class="c">-- a subset of columns; the JSON SerDe ignores fields you leave out</span>
+CREATE EXTERNAL TABLE cloudtrail_logs_pp (
+  useridentity STRUCT&lt;
+    type: STRING, principalid: STRING, arn: STRING,
+    accountid: STRING, accesskeyid: STRING, username: STRING&gt;,
+  eventtime STRING,
+  eventsource STRING,
+  eventname STRING,
+  awsregion STRING,
+  sourceipaddress STRING,
+  useragent STRING,
+  errorcode STRING,
+  errormessage STRING,
+  requestparameters STRING,
+  readonly STRING,
+  recipientaccountid STRING
+)
+PARTITIONED BY (`timestamp` STRING)
+ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'
+STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://org-cloudtrail-logs/AWSLogs/222222222222/CloudTrail/us-east-1'
+TBLPROPERTIES (
+  'projection.enabled' = 'true',
+  'projection.timestamp.type' = 'date',
+  'projection.timestamp.format' = 'yyyy/MM/dd',
+  'projection.timestamp.range' = '2025/01/01,NOW',
+  'projection.timestamp.interval' = '1',
+  'projection.timestamp.interval.unit' = 'DAYS',
+  <span class="c">-- where each day's files live</span>
+  'storage.location.template' = 's3://org-cloudtrail-logs/AWSLogs/222222222222/CloudTrail/us-east-1/${timestamp}'
+)</code></pre>
+				<p class="watch"><b>Watch for</b>Partition projection works out partitions from the table properties, so you never run <code>ALTER TABLE ADD PARTITION</code> or a crawler. An organization trail adds the organization ID to the path (<code>AWSLogs/o-.../&lt;account&gt;/...</code>); project account and Region as extra partitions to query them all.</p>
+			</div>
+
+			<div class="snippet" id="everything-one-access-key-did">
+				<h3>Everything one access key did</h3>
+				<p class="use"><b>Use when</b>Investigating an exposed or compromised access key.</p>
+<pre><code>SELECT eventtime, eventsource, eventname,
+       awsregion, sourceipaddress, errorcode
+FROM cloudtrail_logs_pp
+WHERE useridentity.accesskeyid = 'AKIAEXAMPLEKEY123456'
+  <span class="c">-- filter on the partition so Athena reads only 7 days of files</span>
+  AND "timestamp" &gt;= date_format(current_date - interval '7' day, '%Y/%m/%d')
+ORDER BY eventtime;</code></pre>
+				<p class="watch"><b>Watch for</b>Always filter on the partition column. Without it Athena scans every file in the trail, which is slow and expensive. Repeat for every Region the key could have used.</p>
+			</div>
+
+			<div class="snippet" id="alb-5xx-errors-by-target">
+				<h3>ALB 5xx errors by target</h3>
+				<p class="use"><b>Use when</b>Finding out whether 5xx errors come from one bad target or from the load balancer itself (table <code>alb_access_logs</code> from the Athena docs).</p>
+<pre><code>SELECT target_ip, target_port,
+       elb_status_code, target_status_code,
+       count(*) AS requests
+FROM alb_access_logs
+WHERE elb_status_code &gt;= 500
+GROUP BY target_ip, target_port, elb_status_code, target_status_code
+ORDER BY requests DESC
+LIMIT 20;</code></pre>
+				<p class="watch"><b>Watch for</b>A 5xx with <code>target_status_code</code> of <code>-</code> was generated by the load balancer: <strong>502</strong> (bad response from the target), <strong>503</strong> (no healthy targets) or <strong>504</strong> (target timed out). Errors concentrated on one <code>target_ip</code> point to one unhealthy instance.</p>
+			</div>
+
+			<div class="snippet" id="vpc-flow-logs-rejects-by-port">
+				<h3>VPC Flow Logs: rejects by port</h3>
+				<p class="use"><b>Use when</b>Flow logs go to S3 and you need weeks of history (table <code>vpc_flow_logs</code> from the Athena docs).</p>
+<pre><code>SELECT dstport, protocol, count(*) AS rejects
+FROM vpc_flow_logs
+WHERE action = 'REJECT'
+GROUP BY dstport, protocol
+ORDER BY rejects DESC
+LIMIT 20;
+<span class="c">-- protocol 6 = TCP, 17 = UDP</span></code></pre>
+				<p class="watch"><b>Watch for</b>Flow logs to S3 can use Parquet and Hive-compatible prefixes, which make Athena queries much cheaper. Steady rejects on 22 or 3389 from many sources are scans; one source and one port is usually a misconfigured rule.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

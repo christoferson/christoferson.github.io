@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: SAM gradual deployments | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: AWS SAM templates for gradual Lambda deployments with AutoPublishAlias and DeploymentPreference, canary and linear types, alarms, pre-traffic hooks, provisioned concurrency, API Gateway canaries, samconfig.toml and sam pipeline.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">SAM gradual deployments</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>SAM gradual deployments</h1>
+		<p>Shipping a new Lambda version to a small share of traffic first, checking it with alarms and test hooks, and rolling back automatically. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">AWS SAM</span><span class="tag">Lambda</span><span class="tag">CodeDeploy</span><span class="tag">YAML</span><span class="tag">8 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#minimal-sam-template">Minimal SAM template</a></li>
+				<li><a href="#canary-deployment-with-alarms-and-hooks">Canary deployment with alarms and hooks</a></li>
+				<li><a href="#deployment-preference-types">Deployment preference types</a></li>
+				<li><a href="#a-pre-traffic-hook-function">A pre-traffic hook function</a></li>
+				<li><a href="#provisioned-concurrency-on-the-alias">Provisioned concurrency on the alias</a></li>
+				<li><a href="#api-events-and-stage-canaries">API events and stage canaries</a></li>
+				<li><a href="#samconfig-toml-and-deploy-commands">samconfig.toml and deploy commands</a></li>
+				<li><a href="#pipelines-with-sam-pipeline">Pipelines with sam pipeline</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>SAM is a CloudFormation transform. Adding <code>AutoPublishAlias</code> and <code>DeploymentPreference</code> to a function makes SAM publish a new version on every code change and create a CodeDeploy application and deployment group that shifts the alias from the old version to the new one.</p>
+
+			<div class="snippet" id="minimal-sam-template">
+				<h3>Minimal SAM template</h3>
+				<p class="use"><b>Use when</b>Starting a serverless application; every other snippet builds on this.</p>
+				<span class="file">template.yaml</span>
+<pre><code><span class="k">AWSTemplateFormatVersion:</span> "2010-09-09"
+<span class="k">Transform:</span> AWS::Serverless-2016-10-31   <span class="c"># makes this a SAM template</span>
+
+<span class="k">Globals:</span>   <span class="c"># defaults for every function</span>
+  <span class="k">Function:</span>
+    <span class="k">Runtime:</span> python3.12
+    <span class="k">MemorySize:</span> 256
+    <span class="k">Timeout:</span> 10
+    <span class="k">Tracing:</span> Active   <span class="c"># X-Ray</span>
+
+<span class="k">Resources:</span>
+  <span class="k">OrdersFunction:</span>
+    <span class="k">Type:</span> AWS::Serverless::Function
+    <span class="k">Properties:</span>
+      <span class="k">CodeUri:</span> src/orders/
+      <span class="k">Handler:</span> app.handler
+      <span class="k">Policies:</span>   <span class="c"># SAM policy templates</span>
+        - <span class="k">DynamoDBCrudPolicy:</span>
+            <span class="k">TableName:</span> !Ref OrdersTable
+
+  <span class="k">OrdersTable:</span>
+    <span class="k">Type:</span> AWS::Serverless::SimpleTable</code></pre>
+				<p class="watch"><b>Watch for</b>Deploying needs <code>CAPABILITY_IAM</code> (SAM creates roles) and <code>CAPABILITY_AUTO_EXPAND</code> when the template contains nested applications or macros.</p>
+			</div>
+
+			<div class="snippet" id="canary-deployment-with-alarms-and-hooks">
+				<h3>Canary deployment with alarms and hooks</h3>
+				<p class="use"><b>Use when</b>New versions should take 10% of traffic first and roll back automatically if errors rise.</p>
+				<span class="file">template.yaml</span>
+<pre><code><span class="k">OrdersFunction:</span>
+  <span class="k">Type:</span> AWS::Serverless::Function
+  <span class="k">Properties:</span>
+    <span class="k">CodeUri:</span> src/orders/
+    <span class="k">Handler:</span> app.handler
+    <span class="k">AutoPublishAlias:</span> live   <span class="c"># new version + alias "live" on each code change</span>
+    <span class="k">DeploymentPreference:</span>
+      <span class="k">Type:</span> Canary10Percent5Minutes   <span class="c"># 10% for 5 minutes, then 100%</span>
+      <span class="k">Alarms:</span>   <span class="c"># any alarm in ALARM: roll back</span>
+        - !Ref OrdersErrorsAlarm
+        - !Ref OrdersLatencyAlarm
+      <span class="k">Hooks:</span>
+        <span class="k">PreTraffic:</span> !Ref PreTrafficHook   <span class="c"># runs before any traffic shifts</span>
+        <span class="k">PostTraffic:</span> !Ref PostTrafficHook   <span class="c"># runs after 100% has shifted</span>
+
+<span class="k">OrdersErrorsAlarm:</span>
+  <span class="k">Type:</span> AWS::CloudWatch::Alarm
+  <span class="k">Properties:</span>
+    <span class="k">Namespace:</span> AWS/Lambda
+    <span class="k">MetricName:</span> Errors
+    <span class="k">Dimensions:</span>
+      - <span class="k">Name:</span> Resource
+        <span class="k">Value:</span> !Sub "${OrdersFunction}:live"   <span class="c"># the alias</span>
+      - <span class="k">Name:</span> FunctionName
+        <span class="k">Value:</span> !Ref OrdersFunction
+    <span class="k">Statistic:</span> Sum
+    <span class="k">Period:</span> 60
+    <span class="k">EvaluationPeriods:</span> 1
+    <span class="k">Threshold:</span> 1
+    <span class="k">ComparisonOperator:</span> GreaterThanOrEqualToThreshold
+    <span class="k">TreatMissingData:</span> notBreaching</code></pre>
+				<p class="watch"><b>Watch for</b><code>DeploymentPreference</code> only works with <code>AutoPublishAlias</code>. Event sources in the template (API, SQS, schedules) are wired to the alias, so they follow the traffic shift; anything that calls the function by plain name or <code>$LATEST</code> doesn't.</p>
+			</div>
+
+			<div class="snippet" id="deployment-preference-types">
+				<h3>Deployment preference types</h3>
+				<p class="use"><b>Use when</b>Choosing how fast traffic moves to the new version.</p>
+<pre><code><span class="c"># canary: one small step, then the rest</span>
+Canary10Percent5Minutes
+Canary10Percent10Minutes
+Canary10Percent15Minutes
+Canary10Percent30Minutes
+
+<span class="c"># linear: equal 10% steps at a fixed interval</span>
+Linear10PercentEvery1Minute
+Linear10PercentEvery2Minutes
+Linear10PercentEvery3Minutes
+Linear10PercentEvery10Minutes
+
+<span class="c"># everything at once (still gets hooks and alarm rollback)</span>
+AllAtOnce</code></pre>
+				<p class="watch"><b>Watch for</b>"Least time exposed to a bad version with real traffic" is canary; "gradual and even" is linear. For other percentages, create a custom CodeDeploy deployment configuration and put its name in <code>Type</code>.</p>
+			</div>
+
+			<div class="snippet" id="a-pre-traffic-hook-function">
+				<h3>A pre-traffic hook function</h3>
+				<p class="use"><b>Use when</b>The new version must pass a smoke test before it receives any traffic.</p>
+				<span class="file">template.yaml</span>
+<pre><code><span class="k">PreTrafficHook:</span>
+  <span class="k">Type:</span> AWS::Serverless::Function
+  <span class="k">Properties:</span>
+    <span class="k">FunctionName:</span> CodeDeployHook_OrdersPreTraffic   <span class="c"># prefix the default role allows</span>
+    <span class="k">CodeUri:</span> src/hooks/
+    <span class="k">Handler:</span> pre_traffic.handler
+    <span class="k">DeploymentPreference:</span>
+      <span class="k">Enabled:</span> false   <span class="c"># don't gradually deploy the hook itself</span>
+    <span class="k">Environment:</span>
+      <span class="k">Variables:</span>
+        <span class="k">NEW_VERSION:</span> !Ref OrdersFunction.Version   <span class="c"># version under test</span>
+    <span class="k">Policies:</span>
+      - <span class="k">Version:</span> "2012-10-17"
+        <span class="k">Statement:</span>
+          - <span class="k">Effect:</span> Allow
+            <span class="k">Action:</span> codedeploy:PutLifecycleEventHookExecutionStatus
+            <span class="k">Resource:</span> !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ServerlessDeploymentApplication}/*
+          - <span class="k">Effect:</span> Allow
+            <span class="k">Action:</span> lambda:InvokeFunction
+            <span class="k">Resource:</span> !Ref OrdersFunction.Version</code></pre>
+				<p>The handler invokes <code>NEW_VERSION</code> with a test event, then reports the result:</p>
+<pre><code>import os, boto3, json
+
+codedeploy = boto3.client("codedeploy")
+lam = boto3.client("lambda")
+
+def handler(event, context):
+    status = "Succeeded"
+    try:
+        resp = lam.invoke(FunctionName=os.environ["NEW_VERSION"],
+                          Payload=json.dumps({"test": True}))
+        if resp.get("FunctionError"):
+            status = "Failed"
+    except Exception:
+        status = "Failed"
+    codedeploy.put_lifecycle_event_hook_execution_status(
+        deploymentId=event["DeploymentId"],
+        lifecycleEventHookExecutionId=event["LifecycleEventHookExecutionId"],
+        status=status)   <span class="c"># "Failed" stops the deployment and rolls back</span></code></pre>
+				<p class="watch"><b>Watch for</b>A hook that never calls <code>PutLifecycleEventHookExecutionStatus</code> leaves the deployment waiting until it times out and fails. With the CodeDeploy role SAM creates, hook function names must start with <code>CodeDeployHook_</code>.</p>
+			</div>
+
+			<div class="snippet" id="provisioned-concurrency-on-the-alias">
+				<h3>Provisioned concurrency on the alias</h3>
+				<p class="use"><b>Use when</b>Latency-sensitive functions must not have cold starts, even right after a deployment.</p>
+<pre><code><span class="k">OrdersFunction:</span>
+  <span class="k">Type:</span> AWS::Serverless::Function
+  <span class="k">Properties:</span>
+    <span class="k">CodeUri:</span> src/orders/
+    <span class="k">Handler:</span> app.handler
+    <span class="k">AutoPublishAlias:</span> live   <span class="c"># required: provisioned on the alias</span>
+    <span class="k">ProvisionedConcurrencyConfig:</span>
+      <span class="k">ProvisionedConcurrentExecutions:</span> 10
+    <span class="k">DeploymentPreference:</span>
+      <span class="k">Type:</span> Linear10PercentEvery1Minute</code></pre>
+				<p class="watch"><b>Watch for</b>Provisioned concurrency can't be set on <code>$LATEST</code>, only on a version or alias, which is why <code>AutoPublishAlias</code> is needed. It's billed while allocated; scale it with Application Auto Scaling on the alias if load varies.</p>
+			</div>
+
+			<div class="snippet" id="api-events-and-stage-canaries">
+				<h3>API events and stage canaries</h3>
+				<p class="use"><b>Use when</b>An API fronts the function and you need to choose where the canary happens.</p>
+<pre><code><span class="k">OrdersApi:</span>
+  <span class="k">Type:</span> AWS::Serverless::Api   <span class="c"># REST API</span>
+  <span class="k">Properties:</span>
+    <span class="k">StageName:</span> prod
+    <span class="k">CanarySetting:</span>   <span class="c"># stage-level canary (REST APIs only)</span>
+      <span class="k">PercentTraffic:</span> 10   <span class="c"># share sent to the newest API deployment</span>
+
+<span class="k">OrdersFunction:</span>
+  <span class="k">Type:</span> AWS::Serverless::Function
+  <span class="k">Properties:</span>
+    <span class="k">CodeUri:</span> src/orders/
+    <span class="k">Handler:</span> app.handler
+    <span class="k">AutoPublishAlias:</span> live
+    <span class="k">Events:</span>
+      <span class="k">CreateOrder:</span>
+        <span class="k">Type:</span> Api   <span class="c"># or HttpApi for an HTTP API</span>
+        <span class="k">Properties:</span>
+          <span class="k">RestApiId:</span> !Ref OrdersApi
+          <span class="k">Path:</span> /orders
+          <span class="k">Method:</span> post</code></pre>
+				<p class="watch"><b>Watch for</b>Normally you use one or the other. <code>DeploymentPreference</code> shifts traffic between <strong>Lambda versions</strong> behind the same API. A stage <code>CanarySetting</code> splits traffic between two <strong>API deployments</strong> (for example, a changed API definition) and is promoted manually.</p>
+			</div>
+
+			<div class="snippet" id="samconfig-toml-and-deploy-commands">
+				<h3>samconfig.toml and deploy commands</h3>
+				<p class="use"><b>Use when</b>Deploying the same template to several environments with saved settings.</p>
+				<span class="file">samconfig.toml</span>
+<pre><code>version = 0.1
+
+[default.deploy.parameters]
+stack_name = "orders-dev"
+region = "us-east-1"
+resolve_s3 = true   <span class="c"># SAM manages the artifact bucket</span>
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+
+[prod.deploy.parameters]
+stack_name = "orders-prod"
+region = "us-east-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true   <span class="c"># review the change set first</span>
+parameter_overrides = "Stage=prod"</code></pre>
+<pre><code>sam build   <span class="c"># install dependencies, prepare artifacts</span>
+sam deploy --guided   <span class="c"># first time: prompts, then writes samconfig.toml</span>
+sam deploy --config-env prod   <span class="c"># use the [prod] settings</span>
+sam sync --watch --stack-name orders-dev   <span class="c"># dev only: pushes code changes directly</span></code></pre>
+				<p class="watch"><b>Watch for</b><code>sam sync</code> updates code without going through a CloudFormation deployment, so it skips gradual deployment. Never use it for production.</p>
+			</div>
+
+			<div class="snippet" id="pipelines-with-sam-pipeline">
+				<h3>Pipelines with sam pipeline</h3>
+				<p class="use"><b>Use when</b>You want a ready-made multi-stage CI/CD pipeline for a SAM application.</p>
+<pre><code>sam pipeline bootstrap --stage dev   <span class="c"># per stage: deploy role, CloudFormation role, artifact bucket</span>
+sam pipeline bootstrap --stage prod   <span class="c"># run again for each account or Region</span>
+sam pipeline init   <span class="c"># generates the pipeline definition</span></code></pre>
+				<p class="watch"><b>Watch for</b><code>sam pipeline init</code> can generate configurations for CodePipeline, GitHub Actions, GitLab CI/CD, Jenkins and Bitbucket Pipelines. Gradual deployment still comes from <code>DeploymentPreference</code> in the template, not from the pipeline.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>
