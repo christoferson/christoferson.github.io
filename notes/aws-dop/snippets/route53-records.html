@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Route 53 records | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated Route 53 CloudFormation records and health checks: alias to an ALB, HTTPS and CloudWatch alarm health checks, calculated health checks, failover, weighted, latency and geolocation routing, and ARC routing controls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Route 53 records</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Route 53 records</h1>
+		<p>DNS records and health checks that move traffic between targets and Regions: alias records, health checks of several kinds, and failover, weighted, latency and geolocation routing. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Route 53</span><span class="tag">CloudFormation</span><span class="tag">YAML</span><span class="tag">9 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#alias-record-to-an-alb">Alias record to an ALB</a></li>
+				<li><a href="#https-health-check">HTTPS health check</a></li>
+				<li><a href="#failover-primary-and-secondary">Failover: primary and secondary</a></li>
+				<li><a href="#weighted-records-for-blue-green-and-canary">Weighted records for blue/green and canary</a></li>
+				<li><a href="#latency-records-per-region">Latency records per Region</a></li>
+				<li><a href="#health-check-from-a-cloudwatch-alarm">Health check from a CloudWatch alarm</a></li>
+				<li><a href="#calculated-health-check">Calculated health check</a></li>
+				<li><a href="#geolocation-with-a-default">Geolocation with a default</a></li>
+				<li><a href="#routing-control-health-check">Routing control health check</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>The examples use the domain <code>example.com</code> in hosted zone <code>Z0123456789ABCDEFGHIJ</code>, with the application running in us-east-1 and eu-west-1. Records that share a name and type and use a routing policy (failover, weighted, latency, geolocation) each need a unique <code>SetIdentifier</code>; Route 53 chooses among them on every query.</p>
+
+			<div class="snippet" id="alias-record-to-an-alb">
+				<h3>Alias record to an ALB</h3>
+				<p class="use"><b>Use when</b>Pointing a name, including the zone apex <code>example.com</code>, at a load balancer, CloudFront distribution, API Gateway or S3 website.</p>
+				<span class="file">app-dns.yaml</span>
+<pre><code><span class="k">AppRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt AppLoadBalancer.DNSName
+      <span class="c"># the ALB's own zone ID, not your hosted zone's</span>
+      <span class="k">HostedZoneId:</span> !GetAtt AppLoadBalancer.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true   <span class="c"># unhealthy if the ALB has no healthy targets</span></code></pre>
+				<p class="watch"><b>Watch for</b>Alias records have <strong>no TTL</strong> of their own and queries to them are free; a CNAME can't be used at the zone apex. <code>EvaluateTargetHealth</code> lets an alias take part in failover without a separate health check.</p>
+			</div>
+
+			<div class="snippet" id="https-health-check">
+				<h3>HTTPS health check</h3>
+				<p class="use"><b>Use when</b>Route 53 should probe a public endpoint and mark it unhealthy when the application stops answering.</p>
+<pre><code><span class="k">UsEastHealthCheck:</span>
+  <span class="k">Type:</span> AWS::Route53::HealthCheck
+  <span class="k">Properties:</span>
+    <span class="k">HealthCheckConfig:</span>
+      <span class="k">Type:</span> HTTPS
+      <span class="k">FullyQualifiedDomainName:</span> us-east-1.app.example.com
+      <span class="k">Port:</span> 443
+      <span class="c"># a deep check that also tests the database</span>
+      <span class="k">ResourcePath:</span> /health
+      <span class="k">RequestInterval:</span> 10   <span class="c"># 10 (fast, extra cost) or 30 seconds</span>
+      <span class="k">FailureThreshold:</span> 3   <span class="c"># consecutive failures before unhealthy</span>
+      <span class="k">EnableSNI:</span> true
+    <span class="k">HealthCheckTags:</span>
+      - <span class="k">Key:</span> Name
+        <span class="k">Value:</span> app-us-east-1</code></pre>
+				<p class="watch"><b>Watch for</b>Health checkers run from the internet, so the endpoint must be public and its security group must allow the Route 53 health checker IP ranges. A <code>/health</code> page that only returns 200 from the web server misses database failures; make the check exercise real dependencies.</p>
+			</div>
+
+			<div class="snippet" id="failover-primary-and-secondary">
+				<h3>Failover: primary and secondary</h3>
+				<p class="use"><b>Use when</b>Active-passive disaster recovery: all traffic goes to the primary Region until its health check fails.</p>
+<pre><code><span class="k">PrimaryRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> primary-us-east-1
+    <span class="k">Failover:</span> PRIMARY
+    <span class="k">HealthCheckId:</span> !Ref UsEastHealthCheck
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt UsEastAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt UsEastAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true
+
+<span class="k">SecondaryRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> secondary-eu-west-1
+    <span class="k">Failover:</span> SECONDARY   <span class="c"># answered only while PRIMARY is unhealthy</span>
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt EuWestAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt EuWestAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true</code></pre>
+				<p class="watch"><b>Watch for</b>Failover takes the health check's detection time (interval &times; failure threshold) plus the time clients keep cached answers. For non-alias records, a low TTL (60 seconds) shortens that delay.</p>
+			</div>
+
+			<div class="snippet" id="weighted-records-for-blue-green-and-canary">
+				<h3>Weighted records for blue/green and canary</h3>
+				<p class="use"><b>Use when</b>Shifting a share of traffic to a new environment, then moving the rest once it looks healthy.</p>
+<pre><code><span class="k">BlueRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> CNAME
+    <span class="k">TTL:</span> "60"
+    <span class="k">SetIdentifier:</span> blue
+    <span class="k">Weight:</span> 90   <span class="c"># share = weight / sum of weights</span>
+    <span class="k">ResourceRecords:</span>
+      - blue-alb-123456.us-east-1.elb.amazonaws.com
+
+<span class="k">GreenRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> CNAME
+    <span class="k">TTL:</span> "60"
+    <span class="k">SetIdentifier:</span> green
+    <span class="k">Weight:</span> 10   <span class="c"># canary: 10% of queries</span>
+    <span class="k">ResourceRecords:</span>
+      - green-alb-654321.us-east-1.elb.amazonaws.com</code></pre>
+				<p class="watch"><b>Watch for</b>Weights run from 0 to 255. A weight of <code>0</code> drains a record (it gets no traffic while others have weight), and if every record is <code>0</code>, Route 53 answers them equally. DNS-based shifting is coarse: cached answers keep some clients on the old target, so ALB weighted target groups shift faster.</p>
+			</div>
+
+			<div class="snippet" id="latency-records-per-region">
+				<h3>Latency records per Region</h3>
+				<p class="use"><b>Use when</b>Active-active in several Regions: each user goes to the Region with the lowest latency, and away from a Region whose health check fails.</p>
+<pre><code><span class="k">UsEastLatency:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> us-east-1
+    <span class="k">Region:</span> us-east-1   <span class="c"># the Region the target runs in</span>
+    <span class="k">HealthCheckId:</span> !Ref UsEastHealthCheck
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt UsEastAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt UsEastAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true
+
+<span class="k">EuWestLatency:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> eu-west-1
+    <span class="k">Region:</span> eu-west-1
+    <span class="k">HealthCheckId:</span> !Ref EuWestHealthCheck
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt EuWestAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt EuWestAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true</code></pre>
+				<p class="watch"><b>Watch for</b>Latency routing measures network latency between users and AWS Regions, not distance; geography-based rules need geolocation or geoproximity instead. Each Region's capacity must absorb the other's traffic when a Region is removed.</p>
+			</div>
+
+			<div class="snippet" id="health-check-from-a-cloudwatch-alarm">
+				<h3>Health check from a CloudWatch alarm</h3>
+				<p class="use"><b>Use when</b>The resource is private (in a VPC, without a public endpoint) or health depends on a metric such as error rate.</p>
+<pre><code><span class="k">ApiErrorsHealthCheck:</span>
+  <span class="k">Type:</span> AWS::Route53::HealthCheck
+  <span class="k">Properties:</span>
+    <span class="k">HealthCheckConfig:</span>
+      <span class="k">Type:</span> CLOUDWATCH_METRIC
+      <span class="k">AlarmIdentifier:</span>
+        <span class="k">Name:</span> internal-api-errors   <span class="c"># unhealthy while the alarm is in ALARM</span>
+        <span class="k">Region:</span> us-east-1
+      <span class="c"># Healthy | Unhealthy | LastKnownStatus</span>
+      <span class="k">InsufficientDataHealthStatus:</span> LastKnownStatus</code></pre>
+				<p class="watch"><b>Watch for</b>Route 53 health checkers can't reach private IP addresses. Publishing a metric (or using an existing one such as ALB 5xx count), alarming on it, and basing the health check on the alarm is the standard way to health-check private resources.</p>
+			</div>
+
+			<div class="snippet" id="calculated-health-check">
+				<h3>Calculated health check</h3>
+				<p class="use"><b>Use when</b>A Region counts as healthy only if enough of its parts are healthy, for example the web tier and the API both.</p>
+<pre><code><span class="k">UsEastRegionHealth:</span>
+  <span class="k">Type:</span> AWS::Route53::HealthCheck
+  <span class="k">Properties:</span>
+    <span class="k">HealthCheckConfig:</span>
+      <span class="k">Type:</span> CALCULATED
+      <span class="k">ChildHealthChecks:</span>
+        - !Ref UsEastHealthCheck
+        - !Ref ApiErrorsHealthCheck
+      <span class="k">HealthThreshold:</span> 2   <span class="c"># how many children must be healthy</span></code></pre>
+				<p class="watch"><b>Watch for</b>The parent evaluates only its children's status and doesn't probe anything itself. Point the failover or latency record's <code>HealthCheckId</code> at the calculated check so the Region fails over when any required part fails.</p>
+			</div>
+
+			<div class="snippet" id="geolocation-with-a-default">
+				<h3>Geolocation with a default</h3>
+				<p class="use"><b>Use when</b>Users in specific countries or continents must reach a specific deployment, for compliance or localized content.</p>
+<pre><code><span class="k">EuropeRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> europe
+    <span class="k">GeoLocation:</span>
+      <span class="k">ContinentCode:</span> EU
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt EuWestAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt EuWestAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true
+
+<span class="k">DefaultRecord:</span>
+  <span class="k">Type:</span> AWS::Route53::RecordSet
+  <span class="k">Properties:</span>
+    <span class="k">HostedZoneId:</span> Z0123456789ABCDEFGHIJ
+    <span class="k">Name:</span> app.example.com
+    <span class="k">Type:</span> A
+    <span class="k">SetIdentifier:</span> default
+    <span class="k">GeoLocation:</span>
+      <span class="k">CountryCode:</span> "*"   <span class="c"># everyone not matched elsewhere</span>
+    <span class="k">AliasTarget:</span>
+      <span class="k">DNSName:</span> !GetAtt UsEastAlb.DNSName
+      <span class="k">HostedZoneId:</span> !GetAtt UsEastAlb.CanonicalHostedZoneID
+      <span class="k">EvaluateTargetHealth:</span> true</code></pre>
+				<p class="watch"><b>Watch for</b>Without a default (<code>CountryCode: "*"</code>) record, users from unmatched locations, and queries whose location can't be determined, get no answer at all. The most specific match wins: country over continent.</p>
+			</div>
+
+			<div class="snippet" id="routing-control-health-check">
+				<h3>Routing control health check</h3>
+				<p class="use"><b>Use when</b>Failover between Regions must be a deliberate operator decision, made with Application Recovery Controller routing controls, rather than automatic.</p>
+<pre><code><span class="k">UsEastRoutingControlCheck:</span>
+  <span class="k">Type:</span> AWS::Route53::HealthCheck
+  <span class="k">Properties:</span>
+    <span class="k">HealthCheckConfig:</span>
+      <span class="k">Type:</span> RECOVERY_CONTROL
+      <span class="c"># healthy while the routing control is On</span>
+      <span class="k">RoutingControlArn:</span> !Ref UsEastRoutingControl</code></pre>
+				<p class="watch"><b>Watch for</b>Attach this health check to the us-east-1 failover or latency record. Turning the routing control <strong>Off</strong> (through the highly available ARC cluster endpoints) marks it unhealthy, so Route 53 stops sending traffic there even if the Region looks healthy.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

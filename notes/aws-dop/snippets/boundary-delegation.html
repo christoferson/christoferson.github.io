@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Permissions boundary delegation | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: delegating IAM role creation with permissions boundaries, including the boundary policy, developer policy with iam:PermissionsBoundary conditions, tamper protection, iam:PassRole limits, CloudFormation, CDK and IAM Identity Center examples.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Permissions boundary delegation</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Permissions boundary delegation</h1>
+		<p>Letting developers create IAM roles for their own workloads without letting them create a role more powerful than allowed. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">IAM</span><span class="tag">JSON</span><span class="tag">YAML</span><span class="tag">7 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#the-boundary-policy">The boundary policy</a></li>
+				<li><a href="#create-roles-only-with-the-boundary">Create roles only with the boundary</a></li>
+				<li><a href="#protect-the-boundary-from-changes">Protect the boundary from changes</a></li>
+				<li><a href="#pass-only-application-roles">Pass only application roles</a></li>
+				<li><a href="#a-role-with-a-boundary-in-cloudformation">A role with a boundary in CloudFormation</a></li>
+				<li><a href="#a-boundary-on-every-role-in-a-cdk-app">A boundary on every role in a CDK app</a></li>
+				<li><a href="#a-boundary-in-an-identity-center-permission-set">A boundary in an Identity Center permission set</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>A permissions boundary is a managed policy set on a user or role as the <strong>maximum</strong> it may ever do. The effective permissions are the intersection of the identity's own policies and the boundary (and any SCPs); the boundary itself grants nothing. Delegation works in four parts: security writes the boundary, developers may create roles only if they attach it, nobody but security can remove or edit it, and developers may pass only those roles to services. The examples use account <code>222222222222</code>, a boundary named <code>AppBoundary</code>, and application roles named <code>app-*</code>.</p>
+
+			<div class="snippet" id="the-boundary-policy">
+				<h3>The boundary policy</h3>
+				<p class="use"><b>Use when</b>Defining the most any developer-created application role may do.</p>
+				<span class="file">AppBoundary (customer managed policy)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AppData",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query"
+      ],
+      "Resource": "arn:aws:dynamodb:*:222222222222:table/app-*"
+    },
+    {
+      "Sid": "AppObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::app-*/*"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>A role whose own policy allows <code>s3:*</code> on every bucket still gets only <code>GetObject</code> and <code>PutObject</code> on <code>app-*</code> buckets. A role with this boundary but no identity policy can do nothing.</p>
+			</div>
+
+			<div class="snippet" id="create-roles-only-with-the-boundary">
+				<h3>Create roles only with the boundary</h3>
+				<p class="use"><b>Use when</b>Developers create execution roles for their own Lambda functions and containers.</p>
+				<span class="file">DeveloperPolicy (part 1)</span>
+<pre><code>{
+  "Sid": "CreateAndEditAppRolesWithBoundary",
+  "Effect": "Allow",
+  "Action": [
+    "iam:CreateRole",
+    "iam:PutRolePolicy",
+    "iam:AttachRolePolicy",
+    "iam:DetachRolePolicy",
+    "iam:DeleteRolePolicy",
+    "iam:PutRolePermissionsBoundary"
+  ],
+  "Resource": "arn:aws:iam::222222222222:role/app-*",
+  "Condition": {
+    "StringEquals": {   // the request must attach exactly this boundary
+      "iam:PermissionsBoundary": "arn:aws:iam::222222222222:policy/AppBoundary"
+    }
+  }
+}</code></pre>
+				<p class="watch"><b>Watch for</b>The <code>iam:PermissionsBoundary</code> condition is what makes <code>CreateRole</code> fail unless the boundary is attached. The <code>app-*</code> resource keeps developers away from security and admin roles.</p>
+			</div>
+
+			<div class="snippet" id="protect-the-boundary-from-changes">
+				<h3>Protect the boundary from changes</h3>
+				<p class="use"><b>Use when</b>Making sure developers can't remove the boundary from a role or rewrite the boundary policy itself.</p>
+				<span class="file">DeveloperPolicy (part 2)</span>
+<pre><code>{
+  "Sid": "NoRemovingBoundaries",
+  "Effect": "Deny",
+  "Action": "iam:DeleteRolePermissionsBoundary",
+  "Resource": "*"
+},
+{
+  "Sid": "NoSwappingBoundaries",
+  "Effect": "Deny",
+  "Action": "iam:PutRolePermissionsBoundary",
+  "Resource": "*",
+  "Condition": {
+    "StringNotEquals": {   // allowed only when it sets AppBoundary again
+      "iam:PermissionsBoundary": "arn:aws:iam::222222222222:policy/AppBoundary"
+    }
+  }
+},
+{
+  "Sid": "NoEditingTheBoundaryPolicy",
+  "Effect": "Deny",
+  "Action": [
+    "iam:CreatePolicyVersion",
+    "iam:DeletePolicy",
+    "iam:DeletePolicyVersion",
+    "iam:SetDefaultPolicyVersion"
+  ],
+  "Resource": "arn:aws:iam::222222222222:policy/AppBoundary"
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Also deny changes to the developers' own role and policy (for example, <code>iam:PutRolePolicy</code> on <code>role/Developer*</code>), or they could simply grant themselves more.</p>
+			</div>
+
+			<div class="snippet" id="pass-only-application-roles">
+				<h3>Pass only application roles</h3>
+				<p class="use"><b>Use when</b>Developers attach the roles they created to Lambda functions or ECS tasks.</p>
+				<span class="file">DeveloperPolicy (part 3)</span>
+<pre><code>{
+  "Sid": "PassAppRolesToComputeOnly",
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::222222222222:role/app-*",
+  "Condition": {
+    "StringEquals": {
+      "iam:PassedToService": [
+        "lambda.amazonaws.com",
+        "ecs-tasks.amazonaws.com"
+      ]
+    }
+  }
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Without a <code>PassRole</code> limit, a developer could hand an existing admin role to a Lambda function and act through it, bypassing the boundary entirely.</p>
+			</div>
+
+			<div class="snippet" id="a-role-with-a-boundary-in-cloudformation">
+				<h3>A role with a boundary in CloudFormation</h3>
+				<p class="use"><b>Use when</b>Developers deploy their application roles through templates.</p>
+				<span class="file">app-role.yaml</span>
+<pre><code><span class="k">OrdersFunctionRole:</span>
+  <span class="k">Type:</span> AWS::IAM::Role
+  <span class="k">Properties:</span>
+    <span class="k">RoleName:</span> app-orders-function   <span class="c"># matches role/app-*</span>
+    <span class="k">PermissionsBoundary:</span> !Sub arn:aws:iam::${AWS::AccountId}:policy/AppBoundary
+    <span class="k">AssumeRolePolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">Service:</span> lambda.amazonaws.com
+          <span class="k">Action:</span> sts:AssumeRole
+    <span class="k">Policies:</span>
+      - <span class="k">PolicyName:</span> orders-table
+        <span class="k">PolicyDocument:</span>
+          <span class="k">Version:</span> "2012-10-17"
+          <span class="k">Statement:</span>
+            - <span class="k">Effect:</span> Allow
+              <span class="k">Action:</span> [ dynamodb:GetItem, dynamodb:PutItem ]
+              <span class="k">Resource:</span> !GetAtt OrdersTable.Arn</code></pre>
+				<p class="watch"><b>Watch for</b>If the stack runs with the developer's credentials (or a CloudFormation service role with the same restrictions), leaving out <code>PermissionsBoundary</code> or using another name makes <code>CreateRole</code> fail with access denied.</p>
+			</div>
+
+			<div class="snippet" id="a-boundary-on-every-role-in-a-cdk-app">
+				<h3>A boundary on every role in a CDK app</h3>
+				<p class="use"><b>Use when</b>Teams deploy with the CDK and must not be able to forget the boundary on any role, including roles that L2 and L3 constructs create for them.</p>
+				<span class="file">bin/app.ts</span>
+<pre><code>import * as iam from "aws-cdk-lib/aws-iam";
+
+const boundary = iam.ManagedPolicy.fromManagedPolicyName(
+  stack, "Boundary", "AppBoundary");
+
+<span class="c">// every role and user in the stack gets the boundary</span>
+iam.PermissionsBoundary.of(stack).apply(boundary);</code></pre>
+<pre><code><span class="c"># bootstrap the account so CDK deployments use a named boundary</span>
+cdk bootstrap aws://222222222222/us-east-1 \
+  --custom-permissions-boundary AppBoundary</code></pre>
+				<p class="watch"><b>Watch for</b><code>PermissionsBoundary.of(scope).apply()</code> reaches roles created inside constructs too; when boundaries are applied at several scopes, the one closest to the role wins. <code>--example-permissions-boundary</code> deploys an AWS-supplied example boundary instead; the two options can't be combined.</p>
+			</div>
+
+			<div class="snippet" id="a-boundary-in-an-identity-center-permission-set">
+				<h3>A boundary in an Identity Center permission set</h3>
+				<p class="use"><b>Use when</b>People who sign in through IAM Identity Center get broad permissions but must stay inside a company-wide limit.</p>
+				<span class="file">permission-set.yaml</span>
+<pre><code><span class="k">PowerUserBounded:</span>
+  <span class="k">Type:</span> AWS::SSO::PermissionSet
+  <span class="k">Properties:</span>
+    <span class="k">InstanceArn:</span> arn:aws:sso:::instance/ssoins-1234567890abcdef
+    <span class="k">Name:</span> PowerUserBounded
+    <span class="k">SessionDuration:</span> PT8H
+    <span class="k">ManagedPolicies:</span>
+      - arn:aws:iam::aws:policy/PowerUserAccess
+    <span class="k">PermissionsBoundary:</span>
+      <span class="k">CustomerManagedPolicyReference:</span>   <span class="c"># by name, resolved per account</span>
+        <span class="k">Name:</span> AppBoundary
+        <span class="k">Path:</span> /</code></pre>
+				<p class="watch"><b>Watch for</b>A customer managed policy is referenced by <strong>name and path</strong>, so a policy with that name must exist in every account the permission set is assigned to; deploy it with a StackSet first. Use <code>ManagedPolicyArn</code> instead to use an AWS managed policy as the boundary.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

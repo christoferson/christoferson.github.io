@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Config rules and remediation | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: AWS Config managed, periodic, Guard and Lambda rules, automatic remediation with Systems Manager Automation, organization rules, conformance packs and aggregator queries, annotated.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Config rules and remediation</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Config rules and remediation</h1>
+		<p>Rules that check resource configuration after deployment, the automation that fixes what they find, and the ways to roll both out to a whole organization. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">AWS Config</span><span class="tag">Systems Manager</span><span class="tag">YAML</span><span class="tag">8 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#managed-rule-on-configuration-changes">Managed rule on configuration changes</a></li>
+				<li><a href="#periodic-managed-rule">Periodic managed rule</a></li>
+				<li><a href="#custom-rule-written-in-guard">Custom rule written in Guard</a></li>
+				<li><a href="#custom-rule-backed-by-lambda">Custom rule backed by Lambda</a></li>
+				<li><a href="#automatic-remediation">Automatic remediation</a></li>
+				<li><a href="#rule-for-the-whole-organization">Rule for the whole organization</a></li>
+				<li><a href="#conformance-pack">Conformance pack</a></li>
+				<li><a href="#aggregator-and-advanced-query">Aggregator and advanced query</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>AWS Config records each resource's configuration as it changes. A <strong>rule</strong> evaluates those records and marks each resource <code>COMPLIANT</code> or <code>NON_COMPLIANT</code>. Rules detect; they don't prevent. A <strong>remediation</strong> attached to a rule runs a Systems Manager Automation document to fix noncompliant resources. Every rule needs the configuration recorder to be recording the resource types it checks.</p>
+
+			<div class="snippet" id="managed-rule-on-configuration-changes">
+				<h3>Managed rule on configuration changes</h3>
+				<p class="use"><b>Use when</b>An AWS-written check exists for the requirement, such as "every S3 bucket has versioning".</p>
+				<span class="file">s3-versioning-rule.yaml</span>
+<pre><code><span class="k">S3VersioningRule:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> s3-bucket-versioning-enabled
+    <span class="k">Source:</span>
+      <span class="k">Owner:</span> AWS
+      <span class="k">SourceIdentifier:</span> S3_BUCKET_VERSIONING_ENABLED   <span class="c"># the identifier, not the rule name</span>
+    <span class="k">Scope:</span>
+      <span class="k">ComplianceResourceTypes:</span>
+        - AWS::S3::Bucket
+    <span class="k">InputParameters:</span>
+      <span class="k">isMfaDeleteEnabled:</span> "false"   <span class="c"># optional rule parameter</span></code></pre>
+				<p class="watch"><b>Watch for</b>The <code>SourceIdentifier</code> can differ from the rule's documented name: the rule <code>restricted-ssh</code> has the identifier <code>INCOMING_SSH_DISABLED</code>. Configuration-change rules evaluate within minutes of a change.</p>
+			</div>
+
+			<div class="snippet" id="periodic-managed-rule">
+				<h3>Periodic managed rule</h3>
+				<p class="use"><b>Use when</b>The check depends on time passing rather than on a configuration change, such as access key age.</p>
+<pre><code><span class="k">AccessKeysRotatedRule:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> access-keys-rotated
+    <span class="k">Source:</span>
+      <span class="k">Owner:</span> AWS
+      <span class="k">SourceIdentifier:</span> ACCESS_KEYS_ROTATED
+    <span class="k">MaximumExecutionFrequency:</span> TwentyFour_Hours   <span class="c"># One_Hour ... TwentyFour_Hours</span>
+    <span class="k">InputParameters:</span>
+      <span class="k">maxAccessKeyAge:</span> "90"   <span class="c"># days</span></code></pre>
+				<p class="watch"><b>Watch for</b>Rules on global IAM resources only need to run in <strong>one Region</strong>; deploying them everywhere repeats the same evaluations. The rule ignores root user access keys.</p>
+			</div>
+
+			<div class="snippet" id="custom-rule-written-in-guard">
+				<h3>Custom rule written in Guard</h3>
+				<p class="use"><b>Use when</b>No managed rule fits, and the check is a condition on the configuration item that needs no code.</p>
+<pre><code><span class="k">EncryptedVolumesRule:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> ebs-volumes-encrypted
+    <span class="k">Scope:</span>
+      <span class="k">ComplianceResourceTypes:</span>
+        - AWS::EC2::Volume
+    <span class="k">Source:</span>
+      <span class="k">Owner:</span> CUSTOM_POLICY
+      <span class="k">SourceDetails:</span>
+        - <span class="k">EventSource:</span> aws.config
+          <span class="k">MessageType:</span> ConfigurationItemChangeNotification
+      <span class="k">CustomPolicyDetails:</span>
+        <span class="k">PolicyRuntime:</span> guard-2.x.x
+        <span class="k">PolicyText:</span> |
+          rule volume_encrypted when resourceType == "AWS::EC2::Volume" {
+            configuration.encrypted == true
+          }</code></pre>
+				<p class="watch"><b>Watch for</b>The Guard rule checks the <strong>configuration item</strong> Config recorded (fields under <code>configuration</code>), not a CloudFormation template. <code>EnableDebugLogDelivery: true</code> sends evaluation details to CloudWatch Logs while you develop the rule.</p>
+			</div>
+
+			<div class="snippet" id="custom-rule-backed-by-lambda">
+				<h3>Custom rule backed by Lambda</h3>
+				<p class="use"><b>Use when</b>The check needs logic or a lookup that Guard can't express, such as calling another API.</p>
+				<span class="file">lambda-rule.yaml</span>
+<pre><code><span class="k">ConfigCanInvoke:</span>
+  <span class="k">Type:</span> AWS::Lambda::Permission
+  <span class="k">Properties:</span>
+    <span class="k">FunctionName:</span> !GetAtt TagCheckFunction.Arn
+    <span class="k">Action:</span> lambda:InvokeFunction
+    <span class="k">Principal:</span> config.amazonaws.com
+    <span class="k">SourceAccount:</span> !Ref AWS::AccountId
+
+<span class="k">RequiredTagRule:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigRule
+  <span class="k">DependsOn:</span> ConfigCanInvoke
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> instances-have-owner-tag
+    <span class="k">Scope:</span>
+      <span class="k">ComplianceResourceTypes:</span>
+        - AWS::EC2::Instance
+    <span class="k">Source:</span>
+      <span class="k">Owner:</span> CUSTOM_LAMBDA
+      <span class="k">SourceIdentifier:</span> !GetAtt TagCheckFunction.Arn
+      <span class="k">SourceDetails:</span>
+        - <span class="k">EventSource:</span> aws.config
+          <span class="k">MessageType:</span> ConfigurationItemChangeNotification</code></pre>
+				<span class="file">tag_check.py</span>
+<pre><code>import json
+import boto3
+
+config = boto3.client("config")
+
+def handler(event, context):
+    item = json.loads(event["invokingEvent"])["configurationItem"]
+    tags = item.get("tags") or {}
+    compliant = "Owner" in tags
+
+    <span class="c"># report the result back to Config</span>
+    config.put_evaluations(
+        Evaluations=[{
+            "ComplianceResourceType": item["resourceType"],
+            "ComplianceResourceId": item["resourceId"],
+            "ComplianceType": "COMPLIANT" if compliant else "NON_COMPLIANT",
+            "Annotation": "Owner tag present" if compliant else "Missing Owner tag",
+            "OrderingTimestamp": item["configurationItemCaptureTime"],
+        }],
+        ResultToken=event["resultToken"],
+    )</code></pre>
+				<p class="watch"><b>Watch for</b>The function <strong>must</strong> call <code>put_evaluations</code> with the event's <code>resultToken</code>; Config doesn't read the return value. The function's role needs <code>config:PutEvaluations</code>.</p>
+			</div>
+
+			<div class="snippet" id="automatic-remediation">
+				<h3>Automatic remediation</h3>
+				<p class="use"><b>Use when</b>A noncompliant resource should be fixed without a person acting, such as turning versioning back on.</p>
+<pre><code><span class="k">S3VersioningRemediation:</span>
+  <span class="k">Type:</span> AWS::Config::RemediationConfiguration
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> !Ref S3VersioningRule
+    <span class="k">TargetType:</span> SSM_DOCUMENT
+    <span class="k">TargetId:</span> AWS-ConfigureS3BucketVersioning   <span class="c"># AWS-owned Automation runbook</span>
+    <span class="k">Parameters:</span>
+      <span class="k">BucketName:</span>
+        <span class="k">ResourceValue:</span>
+          <span class="k">Value:</span> RESOURCE_ID   <span class="c"># filled with the noncompliant bucket</span>
+      <span class="k">VersioningState:</span>
+        <span class="k">StaticValue:</span>
+          <span class="k">Values:</span>
+            - Enabled
+      <span class="k">AutomationAssumeRole:</span>
+        <span class="k">StaticValue:</span>
+          <span class="k">Values:</span>
+            - !GetAtt RemediationRole.Arn
+    <span class="k">Automatic:</span> true
+    <span class="k">MaximumAutomaticAttempts:</span> 5   <span class="c"># default 5, up to 25</span>
+    <span class="k">RetryAttemptSeconds:</span> 60   <span class="c"># default 60</span></code></pre>
+				<p class="watch"><b>Watch for</b>If the attempts all fail within <code>RetryAttemptSeconds</code>, Config adds a <strong>remediation exception</strong> for that resource and stops retrying. The <code>AutomationAssumeRole</code> needs a trust policy for <code>ssm.amazonaws.com</code> and the permissions the runbook uses (here <code>s3:PutBucketVersioning</code>).</p>
+			</div>
+
+			<div class="snippet" id="rule-for-the-whole-organization">
+				<h3>Rule for the whole organization</h3>
+				<p class="use"><b>Use when</b>The same rule must exist in every member account, including accounts created later.</p>
+<pre><code><span class="k">OrgAccessKeysRotated:</span>
+  <span class="k">Type:</span> AWS::Config::OrganizationConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">OrganizationConfigRuleName:</span> org-access-keys-rotated
+    <span class="k">OrganizationManagedRuleMetadata:</span>
+      <span class="k">RuleIdentifier:</span> ACCESS_KEYS_ROTATED
+      <span class="k">InputParameters:</span> '{"maxAccessKeyAge":"90"}'   <span class="c"># a JSON string here</span>
+      <span class="k">MaximumExecutionFrequency:</span> TwentyFour_Hours
+    <span class="k">ExcludedAccounts:</span>
+      - "999999999999"   <span class="c"># for example a sandbox account</span></code></pre>
+				<p class="watch"><b>Watch for</b>Only the <strong>management account or a delegated administrator</strong> can create organization rules; register the delegate for <code>config-multiaccountsetup.amazonaws.com</code>. Member accounts can't change or delete the rule. Config must already be recording in each account.</p>
+			</div>
+
+			<div class="snippet" id="conformance-pack">
+				<h3>Conformance pack</h3>
+				<p class="use"><b>Use when</b>A set of rules and their remediations should be deployed and reported on as one unit, such as a compliance framework.</p>
+<pre><code><span class="k">SecurityBaselinePack:</span>
+  <span class="k">Type:</span> AWS::Config::OrganizationConformancePack
+  <span class="k">Properties:</span>
+    <span class="k">OrganizationConformancePackName:</span> security-baseline
+    <span class="k">TemplateS3Uri:</span> s3://examplecorp-config/security-baseline.yaml
+    <span class="k">ExcludedAccounts:</span>
+      - "999999999999"</code></pre>
+				<p class="watch"><b>Watch for</b>The pack template contains ordinary <code>AWS::Config::ConfigRule</code> and <code>AWS::Config::RemediationConfiguration</code> resources. AWS publishes sample packs (for example CIS and NIST mappings). For one account, use <code>AWS::Config::ConformancePack</code> instead.</p>
+			</div>
+
+			<div class="snippet" id="aggregator-and-advanced-query">
+				<h3>Aggregator and advanced query</h3>
+				<p class="use"><b>Use when</b>One account needs to see configuration and compliance across all accounts and Regions.</p>
+<pre><code><span class="k">OrgAggregator:</span>
+  <span class="k">Type:</span> AWS::Config::ConfigurationAggregator
+  <span class="k">Properties:</span>
+    <span class="k">ConfigurationAggregatorName:</span> org-aggregator
+    <span class="k">OrganizationAggregationSource:</span>
+      <span class="k">RoleArn:</span> !GetAtt AggregatorRole.Arn   <span class="c"># AWSConfigRoleForOrganizations policy</span>
+      <span class="k">AllAwsRegions:</span> true</code></pre>
+<pre><code><span class="c"># find unencrypted EBS volumes in every account</span>
+aws configservice select-aggregate-resource-config \
+  --configuration-aggregator-name org-aggregator \
+  --expression "SELECT accountId, awsRegion, resourceId
+                WHERE resourceType = 'AWS::EC2::Volume'
+                AND configuration.encrypted = false"</code></pre>
+				<p class="watch"><b>Watch for</b>An aggregator only <strong>reads</strong>: it collects data but doesn't deploy rules. Deploy rules with organization rules, conformance packs or StackSets.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

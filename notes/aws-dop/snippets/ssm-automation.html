@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Systems Manager Automation runbooks | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated Systems Manager Automation runbooks with executeAwsApi, waitForAwsResourceProperty, runCommand, approve, executeScript and branch steps, the Automation service role, rate control, multi-account and multi-Region runs, and EventBridge and Config triggers.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Systems Manager Automation runbooks</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Systems Manager Automation runbooks</h1>
+		<p>Multi-step operations written as documents: call AWS APIs, wait for resources, run commands on instances, pause for approval and branch on results, then run the same runbook across many resources, accounts and Regions. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Systems Manager</span><span class="tag">Automation</span><span class="tag">YAML</span><span class="tag">10 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#a-custom-runbook-stop-snapshot-start">A custom runbook: stop, snapshot, start</a></li>
+				<li><a href="#run-a-command-on-the-instance">Run a command on the instance</a></li>
+				<li><a href="#pause-for-approval">Pause for approval</a></li>
+				<li><a href="#run-a-python-script">Run a Python script</a></li>
+				<li><a href="#branch-and-handle-failure">Branch and handle failure</a></li>
+				<li><a href="#the-automation-service-role">The Automation service role</a></li>
+				<li><a href="#run-across-many-resources">Run across many resources</a></li>
+				<li><a href="#run-in-many-accounts-and-regions">Run in many accounts and Regions</a></li>
+				<li><a href="#start-from-eventbridge-or-config">Start from EventBridge or Config</a></li>
+				<li><a href="#aws-owned-runbooks">AWS-owned runbooks</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>An Automation runbook is an SSM document with <code>schemaVersion: '0.3'</code>. Its <code>mainSteps</code> run in order, each step running one <strong>action</strong> such as <code>aws:executeAwsApi</code> or <code>aws:runCommand</code>. Steps pass values to later steps through outputs, referenced as <code>{{ stepName.outputName }}</code>.</p>
+
+			<div class="snippet" id="a-custom-runbook-stop-snapshot-start">
+				<h3>A custom runbook: stop, snapshot, start</h3>
+				<p class="use"><b>Use when</b>An operation needs several API calls in order, waiting between them, such as taking a consistent snapshot of a stopped instance.</p>
+				<span class="file">SnapshotStoppedInstance.yaml</span>
+<pre><code><span class="k">description:</span> Stop an instance, snapshot its root volume, start it again
+<span class="k">schemaVersion:</span> '0.3'
+<span class="k">assumeRole:</span> '{{ AutomationAssumeRole }}'
+<span class="k">parameters:</span>
+  <span class="k">AutomationAssumeRole:</span>
+    <span class="k">type:</span> String
+  <span class="k">InstanceId:</span>
+    <span class="k">type:</span> String
+<span class="k">mainSteps:</span>
+  - <span class="k">name:</span> getRootVolume
+    <span class="k">action:</span> aws:executeAwsApi
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> DescribeInstances
+      <span class="k">InstanceIds:</span>
+        - '{{ InstanceId }}'
+    <span class="k">outputs:</span>
+      - <span class="k">Name:</span> volumeId
+        <span class="k">Selector:</span> $.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId
+        <span class="k">Type:</span> String
+
+  - <span class="k">name:</span> stopInstance
+    <span class="k">action:</span> aws:executeAwsApi
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> StopInstances
+      <span class="k">InstanceIds:</span>
+        - '{{ InstanceId }}'
+
+  - <span class="k">name:</span> waitUntilStopped   <span class="c"># polls until the value matches</span>
+    <span class="k">action:</span> aws:waitForAwsResourceProperty
+    <span class="k">timeoutSeconds:</span> 600
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> DescribeInstances
+      <span class="k">InstanceIds:</span>
+        - '{{ InstanceId }}'
+      <span class="k">PropertySelector:</span> $.Reservations[0].Instances[0].State.Name
+      <span class="k">DesiredValues:</span>
+        - stopped
+
+  - <span class="k">name:</span> snapshot
+    <span class="k">action:</span> aws:executeAwsApi
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> CreateSnapshot
+      <span class="k">VolumeId:</span> '{{ getRootVolume.volumeId }}'
+      <span class="k">Description:</span> 'Taken by automation {{ automation:EXECUTION_ID }}'
+    <span class="k">outputs:</span>
+      - <span class="k">Name:</span> snapshotId
+        <span class="k">Selector:</span> $.SnapshotId
+        <span class="k">Type:</span> String
+
+  - <span class="k">name:</span> startInstance
+    <span class="k">action:</span> aws:executeAwsApi
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> StartInstances
+      <span class="k">InstanceIds:</span>
+        - '{{ InstanceId }}'
+
+  - <span class="k">name:</span> checkRunning   <span class="c"># fails at once if the value doesn't match</span>
+    <span class="k">action:</span> aws:assertAwsResourceProperty
+    <span class="k">inputs:</span>
+      <span class="k">Service:</span> ec2
+      <span class="k">Api:</span> DescribeInstances
+      <span class="k">InstanceIds:</span>
+        - '{{ InstanceId }}'
+      <span class="k">PropertySelector:</span> $.Reservations[0].Instances[0].State.Name
+      <span class="k">DesiredValues:</span>
+        - pending
+        - running
+<span class="k">outputs:</span>
+  - snapshot.snapshotId</code></pre>
+				<p class="watch"><b>Watch for</b><code>Service</code> and <code>Api</code> use the Boto3 names (<code>ec2</code>, <code>DescribeInstances</code>), and every other input is passed straight to that API. <code>waitForAwsResourceProperty</code> keeps polling until the timeout; <code>assertAwsResourceProperty</code> checks once and fails the step if the value doesn't match.</p>
+			</div>
+
+			<div class="snippet" id="run-a-command-on-the-instance">
+				<h3>Run a command on the instance</h3>
+				<p class="use"><b>Use when</b>A step must run inside the operating system, such as restarting a service or collecting logs, between API calls.</p>
+<pre><code>- <span class="k">name:</span> restartApp
+  <span class="k">action:</span> aws:runCommand
+  <span class="k">timeoutSeconds:</span> 300
+  <span class="k">inputs:</span>
+    <span class="k">DocumentName:</span> AWS-RunShellScript   <span class="c"># AWS-RunPowerShellScript on Windows</span>
+    <span class="k">InstanceIds:</span>
+      - '{{ InstanceId }}'
+    <span class="k">Parameters:</span>
+      <span class="k">commands:</span>
+        - systemctl restart orders
+        - systemctl is-active orders</code></pre>
+				<p class="watch"><b>Watch for</b>The instance must be a <strong>managed node</strong>: SSM Agent running, an instance profile with <code>AmazonSSMManagedInstanceCore</code>, and network access to the Systems Manager endpoints. A non-zero exit code fails the step.</p>
+			</div>
+
+			<div class="snippet" id="pause-for-approval">
+				<h3>Pause for approval</h3>
+				<p class="use"><b>Use when</b>A person must confirm before a disruptive step, such as stopping a production instance.</p>
+<pre><code>- <span class="k">name:</span> approveStop
+  <span class="k">action:</span> aws:approve
+  <span class="k">timeoutSeconds:</span> 3600   <span class="c"># default 7 days, maximum 30 days</span>
+  <span class="k">onFailure:</span> Abort
+  <span class="k">inputs:</span>
+    <span class="k">NotificationArn:</span> arn:aws:sns:us-east-1:222222222222:AutomationApprovals
+    <span class="k">Message:</span> 'Approve stopping {{ InstanceId }} for a snapshot'
+    <span class="k">MinRequiredApprovals:</span> 1
+    <span class="k">Approvers:</span>
+      - arn:aws:iam::222222222222:role/OpsLead</code></pre>
+				<p class="watch"><b>Watch for</b>The SNS topic name must start with <code>Automation</code>. Approvers (up to 10) approve or reject in the Systems Manager console while the execution shows <em>Waiting</em>. <code>aws:approve</code> isn't supported in multi-account and multi-Region runs.</p>
+			</div>
+
+			<div class="snippet" id="run-a-python-script">
+				<h3>Run a Python script</h3>
+				<p class="use"><b>Use when</b>A step needs logic that a single API call can't express, such as filtering or combining results.</p>
+<pre><code>- <span class="k">name:</span> findOldSnapshots
+  <span class="k">action:</span> aws:executeScript
+  <span class="k">inputs:</span>
+    <span class="k">Runtime:</span> python3.11
+    <span class="k">Handler:</span> handler   <span class="c"># function name; takes (events, context)</span>
+    <span class="k">InputPayload:</span>
+      <span class="k">volumeId:</span> '{{ getRootVolume.volumeId }}'
+      <span class="k">keep:</span> 7
+    <span class="k">Script:</span> |-
+      import boto3
+
+      def handler(events, context):
+          ec2 = boto3.client("ec2")
+          snaps = ec2.describe_snapshots(
+              Filters=[{"Name": "volume-id", "Values": [events["volumeId"]]}]
+          )["Snapshots"]
+          snaps.sort(key=lambda s: s["StartTime"], reverse=True)
+          old = [s["SnapshotId"] for s in snaps[events["keep"]:]]
+          return {"oldSnapshots": old, "count": len(old)}
+  <span class="k">outputs:</span>
+    - <span class="k">Name:</span> oldSnapshots
+      <span class="k">Selector:</span> $.Payload.oldSnapshots   <span class="c"># the returned value is under $.Payload</span>
+      <span class="k">Type:</span> StringList
+    - <span class="k">Name:</span> count
+      <span class="k">Selector:</span> $.Payload.count
+      <span class="k">Type:</span> Integer</code></pre>
+				<p class="watch"><b>Watch for</b>A script step runs for at most 10 minutes, and API calls inside it use the runbook's assume role. Unlike <code>aws:executeAwsApi</code>, it doesn't retry throttled calls automatically. Raising an exception fails the step.</p>
+			</div>
+
+			<div class="snippet" id="branch-and-handle-failure">
+				<h3>Branch and handle failure</h3>
+				<p class="use"><b>Use when</b>The next step depends on a parameter or an earlier output, or a failure must trigger cleanup instead of stopping.</p>
+<pre><code>- <span class="k">name:</span> chooseAction
+  <span class="k">action:</span> aws:branch
+  <span class="k">inputs:</span>
+    <span class="k">Choices:</span>
+      - <span class="k">NextStep:</span> deleteOldSnapshots
+        <span class="k">Variable:</span> '{{ findOldSnapshots.count }}'
+        <span class="k">NumericGreater:</span> 0
+    <span class="k">Default:</span> done   <span class="c"># no choice matched</span>
+
+- <span class="k">name:</span> deleteOldSnapshots
+  <span class="k">action:</span> aws:executeScript
+  <span class="k">maxAttempts:</span> 3   <span class="c"># retry the step before it counts as failed</span>
+  <span class="k">onFailure:</span> step:notifyFailure   <span class="c"># Abort (default), Continue, or step:name</span>
+  <span class="k">onCancel:</span> step:notifyFailure
+  <span class="k">nextStep:</span> done
+  <span class="k">inputs:</span>
+    <span class="k">Runtime:</span> python3.11
+    <span class="k">Handler:</span> handler
+    <span class="k">InputPayload:</span>
+      <span class="k">ids:</span> '{{ findOldSnapshots.oldSnapshots }}'
+    <span class="k">Script:</span> |-
+      import boto3
+      def handler(events, context):
+          ec2 = boto3.client("ec2")
+          for snap_id in events["ids"]:
+              ec2.delete_snapshot(SnapshotId=snap_id)
+
+- <span class="k">name:</span> notifyFailure
+  <span class="k">action:</span> aws:executeAwsApi
+  <span class="k">isEnd:</span> true   <span class="c"># stop here after notifying</span>
+  <span class="k">inputs:</span>
+    <span class="k">Service:</span> sns
+    <span class="k">Api:</span> Publish
+    <span class="k">TopicArn:</span> arn:aws:sns:us-east-1:222222222222:ops-alerts
+    <span class="k">Message:</span> 'Snapshot cleanup failed: {{ automation:EXECUTION_ID }}'
+
+- <span class="k">name:</span> done
+  <span class="k">action:</span> aws:sleep
+  <span class="k">isEnd:</span> true
+  <span class="k">inputs:</span>
+    <span class="k">Duration:</span> PT1S</code></pre>
+				<p class="watch"><b>Watch for</b>Without <code>nextStep</code>, steps run in file order, so the failure handler needs <code>isEnd: true</code> or the normal path would fall into it. <code>aws:branch</code> also supports <code>And</code>, <code>Or</code> and <code>Not</code>, and string, numeric and Boolean comparisons.</p>
+			</div>
+
+			<div class="snippet" id="the-automation-service-role">
+				<h3>The Automation service role</h3>
+				<p class="use"><b>Use when</b>A runbook must run with fixed permissions instead of the caller's, for example when EventBridge, Config or a maintenance window starts it.</p>
+<pre><code><span class="k">AutomationServiceRole:</span>
+  <span class="k">Type:</span> AWS::IAM::Role
+  <span class="k">Properties:</span>
+    <span class="k">RoleName:</span> SnapshotAutomationRole
+    <span class="k">AssumeRolePolicyDocument:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Effect:</span> Allow
+          <span class="k">Principal:</span>
+            <span class="k">Service:</span> ssm.amazonaws.com
+          <span class="k">Action:</span> sts:AssumeRole
+          <span class="k">Condition:</span>
+            <span class="k">StringEquals:</span>
+              <span class="k">aws:SourceAccount:</span> !Ref AWS::AccountId
+    <span class="k">ManagedPolicyArns:</span>
+      - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+    <span class="k">Policies:</span>
+      - <span class="k">PolicyName:</span> snapshot-actions
+        <span class="k">PolicyDocument:</span>
+          <span class="k">Version:</span> "2012-10-17"
+          <span class="k">Statement:</span>
+            - <span class="k">Effect:</span> Allow
+              <span class="k">Action:</span>
+                - ec2:DescribeInstances
+                - ec2:StopInstances
+                - ec2:StartInstances
+                - ec2:CreateSnapshot
+              <span class="k">Resource:</span> "*"</code></pre>
+				<p class="watch"><b>Watch for</b>Whoever starts the runbook with this role needs <code>iam:PassRole</code> on it. If <code>AutomationAssumeRole</code> is left empty, the runbook runs with the <strong>caller's</strong> permissions.</p>
+			</div>
+
+			<div class="snippet" id="run-across-many-resources">
+				<h3>Run across many resources</h3>
+				<p class="use"><b>Use when</b>The same runbook must run on every instance with a tag, a few at a time, stopping if too many fail.</p>
+<pre><code>aws ssm start-automation-execution \
+  --document-name SnapshotStoppedInstance \
+  --parameters AutomationAssumeRole=arn:aws:iam::222222222222:role/SnapshotAutomationRole \
+  --target-parameter-name InstanceId \
+  --targets Key=tag:Env,Values=prod \
+  --max-concurrency 10% \
+  --max-errors 2
+<span class="c"># InstanceId is filled in from each matching instance</span>
+<span class="c"># 10% run at once; stop starting new ones after 2 failures</span></code></pre>
+				<p class="watch"><b>Watch for</b><code>--target-parameter-name</code> names the runbook parameter that receives each target. Targets can also be a resource group (<code>Key=ResourceGroup</code>) or explicit values (<code>Key=ParameterValues</code>).</p>
+			</div>
+
+			<div class="snippet" id="run-in-many-accounts-and-regions">
+				<h3>Run in many accounts and Regions</h3>
+				<p class="use"><b>Use when</b>A central operations account runs one runbook in every account of an OU and several Regions.</p>
+<pre><code>aws ssm start-automation-execution \
+  --document-name AWS-RestartEC2Instance \
+  --parameters AutomationAssumeRole=arn:aws:iam::555555555555:role/AWS-SystemsManager-AutomationAdministrationRole \
+  --target-parameter-name InstanceId \
+  --targets Key=tag:Env,Values=prod \
+  --target-locations '[{
+      "Accounts": ["ou-ab12-cdef3456"],
+      "IncludeChildOrganizationUnits": true,
+      "Regions": ["us-east-1", "eu-west-1"],
+      "ExecutionRoleName": "AWS-SystemsManager-AutomationExecutionRole",
+      "TargetLocationMaxConcurrency": "2",
+      "TargetLocationMaxErrors": "1"
+  }]'</code></pre>
+				<ul>
+					<li><code>AWS-SystemsManager-AutomationAdministrationRole</code> lives in the central account; the caller needs <code>iam:PassRole</code> on it.</li>
+					<li><code>AWS-SystemsManager-AutomationExecutionRole</code> must exist in <strong>every</strong> target account (deploy it with a StackSet).</li>
+					<li>Targeting OUs works only from the management account or a Systems Manager delegated administrator.</li>
+				</ul>
+				<p class="watch"><b>Watch for</b>A custom runbook must be <strong>shared</strong> with the target accounts before it can run there. The central execution's step outputs are the IDs of the child executions in each account and Region.</p>
+			</div>
+
+			<div class="snippet" id="start-from-eventbridge-or-config">
+				<h3>Start from EventBridge or Config</h3>
+				<p class="use"><b>Use when</b>A runbook should run automatically when something happens (an event) or when a resource becomes noncompliant.</p>
+				<span class="file">EventBridge rule target</span>
+<pre><code><span class="k">Targets:</span>
+  - <span class="k">Id:</span> snapshot-on-tag
+    <span class="k">Arn:</span> !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/SnapshotStoppedInstance:$DEFAULT
+    <span class="k">RoleArn:</span> !GetAtt EventsToSsmRole.Arn   <span class="c"># may start automation and pass the role</span>
+    <span class="k">InputTransformer:</span>
+      <span class="k">InputPathsMap:</span>
+        <span class="k">instance:</span> $.detail.instance-id
+      <span class="k">InputTemplate:</span> |
+        {
+          "InstanceId": ["&lt;instance&gt;"],
+          "AutomationAssumeRole": ["arn:aws:iam::222222222222:role/SnapshotAutomationRole"]
+        }</code></pre>
+				<span class="file">AWS Config remediation</span>
+<pre><code><span class="k">EncryptBucketRemediation:</span>
+  <span class="k">Type:</span> AWS::Config::RemediationConfiguration
+  <span class="k">Properties:</span>
+    <span class="k">ConfigRuleName:</span> s3-bucket-server-side-encryption-enabled
+    <span class="k">TargetType:</span> SSM_DOCUMENT
+    <span class="k">TargetId:</span> AWS-EnableS3BucketEncryption
+    <span class="k">Automatic:</span> true
+    <span class="k">MaximumAutomaticAttempts:</span> 3
+    <span class="k">RetryAttemptSeconds:</span> 60
+    <span class="k">Parameters:</span>
+      <span class="k">BucketName:</span>
+        <span class="k">ResourceValue:</span>
+          <span class="k">Value:</span> RESOURCE_ID   <span class="c"># the noncompliant bucket</span>
+      <span class="k">AutomationAssumeRole:</span>
+        <span class="k">StaticValue:</span>
+          <span class="k">Values:</span>
+            - !GetAtt RemediationRole.Arn</code></pre>
+				<p class="watch"><b>Watch for</b>Runbook parameters are passed as <strong>lists</strong> in the EventBridge input. The EventBridge role needs <code>ssm:StartAutomationExecution</code> plus <code>iam:PassRole</code> on the runbook's assume role.</p>
+			</div>
+
+			<div class="snippet" id="aws-owned-runbooks">
+				<h3>AWS-owned runbooks</h3>
+				<p class="use"><b>Use when</b>A common operation already has a runbook maintained by AWS; use it before writing your own.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Runbook</th><th>What it does</th></tr></thead>
+						<tbody>
+							<tr><td><code>AWS-RestartEC2Instance</code>, <code>AWS-StopEC2Instance</code>, <code>AWS-StartEC2Instance</code></td><td data-label="What it does">Restart, stop or start instances</td></tr>
+							<tr><td><code>AWS-CreateImage</code></td><td data-label="What it does">Create an AMI from an instance</td></tr>
+							<tr><td><code>AWS-UpdateLinuxAmi</code>, <code>AWS-UpdateWindowsAmi</code></td><td data-label="What it does">Launch from a source AMI, patch it, and create a new AMI (a "golden AMI" pipeline)</td></tr>
+							<tr><td><code>AWS-PatchInstanceWithRollback</code></td><td data-label="What it does">Patch an instance and restore its root volume if patching fails</td></tr>
+							<tr><td><code>AWS-ResizeInstance</code></td><td data-label="What it does">Change an instance's type</td></tr>
+							<tr><td><code>AWSSupport-ExecuteEC2Rescue</code></td><td data-label="What it does">Diagnose and fix an unreachable instance with EC2Rescue</td></tr>
+							<tr><td><code>AWSSupport-ContainEC2Instance</code></td><td data-label="What it does">Isolate an instance for incident response</td></tr>
+							<tr><td><code>AWSConfigRemediation-*</code></td><td data-label="What it does">Fix common Config rule findings, for example <code>AWSConfigRemediation-EnforceEC2InstanceIMDSv2</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p class="watch"><b>Watch for</b>AWS-owned runbooks still run with your permissions or your assume role, so that role needs every permission the runbook's steps use.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>
