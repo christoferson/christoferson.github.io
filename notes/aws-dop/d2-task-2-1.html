@@ -529,24 +529,232 @@ export class OrdersStack extends Stack {
 				<p>The goal: platform teams write the standard once (encryption, logging, tags, network rules), and application teams get it automatically by reusing a component instead of copying and editing templates.</p>
 
 				<h3>CloudFormation modules</h3>
-				<p>A <strong>module</strong> is a reusable template fragment registered in the CloudFormation registry as a type ending in <code>::MODULE</code>. Teams use it like any resource, and CloudFormation expands it into the resources it contains.</p>
+				<p>A <strong>module</strong> is a block of template (parameters, resources, and optionally conditions and outputs) that a platform team registers once in the <strong>CloudFormation registry</strong> as a private extension. Application teams then use it in their templates as if it were a single resource type. When a stack is created or updated, CloudFormation expands the module into the resources it contains, so the standard (encryption, logging, policies) comes with it and can't be forgotten.</p>
+				<div class="table-wrap">
+					<table>
+						<thead><tr><th>Property</th><th>Detail</th></tr></thead>
+						<tbody>
+							<tr><td>Type name</td><td><code>Organization::Service::Name::MODULE</code>, for example <code>ExampleCorp::S3::SecureBucket::MODULE</code>. The <code>::MODULE</code> suffix is what marks it as a module.</td></tr>
+							<tr><td>Contents</td><td>Parameters (the inputs users may set), resources, and optionally conditions and outputs. A module can include other modules.</td></tr>
+							<tr><td>Scope</td><td>Registered per account and Region, like any private registry extension</td></tr>
+							<tr><td>Versions</td><td>Each registration creates a version; stacks always use the account's <strong>default version</strong></td></tr>
+							<tr><td>Cost</td><td>None; you pay only for the resources it expands into. Stack quotas count the expanded resources.</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A module goes through three steps: write the template fragment, package it with its schema, and register it in the CloudFormation registry of every account and Region that uses it. The module's name is given at registration, not inside the fragment. The examples below assume the platform team owns the bucket standard and names the module <code>ExampleCorp::S3::SecureBucket::MODULE</code>.</p>
+
+				<h4>The module project</h4>
+				<p>A module project is a folder with three files:</p>
+				<ul>
+					<li><code>fragments/secure-bucket.yaml</code>: the template fragment. The <code>fragments</code> folder holds exactly one file, in JSON or YAML.</li>
+					<li><code>schema.json</code>: the module schema, generated from the fragment. It lists the module's parameters and resources and is what users see in the registry.</li>
+					<li><code>.rpdk-config</code>: project settings written by <code>cfn init</code>, including the module's type name.</li>
+				</ul>
+				<p>The fragment is an ordinary template body: parameters for the choices users may make, and the resources with the standard built in.</p>
+				<span class="file">fragments/secure-bucket.yaml</span>
+<pre><code><span class="k">Parameters:</span>
+  <span class="k">BucketPrefix:</span>
+    <span class="k">Type:</span> String
+    <span class="k">Description:</span> Prefix for the bucket name
+<span class="k">Resources:</span>
+  <span class="k">Bucket:</span>
+    <span class="k">Type:</span> AWS::S3::Bucket
+    <span class="k">Properties:</span>
+      <span class="k">BucketName:</span> !Sub ${BucketPrefix}-${AWS::AccountId}-${AWS::Region}
+      <span class="k">BucketEncryption:</span>
+        <span class="k">ServerSideEncryptionConfiguration:</span>
+          - <span class="k">ServerSideEncryptionByDefault:</span>
+              <span class="k">SSEAlgorithm:</span> aws:kms
+      <span class="k">PublicAccessBlockConfiguration:</span>
+        <span class="k">BlockPublicAcls:</span> true
+        <span class="k">BlockPublicPolicy:</span> true
+        <span class="k">IgnorePublicAcls:</span> true
+        <span class="k">RestrictPublicBuckets:</span> true
+      <span class="k">VersioningConfiguration:</span>
+        <span class="k">Status:</span> Enabled
+  <span class="k">TlsOnlyPolicy:</span>
+    <span class="k">Type:</span> AWS::S3::BucketPolicy
+    <span class="k">Properties:</span>
+      <span class="k">Bucket:</span> !Ref Bucket
+      <span class="k">PolicyDocument:</span>
+        <span class="k">Statement:</span>
+          - <span class="k">Effect:</span> Deny
+            <span class="k">Principal:</span> "*"
+            <span class="k">Action:</span> s3:*
+            <span class="k">Resource:</span>
+              - !GetAtt Bucket.Arn
+              - !Sub ${Bucket.Arn}/*
+            <span class="k">Condition:</span>
+              <span class="k">Bool:</span>
+                aws:SecureTransport: "false"</code></pre>
+				<p>A fragment can't use <code>Fn::ImportValue</code>, <code>Export</code> on outputs (plain outputs are fine), macros or transforms (including <code>AWS::Serverless</code> and <code>AWS::Include</code>), nested stacks or StackSets. A fragment can include other modules, up to three levels deep.</p>
+
+				<h4>Registering with the CloudFormation CLI</h4>
+				<p>The CloudFormation CLI (<code>cfn</code>) creates the project, generates the schema and registers the module in one flow:</p>
+<pre><code>pip install cloudformation-cli
+mkdir secure-bucket-module &amp;&amp; cd secure-bucket-module
+
+cfn init
+<span class="c"># choose "m" (module), then enter ExampleCorp::S3::SecureBucket::MODULE</span>
+<span class="c"># replace fragments/sample.json with fragments/secure-bucket.yaml</span>
+
+cfn validate
+<span class="c"># regenerates schema.json from the fragment</span>
+
+cfn submit --region us-east-1 --set-default
+<span class="c"># packages the project, uploads it, registers a new version, makes it the default</span></code></pre>
+				<ul>
+					<li><code>cfn submit</code> registers in one Region of the current account; run it once per account and Region, or use one of the methods below to roll out further.</li>
+					<li>The first version registered is the default automatically; <code>--set-default</code> matters for later versions.</li>
+					<li><code>cfn submit --dry-run</code> builds the package zip in the project folder without registering it. That zip is what the next two methods upload to S3.</li>
+				</ul>
+
+				<h4>Registering with the AWS CLI</h4>
+				<p>Without the CloudFormation CLI on the registering machine, upload a package built earlier and call the registry API directly:</p>
+<pre><code><span class="c"># 1. Put the package in S3</span>
+aws s3 cp secure-bucket-v1.zip s3://examplecorp-modules/secure-bucket-v1.zip
+
+<span class="c"># 2. Register it under the module's name</span>
+aws cloudformation register-type \
+  --type MODULE \
+  --type-name ExampleCorp::S3::SecureBucket::MODULE \
+  --schema-handler-package s3://examplecorp-modules/secure-bucket-v1.zip \
+  --region us-east-1
+<span class="c"># returns a RegistrationToken</span>
+
+<span class="c"># 3. Wait until ProgressStatus is COMPLETE</span>
+aws cloudformation describe-type-registration \
+  --registration-token f5525280-104e-4d35-bef5-8f1fexample
+
+<span class="c"># 4. For later versions, choose which one stacks use</span>
+aws cloudformation set-type-default-version \
+  --type MODULE \
+  --type-name ExampleCorp::S3::SecureBucket::MODULE \
+  --version-id 00000002</code></pre>
+				<p>The caller needs <code>s3:GetObject</code> on the package. Registration is asynchronous, which is why step 3 polls for the result.</p>
+
+				<h4>Registering with a CloudFormation template</h4>
+				<p>The CloudFormation console has no page for registering a private module directly; the registry pages there list and activate extensions. The console route is to upload the package zip to S3 (the S3 console is fine), then create a stack from a template whose <code>AWS::CloudFormation::ModuleVersion</code> resource registers it. The same template works in a pipeline, and as a StackSet it registers the same version in every account and Region.</p>
+				<span class="file">register-secure-bucket-module.yaml</span>
+<pre><code><span class="k">Resources:</span>
+  <span class="k">SecureBucketV1:</span>
+    <span class="k">Type:</span> AWS::CloudFormation::ModuleVersion
+    <span class="k">Properties:</span>
+      <span class="k">ModuleName:</span> ExampleCorp::S3::SecureBucket::MODULE
+      <span class="k">ModulePackage:</span> s3://examplecorp-modules/secure-bucket-v1.zip
+
+  <span class="k">SecureBucketDefault:</span>
+    <span class="k">Type:</span> AWS::CloudFormation::ModuleDefaultVersion
+    <span class="k">Properties:</span>
+      <span class="k">Arn:</span> !Ref SecureBucketV1   <span class="c"># the version stacks use</span></code></pre>
+				<ul>
+					<li><strong>Name:</strong> three parts of 2&ndash;64 letters or digits, then <code>::MODULE</code>. The first part can't be <code>Alexa</code>, <code>AMZN</code>, <code>Amazon</code>, <code>AWS</code>, <code>Custom</code> or <code>Dev</code>.</li>
+					<li><strong>New versions:</strong> a registered version can't be changed. Pointing <code>ModulePackage</code> at a new zip registers a new version; deleting the resource marks that version deprecated.</li>
+					<li><strong>Policies:</strong> a <code>DeletionPolicy</code> or <code>UpdateReplacePolicy</code> set where the module is used applies to every resource in it. <code>CreationPolicy</code> and <code>UpdatePolicy</code> can't be set on a module.</li>
+				</ul>
+
+				<h4>Using the module in a stack</h4>
+				<p>Application teams set only the module's parameters. To reference a resource inside the module, combine the module's logical ID and the inner resource's logical ID, with or without a dot: <code>InvoiceBucket.Bucket</code> or <code>InvoiceBucketBucket</code>.</p>
 				<span class="file">app-stack.yml</span>
 <pre><code><span class="k">Resources:</span>
   <span class="k">InvoiceBucket:</span>
-    <span class="k">Type:</span> ExampleCorp::S3::SecureBucket::MODULE     <span class="c"># registered by the platform team</span>
+    <span class="k">Type:</span> ExampleCorp::S3::SecureBucket::MODULE
     <span class="k">Properties:</span>
-      <span class="k">BucketPrefix:</span> invoices                       <span class="c"># encryption, TLS-only policy, logging, block public access built in</span></code></pre>
-				<ul>
-					<li><strong>Sharing:</strong> register the module in each account and Region that uses it (StackSets can do this).</li>
-					<li><strong>Updates:</strong> stacks pick up a new module version on their next update.</li>
-				</ul>
+      <span class="k">BucketPrefix:</span> invoices
 
-				<h3>CDK construct libraries and Aspects</h3>
+  <span class="k">InvoiceQueue:</span>
+    <span class="k">Type:</span> AWS::SQS::Queue
+    <span class="k">Properties:</span>
+      <span class="k">QueueName:</span> !Ref InvoiceBucket.Bucket   <span class="c"># Ref a resource inside the module</span>
+
+<span class="k">Outputs:</span>
+  <span class="k">BucketArn:</span>
+    <span class="k">Value:</span> !GetAtt InvoiceBucket.Bucket.Arn</code></pre>
 				<ul>
-					<li><strong>Shared construct library:</strong> publish your own L3 constructs (for example, <code>SecureBucket</code> or <code>StandardService</code>) as a package in CodeArtifact. Every team installs it and gets the standards by default.</li>
-					<li><strong>Aspects:</strong> visit every construct in an app before synthesis and can add tags, change properties or raise errors. They're useful for rules such as "every bucket is encrypted".</li>
-					<li><strong>cdk-nag:</strong> an open source set of Aspects that checks apps against rule packs such as AWS Solutions or NIST 800-53 and fails synthesis on violations.</li>
+					<li><strong>What gets deployed:</strong> the processed template contains <code>InvoiceBucketBucket</code> and <code>InvoiceBucketTlsOnlyPolicy</code>. A change set shows them before you deploy, and CloudFormation records which resources came from the module.</li>
+					<li><strong>Tags and outputs:</strong> stack-level tags reach the module's resources. Any outputs a module defines become stack outputs named after the module plus the output; a module output <code>BucketName</code> would appear as <code>InvoiceBucketBucketName</code>.</li>
+					<li><strong>Parameters:</strong> module parameters aren't stack parameters; pass a stack parameter into them with <code>!Ref</code> if users should choose the value at deploy time.</li>
 				</ul>
+				<div class="callout trap"><p>Changing a module's default version <strong>doesn't update existing stacks</strong>. Each stack picks up the new version on its next create or update (unless the update uses "use previous template"). And because the default version is per account and Region, the same template can expand differently in two accounts; keep versions aligned when deploying with StackSets.</p></div>
+				<div class="callout tip"><p>Modules versus nested stacks: a <strong>module</strong> expands into resources inside your stack (one stack, governed versions in the registry). A <strong>nested stack</strong> is a separate stack created from a template URL in S3, with its own events, outputs and quotas. Pick modules for small standard building blocks, and nested stacks for large reusable parts or to stay under the per-stack resource limit.</p></div>
+
+				<h3>CDK construct libraries</h3>
+				<p>In the CDK, the reusable unit is a <strong>construct</strong>: a class that creates one or more resources. A platform team writes <strong>L3 constructs</strong> that wrap the company's defaults, publishes them as a package, and teams install that package instead of writing raw resources.</p>
+				<span class="file">lib/secure-bucket.ts (platform team's package @examplecorp/constructs)</span>
+<pre><code>import { Construct } from "constructs";
+import { RemovalPolicy, Duration } from "aws-cdk-lib";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as kms from "aws-cdk-lib/aws-kms";
+
+export interface SecureBucketProps {
+  readonly retentionDays?: number;   <span class="c">// the only choice teams get</span>
+}
+
+export class SecureBucket extends Construct {
+  public readonly bucket: s3.Bucket;
+
+  constructor(scope: Construct, id: string, props: SecureBucketProps = {}) {
+    super(scope, id);
+    const key = new kms.Key(this, "Key", { enableKeyRotation: true });
+    this.bucket = new s3.Bucket(this, "Bucket", {
+      encryption: s3.BucketEncryption.KMS,
+      encryptionKey: key,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,        <span class="c">// adds the TLS-only bucket policy</span>
+      versioned: true,
+      removalPolicy: RemovalPolicy.RETAIN,
+      lifecycleRules: [{
+        expiration: Duration.days(props.retentionDays ?? 365),
+      }],
+    });
+  }
+}</code></pre>
+				<ol class="flow">
+					<li><span class="name">Publish</span><span class="desc">A pipeline builds the package and publishes it to a private <strong>CodeArtifact</strong> repository (npm, PyPI or Maven). Writing it with <strong>jsii</strong> lets one TypeScript library be published for Python, Java, .NET and Go too.</span></li>
+					<li><span class="name">Consume</span><span class="desc">Teams install <code>@examplecorp/constructs</code> and write <code>new SecureBucket(this, "Invoices")</code>. They get encryption, TLS-only access and retention without knowing the details.</span></li>
+					<li><span class="name">Upgrade</span><span class="desc">The platform team releases a new package version; each team picks it up by upgrading the dependency and redeploying.</span></li>
+				</ol>
+
+				<h3>CDK Aspects</h3>
+				<p>A construct library only helps when people use it. <strong>Aspects</strong> enforce rules across <em>everything</em> in an app, including resources teams created directly. An aspect is a class with a <code>visit(node)</code> method; <code>Aspects.of(scope).add(...)</code> attaches it, and during synthesis the CDK calls <code>visit</code> on that scope and every construct inside it, top down.</p>
+<pre><code>import { IAspect, Aspects, Annotations, Tags, Tokenization } from "aws-cdk-lib";
+import { IConstruct } from "constructs";
+import * as s3 from "aws-cdk-lib/aws-s3";
+
+<span class="c">// Read-only aspect: fail synthesis if any bucket lacks versioning</span>
+class BucketVersioningChecker implements IAspect {
+  public visit(node: IConstruct): void {
+    if (node instanceof s3.CfnBucket) {
+      const v = node.versioningConfiguration;
+      if (!v || (!Tokenization.isResolvable(v) &amp;&amp;
+                 (v as s3.CfnBucket.VersioningConfigurationProperty).status !== "Enabled")) {
+        Annotations.of(node).addError("Bucket versioning is not enabled");
+      }
+    }
+  }
+}
+
+<span class="c">// Mutating aspect: force a setting instead of just reporting it</span>
+class ForceBucketKeys implements IAspect {
+  public visit(node: IConstruct): void {
+    if (node instanceof s3.CfnBucket) {
+      node.addPropertyOverride(
+        "BucketEncryption.ServerSideEncryptionConfiguration.0.BucketKeyEnabled", true);
+    }
+  }
+}
+
+Aspects.of(app).add(new BucketVersioningChecker());
+Aspects.of(app).add(new ForceBucketKeys());
+Tags.of(app).add("CostCenter", "1234");   <span class="c">// tagging is itself built on aspects</span></code></pre>
+				<ul>
+					<li><strong>Errors stop the deployment:</strong> <code>Annotations.of(node).addError()</code> makes <code>cdk synth</code> fail, so nothing reaches CloudFormation. <code>addWarning()</code> only reports.</li>
+					<li><strong>Read-only vs mutating:</strong> read-only aspects check and report; mutating aspects change properties (as above, through escape hatches such as <code>addPropertyOverride</code>).</li>
+					<li><strong>cdk-nag:</strong> an open-source library of rule packs (AWS Solutions, HIPAA, NIST 800-53, PCI DSS) implemented as aspects: <code>Aspects.of(app).add(new AwsSolutionsChecks())</code>. Accepted exceptions are recorded with <code>NagSuppressions.addResourceSuppressions(resource, [{ id, reason }])</code>, so every exception is in code review.</li>
+				</ul>
+				<div class="callout trap"><p>Aspects <strong>don't cross <code>Stage</code> boundaries</strong>. In a CDK Pipelines app, where each environment is a <code>Stage</code>, an aspect added to the app doesn't check the stacks inside the stages; add it to each <code>Stage</code> (or the stacks inside it).</p></div>
+				<div class="callout tip"><p>"Ensure every CDK app in the company meets security standards before deployment" is <strong>Aspects (often cdk-nag) that fail synthesis</strong>, run in the pipeline's build step. "Give teams pre-approved building blocks" is a <strong>shared construct library</strong> in CodeArtifact. In plain CloudFormation, the same pair is <strong>modules</strong> for building blocks and <strong>CloudFormation Guard or hooks</strong> for enforcement.</p></div>
 
 				<h3>AWS Service Catalog</h3>
 				<p>Service Catalog lets administrators publish <strong>approved products</strong> (CloudFormation templates, or Terraform configurations) that users launch themselves, <em>without</em> needing permissions to create the underlying resources.</p>
