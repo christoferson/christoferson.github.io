@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: S3 Bucket and KMS Key Policies | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated S3 bucket policies for cross-account access, TLS and SSE-KMS enforcement, VPC endpoint and organization restrictions, CloudTrail delivery and CloudFront OAC, plus KMS key policies for admins and users, cross-account use and CloudWatch Logs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">S3 bucket and KMS key policies</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>S3 bucket and KMS key policies</h1>
+		<p>Resource policies that decide who can reach your data and your keys: sharing across accounts, enforcing TLS and encryption, locking access to a network or the organization, and letting AWS services deliver logs. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Amazon S3</span><span class="tag">AWS KMS</span><span class="tag">JSON</span><span class="tag">10 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s3">S3 bucket policies</a></li>
+				<li class="sub"><a href="#cross-account-read-for-a-role">Cross-account read for a role</a></li>
+				<li class="sub"><a href="#deny-requests-without-tls">Deny requests without TLS</a></li>
+				<li class="sub"><a href="#require-sse-kms-with-a-specific-key">Require SSE-KMS with a specific key</a></li>
+				<li class="sub"><a href="#allow-access-only-through-a-vpc-endpoint">Allow access only through a VPC endpoint</a></li>
+				<li class="sub"><a href="#allow-only-principals-in-the-organization">Allow only principals in the organization</a></li>
+				<li class="sub"><a href="#cloudtrail-log-delivery">CloudTrail log delivery</a></li>
+				<li class="sub"><a href="#cloudfront-origin-access-control">CloudFront origin access control</a></li>
+				<li><a href="#kms">KMS key policies</a></li>
+				<li class="sub"><a href="#separate-key-administrators-from-key-users">Separate key administrators from key users</a></li>
+				<li class="sub"><a href="#cross-account-use-of-a-key">Cross-account use of a key</a></li>
+				<li class="sub"><a href="#allow-cloudwatch-logs-to-encrypt-a-log-group">Allow CloudWatch Logs to encrypt a log group</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>A resource policy is attached to the bucket or key itself and names the <strong>principals</strong> allowed to use it. For access from another account, both sides must allow: the resource policy here, and an identity policy in the caller's account. The <code>//</code> comments are annotations only; remove them before use.</p>
+
+			<!-- S3 -->
+			<h2 id="s3">S3 bucket policies</h2>
+
+			<div class="snippet" id="cross-account-read-for-a-role">
+				<h3>Cross-account read for a role</h3>
+				<p class="use"><b>Use when</b>A role in another account (here an analytics role in <code>222222222222</code>) must read objects in this account's bucket.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListTheBucket",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:role/AnalyticsRole"
+      },
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::shared-reports"            <span class="c">// bucket ARN for List</span>
+    },
+    {
+      "Sid": "ReadTheObjects",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:role/AnalyticsRole"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::shared-reports/*"          <span class="c">// object ARN for Get</span>
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b><code>s3:ListBucket</code> needs the bucket ARN and <code>s3:GetObject</code> needs <code>/*</code>; mixing them up gives Access Denied. If objects use SSE-KMS, the <strong>key policy</strong> must also allow the role <code>kms:Decrypt</code>.</p>
+			</div>
+
+			<div class="snippet" id="deny-requests-without-tls">
+				<h3>Deny requests without TLS</h3>
+				<p class="use"><b>Use when</b>Data in transit must always be encrypted, for compliance or a Security Hub control.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::orders-data",
+        "arn:aws:s3:::orders-data/*"
+      ],
+      "Condition": {
+        "Bool": { "aws:SecureTransport": "false" }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>It's a <strong>deny</strong>, so it applies to everyone, including the bucket owner. Include both the bucket and the object ARNs.</p>
+			</div>
+
+			<div class="snippet" id="require-sse-kms-with-a-specific-key">
+				<h3>Require SSE-KMS with a specific key</h3>
+				<p class="use"><b>Use when</b>Every object must be encrypted with the approved customer managed key, not SSE-S3 or another key.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyWrongKey",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::orders-data/*",
+      "Condition": {
+        "StringNotEqualsIfExists": {                       <span class="c">// IfExists: requests without the header use default encryption</span>
+          "s3:x-amz-server-side-encryption-aws-kms-key-id":
+            "arn:aws:kms:us-east-1:222222222222:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Pair this with <strong>default bucket encryption</strong> set to the same key. Use <code>StringNotEquals</code> instead if every upload must send the header explicitly. Buckets that receive <strong>ALB access logs</strong> support only SSE-S3.</p>
+			</div>
+
+			<div class="snippet" id="allow-access-only-through-a-vpc-endpoint">
+				<h3>Allow access only through a VPC endpoint</h3>
+				<p class="use"><b>Use when</b>Data must never be read or written from outside the private network.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyOutsideTheEndpoint",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::orders-data",
+        "arn:aws:s3:::orders-data/*"
+      ],
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890"
+        },
+        "ArnNotLike": {   <span class="c">// escape hatch</span>
+          "aws:PrincipalArn": "arn:aws:iam::222222222222:role/BucketAdminRole"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Without an exception, this also blocks the console and administrators, who don't come through the endpoint, and you can lock yourself out (only the root user can then delete the policy). <code>aws:SourceIp</code> doesn't work for traffic through a VPC endpoint; use <code>aws:SourceVpce</code> or <code>aws:SourceVpc</code>.</p>
+			</div>
+
+			<div class="snippet" id="allow-only-principals-in-the-organization">
+				<h3>Allow only principals in the organization</h3>
+				<p class="use"><b>Use when</b>Any account in the organization may read the bucket, including accounts created later, without listing account IDs.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OrgRead",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": [ "s3:GetObject", "s3:ListBucket" ],
+      "Resource": [
+        "arn:aws:s3:::org-artifacts",
+        "arn:aws:s3:::org-artifacts/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>To stop <em>any</em> bucket in the organization being reached from outside, even with a misconfigured bucket policy, use a resource control policy (RCP) instead of editing every bucket.</p>
+			</div>
+
+			<div class="snippet" id="cloudtrail-log-delivery">
+				<h3>CloudTrail log delivery</h3>
+				<p class="use"><b>Use when</b>A trail (here the organization trail from management account <code>000000000000</code>) writes to a bucket in the log archive account.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AWSCloudTrailAclCheck",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudtrail.amazonaws.com"
+      },
+      "Action": "s3:GetBucketAcl",
+      "Resource": "arn:aws:s3:::org-cloudtrail-666666666666",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:000000000000:trail/org-trail"
+        }
+      }
+    },
+    {
+      "Sid": "AWSCloudTrailWrite",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudtrail.amazonaws.com"
+      },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::org-cloudtrail-666666666666/AWSLogs/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:000000000000:trail/org-trail"   <span class="c">// only this trail</span>
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>"Trail creation fails" or "logs stop arriving" usually means this policy, or a <strong>KMS key policy</strong> that doesn't allow <code>cloudtrail.amazonaws.com</code> <code>kms:GenerateDataKey*</code> (scoped with <code>aws:SourceArn</code> and <code>kms:EncryptionContext:aws:cloudtrail:arn</code>).</p>
+			</div>
+
+			<div class="snippet" id="cloudfront-origin-access-control">
+				<h3>CloudFront origin access control</h3>
+				<p class="use"><b>Use when</b>A private bucket must be readable only through one CloudFront distribution, not directly.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontOAC",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::shop-assets/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::222222222222:distribution/E1A2B3C4D5E6F7"   <span class="c">// only this distribution</span>
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Origin access control (OAC) replaces the older origin access identity (OAI) and supports SSE-KMS buckets; the key policy must then allow <code>cloudfront.amazonaws.com</code> <code>kms:Decrypt</code> with the same <code>AWS:SourceArn</code>. Keep S3 Block Public Access on.</p>
+			</div>
+
+			<!-- KMS -->
+			<h2 id="kms">KMS key policies</h2>
+			<p>Every KMS key has exactly one key policy, and it's the primary control: IAM policies only work for a key if the key policy lets the account delegate to IAM.</p>
+
+			<div class="snippet" id="separate-key-administrators-from-key-users">
+				<h3>Separate key administrators from key users</h3>
+				<p class="use"><b>Use when</b>The people who manage a key must not be able to decrypt data with it, and the application should use it only through one service.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnableIAMPolicies",                          <span class="c">// the default statement: lets IAM policies grant access</span>
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:root"
+      },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "KeyAdministrators",                          <span class="c">// manage, but no Encrypt or Decrypt</span>
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:role/KeyAdminRole"
+      },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*",
+        "kms:Update*", "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*",
+        "kms:TagResource", "kms:UntagResource",
+        "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KeyUsersThroughS3Only",                      <span class="c">// use, only via S3 in this Region</span>
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::222222222222:role/OrdersAppRole"
+      },
+      "Action": [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey" ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.us-east-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>In a key policy, <code>"Resource": "*"</code> means "this key". Removing the root statement without another admin can make the key <strong>unmanageable</strong>, so AWS Support has to recover it.</p>
+			</div>
+
+			<div class="snippet" id="cross-account-use-of-a-key">
+				<h3>Cross-account use of a key</h3>
+				<p class="use"><b>Use when</b>A deploy role in production <code>222222222222</code> must decrypt pipeline artifacts encrypted with a key in tooling <code>111111111111</code>.</p>
+<pre><code><span class="c">// 1. Key policy, in 111111111111: trust the other account (or a specific role)</span>
+{
+  "Sid": "AllowProductionToDecrypt",
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::222222222222:role/CrossAccountDeployRole"
+  },
+  "Action": [ "kms:Decrypt", "kms:DescribeKey" ],
+  "Resource": "*"
+}
+
+<span class="c">// 2. Identity policy on the role, in 222222222222: allow the key by ARN</span>
+{
+  "Effect": "Allow",
+  "Action": [ "kms:Decrypt", "kms:DescribeKey" ],
+  "Resource": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Both statements are needed. AWS managed keys (<code>aws/s3</code>, <code>aws/ebs</code>) can't be shared at all because you can't edit their key policy; use a customer managed key.</p>
+			</div>
+
+			<div class="snippet" id="allow-cloudwatch-logs-to-encrypt-a-log-group">
+				<h3>Allow CloudWatch Logs to encrypt a log group</h3>
+				<p class="use"><b>Use when</b>A log group must be encrypted with a customer managed key.</p>
+<pre><code>{
+  "Sid": "AllowCloudWatchLogs",
+  "Effect": "Allow",
+  "Principal": {   <span class="c">// Regional service principal</span>
+    "Service": "logs.us-east-1.amazonaws.com"
+  },
+  "Action": [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:Describe*" ],
+  "Resource": "*",
+  "Condition": {
+    "ArnEquals": {
+      "kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:us-east-1:222222222222:log-group:/app/orders"   <span class="c">// only this log group</span>
+    }
+  }
+}</code></pre>
+				<p class="watch"><b>Watch for</b>The principal is <code>logs.&lt;region&gt;.amazonaws.com</code>, in the key's Region. "Associating the key fails" or "logs stop arriving after encrypting the log group" points to this statement being missing.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

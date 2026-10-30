@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: AppSpec files | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated CodeDeploy AppSpec files for EC2 and on-premises, ECS and Lambda, the in-place hook order, a lifecycle hook Lambda function, deployment configurations and automatic rollback.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">AppSpec files</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>AppSpec files</h1>
+		<p>The file that tells CodeDeploy what to deploy and which scripts or functions to run at each lifecycle event, for EC2 and on-premises servers, ECS and Lambda. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CodeDeploy</span><span class="tag">YAML</span><span class="tag">6 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#ec2-and-on-premises-appspec">EC2 and on-premises AppSpec</a></li>
+				<li><a href="#in-place-hook-order-behind-a-load-balancer">In-place hook order behind a load balancer</a></li>
+				<li><a href="#ecs-blue-green-appspec">ECS blue/green AppSpec</a></li>
+				<li><a href="#lambda-appspec">Lambda AppSpec</a></li>
+				<li><a href="#a-lifecycle-hook-lambda-function">A lifecycle hook Lambda function</a></li>
+				<li><a href="#deployment-group-with-traffic-shifting-and-automatic-rollback">Deployment group with traffic shifting and automatic rollback</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>The AppSpec file (<code>appspec.yml</code>, or <code>appspec.yaml</code> for ECS and Lambda) is part of the deployment revision. On EC2 and on-premises, hooks run <strong>scripts</strong> on the instance; on ECS and Lambda, hooks run <strong>Lambda functions</strong>.</p>
+
+			<div class="snippet" id="ec2-and-on-premises-appspec">
+				<h3>EC2 and on-premises AppSpec</h3>
+				<p class="use"><b>Use when</b>Deploying an application bundle to instances that run the CodeDeploy agent, in place or blue/green.</p>
+				<span class="file">appspec.yml (root of the revision)</span>
+<pre><code><span class="k">version:</span> 0.0
+<span class="k">os:</span> linux                                    <span class="c"># or windows</span>
+<span class="k">files:</span>
+  - <span class="k">source:</span> /app                           <span class="c"># path inside the revision</span>
+    <span class="k">destination:</span> /opt/orders                <span class="c"># path on the instance</span>
+<span class="k">permissions:</span>
+  - <span class="k">object:</span> /opt/orders
+    <span class="k">owner:</span> orders
+    <span class="k">group:</span> orders
+    <span class="k">mode:</span> 750
+    <span class="k">type:</span> [ directory ]
+<span class="k">hooks:</span>
+  <span class="k">ApplicationStop:</span>                          <span class="c"># runs the script from the PREVIOUS revision</span>
+    - <span class="k">location:</span> scripts/stop.sh
+      <span class="k">timeout:</span> 60
+      <span class="k">runas:</span> root
+  <span class="k">BeforeInstall:</span>
+    - <span class="k">location:</span> scripts/install_deps.sh
+      <span class="k">timeout:</span> 300
+      <span class="k">runas:</span> root
+  <span class="k">AfterInstall:</span>
+    - <span class="k">location:</span> scripts/configure.sh
+      <span class="k">timeout:</span> 120
+      <span class="k">runas:</span> orders
+  <span class="k">ApplicationStart:</span>
+    - <span class="k">location:</span> scripts/start.sh
+      <span class="k">timeout:</span> 60
+      <span class="k">runas:</span> orders
+  <span class="k">ValidateService:</span>                          <span class="c"># fail here and the deployment fails (and can roll back)</span>
+    - <span class="k">location:</span> scripts/health_check.sh
+      <span class="k">timeout:</span> 120
+      <span class="k">runas:</span> orders</code></pre>
+				<p class="watch"><b>Watch for</b><code>version</code> is always <code>0.0</code>. A broken <code>ApplicationStop</code> script in the <strong>currently deployed</strong> revision makes every new deployment fail; fix it by deploying with "ignore ApplicationStop failures" or removing the old script. A script that exceeds its <code>timeout</code> fails the event.</p>
+			</div>
+
+			<div class="snippet" id="in-place-hook-order-behind-a-load-balancer">
+				<h3>In-place hook order behind a load balancer</h3>
+				<p class="use"><b>Use when</b>Deciding which hook a script belongs in. Steps marked <span class="who auto">CodeDeploy</span> are run by CodeDeploy itself and can't run scripts.</p>
+				<ol class="flow">
+					<li><span class="name"><code>BeforeBlockTraffic</code><span class="who">Your script</span></span><span class="desc">Before the instance is taken out of the load balancer.</span></li>
+					<li class="auto"><span class="name"><code>BlockTraffic</code><span class="who auto">CodeDeploy</span></span><span class="desc">Deregisters the instance and waits for connection draining.</span></li>
+					<li><span class="name"><code>AfterBlockTraffic</code><span class="who">Your script</span></span><span class="desc">The instance no longer receives traffic.</span></li>
+					<li><span class="name"><code>ApplicationStop</code><span class="who">Your script</span></span><span class="desc">Stops the running app, using the previous revision's script.</span></li>
+					<li class="auto"><span class="name"><code>DownloadBundle</code><span class="who auto">CodeDeploy</span></span><span class="desc">The agent copies the revision to a temporary folder.</span></li>
+					<li><span class="name"><code>BeforeInstall</code><span class="who">Your script</span></span><span class="desc">Back up, install dependencies, decrypt files.</span></li>
+					<li class="auto"><span class="name"><code>Install</code><span class="who auto">CodeDeploy</span></span><span class="desc">Copies files to their destinations from the <code>files</code> section.</span></li>
+					<li><span class="name"><code>AfterInstall</code><span class="who">Your script</span></span><span class="desc">Configure the app, change permissions.</span></li>
+					<li><span class="name"><code>ApplicationStart</code><span class="who">Your script</span></span><span class="desc">Start the services.</span></li>
+					<li><span class="name"><code>ValidateService</code><span class="who">Your script</span></span><span class="desc">Check that the new version works.</span></li>
+					<li><span class="name"><code>BeforeAllowTraffic</code><span class="who">Your script</span></span><span class="desc">Last chance before traffic returns.</span></li>
+					<li class="auto"><span class="name"><code>AllowTraffic</code><span class="who auto">CodeDeploy</span></span><span class="desc">Registers the instance with the load balancer again.</span></li>
+					<li><span class="name"><code>AfterAllowTraffic</code><span class="who">Your script</span></span><span class="desc">The instance is serving traffic again.</span></li>
+				</ol>
+				<p class="watch"><b>Watch for</b>Without a load balancer, the three block-traffic and three allow-traffic events are skipped. A deployment stuck at <code>BlockTraffic</code> or <code>AllowTraffic</code> usually means long deregistration delay or failing target group health checks.</p>
+			</div>
+
+			<div class="snippet" id="ecs-blue-green-appspec">
+				<h3>ECS blue/green AppSpec</h3>
+				<p class="use"><b>Use when</b>CodeDeploy shifts traffic from the current (blue) task set to a new (green) one behind an ALB or NLB.</p>
+				<span class="file">appspec.yaml</span>
+<pre><code><span class="k">version:</span> 0.0
+<span class="k">Resources:</span>
+  - <span class="k">TargetService:</span>
+      <span class="k">Type:</span> AWS::ECS::Service
+      <span class="k">Properties:</span>
+        <span class="k">TaskDefinition:</span> &lt;TASK_DEFINITION&gt;      <span class="c"># CodePipeline's CodeDeployToECS action fills this in</span>
+        <span class="k">LoadBalancerInfo:</span>
+          <span class="k">ContainerName:</span> orders                <span class="c"># must match the task definition</span>
+          <span class="k">ContainerPort:</span> 8080
+        <span class="k">PlatformVersion:</span> LATEST              <span class="c"># Fargate only</span>
+<span class="k">Hooks:</span>
+  - <span class="k">BeforeInstall:</span> CodeDeployHook_BeforeInstall
+  - <span class="k">AfterInstall:</span> CodeDeployHook_AfterInstall
+  - <span class="k">AfterAllowTestTraffic:</span> CodeDeployHook_RunTests   <span class="c"># green receives only test-listener traffic</span>
+  - <span class="k">BeforeAllowTraffic:</span> CodeDeployHook_BeforeAllowTraffic
+  - <span class="k">AfterAllowTraffic:</span> CodeDeployHook_AfterAllowTraffic</code></pre>
+				<p class="watch"><b>Watch for</b><code>AfterAllowTestTraffic</code> is where automated tests run against the green tasks through the <strong>test listener</strong>, before any production traffic moves. The managed policy <code>AWSCodeDeployRoleForECS</code> only allows invoking functions whose names start with <code>CodeDeployHook_</code>.</p>
+			</div>
+
+			<div class="snippet" id="lambda-appspec">
+				<h3>Lambda AppSpec</h3>
+				<p class="use"><b>Use when</b>Shifting an alias from one function version to another, with checks before and after.</p>
+				<span class="file">appspec.yaml</span>
+<pre><code><span class="k">version:</span> 0.0
+<span class="k">Resources:</span>
+  - <span class="k">OrdersFunction:</span>
+      <span class="k">Type:</span> AWS::Lambda::Function
+      <span class="k">Properties:</span>
+        <span class="k">Name:</span> orders-api
+        <span class="k">Alias:</span> live                           <span class="c"># callers invoke the alias, never a version</span>
+        <span class="k">CurrentVersion:</span> "7"                   <span class="c"># version the alias points to now</span>
+        <span class="k">TargetVersion:</span> "8"                    <span class="c"># version to shift traffic to</span>
+<span class="k">Hooks:</span>
+  - <span class="k">BeforeAllowTraffic:</span> CodeDeployHook_PreTraffic   <span class="c"># test version 8 before any traffic</span>
+  - <span class="k">AfterAllowTraffic:</span> CodeDeployHook_PostTraffic  <span class="c"># check after all traffic has moved</span></code></pre>
+				<p class="watch"><b>Watch for</b>Lambda has only these two hooks. With SAM you don't write this file: <code>AutoPublishAlias</code> and <code>DeploymentPreference</code> (with <code>Hooks: PreTraffic / PostTraffic</code>) generate it.</p>
+			</div>
+
+			<div class="snippet" id="a-lifecycle-hook-lambda-function">
+				<h3>A lifecycle hook Lambda function</h3>
+				<p class="use"><b>Use when</b>Running a test from an ECS or Lambda hook and telling CodeDeploy whether to continue.</p>
+				<span class="file">codedeploy_hook.py</span>
+<pre><code>import boto3, urllib.request
+
+codedeploy = boto3.client("codedeploy")
+
+def handler(event, context):
+    status = "Succeeded"
+    try:
+        <span class="c"># test the new version, e.g. through the test listener on port 8443</span>
+        with urllib.request.urlopen("https://orders-test.internal.example.com:8443/health", timeout=10) as r:
+            if r.status != 200:
+                status = "Failed"
+    except Exception:
+        status = "Failed"
+
+    <span class="c"># CodeDeploy waits for this call; without it the hook times out and fails</span>
+    codedeploy.put_lifecycle_event_hook_execution_status(
+        deploymentId=event["DeploymentId"],
+        lifecycleEventHookExecutionId=event["LifecycleEventHookExecutionId"],
+        status=status,                          <span class="c"># "Succeeded" or "Failed"</span>
+    )</code></pre>
+				<p class="watch"><b>Watch for</b>The function's role needs <code>codedeploy:PutLifecycleEventHookExecutionStatus</code>. If the function never reports, the deployment waits until the hook times out (up to an hour), then fails. Reporting <code>Failed</code> triggers rollback when automatic rollback is on.</p>
+			</div>
+
+			<div class="snippet" id="deployment-group-with-traffic-shifting-and-automatic-rollback">
+				<h3>Deployment group with traffic shifting and automatic rollback</h3>
+				<p class="use"><b>Use when</b>Defining how fast traffic shifts and when CodeDeploy rolls back, for an ECS blue/green service.</p>
+				<span class="file">deployment-group.yaml</span>
+<pre><code><span class="k">OrdersDeploymentGroup:</span>
+  <span class="k">Type:</span> AWS::CodeDeploy::DeploymentGroup
+  <span class="k">Properties:</span>
+    <span class="k">ApplicationName:</span> !Ref OrdersApp              <span class="c"># application with ComputePlatform: ECS</span>
+    <span class="k">ServiceRoleArn:</span> !GetAtt CodeDeployEcsRole.Arn
+    <span class="k">DeploymentConfigName:</span> CodeDeployDefault.ECSCanary10Percent5Minutes
+    <span class="k">DeploymentStyle:</span>
+      <span class="k">DeploymentType:</span> BLUE_GREEN
+      <span class="k">DeploymentOption:</span> WITH_TRAFFIC_CONTROL
+    <span class="k">BlueGreenDeploymentConfiguration:</span>
+      <span class="k">DeploymentReadyOption:</span>
+        <span class="k">ActionOnTimeout:</span> CONTINUE_DEPLOYMENT
+      <span class="k">TerminateBlueInstancesOnDeploymentSuccess:</span>
+        <span class="k">Action:</span> TERMINATE
+        <span class="k">TerminationWaitTimeInMinutes:</span> 15          <span class="c"># keep blue for a fast manual rollback</span>
+    <span class="k">ECSServices:</span>
+      - { ClusterName: prod, ServiceName: orders }
+    <span class="k">LoadBalancerInfo:</span>
+      <span class="k">TargetGroupPairInfoList:</span>
+        - <span class="k">TargetGroups:</span> [ { Name: orders-blue }, { Name: orders-green } ]
+          <span class="k">ProdTrafficRoute:</span>
+            <span class="k">ListenerArns:</span> [ !Ref ProdListener ]
+          <span class="k">TestTrafficRoute:</span>
+            <span class="k">ListenerArns:</span> [ !Ref TestListener ]
+    <span class="k">AlarmConfiguration:</span>
+      <span class="k">Enabled:</span> true
+      <span class="k">Alarms:</span> [ { Name: orders-5xx-high }, { Name: orders-p99-latency-high } ]
+    <span class="k">AutoRollbackConfiguration:</span>
+      <span class="k">Enabled:</span> true
+      <span class="k">Events:</span> [ DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM ]</code></pre>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Platform</th><th>Predefined configurations</th></tr></thead>
+						<tbody>
+							<tr><td>EC2 and on-premises</td><td data-label="Predefined configurations"><code>CodeDeployDefault.OneAtATime</code> (the default), <code>HalfAtATime</code>, <code>AllAtOnce</code>; custom minimum healthy hosts, optionally per Availability Zone</td></tr>
+							<tr><td>ECS</td><td data-label="Predefined configurations"><code>CodeDeployDefault.ECSCanary10Percent5Minutes</code>, <code>ECSCanary10Percent15Minutes</code>, <code>ECSLinear10PercentEvery1Minutes</code>, <code>ECSLinear10PercentEvery3Minutes</code>, <code>ECSAllAtOnce</code></td></tr>
+							<tr><td>Lambda</td><td data-label="Predefined configurations"><code>CodeDeployDefault.LambdaCanary10Percent5Minutes</code> (also 10, 15, 30 minutes), <code>LambdaLinear10PercentEvery1Minute</code> (also 2, 3, 10 minutes), <code>LambdaAllAtOnce</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p class="watch"><b>Watch for</b>Alarms only stop a deployment if they're listed in <code>AlarmConfiguration</code>; rollback on them also needs <code>DEPLOYMENT_STOP_ON_ALARM</code>. Behind a Network Load Balancer, ECS supports only <code>CodeDeployDefault.ECSAllAtOnce</code>.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

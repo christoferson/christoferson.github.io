@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: Service and Resource Control Policies | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated service control policies for staying in the organization, approved Regions, protecting security services, blocking root, requiring IMDSv2 and banning IAM users, plus resource control policies for an S3 data perimeter and TLS.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">Service and resource control policies</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>Service and resource control policies</h1>
+		<p>Organization guardrails: service control policies (SCPs) that cap what principals in member accounts can do, and resource control policies (RCPs) that cap what anyone can do to resources in those accounts. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">AWS Organizations</span><span class="tag">SCP</span><span class="tag">RCP</span><span class="tag">JSON</span><span class="tag">9 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#stay-in-the-organization">Stay in the organization</a></li>
+				<li><a href="#approved-regions-only">Approved Regions only</a></li>
+				<li><a href="#protect-security-services">Protect security services</a></li>
+				<li><a href="#block-the-root-user-in-member-accounts">Block the root user in member accounts</a></li>
+				<li><a href="#require-imdsv2">Require IMDSv2</a></li>
+				<li><a href="#no-iam-users-or-access-keys">No IAM users or access keys</a></li>
+				<li><a href="#keep-account-level-protections-on">Keep account-level protections on</a></li>
+				<li><a href="#rcp-s3-data-perimeter">RCP: S3 data perimeter</a></li>
+				<li><a href="#rcp-https-only-for-s3">RCP: HTTPS only for S3</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>Both policy types are attached to the organization root, an OU or an account, and both only <strong>limit</strong>: neither grants anything, so principals still need identity or resource policies. SCPs limit principals in member accounts (including their root users); RCPs limit access to resources in member accounts, whoever the caller is. Neither affects the <strong>management account</strong>, and neither restricts <strong>service-linked roles</strong>. SCPs have no <code>Principal</code> element; RCPs must use <code>"Principal": "*"</code>, only <code>Deny</code> statements, and no <code>NotAction</code>.</p>
+
+			<div class="snippet" id="stay-in-the-organization">
+				<h3>Stay in the organization</h3>
+				<p class="use"><b>Use when</b>Member accounts must never leave and escape the guardrails.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyLeaveOrganization",
+    "Effect": "Deny",
+    "Action": "organizations:LeaveOrganization",
+    "Resource": "*"
+  }]
+}</code></pre>
+			</div>
+
+			<div class="snippet" id="approved-regions-only">
+				<h3>Approved Regions only</h3>
+				<p class="use"><b>Use when</b>Data residency or cost rules allow only some Regions.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyOutsideApprovedRegions",
+    "Effect": "Deny",
+    "NotAction": [                          <span class="c">// global services, served from us-east-1</span>
+      "iam:*", "organizations:*", "sts:*", "support:*",
+      "cloudfront:*", "route53:*", "waf:*", "wafv2:*", "shield:*",
+      "budgets:*", "ce:*", "health:*", "globalaccelerator:*",
+      "s3:ListAllMyBuckets", "ec2:DescribeRegions"
+    ],
+    "Resource": "*",
+    "Condition": {
+      "StringNotEquals": {
+        "aws:RequestedRegion": ["us-east-1", "eu-west-1"]
+      },
+      "ArnNotLike": {
+        "aws:PrincipalArn": "arn:aws:iam::*:role/BreakGlassRole"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Without the <code>NotAction</code> exemptions, IAM, CloudFront, Route 53 and other global services break outside us-east-1. AWS's published example has a longer list; check it before use.</p>
+			</div>
+
+			<div class="snippet" id="protect-security-services">
+				<h3>Protect security services</h3>
+				<p class="use"><b>Use when</b>Nobody in a workload account may switch off logging or threat detection, except the security team's role.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "ProtectSecurityTooling",
+    "Effect": "Deny",
+    "Action": [
+      "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail",
+      "config:StopConfigurationRecorder", "config:DeleteConfigurationRecorder", "config:DeleteDeliveryChannel",
+      "guardduty:DeleteDetector", "guardduty:UpdateDetector", "guardduty:DisassociateFromAdministratorAccount",
+      "securityhub:DisableSecurityHub", "securityhub:DisassociateFromAdministratorAccount"
+    ],
+    "Resource": "*",
+    "Condition": {
+      "ArnNotLike": {   <span class="c">// exemption</span>
+        "aws:PrincipalArn": "arn:aws:iam::*:role/SecurityAdminRole"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Exempt by <code>aws:PrincipalArn</code> with <code>ArnNotLike</code>, not by naming a principal: SCPs have no <code>Principal</code> element.</p>
+			</div>
+
+			<div class="snippet" id="block-the-root-user-in-member-accounts">
+				<h3>Block the root user in member accounts</h3>
+				<p class="use"><b>Use when</b>Member account root users should never be used for day-to-day actions.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyMemberRoot",
+    "Effect": "Deny",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {
+      "StringLike": {
+        "aws:PrincipalArn": "arn:aws:iam::*:root"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>SCPs do apply to member root users (but not the management account's). With centralized root access, the management account can also remove member root credentials and run privileged root tasks itself.</p>
+			</div>
+
+			<div class="snippet" id="require-imdsv2">
+				<h3>Require IMDSv2</h3>
+				<p class="use"><b>Use when</b>Instance role credentials must be protected from SSRF attacks through IMDSv1.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LaunchOnlyWithImdsv2",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "StringNotEquals": {
+          "ec2:MetadataHttpTokens": "required"
+        }
+      }
+    },
+    {
+      "Sid": "NoCredentialsFromImdsv1",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {   <span class="c">// only on instance-role requests</span>
+        "NumericLessThan": {
+          "ec2:RoleDelivery": "2.0"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>A <strong>declarative policy</strong> (or the account-level IMDS defaults with enforcement) is the newer way to require IMDSv2 across accounts; it also blocks launches that ask for IMDSv1.</p>
+			</div>
+
+			<div class="snippet" id="no-iam-users-or-access-keys">
+				<h3>No IAM users or access keys</h3>
+				<p class="use"><b>Use when</b>People must federate through IAM Identity Center and workloads must use roles.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyLongTermCredentials",
+    "Effect": "Deny",
+    "Action": [ "iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile" ],
+    "Resource": "*",
+    "Condition": {
+      "ArnNotLike": {
+        "aws:PrincipalArn": "arn:aws:iam::*:role/BreakGlassRole"
+      }
+    }
+  }]
+}</code></pre>
+			</div>
+
+			<div class="snippet" id="keep-account-level-protections-on">
+				<h3>Keep account-level protections on</h3>
+				<p class="use"><b>Use when</b>S3 Block Public Access and EBS encryption by default, once on, must stay on.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "LockAccountProtections",
+    "Effect": "Deny",
+    "Action": [
+      "s3:PutAccountPublicAccessBlock",       <span class="c">// account-level Block Public Access</span>
+      "ec2:DisableEbsEncryptionByDefault"
+    ],
+    "Resource": "*",
+    "Condition": {
+      "ArnNotLike": {
+        "aws:PrincipalArn": "arn:aws:iam::*:role/SecurityAdminRole"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Turn the protections on first (for example with a StackSet or Config remediation), then lock them with the SCP.</p>
+			</div>
+
+			<div class="snippet" id="rcp-s3-data-perimeter">
+				<h3>RCP: S3 data perimeter</h3>
+				<p class="use"><b>Use when</b>No principal outside the organization may reach your buckets, even if a bucket policy is misconfigured.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "EnforceOrgIdentityPerimeter",
+    "Effect": "Deny",
+    "Principal": "*",                         <span class="c">// required, and the only value allowed</span>
+    "Action": "s3:*",
+    "Resource": "*",
+    "Condition": {
+      "StringNotEqualsIfExists": {
+        "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+      },
+      "BoolIfExists": {   <span class="c">// let AWS services (CloudTrail...) write</span>
+        "aws:PrincipalIsAWSService": "false"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Without the <code>aws:PrincipalIsAWSService</code> exemption, service principals such as <code>cloudtrail.amazonaws.com</code> are blocked from delivering logs. Real perimeters also exempt approved partner accounts or public buckets, often by resource tag.</p>
+			</div>
+
+			<div class="snippet" id="rcp-https-only-for-s3">
+				<h3>RCP: HTTPS only for S3</h3>
+				<p class="use"><b>Use when</b>Every bucket in the organization must refuse unencrypted requests, without editing each bucket policy.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "DenyInsecureTransport",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": "*",
+    "Condition": {
+      "BoolIfExists": {
+        "aws:SecureTransport": "false"
+      }
+    }
+  }]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>RCPs cover only supported services (S3, KMS, STS, SQS, Secrets Manager, DynamoDB, ECR and others) and don't apply to AWS managed KMS keys. The same deny in a single bucket policy protects only that bucket.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: buildspec patterns | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: annotated CodeBuild buildspec patterns for phases, Docker build and push to ECR, test and coverage reports, caching, secrets and exported variables, secondary artifacts, batch builds, finally blocks and retries.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">buildspec patterns</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>buildspec patterns</h1>
+		<p>CodeBuild build specifications for the jobs pipelines ask of them: building and pushing images, publishing test reports, caching, reading secrets, passing values to later stages, and running builds in parallel. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CodeBuild</span><span class="tag">YAML</span><span class="tag">8 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#a-minimal-annotated-buildspec">A minimal annotated buildspec</a></li>
+				<li><a href="#build-and-push-a-docker-image-to-ecr">Build and push a Docker image to ECR</a></li>
+				<li><a href="#test-and-coverage-reports">Test and coverage reports</a></li>
+				<li><a href="#caching-dependencies">Caching dependencies</a></li>
+				<li><a href="#secrets-and-exported-variables">Secrets and exported variables</a></li>
+				<li><a href="#primary-and-secondary-artifacts">Primary and secondary artifacts</a></li>
+				<li><a href="#batch-builds-build-list-and-build-matrix">Batch builds: build list and build matrix</a></li>
+				<li><a href="#cleanup-and-retries-finally-and-on-failure">Cleanup and retries: finally and on-failure</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>A buildspec (<code>buildspec.yml</code> in the source root by default) tells CodeBuild which commands to run in each phase and what to keep afterwards. Phases always run in the order <code>install</code>, <code>pre_build</code>, <code>build</code>, <code>post_build</code>.</p>
+
+			<div class="snippet" id="a-minimal-annotated-buildspec">
+				<h3>A minimal annotated buildspec</h3>
+				<p class="use"><b>Use when</b>Starting a build project for an application, such as a Node.js service.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2                          <span class="c"># always 0.2: all commands share one shell</span>
+
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">runtime-versions:</span>
+      <span class="k">nodejs:</span> 20                       <span class="c"># pin it; the default changes when versions retire</span>
+    <span class="k">commands:</span>
+      - npm ci
+  <span class="k">pre_build:</span>
+    <span class="k">commands:</span>
+      - npm run lint
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - npm test
+      - npm run build
+  <span class="k">post_build:</span>
+    <span class="k">commands:</span>
+      - echo "Build finished on $(date)"
+
+<span class="k">artifacts:</span>
+  <span class="k">files:</span>
+    - '**/*'
+  <span class="k">base-directory:</span> dist                 <span class="c"># zip the contents of dist/, not the folder itself</span></code></pre>
+				<p class="watch"><b>Watch for</b>If a command fails in <code>build</code>, CodeBuild still runs <code>post_build</code>, so check <code>$CODEBUILD_BUILD_SUCCEEDING</code> (1 or 0) there before pushing or deploying anything.</p>
+			</div>
+
+			<div class="snippet" id="build-and-push-a-docker-image-to-ecr">
+				<h3>Build and push a Docker image to ECR</h3>
+				<p class="use"><b>Use when</b>A pipeline builds a container image and the next stage deploys it to ECS.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+
+<span class="k">env:</span>
+  <span class="k">variables:</span>
+    <span class="k">REPO:</span> 111111111111.dkr.ecr.us-east-1.amazonaws.com/orders
+
+<span class="k">phases:</span>
+  <span class="k">pre_build:</span>
+    <span class="k">commands:</span>
+      - aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
+      - TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)   <span class="c"># commit ID, not "latest"</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - docker build -t $REPO:$TAG .
+  <span class="k">post_build:</span>
+    <span class="k">commands:</span>
+      - docker push $REPO:$TAG
+      - printf '[{"name":"orders","imageUri":"%s"}]' $REPO:$TAG &gt; imagedefinitions.json
+
+<span class="k">artifacts:</span>
+  <span class="k">files:</span>
+    - imagedefinitions.json             <span class="c"># read by the CodePipeline ECS deploy action</span></code></pre>
+				<p class="watch"><b>Watch for</b>The project needs <strong>privileged mode</strong> to run the Docker daemon, and its service role needs ECR push permissions (<code>ecr:GetAuthorizationToken</code> plus the layer upload actions). The <code>name</code> in <code>imagedefinitions.json</code> must match the container name in the task definition. For CodeDeploy blue/green, write <code>imageDetail.json</code> instead.</p>
+			</div>
+
+			<div class="snippet" id="test-and-coverage-reports">
+				<h3>Test and coverage reports</h3>
+				<p class="use"><b>Use when</b>Test results and code coverage should appear in the CodeBuild console, with trends across builds.</p>
+<pre><code><span class="k">phases:</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - npx jest --ci --reporters=default --reporters=jest-junit --coverage
+
+<span class="k">reports:</span>
+  <span class="k">unit-tests:</span>                           <span class="c"># creates report group &lt;project&gt;-unit-tests</span>
+    <span class="k">files:</span>
+      - junit.xml
+    <span class="k">file-format:</span> JUNITXML                 <span class="c"># default; also CUCUMBERJSON, NUNITXML, TESTNGXML...</span>
+  <span class="k">coverage:</span>
+    <span class="k">files:</span>
+      - coverage/clover.xml
+    <span class="k">file-format:</span> CLOVERXML                <span class="c"># or COBERTURAXML, JACOCOXML, SIMPLECOV</span></code></pre>
+				<p class="watch"><b>Watch for</b>Reports are uploaded even if the tests fail, which is when you need them most. The service role needs <code>codebuild:CreateReportGroup</code>, <code>CreateReport</code>, <code>UpdateReport</code> and <code>BatchPutTestCases</code> (plus <code>BatchPutCodeCoverages</code> for coverage).</p>
+			</div>
+
+			<div class="snippet" id="caching-dependencies">
+				<h3>Caching dependencies</h3>
+				<p class="use"><b>Use when</b>Builds spend minutes downloading the same packages or Docker layers every time.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">cache:</span>
+  <span class="k">key:</span> npm-$(codebuild-hash-files package-lock.json)   <span class="c"># exact match first (S3 cache)</span>
+  <span class="k">fallback-keys:</span>
+    - npm-                               <span class="c"># then prefix match on older caches</span>
+  <span class="k">paths:</span>
+    - '/root/.npm/**/*'</code></pre>
+				<span class="file">build project (CloudFormation)</span>
+<pre><code><span class="k">Cache:</span>
+  <span class="k">Type:</span> S3                             <span class="c"># shared by every build, survives between hosts</span>
+  <span class="k">Location:</span> tooling-build-cache/orders
+<span class="c"># or a local cache on the build host:</span>
+<span class="c"># Cache:</span>
+<span class="c">#   Type: LOCAL</span>
+<span class="c">#   Modes: [ LOCAL_DOCKER_LAYER_CACHE, LOCAL_SOURCE_CACHE, LOCAL_CUSTOM_CACHE ]</span></code></pre>
+				<p class="watch"><b>Watch for</b>Local caches are best effort and only help builds that land on the same host shortly after. <code>LOCAL_DOCKER_LAYER_CACHE</code> requires privileged mode. <code>LOCAL_CUSTOM_CACHE</code> caches the buildspec <code>paths</code>.</p>
+			</div>
+
+			<div class="snippet" id="secrets-and-exported-variables">
+				<h3>Secrets and exported variables</h3>
+				<p class="use"><b>Use when</b>The build needs a token or password, or a later pipeline stage needs a value the build calculated.</p>
+<pre><code><span class="k">env:</span>
+  <span class="k">parameter-store:</span>
+    <span class="k">SONAR_URL:</span> /build/sonar/url            <span class="c"># parameter name</span>
+  <span class="k">secrets-manager:</span>
+    <span class="k">SONAR_TOKEN:</span> prod/sonar:token          <span class="c"># secret-id:json-key[:version-stage:version-id]</span>
+    <span class="k">NPM_TOKEN:</span> arn:aws:secretsmanager:us-east-1:333333333333:secret:npm-AbCdEf:token   <span class="c"># another account: use the ARN</span>
+  <span class="k">exported-variables:</span>
+    - IMAGE_TAG                          <span class="c"># available to later actions</span>
+
+<span class="k">phases:</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - export IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)
+<span class="c"># in CodePipeline, give the build action a namespace (BuildVariables)</span>
+<span class="c"># and reference the value in a later action as #{BuildVariables.IMAGE_TAG}</span></code></pre>
+				<p class="watch"><b>Watch for</b>Secret and parameter values are masked in the logs. The service role needs <code>ssm:GetParameters</code> or <code>secretsmanager:GetSecretValue</code> (and <code>kms:Decrypt</code> for a customer managed key). Plain <code>variables</code> are visible in the console, so never put secrets there.</p>
+			</div>
+
+			<div class="snippet" id="primary-and-secondary-artifacts">
+				<h3>Primary and secondary artifacts</h3>
+				<p class="use"><b>Use when</b>One build produces several outputs, such as an application bundle and a CloudFormation template for different pipeline actions.</p>
+<pre><code><span class="k">artifacts:</span>
+  <span class="k">files:</span>                                 <span class="c"># primary artifact (always required)</span>
+    - '**/*'
+  <span class="k">base-directory:</span> dist
+  <span class="k">exclude-paths:</span>
+    - '**/*.map'
+  <span class="k">secondary-artifacts:</span>
+    <span class="k">TemplateArtifact:</span>                     <span class="c"># must match an output artifact name in the action</span>
+      <span class="k">files:</span>
+        - infra/template.yaml
+        - infra/prod-config.json
+      <span class="k">discard-paths:</span> yes                 <span class="c"># put both files at the root of the zip</span>
+    <span class="k">AppArtifact:</span>
+      <span class="k">files:</span>
+        - '**/*'
+      <span class="k">base-directory:</span> dist</code></pre>
+				<p class="watch"><b>Watch for</b>When a CodePipeline build action has more than one output artifact, every identifier under <code>secondary-artifacts</code> must match one of the action's output artifact names.</p>
+			</div>
+
+			<div class="snippet" id="batch-builds-build-list-and-build-matrix">
+				<h3>Batch builds: build list and build matrix</h3>
+				<p class="use"><b>Use when</b>One trigger should run several builds in parallel, such as tests on several runtimes or images for several architectures.</p>
+<pre><code><span class="k">batch:</span>
+  <span class="k">fast-fail:</span> true                       <span class="c"># stop the others when one fails</span>
+  <span class="k">build-list:</span>
+    - <span class="k">identifier:</span> amd64
+      <span class="k">env:</span>
+        <span class="k">image:</span> aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        <span class="k">variables:</span> { ARCH: amd64 }
+    - <span class="k">identifier:</span> arm64
+      <span class="k">env:</span>
+        <span class="k">type:</span> ARM_CONTAINER
+        <span class="k">image:</span> aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        <span class="k">variables:</span> { ARCH: arm64 }
+    - <span class="k">identifier:</span> integration
+      <span class="k">buildspec:</span> buildspec-integration.yml
+      <span class="k">ignore-failure:</span> true                <span class="c"># don't fail the batch</span>
+
+<span class="c"># or every combination of the listed values:</span>
+<span class="c"># batch:</span>
+<span class="c">#   build-matrix:</span>
+<span class="c">#     dynamic:</span>
+<span class="c">#       env:</span>
+<span class="c">#         variables:</span>
+<span class="c">#           NODE_VERSION: [ "18", "20", "22" ]</span></code></pre>
+				<p class="watch"><b>Watch for</b>Batch builds must be enabled on the project, with a batch service role. Use <code>build-graph</code> with <code>depend-on</code> when some builds must wait for others, and <code>build-fanout</code> to split one test suite across parallel builds.</p>
+			</div>
+
+			<div class="snippet" id="cleanup-and-retries-finally-and-on-failure">
+				<h3>Cleanup and retries: finally and on-failure</h3>
+				<p class="use"><b>Use when</b>Test resources must be cleaned up even when tests fail, or a flaky step should be retried.</p>
+<pre><code><span class="k">phases:</span>
+  <span class="k">pre_build:</span>
+    <span class="k">on-failure:</span> RETRY-2-.*connection timed out.*   <span class="c"># retry the build twice on this error only</span>
+    <span class="k">commands:</span>
+      - ./scripts/start-test-db.sh
+  <span class="k">build:</span>
+    <span class="k">on-failure:</span> ABORT                    <span class="c"># ABORT | CONTINUE | RETRY | RETRY-count | RETRY-regex</span>
+    <span class="k">commands:</span>
+      - npm run test:integration
+    <span class="k">finally:</span>                             <span class="c"># runs even if a command above failed</span>
+      - ./scripts/stop-test-db.sh</code></pre>
+				<p class="watch"><b>Watch for</b>A failure in <code>finally</code> still fails the phase. <code>on-failure</code> works only on the EC2 compute images CodeBuild provides, not on Lambda compute or reserved capacity.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>
