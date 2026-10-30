@@ -41,6 +41,10 @@
 			<p>On this page</p>
 			<ol>
 				<li><a href="#deploy">Deployment strategies</a></li>
+				<li><a href="#beanstalk">Elastic Beanstalk deployment policies</a></li>
+				<li><a href="#codedeploy">CodeDeploy deployment configurations</a></li>
+				<li><a href="#asg-updates">Updating instances in an Auto Scaling group</a></li>
+				<li><a href="#cfn-updates">CloudFormation update behaviors and deletion policies</a></li>
 				<li><a href="#dr">Disaster recovery strategies</a></li>
 				<li><a href="#db">Database availability options</a></li>
 				<li><a href="#scaling">Scaling options</a></li>
@@ -92,6 +96,110 @@
 				</table>
 			</div>
 			<div class="callout tip"><p>"Fastest rollback" means <strong>blue/green</strong>. "Keep full capacity at the lowest cost" on Beanstalk means <strong>rolling with additional batch</strong>. "Safest, new instances only" on Beanstalk means <strong>immutable</strong>. "Test with a small share of real users" means <strong>canary</strong>.</p></div>
+
+			<h2 id="beanstalk">Elastic Beanstalk deployment policies</h2>
+			<p>Beanstalk offers five deployment policies inside one environment, plus blue/green across two environments. They trade deployment speed against capacity and rollback speed.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Policy</th><th>How it works</th><th>If the deployment fails</th><th>Rollback</th><th>Capacity during deploy</th><th>Deployed to</th></tr></thead>
+					<tbody>
+						<tr><td>All at once</td><td data-label="How it works">Deploys the new version to every instance at the same time</td><td data-label="If the deployment fails">Downtime</td><td data-label="Rollback">Manual redeploy of the old version</td><td data-label="Capacity during deploy">Drops to zero while instances restart</td><td data-label="Deployed to">Existing instances</td></tr>
+						<tr><td>Rolling</td><td data-label="How it works">Takes one batch out of service, deploys to it, then moves to the next batch</td><td data-label="If the deployment fails">One batch out of service; batches already done run the new version (mixed versions)</td><td data-label="Rollback">Manual redeploy</td><td data-label="Capacity during deploy">Reduced by one batch</td><td data-label="Deployed to">Existing instances</td></tr>
+						<tr><td>Rolling with additional batch</td><td data-label="How it works">Launches an extra batch first, then deploys in rolling batches</td><td data-label="If the deployment fails">Minimal if the first batch fails; otherwise like rolling</td><td data-label="Rollback">Manual redeploy</td><td data-label="Capacity during deploy">Full capacity throughout</td><td data-label="Deployed to">New and existing instances</td></tr>
+						<tr><td>Immutable</td><td data-label="How it works">Launches a full set of new instances in a temporary Auto Scaling group; moves them into the environment when healthy, then terminates the old ones</td><td data-label="If the deployment fails">Minimal: the old instances never changed</td><td data-label="Rollback">Terminate the new instances</td><td data-label="Capacity during deploy">Doubles during the deployment</td><td data-label="Deployed to">New instances</td></tr>
+						<tr><td>Traffic splitting</td><td data-label="How it works">Like immutable, but sends a percentage of traffic to the new instances for an evaluation period first (canary)</td><td data-label="If the deployment fails">Only the share of traffic sent to the new version is affected</td><td data-label="Rollback">Reroute traffic and terminate the new instances</td><td data-label="Capacity during deploy">Doubles during the deployment</td><td data-label="Deployed to">New instances (needs an Application Load Balancer)</td></tr>
+						<tr><td>Blue/green (swap URLs)</td><td data-label="How it works">A second environment runs the new version; swapping environment URLs moves traffic</td><td data-label="If the deployment fails">Minimal: the old environment keeps running</td><td data-label="Rollback">Swap the URLs back</td><td data-label="Capacity during deploy">A whole second environment</td><td data-label="Deployed to">A new environment (a DNS change, so client caching delays the switch)</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Detail</th><th>Fact</th></tr></thead>
+					<tbody>
+						<tr><td>Speed order</td><td data-label="Fact">All at once is fastest, then rolling, then rolling with additional batch; immutable, traffic splitting and blue/green are slowest</td></tr>
+						<tr><td>Single-instance environments</td><td data-label="Fact">Support only all at once and immutable</td></tr>
+						<tr><td>Batch size</td><td data-label="Fact">Fixed number or percentage of instances (<code>BatchSizeType</code>, <code>BatchSize</code>)</td></tr>
+						<tr><td>Configuration changes</td><td data-label="Fact">Changes that replace instances (for example, instance type) use rolling updates or immutable updates, set separately from the deployment policy</td></tr>
+						<tr><td>Databases</td><td data-label="Fact">An RDS database created inside the environment is deleted with it; for blue/green, create the database outside the environment and pass its endpoint in</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Zero downtime and full capacity at the lowest cost" is <strong>rolling with additional batch</strong>. "Safest rollback without a new environment" is <strong>immutable</strong>. "Test the new version on 10% of users" is <strong>traffic splitting</strong>. "Platform change that can't run side by side, instant switch back" is <strong>blue/green with a URL swap</strong>.</p></div>
+
+			<h2 id="codedeploy">CodeDeploy deployment configurations</h2>
+			<p>A deployment configuration tells CodeDeploy how fast to move. On EC2 it controls how many instances update at once; on Lambda and ECS it controls how traffic shifts to the new version.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Platform</th><th>Deployment types</th><th>Predefined configurations</th><th>Rollback</th></tr></thead>
+					<tbody>
+						<tr><td>EC2 and on premises</td><td data-label="Deployment types">In-place, or blue/green (new instances behind the same load balancer)</td><td data-label="Predefined configurations"><code>OneAtATime</code> (default), <code>HalfAtATime</code>, <code>AllAtOnce</code>; custom configurations set a minimum number or percentage of healthy hosts, optionally per AZ</td><td data-label="Rollback">Redeploys the last good revision (automatic on failure or alarm, if enabled)</td></tr>
+						<tr><td>Lambda</td><td data-label="Deployment types">Traffic shifting between two versions behind an alias</td><td data-label="Predefined configurations">Canary 10% then the rest after 5, 10, 15 or 30 minutes; linear 10% every 1, 2, 3 or 10 minutes; all at once</td><td data-label="Rollback">Points the alias back to the old version</td></tr>
+						<tr><td>ECS</td><td data-label="Deployment types">Blue/green: a replacement task set behind a second target group, with an optional test listener</td><td data-label="Predefined configurations">Canary 10% then the rest after 5 or 15 minutes; linear 10% every 1 or 3 minutes; all at once</td><td data-label="Rollback">Shifts traffic back to the original task set</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>EC2 configuration</th><th>Updates at a time</th><th>Deployment succeeds when</th></tr></thead>
+					<tbody>
+						<tr><td><code>OneAtATime</code></td><td data-label="Updates at a time">One instance</td><td data-label="Deployment succeeds when">Every instance succeeds, except that a failure on the last instance still counts as success</td></tr>
+						<tr><td><code>HalfAtATime</code></td><td data-label="Updates at a time">Up to half the instances (rounded down)</td><td data-label="Deployment succeeds when">At least half the instances (rounded up) succeed</td></tr>
+						<tr><td><code>AllAtOnce</code></td><td data-label="Updates at a time">All instances</td><td data-label="Deployment succeeds when">At least one instance succeeds</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>The configuration names include the platform: <code>CodeDeployDefault.LambdaCanary10Percent5Minutes</code>, <code>CodeDeployDefault.ECSLinear10PercentEvery1Minutes</code>. Behind a <strong>Network Load Balancer</strong>, ECS supports only <code>CodeDeployDefault.ECSAllAtOnce</code>.</p></div>
+
+			<h2 id="asg-updates">Updating instances in an Auto Scaling group</h2>
+			<p>Three ways to replace running instances after the launch template changes. The first two are CloudFormation <code>UpdatePolicy</code> settings; the third is an Auto Scaling feature you start directly.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Method</th><th>How it works</th><th>Capacity</th><th>Rollback</th></tr></thead>
+					<tbody>
+						<tr><td>CloudFormation <code>AutoScalingRollingUpdate</code></td><td data-label="How it works">During a stack update, replaces instances in batches (<code>MaxBatchSize</code>, <code>MinInstancesInService</code>, <code>PauseTime</code>, optional <code>WaitOnResourceSignals</code>)</td><td data-label="Capacity">Can dip unless <code>MinInstancesInService</code> keeps enough running</td><td data-label="Rollback">Stack rollback replaces instances again, batch by batch (slow)</td></tr>
+						<tr><td>CloudFormation <code>AutoScalingReplacingUpdate</code> (<code>WillReplace: true</code>)</td><td data-label="How it works">Creates a whole new Auto Scaling group, and deletes the old one only after the update succeeds</td><td data-label="Capacity">Doubles during the update</td><td data-label="Rollback">Fast: the new group is deleted and the old one never changed</td></tr>
+						<tr><td>Instance refresh</td><td data-label="How it works">Auto Scaling replaces instances in batches set by minimum and maximum healthy percentage; supports checkpoints, bake time, skip matching and a desired configuration</td><td data-label="Capacity">Kept at or above the minimum healthy percentage; 100% minimum launches new instances before terminating old ones</td><td data-label="Rollback">Roll back on request, or automatically when the refresh fails or a CloudWatch alarm fires</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Instance refresh setting</th><th>Effect</th></tr></thead>
+					<tbody>
+						<tr><td>Minimum healthy percentage</td><td data-label="Effect">Share of desired capacity that must stay in service; 90% replaces 10% at a time, 0% replaces everything at once</td></tr>
+						<tr><td>Maximum healthy percentage</td><td data-label="Effect">How far capacity may grow during the refresh; above 100% allows launching replacements before terminating</td></tr>
+						<tr><td>Checkpoints</td><td data-label="Effect">Pause after a percentage of instances is replaced, emitting EventBridge events, so you can verify before continuing</td></tr>
+						<tr><td>Skip matching</td><td data-label="Effect">Leave instances that already match the desired configuration (doesn't detect code pulled by user data)</td></tr>
+						<tr><td>Limits</td><td data-label="Effect">A refresh can run for at most 14 days; it fails after an hour of being unable to make progress</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Roll out a new AMI to an Auto Scaling group gradually, pause to verify, and roll back automatically on an alarm" is an <strong>instance refresh</strong> with checkpoints and auto rollback. "Fastest rollback when a CloudFormation update fails" is <strong><code>AutoScalingReplacingUpdate</code></strong>.</p></div>
+
+			<h2 id="cfn-updates">CloudFormation update behaviors and deletion policies</h2>
+			<p>Every resource property is documented with what happens when it changes. Change sets show this before you deploy.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Update behavior</th><th>What happens</th><th>Example</th></tr></thead>
+					<tbody>
+						<tr><td>No interruption</td><td data-label="What happens">The resource is updated in place and keeps working</td><td data-label="Example">Changing tags, or a Lambda function's memory size</td></tr>
+						<tr><td>Some interruption</td><td data-label="What happens">Updated in place, but briefly unavailable</td><td data-label="Example">Changing an EBS-backed EC2 instance's type (stop and start)</td></tr>
+						<tr><td>Replacement</td><td data-label="What happens">A new resource with a new physical ID is created, references are updated, then the old one is deleted</td><td data-label="Example">Changing an EC2 instance's AMI, or an RDS instance's identifier</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Policy value</th><th>On stack delete or removal from the template</th><th>Notes</th></tr></thead>
+					<tbody>
+						<tr><td><code>Delete</code></td><td data-label="On stack delete or removal from the template">The resource is deleted</td><td data-label="Notes">The default for most resources; S3 buckets must be empty first</td></tr>
+						<tr><td><code>Retain</code></td><td data-label="On stack delete or removal from the template">The resource is kept and leaves CloudFormation's management</td><td data-label="Notes">Works on any resource; it still costs money</td></tr>
+						<tr><td><code>RetainExceptOnCreate</code></td><td data-label="On stack delete or removal from the template">Kept, except when the stack operation that created it rolls back</td><td data-label="Notes">Avoids leaving empty resources behind after a failed create</td></tr>
+						<tr><td><code>Snapshot</code></td><td data-label="On stack delete or removal from the template">A snapshot is taken, then the resource is deleted</td><td data-label="Notes">EBS volumes, RDS instances and clusters, ElastiCache, Neptune, DocumentDB, Redshift. The default for RDS clusters, and for RDS instances that aren't in a cluster</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p><code>DeletionPolicy</code> doesn't apply when an update <strong>replaces</strong> a resource; that's <code>UpdateReplacePolicy</code>, with the same values. And a resource with a <strong>custom name</strong> (for example, a fixed <code>BucketName</code>) can't be replaced, because the new one would need the same name; the update fails.</p></div>
 
 			<h2 id="dr">Disaster recovery strategies</h2>
 			<p>Ordered from cheapest and slowest to most expensive and fastest. Pick the cheapest strategy that still meets the stated RTO (how long to recover) and RPO (how much data can be lost).</p>
