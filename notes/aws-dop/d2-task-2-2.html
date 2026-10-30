@@ -47,7 +47,7 @@
 				<li class="sub"><a href="#organizations">AWS Organizations</a></li>
 				<li class="sub"><a href="#control-tower">AWS Control Tower</a></li>
 				<li><a href="#s3">IAM across many accounts</a></li>
-				<li class="sub"><a href="#scps">Service control policies</a></li>
+				<li class="sub"><a href="#scps">SCPs and RCPs</a></li>
 				<li class="sub"><a href="#cross-account">Assuming roles</a></li>
 				<li class="sub"><a href="#identity-center">IAM Identity Center</a></li>
 				<li><a href="#s4">Governance and security at scale</a></li>
@@ -233,13 +233,57 @@
 			<div class="item" id="scps">
 				<span class="kicker">Skill</span>
 				<h3>Service control policies (SCPs)</h3>
-				<p>An SCP sets the <strong>maximum</strong> permissions for every principal in the accounts it applies to. It never grants anything: a user still needs an IAM policy that allows the action.</p>
+				<p>An SCP sets the <strong>maximum</strong> permissions for every IAM user and role in the accounts it applies to. It never grants anything: a user still needs an IAM policy that allows the action. Think of it as a filter between your people and AWS: whatever their own policies say, nothing outside the filter gets through.</p>
 				<ul>
-					<li><strong>Who it affects:</strong> all users and roles in member accounts, including the member account's root user.</li>
-					<li><strong>Who it doesn't:</strong> the management account, and service-linked roles.</li>
-					<li><strong>Inheritance:</strong> an action must be allowed by the SCPs at <em>every</em> level from the root down to the account. A <code>Deny</code> anywhere on the path wins.</li>
-					<li><strong>Deny list (default):</strong> keep AWS's <code>FullAWSAccess</code> policy attached and add <code>Deny</code> statements. This is easy to maintain.</li>
-					<li><strong>Allow list:</strong> replace <code>FullAWSAccess</code> with policies that allow only listed services. This is stricter, but every new service must be added.</li>
+					<li><strong>Who it affects:</strong> all users and roles in member accounts, including each member account's root user and administrators with <code>AdministratorAccess</code>.</li>
+					<li><strong>Who it doesn't:</strong> the management account, service-linked roles, and principals <em>outside</em> the organization (even when they access your resources through a bucket or key policy). Resource control policies cover that last gap.</li>
+					<li><strong>Prerequisites:</strong> the organization uses <em>all features</em>, and the SCP policy type is enabled on the root.</li>
+				</ul>
+
+				<h4>How an SCP is evaluated</h4>
+				<p>When a user in a member account makes a request, the SCPs of <em>that user's</em> account decide the ceiling, whichever account owns the resource:</p>
+				<ol class="flow">
+					<li><span class="name">Collect the SCPs on the path</span><span class="desc">The root, every OU above the account, and the account itself.</span></li>
+					<li><span class="name">Any explicit Deny ends it</span><span class="desc">A <code>Deny</code> matching the request at any level denies the request.</span></li>
+					<li><span class="name">Every level must allow</span><span class="desc">Each level needs at least one SCP whose <code>Allow</code> covers the action. The default <code>FullAWSAccess</code> SCP allows everything, so with it attached everywhere, only Deny statements matter.</span></li>
+					<li><span class="name">Then the normal IAM evaluation</span><span class="desc">Identity policies, resource policies, permissions boundaries and session policies decide within that ceiling.</span></li>
+				</ol>
+
+				<h4>Deny list and allow list strategies</h4>
+				<p>With a <strong>deny list</strong>, <code>FullAWSAccess</code> stays attached at every level and you add SCPs that deny specific actions. New AWS services work automatically; you only write the exceptions. This is the common approach and the one Control Tower uses.</p>
+				<p>With an <strong>allow list</strong>, you detach <code>FullAWSAccess</code> from a level and attach an SCP that allows only listed services. Because every level must allow an action, the effective permissions are the services allowed at <em>all</em> levels. For example:</p>
+				<ol class="flow">
+					<li><span class="name">Root</span><span class="desc"><code>FullAWSAccess</code>: everything passes.</span></li>
+					<li><span class="name">Workloads OU</span><span class="desc"><code>FullAWSAccess</code> replaced by an SCP allowing <code>ec2:*</code>, <code>s3:*</code>, <code>rds:*</code>, <code>cloudwatch:*</code>, <code>logs:*</code>.</span></li>
+					<li><span class="name">Account <code>222222222222</code></span><span class="desc"><code>FullAWSAccess</code>: everything passes at this level.</span></li>
+					<li class="auto"><span class="name">Effective ceiling</span><span class="desc">Only EC2, S3, RDS, CloudWatch and CloudWatch Logs. Any other service is denied, even for administrators.</span></li>
+				</ol>
+				<span class="file">workloads-allow-list-scp.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowApprovedServicesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:*",
+        "s3:*",
+        "rds:*",
+        "cloudwatch:*",
+        "logs:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+				<p>Allow lists are stricter but costly to maintain: every new service a team needs means an SCP change, and forgetting supporting services (such as <code>kms:*</code> for encrypted volumes) breaks things in confusing ways.</p>
+
+				<h4>Policy language and limits</h4>
+				<ul>
+					<li><strong>Elements:</strong> <code>Effect</code> (<code>Allow</code> or <code>Deny</code>), <code>Action</code> or <code>NotAction</code>, <code>Resource</code> or <code>NotResource</code>, and <code>Condition</code>, in both Allow and Deny statements.</li>
+					<li><strong>Specific resources:</strong> only <code>Deny</code> statements can name resource ARNs; an <code>Allow</code> statement's <code>Resource</code> must be <code>"*"</code>.</li>
+					<li><strong>No <code>Principal</code>:</strong> SCPs don't support <code>Principal</code> or <code>NotPrincipal</code>. To exempt a role, use a condition on <code>aws:PrincipalArn</code>.</li>
+					<li><strong>Limits:</strong> up to 10,240 characters per SCP and up to 10 SCPs attached directly to the root, each OU and each account. OUs can be nested five levels deep.</li>
 				</ul>
 
 				<h4>Example: guardrails for the Workloads OU</h4>
@@ -295,10 +339,213 @@
 					<li><strong><code>NotAction</code> in the Region rule:</strong> exempts global services whose API calls go to <code>us-east-1</code> (IAM, CloudFront, Route 53 and others). Without the exemption, the SCP would break them.</li>
 					<li><strong><code>ArnNotLike</code> on <code>aws:PrincipalArn</code>:</strong> lets one administrator role through while everyone else is denied.</li>
 				</ul>
+
+				<h4>Creating and attaching an SCP</h4>
+				<p>SCPs are created and attached from the management account (or a delegated administrator for Organizations policies). As code, the policy and its targets are one CloudFormation resource:</p>
+				<span class="file">workloads-guardrails.yaml (in the management account)</span>
+<pre><code><span class="k">WorkloadGuardrails:</span>
+  <span class="k">Type:</span> AWS::Organizations::Policy
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> workloads-guardrails
+    <span class="k">Type:</span> SERVICE_CONTROL_POLICY
+    <span class="k">TargetIds:</span>
+      - ou-ab12-workload1   <span class="c"># Workloads OU</span>
+    <span class="k">Content:</span>
+      <span class="k">Version:</span> "2012-10-17"
+      <span class="k">Statement:</span>
+        - <span class="k">Sid:</span> DenyLeavingOrganization
+          <span class="k">Effect:</span> Deny
+          <span class="k">Action:</span> organizations:LeaveOrganization
+          <span class="k">Resource:</span> "*"</code></pre>
+				<p>The same with the AWS CLI:</p>
+<pre><code>aws organizations create-policy \
+  --name workloads-guardrails \
+  --type SERVICE_CONTROL_POLICY \
+  --content file://workloads-guardrails-scp.json
+
+aws organizations attach-policy \
+  --policy-id p-examplepolicyid111 \
+  --target-id ou-ab12-workload1</code></pre>
+
+				<h4>Rolling out an SCP safely</h4>
+				<ol class="flow">
+					<li><span class="name">Test in a Policy Staging OU</span><span class="desc">Attach the SCP to an OU that holds test accounts with the same workloads, not to production.</span></li>
+					<li><span class="name">Look for denials</span><span class="desc">In CloudTrail, <code>AccessDenied</code> errors whose message says <em>explicit deny in a service control policy</em> show what the SCP blocked.</span></li>
+					<li><span class="name">Check real usage first for allow lists</span><span class="desc">IAM last-accessed information (service and action level) shows which services accounts actually use before you remove them.</span></li>
+					<li><span class="name">Attach to the target OU</span><span class="desc">Start low in the hierarchy and move up; attaching an untested SCP to the root affects every member account at once.</span></li>
+				</ol>
 				<div class="callout trap"><p>"An SCP denies an action, but the user has <code>AdministratorAccess</code>": the action is still denied. Conversely, "an SCP allows S3, but the user gets <em>AccessDenied</em>": SCPs don't grant, so the user's IAM policy must allow it too.</p></div>
 
-				<h4>Resource control policies (RCPs)</h4>
-				<p>An RCP limits what can be done <em>to</em> resources in member accounts, whoever the caller is. A typical use is a data perimeter: deny access to S3 buckets, KMS keys or secrets from principals outside the organization, using the condition <code>aws:PrincipalOrgID</code>.</p>
+				<h3>Resource control policies (RCPs)</h3>
+				<p>An RCP sets the <strong>maximum</strong> permissions for <em>resources</em> in member accounts, whoever the caller is. SCPs can only limit your own principals; a bucket policy, key policy or role trust policy can still grant access to an account outside the organization, and no SCP stops that caller. An RCP is attached to the root, an OU or an account like an SCP, but it applies to requests made <em>to</em> the resources there, from anyone, including other organizations.</p>
+				<p>The main use is a <strong>data perimeter</strong>: data in your S3 buckets, KMS keys, secrets and queues can be reached only by your own organization's identities and by AWS services acting for you, even if someone writes an overly open resource policy.</p>
+
+				<h4>How an RCP is evaluated</h4>
+				<ol class="flow">
+					<li><span class="name">Find the resource's owner</span><span class="desc">The RCPs that apply are the ones on the path to the account that <strong>owns the resource</strong>, not the caller's account.</span></li>
+					<li><span class="name">Any explicit Deny ends it</span><span class="desc">A matching <code>Deny</code> at any level denies the request, for any caller: your users, other accounts, other organizations, root users.</span></li>
+					<li><span class="name">Then the normal evaluation</span><span class="desc">SCPs of the caller's account (if in your organization), identity policies and resource policies decide within that ceiling.</span></li>
+				</ol>
+				<ul>
+					<li><strong>Not affected:</strong> resources in the management account, calls made by service-linked roles, and AWS managed KMS keys.</li>
+					<li><strong>Services:</strong> RCPs apply only to services that support them. The list includes S3, STS, KMS, SQS, Secrets Manager, DynamoDB, ECR, CloudWatch Logs and Cognito, among about sixty; check the Organizations documentation for the current list.</li>
+				</ul>
+
+				<h4>Policy language and limits</h4>
+				<ul>
+					<li><strong>Deny only:</strong> RCPs you write must use <code>"Effect": "Deny"</code>. The only Allow is the AWS managed <code>RCPFullAWSAccess</code>, attached automatically to every root, OU and account when RCPs are enabled; it can't be detached and lets everything through until you add your own.</li>
+					<li><strong><code>Principal</code> is always <code>"*"</code>:</strong> name the callers to exclude with conditions such as <code>aws:PrincipalOrgID</code> or <code>aws:PrincipalArn</code>.</li>
+					<li><strong>Actions:</strong> must name a service (<code>"s3:*"</code>, not <code>"*"</code>). <code>NotAction</code> and <code>NotPrincipal</code> aren't supported; <code>Resource</code>, <code>NotResource</code> and <code>Condition</code> are.</li>
+					<li><strong>Limits:</strong> up to 5,120 characters per RCP, and up to 5 RCPs per root, OU or account, counting <code>RCPFullAWSAccess</code>.</li>
+				</ul>
+
+				<h4>Example 1: block callers from outside the organization</h4>
+				<p>Assume the organization ID is <code>o-a1b2c3d4e5</code>, and the RCP is attached to the Workloads OU. It protects the <strong>resources</strong> in those accounts (S3 buckets and objects, KMS keys, Secrets Manager secrets and SQS queues), not the use of the services. Your own users keep using S3, KMS, Secrets Manager and SQS as their IAM permissions allow. What the RCP blocks is any request to these resources from a caller <strong>outside the organization</strong>, even if a bucket policy, key policy or secret policy says that caller is allowed.</p>
+				<span class="file">deny-outside-callers-rcp.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyCallersOutsideOurOrganization",
+      "Effect": "Deny",          <span class="c">// RCPs you write can only deny</span>
+      "Principal": "*",          <span class="c">// required in RCPs: applies to every caller</span>
+      "Action": [                <span class="c">// requests to resources of these services</span>
+        "s3:*",
+        "kms:*",
+        "secretsmanager:*",
+        "sqs:*"
+      ],
+      "Resource": "*",           <span class="c">// every bucket, key, secret and queue in the OU</span>
+      "Condition": {
+        <span class="c">// both conditions must be true for the Deny to apply</span>
+        "StringNotEqualsIfExists": {
+          <span class="c">// true when the caller's account is NOT in our organization</span>
+          "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+        },
+        "BoolIfExists": {
+          <span class="c">// true when the caller is NOT an AWS service (CloudTrail, Config...)</span>
+          "aws:PrincipalIsAWSService": "false"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The <code>//</code> comments are explanations only; JSON doesn't allow comments, so remove them before using the policy.</p>
+				<p>How the RCP treats different callers trying to read a secret or an S3 object in account <code>222222222222</code>:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Caller</th><th>Conditions</th><th>Result</th></tr></thead>
+						<tbody>
+							<tr><td>A developer role in <code>222222222222</code></td><td data-label="Conditions">In the organization, so the first condition is false; no Deny</td><td data-label="Result">The RCP doesn't block it; the developer's IAM policies and the resource policy decide</td></tr>
+							<tr><td>A role in another of your accounts, <code>333333333333</code></td><td data-label="Conditions">Same organization ID; no Deny</td><td data-label="Result">Allowed if the resource policy and the role's IAM policy allow it</td></tr>
+							<tr><td>A partner's role in <code>999999999999</code>, outside the organization, granted access in a bucket policy</td><td data-label="Conditions">Outside the organization and not an AWS service; both conditions true</td><td data-label="Result"><strong>Denied</strong>, even though the bucket policy allows it</td></tr>
+							<tr><td>CloudTrail writing log files to a bucket</td><td data-label="Conditions">An AWS service, so the second condition is false; no Deny</td><td data-label="Result">Allowed if the bucket policy allows CloudTrail</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Why two conditions:</strong> with the organization check alone, AWS services that act on your behalf (CloudTrail delivering logs, Config writing snapshots) would be blocked, because they aren't principals in your organization.</li>
+					<li><strong><code>IfExists</code>:</strong> if a request doesn't carry the key at all, the condition counts as true, so requests that can't prove they come from your organization are denied rather than let through.</li>
+					<li><strong>Exceptions:</strong> a partner that must read one bucket needs an exception, for example an extra condition that skips resources carrying an agreed tag. Design those before attaching the RCP, or the partner's access stops.</li>
+				</ul>
+
+				<h4>Why an RCP, and not an SCP or resource policies</h4>
+				<p>Three tools can each stop part of this. The difference is <em>whose</em> requests they see and <em>who</em> can change them:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>Stops outside callers?</th><th>Covers every resource?</th><th>Can an account admin remove it?</th></tr></thead>
+						<tbody>
+							<tr><td>SCP</td><td data-label="Stops outside callers?">No. It limits only principals in your member accounts; the partner's account isn't in your organization, so your SCPs never evaluate its requests</td><td data-label="Covers every resource?">Not applicable</td><td data-label="Can an account admin remove it?">No</td></tr>
+							<tr><td>Bucket, key, secret and queue policies</td><td data-label="Stops outside callers?">Yes, with the same <code>aws:PrincipalOrgID</code> condition</td><td data-label="Covers every resource?">Only the resources whose owners add it; a new bucket created tomorrow has none</td><td data-label="Can an account admin remove it?">Yes: whoever can edit the resource policy can delete the protection</td></tr>
+							<tr><td>RCP</td><td data-label="Stops outside callers?">Yes, for every caller</td><td data-label="Covers every resource?">Yes, every supported resource in the OU, including ones created later</td><td data-label="Can an account admin remove it?">No; only the management account (or a delegated admin) manages it</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Resource policies are still the right tool for <em>granting</em> access, and for rules specific to one resource; the RCP is the ceiling none of them can exceed.</p>
+
+				<h4>Example 2: HTTPS only, on every S3 bucket</h4>
+				<p>This is the same deny-unless-HTTPS statement many teams put into each bucket policy. As an RCP it applies to every bucket in the OU at once, including buckets created later, and account administrators can't remove it by editing a bucket policy.</p>
+				<span class="file">s3-https-only-rcp.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3OnlyOverHttps",
+      "Effect": "Deny",
+      "Principal": "*",          <span class="c">// every caller, inside or outside the organization</span>
+      "Action": "s3:*",
+      "Resource": "*",           <span class="c">// every bucket and object in the OU</span>
+      "Condition": {
+        "BoolIfExists": {
+          <span class="c">// true when the request came over plain HTTP</span>
+          "aws:SecureTransport": "false"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<ul>
+					<li><strong>Compared with an SCP:</strong> an SCP with the same condition would force <em>your</em> users onto HTTPS, but outside callers (a partner, a public website visitor) aren't covered by your SCPs.</li>
+					<li><strong>Compared with a bucket policy:</strong> the statement works the same, but only on the buckets that have it, and anyone who can edit the bucket policy can delete it.</li>
+					<li><strong>Before attaching:</strong> clients still using plain HTTP, such as an old script or a website served from an S3 website endpoint over HTTP, stop working. CloudTrail data events show which requests arrive without TLS.</li>
+				</ul>
+
+				<h4>Example 3: only your organization can assume your roles</h4>
+				<p>Role trust policies are resource policies too. A mistake such as trusting <code>"AWS": "*"</code> lets anyone assume the role, and no SCP can stop an outside account from calling <code>sts:AssumeRole</code>. This RCP blocks role assumption from outside the organization, except for roles tagged as approved for a vendor:</p>
+				<span class="file">deny-external-role-assumption-rcp.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyAssumeRoleFromOutsideOrganization",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "sts:AssumeRole",   <span class="c">// the role being assumed is the resource</span>
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          <span class="c">// caller isn't in our organization...</span>
+          "aws:PrincipalOrgID": "o-a1b2c3d4e5",
+          <span class="c">// ...and the role isn't tagged as an approved vendor role</span>
+          "aws:ResourceTag/dp:exclude:identity": "true"
+        },
+        "BoolIfExists": {
+          <span class="c">// ...and the caller isn't an AWS service</span>
+          "aws:PrincipalIsAWSService": "false"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<ul>
+					<li><strong>Several keys under one operator are ANDed:</strong> the Deny applies only when the caller is outside the organization <em>and</em> the role lacks the exception tag <em>and</em> the caller isn't an AWS service.</li>
+					<li><strong>The exception is controlled centrally:</strong> pair the RCP with an SCP that denies <code>iam:TagRole</code> and <code>iam:UntagRole</code> for the <code>dp:exclude:identity</code> key, except for the platform team, so account admins can't exempt their own roles.</li>
+				</ul>
+
+				<h4>Rolling out an RCP safely</h4>
+				<ol class="flow">
+					<li><span class="name">Find today's external access</span><span class="desc">IAM Access Analyzer external access findings list resources already shared outside the organization; each one either needs an exception or is a finding to fix.</span></li>
+					<li><span class="name">Attach to test accounts first</span><span class="desc">Then to lower OUs, then upwards. AWS strongly recommends not attaching an untested RCP to the root.</span></li>
+					<li><span class="name">Watch for denials</span><span class="desc">CloudTrail <code>AccessDenied</code> errors on the protected resources show callers the RCP blocked.</span></li>
+				</ol>
+
+				<h4>SCPs and RCPs side by side</h4>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Aspect</th><th>SCP</th><th>RCP</th></tr></thead>
+						<tbody>
+							<tr><td>Limits</td><td data-label="SCP">What principals in member accounts can do</td><td data-label="RCP">What anyone can do to resources in member accounts</td></tr>
+							<tr><td>Typical use</td><td data-label="SCP">Region limits, protecting security services, blocking risky actions</td><td data-label="RCP">Data perimeter, HTTPS only, blocking outside access</td></tr>
+							<tr><td>Effects you can write</td><td data-label="SCP">Allow and Deny</td><td data-label="RCP">Deny only</td></tr>
+							<tr><td><code>Principal</code></td><td data-label="SCP">Not supported; use <code>aws:PrincipalArn</code></td><td data-label="RCP">Required, always <code>"*"</code></td></tr>
+							<tr><td>Default policy</td><td data-label="SCP"><code>FullAWSAccess</code> (can be replaced)</td><td data-label="RCP"><code>RCPFullAWSAccess</code> (can't be detached)</td></tr>
+							<tr><td>Size, number</td><td data-label="SCP">10,240 characters, 10 per target</td><td data-label="RCP">5,120 characters, 5 per target</td></tr>
+							<tr><td>Services</td><td data-label="SCP">All</td><td data-label="RCP">Supported services only</td></tr>
+							<tr><td>Not applied to</td><td data-label="SCP">Management account, service-linked roles</td><td data-label="RCP">Management account resources, service-linked roles, AWS managed KMS keys</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>"Users in our accounts must not be able to do X" is an <strong>SCP</strong>. "Nobody outside our organization may access our data, even if a bucket policy allows it" is an <strong>RCP</strong>. A full data perimeter uses both, plus VPC endpoint policies for network paths. More examples are in the <a href="snippets/scp-rcp.html">SCP and RCP snippets</a>.</p></div>
 			</div>
 
 			<div class="item" id="cross-account">
