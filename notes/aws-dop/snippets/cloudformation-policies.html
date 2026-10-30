@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Snippets: CloudFormation resource policies | AWS DOP-C02 Notes</title>
+	<meta name="description" content="DOP-C02 snippets: CloudFormation DeletionPolicy and UpdateReplacePolicy, CreationPolicy with cfn-signal, Auto Scaling UpdatePolicy and stack policies, annotated.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Snippets</a><span class="sep">/</span><span class="here">CloudFormation resource policies</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Snippets</span>
+		<h1>CloudFormation resource policies</h1>
+		<p>DeletionPolicy, UpdateReplacePolicy, CreationPolicy, UpdatePolicy and stack policies. Each snippet shows when to use it, the code with comments, and the detail that usually decides the exam answer.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">CloudFormation</span><span class="tag">YAML</span><span class="tag">4 snippets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#keep-data-when-a-resource-is-deleted-or-replaced">Keep data when a resource is deleted or replaced</a></li>
+				<li><a href="#wait-for-instances-to-finish-bootstrapping">Wait for instances to finish bootstrapping</a></li>
+				<li><a href="#roll-out-a-new-launch-template-to-an-auto-scaling-group">Roll out a new launch template to an Auto Scaling group</a></li>
+				<li><a href="#protect-critical-resources-from-updates-stack-policy">Protect critical resources from updates (stack policy)</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<p>Attributes on a resource that control what happens when it's created, updated, replaced or deleted.</p>
+
+			<div class="snippet" id="keep-data-when-a-resource-is-deleted-or-replaced">
+				<h3>Keep data when a resource is deleted or replaced</h3>
+				<p class="use"><b>Use when</b>Databases, buckets and volumes must survive stack deletion or an update that replaces them.</p>
+<pre><code><span class="k">OrdersDb:</span>
+  <span class="k">Type:</span> AWS::RDS::DBInstance
+  <span class="k">DeletionPolicy:</span> Snapshot            <span class="c"># on stack delete or removal from template: Delete | Retain | RetainExceptOnCreate | Snapshot</span>
+  <span class="k">UpdateReplacePolicy:</span> Snapshot       <span class="c"># when an update replaces it with a new resource</span>
+  <span class="k">Properties:</span>
+    ...</code></pre>
+				<p class="watch"><b>Watch for</b><code>Snapshot</code> works only on resources that support snapshots (RDS, EBS volumes, ElastiCache, Redshift, Neptune, DocumentDB). S3 buckets use <code>Retain</code>.</p>
+			</div>
+
+			<div class="snippet" id="wait-for-instances-to-finish-bootstrapping">
+				<h3>Wait for instances to finish bootstrapping</h3>
+				<p class="use"><b>Use when</b>The stack should succeed only after the application on new instances is actually running.</p>
+<pre><code><span class="k">WebAsg:</span>
+  <span class="k">Type:</span> AWS::AutoScaling::AutoScalingGroup
+  <span class="k">CreationPolicy:</span>
+    <span class="k">ResourceSignal:</span>
+      <span class="k">Count:</span> 2                         <span class="c"># signals needed</span>
+      <span class="k">Timeout:</span> PT15M                    <span class="c"># fail (and roll back) if not received</span>
+  <span class="k">Properties:</span>
+    ...
+
+<span class="c"># at the end of the instance user data:</span>
+<span class="c"># /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebAsg --region ${AWS::Region}</span></code></pre>
+				<p class="watch"><b>Watch for</b>"Stack times out waiting for signals" means the user data failed, <code>cfn-signal</code> isn't installed, or the instance can't reach the CloudFormation endpoint.</p>
+			</div>
+
+			<div class="snippet" id="roll-out-a-new-launch-template-to-an-auto-scaling-group">
+				<h3>Roll out a new launch template to an Auto Scaling group</h3>
+				<p class="use"><b>Use when</b>Updating instances gradually during a stack update, keeping capacity.</p>
+<pre><code><span class="k">WebAsg:</span>
+  <span class="k">Type:</span> AWS::AutoScaling::AutoScalingGroup
+  <span class="k">UpdatePolicy:</span>
+    <span class="k">AutoScalingRollingUpdate:</span>          <span class="c"># replace instances in batches</span>
+      <span class="k">MinInstancesInService:</span> 2
+      <span class="k">MaxBatchSize:</span> 1
+      <span class="k">PauseTime:</span> PT10M
+      <span class="k">WaitOnResourceSignals:</span> true      <span class="c"># each new instance must cfn-signal</span>
+    <span class="c"># or AutoScalingReplacingUpdate: { WillReplace: true }  -- a whole new group, then swap (fast rollback)</span></code></pre>
+				<p class="watch"><b>Watch for</b><strong>Rolling</strong> updates in place batch by batch; <strong>replacing</strong> creates a new group and deletes the old one only on success, so rollback is quick.</p>
+			</div>
+
+			<div class="snippet" id="protect-critical-resources-from-updates-stack-policy">
+				<h3>Protect critical resources from updates (stack policy)</h3>
+				<p class="use"><b>Use when</b>Nobody should replace or delete the production database through a stack update by accident.</p>
+<pre><code>{
+  "Statement": [
+    { "Effect": "Allow", "Principal": "*", "Action": "Update:*", "Resource": "*" },
+    {
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["Update:Replace", "Update:Delete"],
+      "Resource": "LogicalResourceId/OrdersDb"
+    }
+  ]
+}</code></pre>
+				<p class="watch"><b>Watch for</b>Once a stack policy exists, anything not explicitly allowed is denied, so include the allow-all statement. Termination protection is separate: it blocks deleting the whole stack.</p>
+			</div>
+
+			<nav class="pager" aria-label="Snippets navigation">
+				<a href="index.html"><small>Back</small>All snippets</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+<script src="copy.js"></script>
+
+</body>
+</html>
