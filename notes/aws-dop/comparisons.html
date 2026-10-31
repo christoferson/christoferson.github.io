@@ -49,12 +49,15 @@
 				<li><a href="#db">Database availability options</a></li>
 				<li><a href="#scaling">Scaling options</a></li>
 				<li><a href="#messaging">Event routing and messaging</a></li>
+				<li><a href="#queues">Queues and streams in detail</a></li>
 				<li><a href="#iac">Infrastructure as code and sharing</a></li>
 				<li><a href="#config">Configuration and parameters</a></li>
 				<li><a href="#observe">Monitoring, logging and auditing</a></li>
 				<li><a href="#security">Security detection services</a></li>
 				<li><a href="#policies">Permission policy types</a></li>
 				<li><a href="#network">Network controls, load balancers and DNS routing</a></li>
+				<li><a href="#endpoints">VPC endpoints</a></li>
+				<li><a href="#connectivity">Connecting networks</a></li>
 				<li><a href="#encryption">Encryption options</a></li>
 				<li><a href="#backup">Backup and replication</a></li>
 				<li><a href="#compute">Compute platforms</a></li>
@@ -287,6 +290,51 @@
 			</div>
 			<div class="callout tip"><p>A common combination is <strong>SNS to several SQS queues</strong> (fan-out with buffering). "Respond when an EC2 instance changes state or a CodePipeline stage fails" is <strong>EventBridge</strong>.</p></div>
 
+			<h2 id="queues">Queues and streams in detail</h2>
+			<p>SQS queues hand each message to one consumer and delete it when processed. Kinesis Data Streams keeps an ordered log that many consumers read independently. Data Firehose delivers a stream to a destination without consumer code.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th></th><th>SQS standard</th><th>SQS FIFO</th></tr></thead>
+					<tbody>
+						<tr><td>Ordering</td><td data-label="SQS standard">Best effort; messages can arrive out of order</td><td data-label="SQS FIFO">Strict order within a message group (<code>MessageGroupId</code>)</td></tr>
+						<tr><td>Delivery</td><td data-label="SQS standard">At least once: occasional duplicates, so consumers must be idempotent</td><td data-label="SQS FIFO">Exactly-once processing: duplicates within a 5-minute window are dropped (content-based or <code>MessageDeduplicationId</code>)</td></tr>
+						<tr><td>Throughput</td><td data-label="SQS standard">Nearly unlimited</td><td data-label="SQS FIFO">300 API calls per second per action, or 3,000 messages per second with batches of 10; high throughput mode goes much higher, depending on the Region</td></tr>
+						<tr><td>Parallelism</td><td data-label="SQS standard">Any number of consumers on any message</td><td data-label="SQS FIFO">One message group is processed in order by one consumer at a time; more groups means more parallelism</td></tr>
+						<tr><td>Dead-letter queue</td><td data-label="SQS standard">Standard queue</td><td data-label="SQS FIFO">Must also be FIFO</td></tr>
+						<tr><td>Name</td><td data-label="SQS standard">Any</td><td data-label="SQS FIFO">Must end in <code>.fifo</code></td></tr>
+						<tr><td>Use when</td><td data-label="SQS standard">High volume, order doesn't matter (image processing, fan-out work)</td><td data-label="SQS FIFO">Order and no duplicates matter (payments per account, inventory updates per item)</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>SQS setting</th><th>Range</th></tr></thead>
+					<tbody>
+						<tr><td>Message size</td><td data-label="Range">Up to 1 MiB; larger payloads go to S3 with the Extended Client Library (message holds a pointer)</td></tr>
+						<tr><td>Retention</td><td data-label="Range">1 minute to 14 days (default 4 days)</td></tr>
+						<tr><td>Visibility timeout</td><td data-label="Range">0 seconds to 12 hours (default 30 seconds): how long a received message stays hidden before it can be received again</td></tr>
+						<tr><td>Delay</td><td data-label="Range">0 to 15 minutes, per queue or per message (per-message timers are standard queues only)</td></tr>
+						<tr><td>Long polling</td><td data-label="Range">Wait up to 20 seconds for messages, which cuts empty receives and cost</td></tr>
+						<tr><td>Batch</td><td data-label="Range">Up to 10 messages per send, receive or delete call</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th></th><th>SQS</th><th>Kinesis Data Streams</th><th>Amazon Data Firehose</th></tr></thead>
+					<tbody>
+						<tr><td>Model</td><td data-label="SQS">Queue: each message processed once, then deleted</td><td data-label="Kinesis Data Streams">Ordered log per shard; records stay until retention ends</td><td data-label="Amazon Data Firehose">Managed delivery to a destination</td></tr>
+						<tr><td>Consumers</td><td data-label="SQS">Competing consumers share the work</td><td data-label="Kinesis Data Streams">Many independent consumers each read everything (up to 20 with enhanced fan-out per stream)</td><td data-label="Amazon Data Firehose">None to write: S3, Redshift, OpenSearch, Splunk, HTTP endpoints</td></tr>
+						<tr><td>Ordering</td><td data-label="SQS">FIFO only</td><td data-label="Kinesis Data Streams">Per shard (by partition key)</td><td data-label="Amazon Data Firehose">Not applicable</td></tr>
+						<tr><td>Replay</td><td data-label="SQS">No (once deleted, gone)</td><td data-label="Kinesis Data Streams">Yes, within retention (24 hours to 365 days)</td><td data-label="Amazon Data Firehose">No</td></tr>
+						<tr><td>Capacity</td><td data-label="SQS">Automatic</td><td data-label="Kinesis Data Streams">Shards (1 MB/s or 1,000 records/s in, 2 MB/s out each) or on-demand mode</td><td data-label="Amazon Data Firehose">Automatic; buffers by size and time before delivery</td></tr>
+						<tr><td>Record size</td><td data-label="SQS">Up to 1 MiB</td><td data-label="Kinesis Data Streams">Up to 10 MiB</td><td data-label="Amazon Data Firehose">Up to 1,000 KiB</td></tr>
+						<tr><td>Use when</td><td data-label="SQS">Decoupling services, buffering work, absorbing spikes</td><td data-label="Kinesis Data Streams">Real-time analytics, several consumers of the same data, replay</td><td data-label="Amazon Data Firehose">Loading logs or events into storage with no code</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Several applications must each process every event, and be able to reprocess the last day" is <strong>Kinesis Data Streams</strong>. "Decouple the order service from the shipping service and absorb spikes" is <strong>SQS</strong>. "Deliver CloudWatch Logs or clickstream data to S3 as Parquet" is <strong>Data Firehose</strong>.</p></div>
+
 			<h2 id="iac">Infrastructure as code and sharing</h2>
 			<div class="table-wrap">
 				<table class="stack labeled">
@@ -439,6 +487,61 @@
 					</tbody>
 				</table>
 			</div>
+
+			<h2 id="endpoints">VPC endpoints</h2>
+			<p>Endpoints let resources in private subnets reach AWS services (or your own services) without an internet gateway, NAT or public IP addresses.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th></th><th>Gateway endpoint</th><th>Interface endpoint (PrivateLink)</th><th>Gateway Load Balancer endpoint</th></tr></thead>
+					<tbody>
+						<tr><td>Services</td><td data-label="Gateway endpoint">S3 and DynamoDB only</td><td data-label="Interface endpoint (PrivateLink)">Most AWS services, your own services behind an NLB, and partner services</td><td data-label="Gateway Load Balancer endpoint">Your inspection appliances behind a Gateway Load Balancer</td></tr>
+						<tr><td>How traffic gets there</td><td data-label="Gateway endpoint">A route in the subnet's route table (prefix list as destination)</td><td data-label="Interface endpoint (PrivateLink)">Network interfaces with private IPs in your subnets; private DNS makes the normal service name resolve to them</td><td data-label="Gateway Load Balancer endpoint">A route table entry sends traffic through the endpoint to the appliances</td></tr>
+						<tr><td>Controls</td><td data-label="Gateway endpoint">Endpoint policy</td><td data-label="Interface endpoint (PrivateLink)">Endpoint policy and security groups</td><td data-label="Gateway Load Balancer endpoint">Route tables</td></tr>
+						<tr><td>Reachable from on premises or peered VPCs</td><td data-label="Gateway endpoint">No</td><td data-label="Interface endpoint (PrivateLink)">Yes, over Direct Connect, VPN or peering</td><td data-label="Gateway Load Balancer endpoint">Not applicable</td></tr>
+						<tr><td>Cost</td><td data-label="Gateway endpoint">Free</td><td data-label="Interface endpoint (PrivateLink)">Per hour per AZ, plus per GB</td><td data-label="Gateway Load Balancer endpoint">Per hour plus per GB</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Pattern</th><th>How</th></tr></thead>
+					<tbody>
+						<tr><td>Restrict a bucket to the VPC</td><td data-label="How">Bucket policy denying requests where <code>aws:SourceVpce</code> isn't your endpoint (keep an exception for administrators)</td></tr>
+						<tr><td>Restrict what the VPC can reach</td><td data-label="How">Endpoint policy allowing only your organization's buckets (<code>aws:ResourceOrgID</code>)</td></tr>
+						<tr><td>S3 from on premises privately</td><td data-label="How">An S3 <strong>interface</strong> endpoint, reached over Direct Connect or VPN; the gateway endpoint can't be used from outside the VPC</td></tr>
+						<tr><td>Share one set of interface endpoints</td><td data-label="How">Centralize them in a shared services VPC behind Transit Gateway, with Route 53 private hosted zones for the DNS names</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>A private subnet with a gateway endpoint to S3 still can't reach <strong>other</strong> services (for example, ECR, CloudWatch Logs, Secrets Manager): each needs its own interface endpoint, or a NAT gateway. "ECS tasks in private subnets can't pull images" often means the ECR (<code>ecr.api</code>, <code>ecr.dkr</code>) and S3 endpoints are missing.</p></div>
+
+			<h2 id="connectivity">Connecting networks</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>Connects</th><th>Transitive routing</th><th>Encrypted</th><th>Use when</th></tr></thead>
+					<tbody>
+						<tr><td>VPC peering</td><td data-label="Connects">Two VPCs (any account, any Region)</td><td data-label="Transitive routing">No: A&ndash;B and B&ndash;C doesn't give A&ndash;C; CIDRs can't overlap</td><td data-label="Encrypted">Traffic stays on the AWS network</td><td data-label="Use when">A few VPCs that need full connectivity, lowest cost per GB</td></tr>
+						<tr><td>Transit Gateway</td><td data-label="Connects">Many VPCs, VPNs and Direct Connect through a hub</td><td data-label="Transitive routing">Yes, controlled by route tables; peers with Transit Gateways in other Regions</td><td data-label="Encrypted">Stays on the AWS network</td><td data-label="Use when">Tens or hundreds of VPCs, central inspection or egress, segmentation</td></tr>
+						<tr><td>PrivateLink</td><td data-label="Connects">Consumers to one service, one direction</td><td data-label="Transitive routing">Not applicable; overlapping CIDRs are fine</td><td data-label="Encrypted">Stays on the AWS network</td><td data-label="Use when">Exposing a service to other VPCs or accounts without opening networks to each other</td></tr>
+						<tr><td>Site-to-Site VPN</td><td data-label="Connects">On premises to a virtual private gateway or Transit Gateway</td><td data-label="Transitive routing">Through Transit Gateway</td><td data-label="Encrypted">Yes, IPsec</td><td data-label="Use when">Quick setup over the internet; backup for Direct Connect</td></tr>
+						<tr><td>Direct Connect</td><td data-label="Connects">On premises to AWS over a private dedicated link</td><td data-label="Transitive routing">Through a Direct Connect gateway and Transit Gateway</td><td data-label="Encrypted">Not by default; MACsec on dedicated connections, or VPN over Direct Connect</td><td data-label="Use when">Consistent bandwidth and latency, large data transfer; takes weeks to provision</td></tr>
+						<tr><td>Client VPN</td><td data-label="Connects">Individual users to a VPC</td><td data-label="Transitive routing">Not applicable</td><td data-label="Encrypted">Yes, TLS</td><td data-label="Use when">Remote staff access with certificate, Active Directory or SAML authentication</td></tr>
+						<tr><td>Cloud WAN</td><td data-label="Connects">Global network of Regions and sites from one policy</td><td data-label="Transitive routing">Yes, by segments</td><td data-label="Encrypted">Stays on the AWS network</td><td data-label="Use when">Large multi-Region networks managed centrally</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Direct Connect resilience</th><th>Setup</th></tr></thead>
+					<tbody>
+						<tr><td>Development</td><td data-label="Setup">One connection at one location</td></tr>
+						<tr><td>High resiliency</td><td data-label="Setup">Two connections at two different locations</td></tr>
+						<tr><td>Maximum resiliency</td><td data-label="Setup">Two connections at each of two locations (four in total)</td></tr>
+						<tr><td>Cost-effective backup</td><td data-label="Setup">One Direct Connect connection plus a Site-to-Site VPN as failover</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Encrypt traffic over Direct Connect" is <strong>MACsec</strong> (dedicated connections) or an <strong>IPsec VPN over Direct Connect</strong>. "Connect 200 VPCs and on premises with central control" is <strong>Transit Gateway</strong>. "Let other accounts use our API without network-level access, even with overlapping CIDRs" is <strong>PrivateLink</strong>.</p></div>
 
 			<h2 id="encryption">Encryption options</h2>
 			<div class="table-wrap">
