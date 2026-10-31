@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Database Changes with No Downtime | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: an RDS for PostgreSQL major version upgrade with Amazon RDS Blue/Green Deployments and switchover guardrails, and schema changes shipped through CodePipeline with expand/contract migrations run by CodeBuild.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Database changes</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Database changes with no downtime</h1>
+		<p>An orders application runs on Amazon RDS for PostgreSQL. Two kinds of change keep coming: platform changes (a new major engine version, a bigger instance class) and schema changes that ship with every release. Both must happen with about a minute of interruption at most, and both need a way back if something goes wrong.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Amazon RDS</span><span class="tag">Blue/Green Deployments</span><span class="tag">CodePipeline</span><span class="tag">CodeBuild</span><span class="tag">Secrets Manager</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Prepare the source database</a></li>
+				<li class="sub"><a href="#b2">2. Create the blue/green deployment</a></li>
+				<li class="sub"><a href="#b3">3. Switch over</a></li>
+				<li class="sub"><a href="#b4">4. Migration build</a></li>
+				<li class="sub"><a href="#b5">5. Pipeline stage order</a></li>
+				<li class="sub"><a href="#b6">6. Expand and contract</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The database is <code>orders-db</code>, a Multi-AZ RDS for PostgreSQL DB instance. The application connects through the instance endpoint. Platform changes happen a few times a year; schema changes go out with application releases, several times a week.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Major version upgrade and instance class change with minimal downtime</td><td data-label="Design choice">Amazon RDS Blue/Green Deployments: a synchronized copy is upgraded and tested, then switched over</td></tr>
+						<tr><td>Test the upgraded database with production data first</td><td data-label="Design choice">The green environment stays in sync with production and can be tested read-only</td></tr>
+						<tr><td>No application configuration change</td><td data-label="Design choice">Switchover renames the green instance and endpoint to the production names</td></tr>
+						<tr><td>No data loss and no surprise long outage</td><td data-label="Design choice">Switchover guardrails and a switchover timeout; a switchover that can't finish in time is rolled back</td></tr>
+						<tr><td>Schema changes released with the code, through the pipeline</td><td data-label="Design choice">A CodeBuild step runs versioned migrations (Flyway) before the application deploys</td></tr>
+						<tr><td>A release can roll back without a database rollback</td><td data-label="Design choice">Only backward-compatible migrations per release: expand first, contract in a later release</td></tr>
+						<tr><td>No database passwords in the pipeline</td><td data-label="Design choice">Credentials read from Secrets Manager by CodeBuild at run time</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, both in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Tooling</td><td data-label="ID"><code>111111111111</code></td><td data-label="What lives there">CodePipeline and the artifact bucket</td></tr>
+						<tr><td>Production</td><td data-label="ID"><code>222222222222</code></td><td data-label="What lives there"><code>orders-db</code>, its secret <code>prod/orders/db-migrator</code>, the migration CodeBuild project (in the database's VPC) and the application</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> are done by RDS or CodeBuild on their own; steps marked <span class="who">You</span> are actions you start; <span class="who">Pipeline</span> marks pipeline stages.</p>
+			<ol class="flow">
+				<li class="group">Part A: engine upgrade with a blue/green deployment</li>
+				<li><span class="name">Create the blue/green deployment<span class="who">You</span></span><span class="desc">Name the source (blue) instance and the target engine version, parameter group and instance class for the copy (green).</span></li>
+				<li class="auto"><span class="name">Green is built and kept in sync<span class="who auto">AWS</span></span><span class="desc">RDS copies the topology (Multi-AZ, read replicas, monitoring settings) and replicates from blue to green. For a PostgreSQL major version upgrade, it uses logical replication.</span></li>
+				<li><span class="name">Test green<span class="who">You</span></span><span class="desc">Green is read-only by default. Run read-only tests and performance checks against its own endpoint while production keeps running on blue.</span></li>
+				<li><span class="name">Start the switchover<span class="who">You</span></span><span class="desc">At a quiet time, with a timeout, for example 600 seconds.</span></li>
+				<li class="auto"><span class="name">Guardrails are checked<span class="who auto">AWS</span></span><span class="desc">Replication is healthy, replica lag is small enough, there are no long-running writes or DDL on blue, and (with logical replication) no unsupported changes such as DDL.</span></li>
+				<li class="auto"><span class="name">Writes stop and replication catches up<span class="who auto">AWS</span></span><span class="desc">New writes stop on both environments and connections are dropped, so green holds every committed change.</span></li>
+				<li class="auto"><span class="name">Names and endpoints swap<span class="who auto">AWS</span></span><span class="desc"><code>orders-db-green-…</code> becomes <code>orders-db</code> with the production endpoint; blue becomes <code>orders-db-old1</code>. Writes resume on the new production instance, typically within a minute.</span></li>
+				<li><span class="name">Keep the old instance for a while<span class="who">You</span></span><span class="desc"><code>orders-db-old1</code> isn't deleted. Keep it for regression comparisons and for its point-in-time recovery history, then delete it.</span></li>
+				<li class="group">Part B: a schema change in a release</li>
+				<li><span class="name">Commit migration and code together<span class="who">Pipeline</span></span><span class="desc">The release contains <code>V42__add_order_status.sql</code> and the code that uses it.</span></li>
+				<li class="auto"><span class="name">Migrate<span class="who auto">AWS</span></span><span class="desc">A CodeBuild project inside the VPC reads the migrator credentials from Secrets Manager and runs Flyway, which applies only migrations not yet recorded in its history table.</span></li>
+				<li><span class="name">Deploy the application<span class="who">Pipeline</span></span><span class="desc">Only after the migration succeeds. Old and new application versions both work with the expanded schema during the rollout.</span></li>
+				<li><span class="name">Contract later<span class="who">Pipeline</span></span><span class="desc">When no running version needs the old shape, a later release removes it.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Prepare the source database</h3>
+				<p>RDS for PostgreSQL uses <strong>physical replication</strong> for most blue/green deployments, and <strong>logical replication</strong> when you request a major version upgrade on a supported source version (Amazon RDS User Guide, <em>PostgreSQL replication methods for blue/green deployments</em>). A major version upgrade therefore needs logical replication prepared on blue:</p>
+				<ol class="flow">
+					<li><span class="name">Automated backups on</span><span class="desc">Required for blue/green deployments.</span></li>
+					<li><span class="name">A custom parameter group with <code>rds.logical_replication = 1</code></span><span class="desc">Also size <code>max_replication_slots</code>, <code>max_wal_senders</code>, <code>max_logical_replication_workers</code> and <code>max_worker_processes</code>: each database needs its own slot and worker. Reboot so the instance is in sync with its parameter group, or creation fails.</span></li>
+					<li><span class="name">A primary key on every table</span><span class="desc">Logical replication can't replicate <code>UPDATE</code> or <code>DELETE</code> on tables without one.</span></li>
+					<li><span class="name">No external replication</span><span class="desc">Blue can't be the source or target of self-managed replication.</span></li>
+				</ol>
+				<span class="file">orders-pg16-params.yaml (parameter group for blue)</span>
+<pre><code><span class="k">OrdersPgParams:</span>
+  <span class="k">Type:</span> AWS::RDS::DBParameterGroup
+  <span class="k">Properties:</span>
+    <span class="k">Family:</span> postgres16
+    <span class="k">Description:</span> orders-db with logical replication for blue/green
+    <span class="k">Parameters:</span>
+      <span class="k">rds.logical_replication:</span> "1"   <span class="c"># static: needs a reboot</span>
+      <span class="k">max_replication_slots:</span> "20"
+      <span class="k">max_wal_senders:</span> "20"
+      <span class="k">max_logical_replication_workers:</span> "10"
+      <span class="k">max_worker_processes:</span> "20"</code></pre>
+				<p>Logical replication doesn't carry everything over, so plan around these while the deployment exists: <strong>DDL</strong> on blue isn't replicated (and blocks switchover), <strong>large objects</strong> aren't replicated, <strong>sequence</strong> values are adjusted by RDS at switchover, <strong>materialized views</strong> must be refreshed on green, and unlogged tables aren't copied (Amazon RDS User Guide, <em>Limitations and considerations for Amazon RDS blue/green deployments</em>).</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Create the blue/green deployment</h3>
+<pre><code>aws rds create-blue-green-deployment \
+  --blue-green-deployment-name orders-pg17-upgrade \
+  --source arn:aws:rds:us-east-1:222222222222:db:orders-db \
+  --target-engine-version 17.4 \
+  --target-db-parameter-group-name orders-pg17-params \
+  --target-db-instance-class db.r7g.xlarge
+<span class="c"># returns a BlueGreenDeploymentIdentifier such as bgd-1234567890abcdef</span></code></pre>
+				<ul>
+					<li><strong>Parameter group:</strong> the target group must match the new major version's family; without one, green keeps blue's group.</li>
+					<li><strong>Testing green:</strong> connect to green's own endpoint for read-only tests. Green is read-only by default; with logical replication, writes can be enabled per session, but the docs warn they can cause replication conflicts and unexpected data after switchover. With physical replication, green can't accept writes at all.</li>
+					<li><strong>Monitoring:</strong> watch the <code>ReplicaLag</code> metric on green before switching over.</li>
+				</ul>
+				<div class="callout note"><p>Blue/green deployments aren't supported through <strong>CloudFormation</strong>, and also not with cross-Region or cascading read replicas or Multi-AZ DB clusters (Amazon RDS User Guide, <em>Limitations and considerations for Amazon RDS blue/green deployments</em>). Run them with the CLI, API or console. If <code>orders-db</code> is managed by a stack, keep the stack's engine version and instance class matching what you switched to, so the next stack update doesn't try to change them back.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Switch over</h3>
+<pre><code>aws rds switchover-blue-green-deployment \
+  --blue-green-deployment-identifier bgd-1234567890abcdef \
+  --switchover-timeout 600   <span class="c"># 30 to 3,600 seconds; default 300</span></code></pre>
+				<ul>
+					<li><strong>Guardrails:</strong> on green, replication health, replica lag and no active writes; on blue, no external replication, no long-running writes or DDL, and (logical replication) no unsupported changes. If a guardrail fails, the switchover doesn't start.</li>
+					<li><strong>Timeout:</strong> if the switchover takes longer than the timeout, every change is rolled back and both environments stay as they were.</li>
+					<li><strong>Clients:</strong> keep DNS caching at or below RDS's five-second TTL, or clients keep writing to the old instance. RDS Proxy (registered with blue before creating the deployment) and AWS smart drivers detect the change without waiting for DNS.</li>
+					<li><strong>Afterwards:</strong> the old primary stays read-only. Point-in-time recovery of the new production instance starts from when green was created, so keep <code>orders-db-old1</code> for at least your recovery window; restore it by its resource ID, because its name changed.</li>
+					<li><strong>Events:</strong> switchover progress is published as blue/green deployment events, so an EventBridge rule can notify the team.</li>
+				</ul>
+				<p>The launch post on the AWS News Blog walks through the same flow end to end: <a href="https://aws.amazon.com/blogs/aws/new-fully-managed-blue-green-deployments-in-amazon-aurora-and-amazon-rds/">New &ndash; Fully Managed Blue/Green Deployments in Amazon Aurora and Amazon RDS</a>.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Migration build</h3>
+				<p>The migration runs in a CodeBuild project attached to the database's VPC (private subnets, a security group the database accepts on port 5432). The <code>secrets-manager</code> mapping injects the secret's fields as environment variables, so no credential is stored in the project or the repository.</p>
+				<span class="file">buildspec-migrate.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">env:</span>
+  <span class="k">secrets-manager:</span>   <span class="c"># secret-id:json-key</span>
+    <span class="k">DB_HOST:</span> prod/orders/db-migrator:host
+    <span class="k">DB_USER:</span> prod/orders/db-migrator:username
+    <span class="k">DB_PASSWORD:</span> prod/orders/db-migrator:password
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">commands:</span>
+      - ./scripts/install-flyway.sh   <span class="c"># pinned Flyway version</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - flyway
+          -url=jdbc:postgresql://${DB_HOST}:5432/orders
+          -user=${DB_USER}
+          -password=${DB_PASSWORD}
+          -locations=filesystem:db/migrations
+          migrate
+      - flyway info -url=jdbc:postgresql://${DB_HOST}:5432/orders -user=${DB_USER} -password=${DB_PASSWORD}</code></pre>
+				<ul>
+					<li>Flyway records each applied migration in a history table, so re-running the step after a failure applies only what's missing.</li>
+					<li>The project's role needs <code>secretsmanager:GetSecretValue</code> on the secret (and <code>kms:Decrypt</code> if it uses a customer managed key); the VPC needs a Secrets Manager interface endpoint or a NAT gateway.</li>
+					<li>Liquibase works the same way; what matters is versioned, repeatable migrations run by the pipeline, not by hand.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Pipeline stage order</h3>
+				<p>In the production stage, the migration runs before the application deploy, through a role in <code>222222222222</code>:</p>
+				<span class="file">pipeline.yaml (production stage, excerpt)</span>
+<pre><code>- <span class="k">Name:</span> Production
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> MigrateSchema
+      <span class="k">RunOrder:</span> 1
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Build
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> CodeBuild
+        <span class="k">Version:</span> "1"
+      <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/PipelineDeployRole
+      <span class="k">InputArtifacts:</span>
+        - <span class="k">Name:</span> SourceOutput
+      <span class="k">Configuration:</span>
+        <span class="k">ProjectName:</span> orders-db-migrate   <span class="c"># project in 222222222222, in the VPC</span>
+
+    - <span class="k">Name:</span> DeployApp
+      <span class="k">RunOrder:</span> 2   <span class="c"># only if the migration succeeded</span>
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Deploy
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> CodeDeploy
+        <span class="k">Version:</span> "1"
+      <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/PipelineDeployRole
+      <span class="k">InputArtifacts:</span>
+        - <span class="k">Name:</span> BuildOutput
+      <span class="k">Configuration:</span>
+        <span class="k">ApplicationName:</span> orders
+        <span class="k">DeploymentGroupName:</span> orders-prod</code></pre>
+				<p>If the migration fails, the stage stops and the running application is untouched. Because each migration is backward-compatible, the application can be rolled back without undoing the schema.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Expand and contract</h3>
+				<p>During a rolling, canary or blue/green application deployment, old and new code run at the same time against one database. Every release must therefore work with both the schema it found and the schema it leaves. Renaming <code>status</code> to <code>order_status</code> becomes three releases:</p>
+				<ol class="flow">
+					<li class="group">Release 1: expand</li>
+					<li><span class="name">Add, don't change</span><span class="desc">Add the new column, nullable or with a default; the code writes both columns and reads the new one when it's set.</span></li>
+					<li class="group">Release 2: migrate data</li>
+					<li><span class="name">Backfill and switch reads</span><span class="desc">Copy old values in batches; the code now reads and writes only the new column.</span></li>
+					<li class="group">Release 3: contract</li>
+					<li><span class="name">Remove the old shape</span><span class="desc">Once no running version uses it, drop the old column.</span></li>
+				</ol>
+				<span class="file">db/migrations/V42__add_order_status.sql (release 1)</span>
+<pre><code><span class="c">-- expand: old code ignores the new column, new code uses it</span>
+ALTER TABLE orders ADD COLUMN order_status text;
+
+<span class="c">-- build the index without blocking writes</span>
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_order_status
+  ON orders (order_status);</code></pre>
+				<span class="file">db/migrations/V45__drop_old_status.sql (release 3)</span>
+<pre><code><span class="c">-- contract: only after no deployed version reads "status"</span>
+ALTER TABLE orders DROP COLUMN status;</code></pre>
+				<div class="callout trap"><p>A <strong>destructive</strong> change (drop, rename, change a type) in the same release as the code that needs it breaks the <strong>old</strong> version still serving traffic during the rollout, and makes rolling back the application fail. Destructive steps always come in a later release.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Blue/green deployment for engine and instance changes</td><td data-label="Why">The change is made and tested on a synchronized copy; downtime is the switchover, typically under a minute, instead of the whole upgrade</td></tr>
+						<tr><td>Switchover with a timeout</td><td data-label="Why">If replication can't catch up in time, RDS rolls back automatically rather than extending the outage</td></tr>
+						<tr><td>No schema changes while a deployment exists</td><td data-label="Why">With logical replication, DDL on blue isn't replicated and makes switchover unavailable; freeze migrations until the switchover is done</td></tr>
+						<tr><td>Keep the old instance after switchover</td><td data-label="Why">It holds the point-in-time recovery history from before the switchover and is a reference for regression tests</td></tr>
+						<tr><td>Migrations in the pipeline, before the deploy</td><td data-label="Why">The schema change is versioned, reviewed and applied the same way in every environment, and a failure stops the release early</td></tr>
+						<tr><td>Expand/contract</td><td data-label="Why">Every release is backward-compatible, so application rollback never needs a database rollback</td></tr>
+						<tr><td>Separate migrator credentials</td><td data-label="Why">The application's database user doesn't need DDL rights; only the migration step does</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>In-place upgrade (modify the instance)</td><td data-label="When it fits better">A maintenance window with longer downtime is acceptable and there's no need to test on a copy first</td></tr>
+						<tr><td>Snapshot restore on the new version, then AWS DMS to catch up</td><td data-label="When it fits better">The change isn't supported by blue/green (for example, moving accounts or engines), at the cost of building and running replication yourself</td></tr>
+						<tr><td>Read replica promotion</td><td data-label="When it fits better">Moving to a new instance on the same engine version; promotion breaks replication and needs the application repointed</td></tr>
+						<tr><td>Aurora Blue/Green Deployments</td><td data-label="When it fits better">The database is Aurora PostgreSQL; the same blue/green approach applies to Aurora clusters</td></tr>
+						<tr><td>Aurora fast database cloning</td><td data-label="When it fits better">Testing a migration against a full-size copy quickly and cheaply before it reaches production</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Rehearse in staging</span><span class="desc">Run the whole blue/green deployment and switchover on a staging copy, and time the write outage seen by the application.</span></li>
+				<li><span class="name">Test green before switching</span><span class="desc">Read-only functional tests and query plans against green's endpoint; compare performance with blue.</span></li>
+				<li><span class="name">Exercise the guardrails</span><span class="desc">In staging, start a switchover during a long-running transaction and confirm it's refused or rolled back within the timeout.</span></li>
+				<li><span class="name">Migrations in a clean database</span><span class="desc">A pipeline test step runs all migrations from scratch on a temporary database, so a broken migration fails before production.</span></li>
+				<li><span class="name">Rollback drill</span><span class="desc">Deploy release N+1 with an expand migration, then roll the application back to N and confirm N still works on the expanded schema.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Deployment strategies</td><td data-label="What this architecture demonstrates">Blue/green for the database tier; backward-compatible schema changes during rolling and canary deployments</td></tr>
+						<tr><td><a href="../d1-task-1-1.html">1.1</a> CI/CD pipelines</td><td data-label="What this architecture demonstrates">A migration action ordered before the deploy action; secrets injected into CodeBuild</td></tr>
+						<tr><td><a href="../d3-task-3-1.html">3.1</a> Highly available solutions</td><td data-label="What this architecture demonstrates">Upgrading a Multi-AZ database with a short, predictable switchover</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Recovery to RTO and RPO</td><td data-label="What this architecture demonstrates">Point-in-time recovery after switchover, keeping the old instance for the recovery window</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Upgrade the RDS database to a new major version with minimal downtime and test it with production data first, without changing application connection strings" is <strong>Amazon RDS Blue/Green Deployments</strong>. "Release schema changes without breaking the version still running" is <strong>expand/contract migrations run by the pipeline before the deploy</strong>.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Container Image Scanning and Deployment Gate | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: ECR basic and enhanced (Amazon Inspector) image scanning, scanning in CodeBuild before push with the Inspector SBOM generator and Scan API, a CodePipeline gate that stops images with CRITICAL or HIGH findings, deploying by digest, and alerts when new CVEs affect images in use.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Image scanning</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Container image scanning and deployment gate</h1>
+		<p>Every container image is checked for known vulnerabilities twice before it can run: once in the build, before it's pushed, and again in Amazon ECR after the push. An image with any CRITICAL or HIGH finding stops the pipeline. Images already running keep being rescanned, and the security team hears about it when a newly published CVE affects one of them.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 1</span><span class="tag">Domain 6</span><span class="tag">Amazon ECR</span><span class="tag">Amazon Inspector</span><span class="tag">CodeBuild</span><span class="tag">CodePipeline</span><span class="tag">EventBridge</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#scan-types">Basic and enhanced scanning</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Registry scanning configuration</a></li>
+				<li class="sub"><a href="#b2">2. Scan in the build, before push</a></li>
+				<li class="sub"><a href="#b3">3. Gate in the pipeline, after push</a></li>
+				<li class="sub"><a href="#b4">4. Deploy by digest</a></li>
+				<li class="sub"><a href="#b5">5. Alert on new CVEs</a></li>
+				<li class="sub"><a href="#b6">6. Track exceptions</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>Teams build container images in CodeBuild, push them to Amazon ECR, and deploy them to Amazon ECS (and some to Amazon EKS). The security team sets the rules below.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Scan OS packages and application dependencies (npm, pip, Maven and so on)</td><td data-label="Design choice">ECR <strong>enhanced scanning</strong> with Amazon Inspector, not basic scanning</td></tr>
+						<tr><td>Find problems as early as possible</td><td data-label="Design choice">Scan the image in CodeBuild with the Inspector SBOM generator and Scan API before it's pushed</td></tr>
+						<tr><td>No image with CRITICAL or HIGH findings reaches staging or production</td><td data-label="Design choice">A pipeline gate (the CodePipeline <code>InspectorScan</code> action) with critical and high thresholds of zero, before every deploy stage</td></tr>
+						<tr><td>The image that was checked is the image that runs</td><td data-label="Design choice">Immutable tags, and deployments that reference the image <strong>digest</strong></td></tr>
+						<tr><td>Re-check deployed images when new CVEs are published</td><td data-label="Design choice">Continuous scanning, plus an EventBridge rule on new CRITICAL findings for images in use</td></tr>
+						<tr><td>Accepted risks are recorded, not silently ignored</td><td data-label="Design choice">Inspector suppression rules managed by the security account, with a written reason</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, all in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Tooling</td><td data-label="ID"><code>111111111111</code></td><td data-label="What lives there">CodePipeline, CodeBuild, the ECR repositories</td></tr>
+						<tr><td>Production</td><td data-label="ID"><code>222222222222</code></td><td data-label="What lives there">ECS services that pull images from the tooling account's ECR</td></tr>
+						<tr><td>Security</td><td data-label="ID"><code>555555555555</code></td><td data-label="What lives there">Amazon Inspector delegated administrator: sees findings for all accounts and owns suppression rules</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="scan-types">Basic and enhanced scanning</h2>
+			<p>ECR offers two scanning types, chosen per Region for the whole private registry (Amazon ECR User Guide, <em>Scan images for software vulnerabilities in Amazon ECR</em>).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Aspect</th><th>Basic scanning</th><th>Enhanced scanning</th></tr></thead>
+					<tbody>
+						<tr><td>Engine</td><td data-label="Basic scanning">AWS native technology using CVE data</td><td data-label="Enhanced scanning">Amazon Inspector</td></tr>
+						<tr><td>What it finds</td><td data-label="Basic scanning">Operating system package vulnerabilities</td><td data-label="Enhanced scanning">OS <strong>and programming language package</strong> vulnerabilities</td></tr>
+						<tr><td>When it scans</td><td data-label="Basic scanning">On push (for repositories matching a filter) or manually; each image at most once per 24 hours</td><td data-label="Enhanced scanning">On push or <strong>continuously</strong> (rescanned as new CVEs appear); manual scans aren't supported</td></tr>
+						<tr><td>Repositories not matching a filter</td><td data-label="Basic scanning">Manual scanning</td><td data-label="Enhanced scanning">Not scanned</td></tr>
+						<tr><td>Where findings appear</td><td data-label="Basic scanning">ECR (<code>DescribeImageScanFindings</code>)</td><td data-label="Enhanced scanning">ECR and the Inspector console and API; also which ECS and EKS clusters use the image</td></tr>
+						<tr><td>EventBridge events</td><td data-label="Basic scanning"><code>ECR Image Scan</code> from <code>aws.ecr</code> when a scan completes</td><td data-label="Enhanced scanning"><code>Inspector2 Scan</code> (initial scan) and <code>Inspector2 Finding</code> (created, updated, closed) from <code>aws.inspector2</code></td></tr>
+						<tr><td>Cost</td><td data-label="Basic scanning">No charge</td><td data-label="Enhanced scanning">No extra ECR charge; Inspector charges per image scanned and rescanned</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<ul>
+				<li><strong>Scan duration:</strong> with enhanced scanning, Inspector keeps rescanning images for a configurable period after push (by default until the image is deleted). When the period ends, the image's scan status becomes <code>SCAN_ELIGIBILITY_EXPIRED</code>.</li>
+				<li><strong>Turning it on later:</strong> when enhanced scanning is first enabled, only images pushed in the <strong>last 14 days</strong> are scanned; older images show <code>SCAN_ELIGIBILITY_EXPIRED</code> and must be pushed again.</li>
+				<li><strong>Switching types:</strong> moving between basic and enhanced means the previous type's scans are no longer available until you switch back.</li>
+			</ul>
+			<p>Basic scanning: scan on push for every repository, and run or read a scan by hand:</p>
+<pre><code>aws ecr put-registry-scanning-configuration \
+  --scan-type BASIC \
+  --rules '[{"repositoryFilters":[{"filter":"*","filterType":"WILDCARD"}],
+             "scanFrequency":"SCAN_ON_PUSH"}]'
+
+aws ecr start-image-scan --repository-name orders --image-id imageTag=1.4.2
+
+aws ecr describe-image-scan-findings --repository-name orders \
+  --image-id imageTag=1.4.2 \
+  --query 'imageScanFindings.findingSeverityCounts'</code></pre>
+			<p>Enhanced scanning: continuous for production repositories, scan on push for everything else. If several filters match a repository, continuous scanning wins:</p>
+<pre><code>aws ecr put-registry-scanning-configuration \
+  --scan-type ENHANCED \
+  --rules '[{"repositoryFilters":[{"filter":"prod","filterType":"WILDCARD"}],
+             "scanFrequency":"CONTINUOUS_SCAN"},
+            {"repositoryFilters":[{"filter":"*","filterType":"WILDCARD"}],
+             "scanFrequency":"SCAN_ON_PUSH"}]'</code></pre>
+			<p>A filter without a wildcard matches any repository name that <em>contains</em> it, so <code>prod</code> matches <code>orders-prod</code> and <code>prod-payments</code>; with <code>*</code>, the wildcard stands for zero or more characters.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen inside AWS services; steps marked <span class="who">Pipeline</span> are stages and actions you define.</p>
+			<ol class="flow">
+				<li class="group">Build</li>
+				<li><span class="name">Build the image<span class="who">Pipeline</span></span><span class="desc">CodeBuild runs <code>docker build</code> for the commit.</span></li>
+				<li><span class="name">Scan before pushing<span class="who">Pipeline</span></span><span class="desc">The Inspector SBOM generator lists the image's packages, the Inspector Scan API checks them, and the build fails on any CRITICAL or HIGH finding. Nothing vulnerable is ever pushed.</span></li>
+				<li><span class="name">Push with an immutable tag<span class="who">Pipeline</span></span><span class="desc">The repository rejects any attempt to reuse a tag, so the tag always means the same digest.</span></li>
+				<li class="group">Gate</li>
+				<li class="auto"><span class="name">Enhanced scan in ECR<span class="who auto">AWS</span></span><span class="desc">Inspector scans the pushed image and records findings for its digest.</span></li>
+				<li><span class="name">Pipeline gate<span class="who">Pipeline</span></span><span class="desc">An <code>InspectorScan</code> action scans the ECR image and fails the stage if critical or high findings exceed zero. Later stages never start.</span></li>
+				<li class="group">Deploy</li>
+				<li><span class="name">Deploy by digest<span class="who">Pipeline</span></span><span class="desc">The ECS task definition references <code>orders@sha256:...</code>, the exact image that passed the gate.</span></li>
+				<li class="group">After deployment</li>
+				<li class="auto"><span class="name">Continuous rescans<span class="who auto">AWS</span></span><span class="desc">When a new CVE is published for a package in the image, Inspector creates a finding and emits an <code>Inspector2 Finding</code> event.</span></li>
+				<li class="auto"><span class="name">Alert on images in use<span class="who auto">AWS</span></span><span class="desc">An EventBridge rule in the security account matches new CRITICAL findings on images that ECS or EKS are running, and notifies the owning team.</span></li>
+				<li><span class="name">Fix forward<span class="who">Pipeline</span></span><span class="desc">The team updates the base image or dependency; the new image passes the same gates and replaces the old one.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Registry scanning configuration and repository</h3>
+				<p>The scanning configuration is a registry-wide resource; the repository adds immutable tags and a lifecycle policy:</p>
+				<span class="file">ecr.yaml (in 111111111111)</span>
+<pre><code><span class="k">ScanningConfiguration:</span>
+  <span class="k">Type:</span> AWS::ECR::RegistryScanningConfiguration
+  <span class="k">Properties:</span>
+    <span class="k">ScanType:</span> ENHANCED
+    <span class="k">Rules:</span>   <span class="c"># at most two rules</span>
+      - <span class="k">ScanFrequency:</span> CONTINUOUS_SCAN
+        <span class="k">RepositoryFilters:</span>
+          - <span class="k">Filter:</span> "*"
+            <span class="k">FilterType:</span> WILDCARD
+
+<span class="k">OrdersRepository:</span>
+  <span class="k">Type:</span> AWS::ECR::Repository
+  <span class="k">Properties:</span>
+    <span class="k">RepositoryName:</span> orders
+    <span class="k">ImageTagMutability:</span> IMMUTABLE   <span class="c"># a tag can't be pushed twice</span>
+    <span class="k">LifecyclePolicy:</span>
+      <span class="k">LifecyclePolicyText:</span> |
+        {
+          "rules": [{
+            "rulePriority": 1,
+            "description": "Keep the last 50 images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 50
+            },
+            "action": { "type": "expire" }
+          }]
+        }</code></pre>
+				<p>Organization-wide, the security account (<code>555555555555</code>) is the Inspector delegated administrator and turns on ECR scanning for every member account, so new accounts are covered too.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Scan in the build, before push</h3>
+				<p>Amazon Inspector's CI/CD integration combines the <strong>Inspector SBOM generator</strong> (<code>inspector-sbomgen</code>), which produces a CycloneDX SBOM for an image, with the <strong>Inspector Scan API</strong> (<code>inspector-scan:ScanSbom</code>), which returns the vulnerabilities in it (Amazon Inspector User Guide, <em>Integrating Amazon Inspector scans into your CI/CD pipeline</em>). Plugins exist for Jenkins, TeamCity, GitHub Actions and GitLab; in CodeBuild, call the two directly. The build role needs <code>inspector-scan:ScanSbom</code>.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">env:</span>
+  <span class="k">variables:</span>
+    <span class="k">REPO:</span> 111111111111.dkr.ecr.us-east-1.amazonaws.com/orders
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">commands:</span>
+      <span class="c"># install the inspector-sbomgen binary (see the Inspector docs)</span>
+      - ./scripts/install-sbomgen.sh
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - TAG=$CODEBUILD_RESOLVED_SOURCE_VERSION
+      - docker build -t $REPO:$TAG .
+      <span class="c"># 1. list every package in the image</span>
+      - ./inspector-sbomgen container --image $REPO:$TAG -o sbom.json
+      <span class="c"># 2. check the packages for known vulnerabilities</span>
+      - aws inspector-scan scan-sbom --sbom file://sbom.json --output-format INSPECTOR > scan.json
+      <span class="c"># 3. fail the build on any CRITICAL or HIGH finding</span>
+      - CRIT=$(jq '.inspector.vulnerability_count.critical' scan.json)
+      - HIGH=$(jq '.inspector.vulnerability_count.high' scan.json)
+      - echo "critical=$CRIT high=$HIGH"
+      - |
+        if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+          echo "Vulnerabilities found; not pushing"; exit 1
+        fi
+      <span class="c"># 4. push only after the check passed (still in the build phase)</span>
+      - aws ecr get-login-password | docker login --username AWS --password-stdin ${REPO%%/*}
+      - docker push $REPO:$TAG
+<span class="k">artifacts:</span>
+  <span class="k">files:</span> [ sbom.json, scan.json ]   <span class="c"># keep the evidence with the build</span></code></pre>
+				<ul>
+					<li><strong>Output formats:</strong> the Scan API returns CycloneDX 1.5 (counts as <code>amazon:inspector:sbom_scanner:critical_vulnerabilities</code> properties) or Inspector JSON (counts under <code>inspector.vulnerability_count</code>), as used above.</li>
+					<li><strong>One command:</strong> <code>inspector-sbomgen container --image ... --scan-sbom</code> generates and scans in a single step.</li>
+				</ul>
+				<div class="callout trap"><p>In a buildspec, <code>post_build</code> commands still run after a failed <code>build</code> phase. A push placed in <code>post_build</code> without checking <code>CODEBUILD_BUILD_SUCCEEDING</code> pushes the vulnerable image anyway, which defeats the gate.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Gate in the pipeline, after push</h3>
+				<p>The CodePipeline <strong><code>InspectorScan</code></strong> action (category Invoke, provider <code>InspectorScan</code>) scans either source code or an ECR image and fails the action when findings exceed the thresholds you set (AWS CodePipeline User Guide, <em>Amazon Inspector InspectorScan invoke action reference</em>). Each threshold is "the number of vulnerabilities beyond which CodePipeline should fail the action", so zero means any finding fails it.</p>
+				<span class="file">pipeline stage (excerpt)</span>
+<pre><code>- <span class="k">Name:</span> SecurityGate
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> ScanImage
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Invoke
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> InspectorScan
+        <span class="k">Version:</span> "1"
+      <span class="k">Namespace:</span> Scan
+      <span class="k">Configuration:</span>
+        <span class="k">InspectorRunMode:</span> ECRImageScan
+        <span class="k">ECRRepositoryName:</span> orders
+        <span class="k">ImageTag:</span> "#{Build.IMAGE_TAG}"   <span class="c"># exported by the build action</span>
+        <span class="k">CriticalThreshold:</span> 0
+        <span class="k">HighThreshold:</span> 0
+      <span class="k">OutputArtifacts:</span>
+        - <span class="k">Name:</span> ScanReport   <span class="c"># SBOM with vulnerability details</span></code></pre>
+				<ul>
+					<li><strong>Output variable:</strong> <code>HighestScannedSeverity</code> (<code>#{Scan.HighestScannedSeverity}</code>) can be used by later actions, for example in a notification.</li>
+					<li><strong>Permissions:</strong> the pipeline role needs <code>inspector-scan:ScanSbom</code> and ECR read actions on the repository. The action runs on managed CodeBuild compute, which is billed separately.</li>
+				</ul>
+				<p>The gate can also be your own CodeBuild step that reads the enhanced findings for the pushed digest. With enhanced scanning, an image's scan status settles at <code>ACTIVE</code> (continuously monitored), not <code>COMPLETE</code>, so a script waits until findings are available rather than for a completed scan:</p>
+<pre><code><span class="c"># findings Inspector holds for this exact image</span>
+aws inspector2 list-findings --filter-criteria '{
+  "ecrImageHash":   [{"comparison":"EQUALS","value":"'"$DIGEST"'"}],
+  "severity":       [{"comparison":"EQUALS","value":"CRITICAL"},
+                     {"comparison":"EQUALS","value":"HIGH"}],
+  "findingStatus":  [{"comparison":"EQUALS","value":"ACTIVE"}]
+}' --query 'length(findings)'</code></pre>
+				<p>With basic scanning, <code>aws ecr wait image-scan-complete</code> followed by <code>describe-image-scan-findings</code> and its <code>findingSeverityCounts</code> does the same job.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Deploy by digest</h3>
+				<p>A tag is only a pointer; a digest identifies the exact image content. Deploying the digest that passed the gate guarantees nothing was swapped in between.</p>
+				<span class="file">imagedefinitions.json (ECS standard deploy action)</span>
+<pre><code>[
+  {
+    "name": "orders",
+    "imageUri": "111111111111.dkr.ecr.us-east-1.amazonaws.com/orders@sha256:4f1c..."
+  }
+]</code></pre>
+				<p>For Amazon EKS, an admission controller (for example, a policy engine such as Kyverno or OPA Gatekeeper) can additionally refuse pods whose image doesn't come from the approved repository or isn't referenced by digest. That is an optional, cluster-side layer on top of the pipeline gate.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Alert on new CVEs in images in use</h3>
+				<p>Continuous scanning creates new findings for images that passed the gate months ago. Inspector finding events include the resource type and how many ECS tasks or EKS pods use the image, so a rule can focus on what's actually running (Amazon ECR User Guide, <em>EventBridge events sent for enhanced scanning</em>).</p>
+				<span class="file">new-critical-in-use-rule.json (in 555555555555)</span>
+<pre><code>{
+  "source": ["aws.inspector2"],
+  "detail-type": ["Inspector2 Finding"],
+  "detail": {
+    "severity": ["CRITICAL"],
+    "status": ["ACTIVE"],
+    "resources": {
+      "type": ["AWS_ECR_CONTAINER_IMAGE"],
+      "details": {
+        "awsEcrContainerImage": {
+          "inUseCount": [{ "numeric": [">", 0] }]   <span class="c">// running somewhere</span>
+        }
+      }
+    }
+  }
+}</code></pre>
+				<p>Targets: an SNS topic for the owning team, an OpsCenter OpsItem or ticket, and optionally an automation that starts a rebuild pipeline with an updated base image. The same event exists in each member account and in the delegated administrator account.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Track exceptions</h3>
+				<p>Sometimes a finding is accepted: the vulnerable code path isn't used, or no fix exists yet. Inspector <strong>suppression rules</strong> hide matching findings from the default view; they don't close or remediate them, and Inspector keeps the findings until they're fixed (Amazon Inspector User Guide, <em>Suppressing Amazon Inspector findings</em>). Only the delegated administrator (or a standalone account) can create them.</p>
+<pre><code>aws inspector2 create-filter \
+  --name accept-CVE-2024-0001-orders \
+  --action SUPPRESS \
+  --reason "Not reachable; fix expected in base image 2026.11" \
+  --filter-criteria '{
+    "vulnerabilityId":        [{"comparison":"EQUALS","value":"CVE-2024-0001"}],
+    "ecrImageRepositoryName": [{"comparison":"EQUALS","value":"orders"}]
+  }'</code></pre>
+				<p>The pipeline gate should apply the same exceptions; otherwise the build keeps failing on an accepted risk. A short allow list of CVE IDs, kept in the repository and reviewed like code, is a common way to do that for the build-time scan.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Scan before push and after push</td><td data-label="Why">The build scan stops vulnerable images from ever reaching the registry; the ECR scan is the record of truth and keeps watching after deployment</td></tr>
+						<tr><td>Enhanced rather than basic scanning</td><td data-label="Why">Most critical findings today are in application dependencies (for example, a vulnerable Java library), which basic scanning doesn't check; continuous rescans catch CVEs published after release</td></tr>
+						<tr><td>A pipeline action as the gate</td><td data-label="Why">Scanning on push only <em>reports</em>; something in the release path must read the result and stop the deployment</td></tr>
+						<tr><td>Immutable tags and deploy by digest</td><td data-label="Why">The image that ran the gate is exactly the image that runs in production</td></tr>
+						<tr><td>Findings managed in the security account</td><td data-label="Why">One place to see every account's images, and exceptions that teams can't grant themselves</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>Scan on push does <strong>not</strong> stop anything by itself: ECR still lets anyone pull a vulnerable image, and ECS will run it. Blocking needs a gate that fails on findings, and tags must be immutable, or a vulnerable image can be pushed under a tag that already passed.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Basic scanning with an <code>ECR Image Scan</code> gate</td><td data-label="When it fits better">Only OS packages matter and cost must be zero; the gate reads <code>findingSeverityCounts</code> after the scan completes</td></tr>
+						<tr><td>Inspector plugin for Jenkins, GitHub Actions or GitLab</td><td data-label="When it fits better">The build runs outside CodeBuild; the plugin wraps the same SBOM generator and Scan API</td></tr>
+						<tr><td>Third-party scanner in the build</td><td data-label="When it fits better">The company has standardized on another tool; ECR enhanced scanning can still run alongside it</td></tr>
+						<tr><td>Image signing (AWS Signer with Notation) and verification at deploy time</td><td data-label="When it fits better">You must also prove <em>who</em> built an image (provenance), not only that it has no known vulnerabilities</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Known-bad image</span><span class="desc">Build an image from an old base image with published CRITICAL CVEs in a test repository. The build-time scan fails and nothing is pushed.</span></li>
+				<li><span class="name">Gate after push</span><span class="desc">Push the same image directly to a test repository and run only the gate stage; the <code>InspectorScan</code> action fails.</span></li>
+				<li><span class="name">Clean image</span><span class="desc">Rebuild with a current base image; both scans pass and the deployment uses the digest.</span></li>
+				<li><span class="name">Tag reuse</span><span class="desc">Try to push a different image under an existing tag; ECR rejects it.</span></li>
+				<li><span class="name">Alert path</span><span class="desc">Check that the EventBridge rule matches a real CRITICAL finding (for example, from the known-bad test image while it's referenced by a test ECS task) and that the notification arrives.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-2.html">1.2</a> Automated testing</td><td data-label="What this architecture demonstrates">Security scanning as a pipeline stage that fails the build on findings</td></tr>
+						<tr><td><a href="../d1-task-1-3.html">1.3</a> Artifacts</td><td data-label="What this architecture demonstrates">ECR scanning types, immutable tags, lifecycle policies, deploying by digest, SBOMs</td></tr>
+						<tr><td><a href="../d6-task-6-2.html">6.2</a> Security controls</td><td data-label="What this architecture demonstrates">Preventive control in the release path; organization-wide Inspector</td></tr>
+						<tr><td><a href="../d6-task-6-3.html">6.3</a> Security monitoring</td><td data-label="What this architecture demonstrates">Alerting on new vulnerability findings with EventBridge; suppression with a recorded reason</td></tr>
+						<tr><td><a href="../snippets/eventbridge-patterns.html">Snippets</a></td><td data-label="What this architecture demonstrates">More EventBridge event patterns</td></tr>
+						<tr><td><a href="../snippets/buildspec.html">Snippets</a></td><td data-label="What this architecture demonstrates">More buildspec patterns, including Docker build and push</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Scan container images for vulnerabilities in OS packages <strong>and application libraries</strong>, continuously" is <strong>ECR enhanced scanning (Amazon Inspector)</strong>. "Prevent images with critical vulnerabilities from being deployed" needs a <strong>gate in the pipeline</strong> (the <code>InspectorScan</code> action or a build step that fails on findings), not scan on push alone. Background on the Inspector integration: AWS Containers Blog, <a href="https://aws.amazon.com/blogs/containers/container-scanning-updates-in-amazon-ecr-private-registries-using-amazon-inspector/">Container scanning updates in Amazon ECR private registries using Amazon Inspector</a>.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

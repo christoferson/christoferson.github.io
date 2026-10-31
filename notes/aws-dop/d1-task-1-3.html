@@ -295,6 +295,48 @@
 					<li><strong>Approved packages only:</strong> remove the external connection from team repositories and let only a curated repository fetch from public registries.</li>
 				</ul>
 				<div class="callout trap"><p>"The build role has <code>codeartifact:GetAuthorizationToken</code> but <code>aws codeartifact login</code> is denied" usually means the role is missing <strong><code>sts:GetServiceBearerToken</code></strong>.</p></div>
+				<h4>Using CodeArtifact from private subnets</h4>
+				<p>Builds that run in private subnets without a NAT gateway can still install and publish packages through VPC endpoints (CodeArtifact User Guide, <em>Working with Amazon VPC endpoints</em>). Three endpoints are involved:</p>
+				<ol class="flow">
+					<li><span class="name"><code>com.amazonaws.&lt;region&gt;.codeartifact.api</code></span><span class="desc">Interface endpoint for API calls such as <code>GetAuthorizationToken</code> and <code>GetRepositoryEndpoint</code>.</span></li>
+					<li><span class="name"><code>com.amazonaws.&lt;region&gt;.codeartifact.repositories</code></span><span class="desc">Interface endpoint for package manager traffic (npm, pip, Maven). With private DNS on, the normal repository URL resolves to it; without private DNS, configure the package manager with the endpoint's own DNS name instead of using <code>codeartifact login</code>.</span></li>
+					<li><span class="name">S3 gateway endpoint</span><span class="desc">Package files are downloaded from an S3 bucket that CodeArtifact owns, so the route tables need an S3 gateway endpoint. Python and Swift packages don't need it.</span></li>
+				</ol>
+				<ul>
+					<li><strong>Same Region:</strong> endpoints don't serve requests for another Region.</li>
+					<li><strong>Security group:</strong> the interface endpoints must allow HTTPS (443) from the build subnets.</li>
+					<li><strong>DNS:</strong> endpoints rely on Amazon-provided DNS; with your own DNS servers, add conditional forwarding.</li>
+					<li><strong>Public packages:</strong> with an external connection, CodeArtifact itself fetches packages from the public registry and caches them, so the build only ever talks to CodeArtifact through the endpoints.</li>
+				</ul>
+				<p>Endpoint policies narrow what can be done through each endpoint. On the CodeArtifact endpoints, allow only your account to get tokens and read packages:</p>
+				<span class="file">codeartifact-endpoint-policy.json</span>
+<pre><code>{
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111111111111:root"
+      },
+      "Action": [
+        "codeartifact:GetAuthorizationToken",
+        "codeartifact:GetRepositoryEndpoint",
+        "codeartifact:ReadFromRepository",
+        "sts:GetServiceBearerToken"   <span class="c">// needed to obtain the authorization token</span>
+      ],
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+				<p>On the S3 gateway endpoint, allow reads from CodeArtifact's assets bucket for the Region (shown by <code>aws codeartifact describe-domain</code> as <code>s3BucketArn</code>; for us-east-1 it's <code>assets-193858265520-us-east-1</code>):</p>
+				<span class="file">s3-gateway-endpoint-policy.json (statement)</span>
+<pre><code>{
+  "Effect": "Allow",
+  "Principal": "*",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::assets-193858265520-us-east-1/*"
+}</code></pre>
+				<div class="callout trap"><p>"The build can list package versions but downloads of <code>.jar</code> files time out" means the <strong>S3 gateway endpoint is missing</strong> (or its policy doesn't allow CodeArtifact's assets bucket): metadata comes through the CodeArtifact endpoints, but the files come from S3.</p></div>
+
 			</div>
 
 			<div class="item" id="ecr">

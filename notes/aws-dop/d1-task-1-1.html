@@ -369,17 +369,85 @@
 			<div class="item">
 				<span class="kicker">Skill</span>
 				<h3>How pipelines detect changes</h3>
+				<p>A pipeline starts when its source changes. CodePipeline supports two ways to notice a change: <strong>event-based detection</strong>, where the source announces the change, and <strong>polling</strong>, where CodePipeline checks the source on a schedule. AWS recommends event-based detection for every source type (CodePipeline User Guide, <em>Source actions and change detection methods</em>).</p>
 				<div class="table-wrap">
-					<table>
-						<thead><tr><th>Source</th><th>Recommended change detection</th><th>Notes</th></tr></thead>
+					<table class="stack labeled">
+						<thead><tr><th>Source</th><th>Recommended detection</th><th>How it works</th><th>Legacy option</th></tr></thead>
 						<tbody>
-							<tr><td>CodeCommit</td><td>EventBridge rule on repository state change</td><td>Polling is legacy and slower; avoid it in answers</td></tr>
-							<tr><td>GitHub, GitLab, Bitbucket</td><td>Webhooks managed by CodeConnections</td><td>V2 triggers add branch, tag, file path and pull request filters</td></tr>
-							<tr><td>S3</td><td>EventBridge rule on object events</td><td>Bucket versioning required</td></tr>
-							<tr><td>ECR</td><td>EventBridge rule on image push</td><td>Trigger on a specific repository and tag</td></tr>
+							<tr><td>CodeCommit</td><td data-label="Recommended detection">EventBridge rule</td><td data-label="How it works">A rule on <em>CodeCommit Repository State Change</em> for the branch starts the pipeline; the console creates it automatically</td><td data-label="Legacy option">Polling</td></tr>
+							<tr><td>Amazon S3</td><td data-label="Recommended detection">EventBridge</td><td data-label="How it works">Either the bucket sends events to EventBridge directly (no CloudTrail needed), or a rule matches CloudTrail data events for the object</td><td data-label="Legacy option">Polling</td></tr>
+							<tr><td>Amazon ECR</td><td data-label="Recommended detection">EventBridge rule</td><td data-label="How it works">A rule on an image push to the repository and tag</td><td data-label="Legacy option">None</td></tr>
+							<tr><td>GitHub, GitHub Enterprise Cloud, GitLab.com, Bitbucket Cloud</td><td data-label="Recommended detection">CodeConnections connection</td><td data-label="How it works">The connection's app, installed on the provider, delivers change events; there's no webhook or polling for you to set up</td><td data-label="Legacy option">GitHub version 1 action (OAuth app), which uses a webhook or polling</td></tr>
+							<tr><td>GitHub Enterprise Server, GitLab self-managed</td><td data-label="Recommended detection">Connection plus a host resource</td><td data-label="How it works">The host represents your own server, and can reach it through a VPC</td><td data-label="Legacy option">None</td></tr>
 						</tbody>
 					</table>
 				</div>
+
+				<h4>Event-based detection or polling</h4>
+				<ul>
+					<li><strong>Event-based:</strong> the pipeline starts within seconds of the change, and nothing runs while nothing changes.</li>
+					<li><strong>Polling:</strong> CodePipeline checks the source periodically, so changes are picked up later, and polling pipelines count against a much lower quota than event-based ones. Existing polling pipelines can be migrated to event-based detection.</li>
+				</ul>
+				<p>For a CodeCommit source, event-based detection is an EventBridge rule plus a source action that doesn't poll:</p>
+				<span class="file">codecommit-trigger.yaml</span>
+<pre><code><span class="c"># In the pipeline's source action</span>
+<span class="k">Configuration:</span>
+  <span class="k">RepositoryName:</span> orders
+  <span class="k">BranchName:</span> main
+  <span class="k">PollForSourceChanges:</span> false   <span class="c"># must be set explicitly</span>
+
+<span class="c"># The rule that starts the pipeline</span>
+<span class="k">StartPipelineOnPush:</span>
+  <span class="k">Type:</span> AWS::Events::Rule
+  <span class="k">Properties:</span>
+    <span class="k">EventPattern:</span>
+      <span class="k">source:</span> [ aws.codecommit ]
+      <span class="k">detail-type:</span> [ CodeCommit Repository State Change ]
+      <span class="k">resources:</span> [ !GetAtt OrdersRepo.Arn ]
+      <span class="k">detail:</span>
+        <span class="k">event:</span> [ referenceCreated, referenceUpdated ]
+        <span class="k">referenceType:</span> [ branch ]
+        <span class="k">referenceName:</span> [ main ]
+    <span class="k">Targets:</span>
+      - <span class="k">Id:</span> start-pipeline
+        <span class="k">Arn:</span> !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${OrdersPipeline}
+        <span class="k">RoleArn:</span> !GetAtt StartPipelineRole.Arn   <span class="c"># allows codepipeline:StartPipelineExecution</span></code></pre>
+				<div class="callout trap"><p>If <code>PollForSourceChanges</code> is <strong>omitted</strong>, CodePipeline defaults to polling. With an EventBridge rule as well, every push starts the pipeline <strong>twice</strong>, and the pipeline still counts toward the polling quota. Set it to <code>false</code> explicitly.</p></div>
+
+				<h4>Starting CodeBuild directly with a webhook</h4>
+				<p>A CodeBuild project whose source is GitHub, GitHub Enterprise, GitLab or Bitbucket can create a <strong>webhook</strong> in the repository, so the provider calls CodeBuild on each event, with no pipeline involved. This is the usual way to build every pull request and report the result back to the provider. <strong>Filter groups</strong> decide which events start a build: every filter in a group must match, and any one matching group starts the build.</p>
+				<span class="file">pr-build-project.yaml (excerpt)</span>
+<pre><code><span class="k">PullRequestBuild:</span>
+  <span class="k">Type:</span> AWS::CodeBuild::Project
+  <span class="k">Properties:</span>
+    <span class="k">Source:</span>
+      <span class="k">Type:</span> GITHUB
+      <span class="k">Location:</span> https://github.com/acme/orders.git
+      <span class="k">ReportBuildStatus:</span> true   <span class="c"># pass/fail shown on the pull request</span>
+    <span class="k">Triggers:</span>
+      <span class="k">Webhook:</span> true
+      <span class="k">FilterGroups:</span>
+        - - <span class="k">Type:</span> EVENT   <span class="c"># group 1: pull requests into main</span>
+            <span class="k">Pattern:</span> PULL_REQUEST_CREATED, PULL_REQUEST_UPDATED
+          - <span class="k">Type:</span> BASE_REF
+            <span class="k">Pattern:</span> ^refs/heads/main$
+          - <span class="k">Type:</span> FILE_PATH   <span class="c"># skip documentation-only changes</span>
+            <span class="k">Pattern:</span> ^docs/
+            <span class="k">ExcludeMatchedPattern:</span> true
+        - - <span class="k">Type:</span> EVENT   <span class="c"># group 2: release tags</span>
+            <span class="k">Pattern:</span> PUSH
+          - <span class="k">Type:</span> HEAD_REF
+            <span class="k">Pattern:</span> ^refs/tags/v.*</code></pre>
+				<ul>
+					<li><strong>Events:</strong> <code>PUSH</code>, <code>PULL_REQUEST_CREATED</code>, <code>PULL_REQUEST_UPDATED</code>, <code>PULL_REQUEST_CLOSED</code>, <code>PULL_REQUEST_REOPENED</code>, <code>PULL_REQUEST_MERGED</code>, <code>RELEASED</code>, <code>PRERELEASED</code> and <code>WORKFLOW_JOB_QUEUED</code> (some are GitHub only).</li>
+					<li><strong>Filters:</strong> <code>HEAD_REF</code>, <code>BASE_REF</code>, <code>FILE_PATH</code>, <code>COMMIT_MESSAGE</code>, <code>ACTOR_ACCOUNT_ID</code> and others, as regular expressions; <code>ExcludeMatchedPattern</code> inverts one.</li>
+					<li><strong>GitHub Actions runners:</strong> the <code>WORKFLOW_JOB_QUEUED</code> event lets CodeBuild run GitHub Actions jobs as a managed self-hosted runner (AWS DevOps Blog, <a href="https://aws.amazon.com/blogs/devops/aws-codebuild-managed-self-hosted-github-action-runners/">AWS CodeBuild Managed Self-Hosted GitHub Action Runners</a>).</li>
+					<li><strong>Limitation:</strong> CloudFormation can't create webhooks for GitHub Enterprise projects; use the console or CLI.</li>
+				</ul>
+
+				<h4>Mirroring isn't a trigger</h4>
+				<p>Repository <strong>mirroring</strong> copies commits from one Git server to another (for example, a GitLab push mirror into CodeCommit). It moves code; it doesn't start anything. CodePipeline connects to GitHub, GitLab and Bitbucket directly through CodeConnections, including self-managed servers through a host, so copying the repository into AWS is rarely needed. When a policy does require a copy in CodeCommit, the pipeline is still started by the CodeCommit EventBridge rule, not by the mirroring.</p>
+				<div class="callout tip"><p>"Start the pipeline as soon as code is pushed to GitHub" is a <strong>CodeConnections source action</strong> (the connection handles change detection). "Build every pull request and show the result on it" is a <strong>CodeBuild webhook</strong> with filter groups. "CodeCommit or S3 source" is an <strong>EventBridge rule</strong>, never polling.</p></div>
 
 				<h3>Mapping branches and tags to environments</h3>
 				<ul>

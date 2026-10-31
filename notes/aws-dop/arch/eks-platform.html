@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: EKS Platform with GitOps | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: Amazon EKS clusters per environment with access entries, EKS Pod Identity, Karpenter, GitOps deployments with Argo CD, Container Insights and control plane logs, and a routine upgrade process.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">EKS platform</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>EKS platform with GitOps</h1>
+		<p>A platform team runs one Amazon EKS cluster per environment for many application teams. Teams deploy by merging a change to Git; a GitOps controller applies it. Pods get only the AWS permissions they need, nodes appear and disappear with demand (on Spot where it's safe), all telemetry lands in CloudWatch, and Kubernetes upgrades are a routine, repeatable procedure.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 6</span><span class="tag">Amazon EKS</span><span class="tag">Pod Identity</span><span class="tag">Karpenter</span><span class="tag">Argo CD</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Cluster access</a></li>
+				<li class="sub"><a href="#b2">2. Pod permissions</a></li>
+				<li class="sub"><a href="#b3">3. Node autoscaling</a></li>
+				<li class="sub"><a href="#b4">4. GitOps deployment</a></li>
+				<li class="sub"><a href="#b5">5. CI that updates Git</a></li>
+				<li class="sub"><a href="#b6">6. Observability</a></li>
+				<li class="sub"><a href="#b7">7. Upgrades</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>Twenty application teams run microservices on shared clusters, one per environment. The platform team owns the clusters; each application team owns one namespace per cluster and must not affect the others.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Clusters are reproducible and identical across environments</td><td data-label="Design choice">Clusters, add-ons and access defined as code (CloudFormation, CDK, Terraform or <code>eksctl</code> config files)</td></tr>
+						<tr><td>People get Kubernetes access through IAM, scoped per team</td><td data-label="Design choice">EKS access entries with access policies scoped to each team's namespace</td></tr>
+						<tr><td>Pods get least-privilege AWS permissions</td><td data-label="Design choice">EKS Pod Identity: one IAM role per service account</td></tr>
+						<tr><td>Deploy by merging to Git, with drift corrected automatically</td><td data-label="Design choice">GitOps with Argo CD (the managed EKS capability, or self-installed) syncing a configuration repository</td></tr>
+						<tr><td>Nodes follow demand and use Spot where safe</td><td data-label="Design choice">Karpenter NodePools (or EKS Auto Mode, which runs Karpenter-based autoscaling for you)</td></tr>
+						<tr><td>No user-facing disruption when nodes are replaced</td><td data-label="Design choice">Readiness probes, several replicas and PodDisruptionBudgets on every service</td></tr>
+						<tr><td>Central logs, metrics and traces</td><td data-label="Design choice">The Amazon CloudWatch Observability add-on (Container Insights and Application Signals) plus control plane logs</td></tr>
+						<tr><td>Routine, low-risk Kubernetes upgrades</td><td data-label="Design choice">Upgrade insights first, staging before production, one minor version at a time</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, all in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Tooling</td><td data-label="ID"><code>111111111111</code></td><td data-label="What lives there">CodeBuild projects, the ECR repositories (pulled cross-account), and the Git repositories' connections</td></tr>
+						<tr><td>Staging</td><td data-label="ID"><code>333333333333</code></td><td data-label="What lives there">EKS cluster <code>staging</code></td></tr>
+						<tr><td>Production</td><td data-label="ID"><code>222222222222</code></td><td data-label="What lives there">EKS cluster <code>production</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> are done by AWS services or controllers on their own; <span class="who">Platform</span> steps are set up once by the platform team; <span class="who">Team</span> steps are what an application team does for each release.</p>
+			<ol class="flow">
+				<li class="group">Cluster foundation</li>
+				<li><span class="name">Create the cluster from code<span class="who">Platform</span></span><span class="desc">The cluster, its subnets, add-ons (VPC CNI, CoreDNS, <code>kube-proxy</code>, EKS Pod Identity Agent, CloudWatch Observability) and logging come from one template per environment.</span></li>
+				<li><span class="name">Grant access with access entries<span class="who">Platform</span></span><span class="desc">The platform role gets cluster-wide admin; each team role gets edit rights in its own namespace only.</span></li>
+				<li><span class="name">Give pods IAM roles<span class="who">Platform</span></span><span class="desc">Pod Identity associations map each service account to an IAM role with only the permissions that service needs.</span></li>
+				<li class="group">Release</li>
+				<li><span class="name">Merge to main<span class="who">Team</span></span><span class="desc">CodeBuild builds the image, scans it, and pushes it to ECR tagged with the commit ID.</span></li>
+				<li><span class="name">Update the configuration repository<span class="who">Team</span></span><span class="desc">The build commits the new image tag to the GitOps repository (staging path first). This commit is the deployment.</span></li>
+				<li class="auto"><span class="name">Argo CD syncs<span class="who auto">AWS</span></span><span class="desc">Argo CD sees the change, applies the manifests, and keeps correcting any manual drift.</span></li>
+				<li class="auto"><span class="name">Rolling update<span class="who auto">AWS</span></span><span class="desc">Kubernetes replaces pods gradually; a pod receives traffic only after its readiness probe passes.</span></li>
+				<li class="auto"><span class="name">Nodes follow demand<span class="who auto">AWS</span></span><span class="desc">Karpenter launches nodes for pods that can't be scheduled, and consolidates or removes nodes that are empty or underused.</span></li>
+				<li><span class="name">Promote to production<span class="who">Team</span></span><span class="desc">A pull request copies the tag to the production path; once merged, Argo CD syncs the production cluster.</span></li>
+				<li class="group">Operate</li>
+				<li class="auto"><span class="name">Telemetry flows to CloudWatch<span class="who auto">AWS</span></span><span class="desc">Container Insights metrics, container logs, Application Signals traces, and the enabled control plane logs.</span></li>
+				<li><span class="name">Upgrade Kubernetes<span class="who">Platform</span></span><span class="desc">Check upgrade insights, upgrade staging's control plane, then nodes and add-ons; repeat for production.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Cluster access with access entries</h3>
+				<p>An <strong>access entry</strong> links one IAM principal to Kubernetes permissions, through the EKS API rather than the <code>aws-auth</code> ConfigMap (Amazon EKS User Guide, <em>Grant IAM users access to Kubernetes with EKS access entries</em>). Permissions come from AWS-maintained <strong>access policies</strong>, scoped to the whole cluster or to namespaces:</p>
+				<span class="file">access.sh (run against the production cluster)</span>
+<pre><code><span class="c"># Platform team: full admin on the whole cluster</span>
+aws eks create-access-entry --cluster-name production \
+  --principal-arn arn:aws:iam::222222222222:role/PlatformAdmin
+aws eks associate-access-policy --cluster-name production \
+  --principal-arn arn:aws:iam::222222222222:role/PlatformAdmin \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+
+<span class="c"># Orders team: edit rights in its own namespace only</span>
+aws eks create-access-entry --cluster-name production \
+  --principal-arn arn:aws:iam::222222222222:role/OrdersTeam
+aws eks associate-access-policy --cluster-name production \
+  --principal-arn arn:aws:iam::222222222222:role/OrdersTeam \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy \
+  --access-scope type=namespace,namespaces=orders</code></pre>
+				<ul>
+					<li><strong>Access policies:</strong> <code>AmazonEKSClusterAdminPolicy</code>, <code>AmazonEKSAdminPolicy</code>, <code>AmazonEKSEditPolicy</code> and <code>AmazonEKSViewPolicy</code>, similar to the Kubernetes user-facing cluster roles. For finer control, give the entry Kubernetes group names and write RBAC bindings instead.</li>
+					<li><strong>Node roles:</strong> managed node groups and Fargate profiles get their access entries automatically.</li>
+					<li><strong>Recovery:</strong> because access lives in the EKS API, a lost admin can be restored with an API call, which isn't possible when a broken <code>aws-auth</code> ConfigMap locks everyone out.</li>
+				</ul>
+				<div class="callout trap"><p>When an existing cluster switches to access entries, only the cluster creator's access is created automatically. Roles that were added to the <code>aws-auth</code> ConfigMap are <strong>not migrated</strong>; create access entries for them before removing the ConfigMap, or those users lose access.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Pod permissions with EKS Pod Identity</h3>
+				<p>Each service runs under its own Kubernetes service account. A <strong>Pod Identity association</strong> maps that service account to an IAM role; the EKS Pod Identity Agent then gives the pods temporary credentials for it. The role's trust policy names the EKS Pod Identity service principal (Amazon EKS User Guide, <em>Assign an IAM role to a Kubernetes service account</em>):</p>
+				<span class="file">orders-pod-role-trust.json</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "pods.eks.amazonaws.com"
+      },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"   <span class="c">// adds cluster, namespace and service account tags</span>
+      ]
+    }
+  ]
+}</code></pre>
+<pre><code>aws eks create-pod-identity-association --cluster-name production \
+  --namespace orders --service-account orders-api \
+  --role-arn arn:aws:iam::222222222222:role/OrdersApiPodRole</code></pre>
+				<ul>
+					<li><strong>No annotation, no OIDC provider:</strong> unlike IAM roles for service accounts (IRSA), nothing is added to the service account, and the same role can be used by several clusters without editing its trust policy (AWS Containers Blog, <a href="https://aws.amazon.com/blogs/containers/amazon-eks-pod-identity-a-new-way-for-applications-on-eks-to-obtain-iam-credentials/">Amazon EKS Pod Identity: a new way for applications on EKS to obtain IAM credentials</a>).</li>
+					<li><strong>Session tags:</strong> the tags Pod Identity adds let a single policy allow access based on the namespace or service account, for ABAC.</li>
+					<li><strong>Who can create associations:</strong> the caller needs <code>iam:PassRole</code> for the role.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Node autoscaling with Karpenter</h3>
+				<p>Karpenter watches for pods that can't be scheduled and launches nodes that fit them, choosing instance types and purchase options from a <strong>NodePool</strong>. It also <strong>consolidates</strong>: removing empty nodes and replacing underused ones with cheaper ones.</p>
+				<span class="file">nodepool-general.yaml</span>
+<pre><code><span class="k">apiVersion:</span> karpenter.sh/v1
+<span class="k">kind:</span> NodePool
+<span class="k">metadata:</span>
+  <span class="k">name:</span> general
+<span class="k">spec:</span>
+  <span class="k">template:</span>
+    <span class="k">spec:</span>
+      <span class="k">nodeClassRef:</span>   <span class="c"># AMI, subnets, security groups</span>
+        <span class="k">group:</span> karpenter.k8s.aws
+        <span class="k">kind:</span> EC2NodeClass
+        <span class="k">name:</span> default
+      <span class="k">requirements:</span>
+        - <span class="k">key:</span> karpenter.sh/capacity-type
+          <span class="k">operator:</span> In
+          <span class="k">values:</span> [ "spot", "on-demand" ]   <span class="c"># Spot preferred when available</span>
+        - <span class="k">key:</span> kubernetes.io/arch
+          <span class="k">operator:</span> In
+          <span class="k">values:</span> [ "amd64", "arm64" ]
+  <span class="k">disruption:</span>
+    <span class="k">consolidationPolicy:</span> WhenEmptyOrUnderutilized
+    <span class="k">consolidateAfter:</span> 1m
+    <span class="k">budgets:</span>
+      - <span class="k">nodes:</span> "10%"   <span class="c"># replace at most 10% of nodes at a time</span>
+  <span class="k">limits:</span>   <span class="c"># ceiling for this NodePool</span>
+    <span class="k">cpu:</span> "1000"
+    <span class="k">memory:</span> 1000Gi</code></pre>
+				<ul>
+					<li><strong>Several NodePools:</strong> a second NodePool restricted to <code>on-demand</code>, with a taint, keeps stateful or Spot-intolerant workloads off Spot.</li>
+					<li><strong>Spot interruptions:</strong> Karpenter can watch an SQS queue fed by EventBridge for Spot interruption warnings and other EC2 events, and moves pods off a node before it's reclaimed.</li>
+					<li><strong>EKS Auto Mode</strong> runs this Karpenter-based autoscaling as part of the cluster, and also handles Spot interruption notices, node OS updates and a 21-day maximum node lifetime (Amazon EKS User Guide, <em>Automate cluster infrastructure with EKS Auto Mode</em>). You add custom NodePools alongside its defaults.</li>
+				</ul>
+				<div class="callout trap"><p>Consolidation and node replacement evict pods. A Deployment with one replica, or with no <strong>PodDisruptionBudget</strong>, can have all its pods evicted at once and go down briefly. PodDisruptionBudgets are respected by Karpenter, by Auto Mode node updates and by managed node group upgrades.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>GitOps deployment with Argo CD</h3>
+				<p>In GitOps, a Git repository holds the desired state of the cluster, and a controller in or next to the cluster continuously makes the cluster match it. Amazon EKS offers Argo CD as a fully managed <strong>EKS capability</strong> that runs in EKS rather than on your nodes and can deploy to several clusters from one instance (Amazon EKS User Guide, <em>EKS Capabilities</em>); Argo CD or Flux can also be installed in the cluster yourself.</p>
+				<span class="file">apps/orders-production.yaml (Argo CD Application)</span>
+<pre><code><span class="k">apiVersion:</span> argoproj.io/v1alpha1
+<span class="k">kind:</span> Application
+<span class="k">metadata:</span>
+  <span class="k">name:</span> orders-production
+<span class="k">spec:</span>
+  <span class="k">project:</span> orders
+  <span class="k">source:</span>
+    <span class="k">repoURL:</span> https://github.com/acme/platform-config.git
+    <span class="k">targetRevision:</span> main
+    <span class="k">path:</span> orders/overlays/production   <span class="c"># Kustomize overlay per environment</span>
+  <span class="k">destination:</span>
+    <span class="k">name:</span> production   <span class="c"># a cluster registered with Argo CD</span>
+    <span class="k">namespace:</span> orders
+  <span class="k">syncPolicy:</span>
+    <span class="k">automated:</span>
+      <span class="k">prune:</span> true   <span class="c"># delete what was removed from Git</span>
+      <span class="k">selfHeal:</span> true   <span class="c"># undo manual changes in the cluster</span></code></pre>
+				<p>The manifests Argo CD applies make the rollout safe:</p>
+				<span class="file">orders/base/deployment.yaml (excerpt)</span>
+<pre><code><span class="k">apiVersion:</span> apps/v1
+<span class="k">kind:</span> Deployment
+<span class="k">metadata:</span>
+  <span class="k">name:</span> orders-api
+<span class="k">spec:</span>
+  <span class="k">replicas:</span> 3
+  <span class="k">strategy:</span>
+    <span class="k">type:</span> RollingUpdate
+    <span class="k">rollingUpdate:</span>
+      <span class="k">maxUnavailable:</span> 0   <span class="c"># keep full capacity during a release</span>
+      <span class="k">maxSurge:</span> 1
+  <span class="k">template:</span>
+    <span class="k">spec:</span>
+      <span class="k">serviceAccountName:</span> orders-api   <span class="c"># mapped to an IAM role by Pod Identity</span>
+      <span class="k">containers:</span>
+        - <span class="k">name:</span> api
+          <span class="k">image:</span> 111111111111.dkr.ecr.us-east-1.amazonaws.com/orders:3f9c2e1
+          <span class="k">readinessProbe:</span>   <span class="c"># no traffic until this passes</span>
+            <span class="k">httpGet:</span>
+              <span class="k">path:</span> /health
+              <span class="k">port:</span> 8080
+---
+<span class="k">apiVersion:</span> policy/v1
+<span class="k">kind:</span> PodDisruptionBudget
+<span class="k">metadata:</span>
+  <span class="k">name:</span> orders-api
+<span class="k">spec:</span>
+  <span class="k">minAvailable:</span> 2   <span class="c"># evictions keep at least two pods running</span>
+  <span class="k">selector:</span>
+    <span class="k">matchLabels:</span>
+      <span class="k">app:</span> orders-api</code></pre>
+				<ul>
+					<li><strong>Rollback</strong> is a Git revert: the controller applies the previous state, and the history shows who changed what.</li>
+					<li><strong>Cross-account images:</strong> the ECR repository policy in <code>111111111111</code> allows the node roles of both workload accounts to pull.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>CI that updates Git instead of the cluster</h3>
+				<p>The build never calls the Kubernetes API. It pushes the image, then changes the image tag in the configuration repository; the GitOps controller does the deployment.</p>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">env:</span>
+  <span class="k">secrets-manager:</span>
+    <span class="k">GIT_TOKEN:</span> ci/platform-config-token   <span class="c"># write access to the config repo only</span>
+<span class="k">phases:</span>
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)
+      - REPO=111111111111.dkr.ecr.us-east-1.amazonaws.com/orders
+      - aws ecr get-login-password | docker login -u AWS --password-stdin $REPO
+      - docker build -t $REPO:$TAG .
+      - docker push $REPO:$TAG
+  <span class="k">post_build:</span>
+    <span class="k">commands:</span>
+      - git clone https://x-access-token:$GIT_TOKEN@github.com/acme/platform-config.git
+      - cd platform-config/orders/overlays/staging
+      - kustomize edit set image orders=$REPO:$TAG   <span class="c"># staging first</span>
+      - git commit -am "orders $TAG to staging" &amp;&amp; git push</code></pre>
+				<p>The CodeBuild project needs privileged mode to build images. Promotion to production is a separate pull request that changes the production overlay, so a person reviews exactly which image goes live.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Observability</h3>
+				<p>The <strong>Amazon CloudWatch Observability</strong> EKS add-on installs the CloudWatch agent and Fluent Bit, turning on Container Insights (node, pod and container metrics and logs) and Application Signals by default. It can get its permissions through Pod Identity:</p>
+<pre><code>aws iam attach-role-policy --role-name CloudWatchAgentRole \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+aws eks create-addon --cluster-name production \
+  --addon-name amazon-cloudwatch-observability \
+  --pod-identity-associations serviceAccount=cloudwatch-agent,roleArn=arn:aws:iam::222222222222:role/CloudWatchAgentRole</code></pre>
+				<p><strong>Control plane logs</strong> are off by default. Turn on the types you need; they go to the log group <code>/aws/eks/production/cluster</code>:</p>
+<pre><code>aws eks update-cluster-config --name production \
+  --logging '{"clusterLogging":[{"types":["api","audit","authenticator"],"enabled":true}]}'</code></pre>
+				<ul>
+					<li><strong><code>audit</code></strong> records who changed which Kubernetes object; <strong><code>authenticator</code></strong> shows IAM authentication to the cluster, useful when someone gets <em>Unauthorized</em>. <code>controllerManager</code> and <code>scheduler</code> help with scheduling problems.</li>
+					<li>The logs are charged as normal CloudWatch Logs ingestion and storage, so enable the types you'll use.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Routine upgrades</h3>
+				<p>The upgrade order comes from the Amazon EKS User Guide (<em>Update existing cluster to new Kubernetes version</em>):</p>
+				<ol class="flow">
+					<li><span class="name">Check readiness</span><span class="desc">EKS <strong>upgrade insights</strong> scan for problems such as deprecated Kubernetes API use. Fix the manifests in Git first.</span></li>
+					<li><span class="name">Match node versions</span><span class="desc">Nodes should run the same minor version as the control plane before you start.</span></li>
+					<li><span class="name">Upgrade the control plane</span><span class="desc">One minor version at a time (<code>aws eks update-cluster-version</code>); 1.30 to 1.32 means two upgrades. It can't be paused once started, and running applications keep working.</span></li>
+					<li><span class="name">Upgrade the nodes</span><span class="desc">Managed node groups update in place; Karpenter replaces nodes as its NodeClass AMI selection picks up the new version; Auto Mode updates nodes itself, respecting PodDisruptionBudgets.</span></li>
+					<li><span class="name">Upgrade add-ons and tools</span><span class="desc">VPC CNI, CoreDNS, <code>kube-proxy</code>, other add-ons, then <code>kubectl</code> on clients.</span></li>
+					<li><span class="name">Staging first</span><span class="desc">Run the whole procedure in staging, test, then repeat in production.</span></li>
+				</ol>
+				<p>If problems appear, a cluster can be rolled back to the previous minor version within 7 days of the upgrade.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Pod Identity instead of IRSA</td><td data-label="Why">No OIDC provider per cluster, no service account annotations, and roles reused across clusters without trust policy edits. IRSA remains for cases Pod Identity doesn't cover</td></tr>
+						<tr><td>Access entries instead of <code>aws-auth</code></td><td data-label="Why">Managed through the EKS API and IaC, audited in CloudTrail, recoverable if misconfigured, and scoped per namespace with access policies</td></tr>
+						<tr><td>Karpenter (or Auto Mode) instead of Cluster Autoscaler</td><td data-label="Why">Chooses instance types per pending pod instead of scaling fixed node groups, and consolidates to cut cost. Auto Mode also takes over node patching and add-on management</td></tr>
+						<tr><td>GitOps pull instead of pipeline push</td><td data-label="Why">The pipeline needs no cluster credentials, drift is corrected automatically, and Git history is the audit trail and the rollback mechanism</td></tr>
+						<tr><td>One cluster per environment</td><td data-label="Why">Staging tests upgrades and platform changes before production; namespaces and access policies separate teams inside each cluster</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Amazon ECS on Fargate</td><td data-label="When it fits better">Teams don't need Kubernetes; ECS has less to operate and built-in deployment rollback</td></tr>
+						<tr><td>EKS Fargate profiles</td><td data-label="When it fits better">No nodes at all for chosen namespaces, at the cost of no DaemonSets and fewer instance choices</td></tr>
+						<tr><td>EKS Auto Mode</td><td data-label="When it fits better">The platform team wants AWS to manage nodes, autoscaling, load balancing and storage drivers</td></tr>
+						<tr><td>Flux, or self-installed Argo CD</td><td data-label="When it fits better">An existing GitOps setup, or features not offered by the managed capability</td></tr>
+						<tr><td>Pipeline push (CodeBuild running <code>kubectl</code> or Helm)</td><td data-label="When it fits better">Few clusters and a team that prefers pipeline-driven deploys; the build role needs an access entry on each cluster</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Access</span><span class="desc">As the Orders team role, confirm you can change objects in <code>orders</code> but get <em>Forbidden</em> in another namespace.</span></li>
+				<li><span class="name">Pod permissions</span><span class="desc">From an <code>orders-api</code> pod, call the allowed DynamoDB table (works) and another table (AccessDenied).</span></li>
+				<li><span class="name">Drift</span><span class="desc">Scale a Deployment by hand with <code>kubectl</code>; Argo CD's self-heal restores the replica count from Git.</span></li>
+				<li><span class="name">Scaling and consolidation</span><span class="desc">Scale a test workload up and down; watch Karpenter add nodes, then consolidate, while the PodDisruptionBudget keeps two pods running.</span></li>
+				<li><span class="name">Upgrade rehearsal</span><span class="desc">Upgrade staging after clearing upgrade insights, and confirm every service stays available.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Deployment strategies</td><td data-label="What this architecture demonstrates">Rolling updates with readiness probes, GitOps promotion and rollback by revert</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Scalable solutions</td><td data-label="What this architecture demonstrates">Karpenter NodePools, Spot with interruption handling, PodDisruptionBudgets</td></tr>
+						<tr><td><a href="../d4-task-4-1.html">4.1</a> Logs and metrics</td><td data-label="What this architecture demonstrates">Container Insights through the CloudWatch Observability add-on, control plane log types</td></tr>
+						<tr><td><a href="../d5-task-5-3.html">5.3</a> Troubleshooting</td><td data-label="What this architecture demonstrates">Authenticator and audit logs for access problems, upgrade insights before upgrades</td></tr>
+						<tr><td><a href="../d6-task-6-1.html">6.1</a> Identity at scale</td><td data-label="What this architecture demonstrates">Access entries and access policies, Pod Identity roles per service account</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Give pods least-privilege AWS access with the least setup, reusing roles across clusters" is <strong>EKS Pod Identity</strong>. "Manage which IAM roles can use kubectl, per namespace, through the EKS API" is <strong>access entries with access policies</strong>. "Deploy by merging to Git and correct drift automatically" is <strong>GitOps with Argo CD or Flux</strong>.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

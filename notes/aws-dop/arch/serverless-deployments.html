@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Serverless Application with Gradual Deployments | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: an API Gateway, Lambda and DynamoDB orders service released by CodePipeline and SAM through staging to production, with CodeDeploy canary traffic shifting, pre-traffic tests, alarm-based rollback and provisioned concurrency.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Serverless deployments</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Serverless application with gradual deployments</h1>
+		<p>An orders API built on API Gateway, Lambda, DynamoDB and SQS is released several times a day. Every release goes through staging first, then reaches production gradually: 10% of traffic for five minutes, checked by a test function and by alarms, then everyone. If errors rise, traffic returns to the old version automatically, without anyone being paged to roll back.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">AWS SAM</span><span class="tag">CodePipeline</span><span class="tag">CodeDeploy</span><span class="tag">Lambda</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. SAM template</a></li>
+				<li class="sub"><a href="#b2">2. Alarms on the alias</a></li>
+				<li class="sub"><a href="#b3">3. Pre-traffic hook</a></li>
+				<li class="sub"><a href="#b4">4. Build specification</a></li>
+				<li class="sub"><a href="#b5">5. Pipeline stages</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The orders service has two functions: <code>OrdersApiFunction</code> behind API Gateway handles requests and writes to a DynamoDB table, and <code>OrdersWorkerFunction</code> processes messages from an SQS queue. The team wants frequent, low-risk releases.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Releases without downtime</td><td data-label="Design choice">Lambda versions behind an alias; callers always invoke the alias, which moves between versions</td></tr>
+						<tr><td>Try a release on a small share of production traffic</td><td data-label="Design choice">CodeDeploy canary: 10% of invocations for five minutes, then 100%</td></tr>
+						<tr><td>Automatic rollback when errors rise</td><td data-label="Design choice">CloudWatch alarms on the alias attached to the deployment; an alarm in <code>ALARM</code> shifts traffic back</td></tr>
+						<tr><td>Check the new version before any real user sees it</td><td data-label="Design choice">A pre-traffic hook function that calls the new version directly</td></tr>
+						<tr><td>No cold-start latency spikes for the API</td><td data-label="Design choice">Provisioned concurrency on the alias</td></tr>
+						<tr><td>Failed queue messages don't block or disappear</td><td data-label="Design choice">Partial batch responses and a dead-letter queue</td></tr>
+						<tr><td>Database changes can't break the version still serving traffic</td><td data-label="Design choice">Backward-compatible (expand, then contract) data changes</td></tr>
+						<tr><td>Same release tested before production</td><td data-label="Design choice">One packaged template deployed to staging, tested, approved, then deployed to production</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, all in us-east-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Tooling</td><td data-label="ID"><code>111111111111</code></td><td data-label="What lives there">CodePipeline, CodeBuild, the artifact bucket and its customer managed KMS key</td></tr>
+						<tr><td>Staging</td><td data-label="ID"><code>333333333333</code></td><td data-label="What lives there">A full copy of the orders stack; <code>PipelineDeployRole</code> and <code>CfnExecutionRole</code></td></tr>
+						<tr><td>Production</td><td data-label="ID"><code>222222222222</code></td><td data-label="What lives there">The production orders stack; the same two roles</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> are done by AWS services on their own; steps marked <span class="who">Pipeline</span> are stages and actions you define; <span class="who">Hook</span> is your test function.</p>
+			<ol class="flow">
+				<li class="group">Build</li>
+				<li><span class="name">A commit reaches main<span class="who">Pipeline</span></span><span class="desc">The pipeline's source action picks up the change.</span></li>
+				<li><span class="name">Build and unit test<span class="who">Pipeline</span></span><span class="desc">CodeBuild runs <code>sam build</code> and the unit tests.</span></li>
+				<li><span class="name">Package<span class="who">Pipeline</span></span><span class="desc"><code>sam package</code> uploads the function code to S3 and writes <code>packaged.yaml</code>, a template that points at it. Both environments deploy this same artifact.</span></li>
+				<li class="group">Staging</li>
+				<li><span class="name">Create and run a change set<span class="who">Pipeline</span></span><span class="desc">CloudFormation actions, through a role in <code>333333333333</code>, update the staging stack.</span></li>
+				<li class="auto"><span class="name">Gradual deployment in staging<span class="who auto">AWS</span></span><span class="desc">CodeDeploy shifts the alias exactly as it will in production, so the rollout itself is tested too.</span></li>
+				<li><span class="name">Integration tests<span class="who">Pipeline</span></span><span class="desc">A CodeBuild action calls the staging API end to end.</span></li>
+				<li><span class="name">Manual approval<span class="who">Pipeline</span></span><span class="desc">A release manager approves the production deployment.</span></li>
+				<li class="group">Production</li>
+				<li><span class="name">Create and run a change set<span class="who">Pipeline</span></span><span class="desc">CloudFormation, through a role in <code>222222222222</code>, publishes a new Lambda version for each changed function.</span></li>
+				<li class="auto"><span class="name">CodeDeploy takes over the alias<span class="who auto">AWS</span></span><span class="desc">SAM created a CodeDeploy application and deployment group; the stack update starts a deployment instead of moving the alias directly.</span></li>
+				<li><span class="name">Pre-traffic test<span class="who">Hook</span></span><span class="desc">The hook function invokes the new version directly and reports success or failure to CodeDeploy. No user traffic has moved yet.</span></li>
+				<li class="auto"><span class="name">Canary: 10% for five minutes<span class="who auto">AWS</span></span><span class="desc">The alias sends 10% of invocations to the new version. CodeDeploy watches the alarms throughout.</span></li>
+				<li class="auto"><span class="name">All traffic, or roll back<span class="who auto">AWS</span></span><span class="desc">If no alarm fired, the alias points fully at the new version. If an alarm fired or the hook failed, the alias points back at the old version and the stack update fails and rolls back.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>SAM template</h3>
+				<p><code>AutoPublishAlias</code> makes SAM publish a new version whenever the code or configuration changes and point the alias <code>live</code> at it. <code>DeploymentPreference</code> makes that move gradual through CodeDeploy.</p>
+				<span class="file">template.yaml (excerpt)</span>
+<pre><code><span class="k">Transform:</span> AWS::Serverless-2016-10-31
+
+<span class="k">Globals:</span>
+  <span class="k">Function:</span>
+    <span class="k">Runtime:</span> python3.12
+    <span class="k">Timeout:</span> 10
+    <span class="k">Tracing:</span> Active
+    <span class="k">Environment:</span>
+      <span class="k">Variables:</span>
+        <span class="k">TABLE_NAME:</span> !Ref OrdersTable
+
+<span class="k">Resources:</span>
+  <span class="k">OrdersApiFunction:</span>
+    <span class="k">Type:</span> AWS::Serverless::Function
+    <span class="k">Properties:</span>
+      <span class="k">Handler:</span> api.handler
+      <span class="k">CodeUri:</span> src/
+      <span class="k">AutoPublishAlias:</span> live   <span class="c"># callers use the live alias</span>
+      <span class="k">ProvisionedConcurrencyConfig:</span>   <span class="c"># applied to the alias</span>
+        <span class="k">ProvisionedConcurrentExecutions:</span> 20
+      <span class="k">DeploymentPreference:</span>
+        <span class="k">Type:</span> Canary10Percent5Minutes
+        <span class="k">Alarms:</span>
+          - !Ref ApiAliasErrorsAlarm
+          - !Ref ApiAliasLatencyAlarm
+        <span class="k">Hooks:</span>
+          <span class="k">PreTraffic:</span> !Ref PreTrafficHookFunction
+      <span class="k">Policies:</span>
+        - <span class="k">DynamoDBCrudPolicy:</span>
+            <span class="k">TableName:</span> !Ref OrdersTable
+      <span class="k">Events:</span>
+        <span class="k">CreateOrder:</span>
+          <span class="k">Type:</span> Api
+          <span class="k">Properties:</span>
+            <span class="k">Path:</span> /orders
+            <span class="k">Method:</span> post
+
+  <span class="k">OrdersWorkerFunction:</span>
+    <span class="k">Type:</span> AWS::Serverless::Function
+    <span class="k">Properties:</span>
+      <span class="k">Handler:</span> worker.handler
+      <span class="k">CodeUri:</span> src/
+      <span class="k">AutoPublishAlias:</span> live
+      <span class="k">DeploymentPreference:</span>
+        <span class="k">Type:</span> Linear10PercentEvery1Minute
+      <span class="k">Policies:</span>
+        - <span class="k">DynamoDBCrudPolicy:</span>
+            <span class="k">TableName:</span> !Ref OrdersTable
+      <span class="k">Events:</span>
+        <span class="k">OrderQueue:</span>
+          <span class="k">Type:</span> SQS
+          <span class="k">Properties:</span>
+            <span class="k">Queue:</span> !GetAtt OrdersQueue.Arn
+            <span class="k">BatchSize:</span> 10
+            <span class="k">FunctionResponseTypes:</span>
+              - ReportBatchItemFailures   <span class="c"># retry only failed messages</span>
+
+  <span class="k">OrdersQueue:</span>
+    <span class="k">Type:</span> AWS::SQS::Queue
+    <span class="k">Properties:</span>
+      <span class="k">VisibilityTimeout:</span> 60   <span class="c"># at least 6x the function timeout</span>
+      <span class="k">RedrivePolicy:</span>
+        <span class="k">deadLetterTargetArn:</span> !GetAtt OrdersDlq.Arn
+        <span class="k">maxReceiveCount:</span> 5
+
+  <span class="k">OrdersDlq:</span>
+    <span class="k">Type:</span> AWS::SQS::Queue
+
+  <span class="k">OrdersTable:</span>
+    <span class="k">Type:</span> AWS::DynamoDB::Table
+    <span class="k">DeletionPolicy:</span> Retain
+    <span class="k">UpdateReplacePolicy:</span> Retain
+    <span class="k">Properties:</span>
+      <span class="k">BillingMode:</span> PAY_PER_REQUEST
+      <span class="k">AttributeDefinitions:</span>
+        - <span class="k">AttributeName:</span> orderId
+          <span class="k">AttributeType:</span> S
+      <span class="k">KeySchema:</span>
+        - <span class="k">AttributeName:</span> orderId
+          <span class="k">KeyType:</span> HASH
+      <span class="k">PointInTimeRecoverySpecification:</span>
+        <span class="k">PointInTimeRecoveryEnabled:</span> true</code></pre>
+				<ul>
+					<li>With <code>AutoPublishAlias</code>, the API event targets the alias, not <code>$LATEST</code>, so API Gateway follows whatever version the alias points to.</li>
+					<li>The SQS event source mapping is also created on the alias, so the worker shifts gradually too; <code>ReportBatchItemFailures</code> lets the handler return only the failed message IDs, so one bad message doesn't make the whole batch retry.</li>
+					<li>The table is kept on stack deletion or replacement, and point-in-time recovery allows restoring it to any second in the last 35 days.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Alarms on the alias</h3>
+				<p>Lambda publishes metrics per function and also per alias or version. The <code>Resource</code> dimension, set to <code>function:alias</code>, selects the invocations that went through the alias, which during the canary is the traffic CodeDeploy is shifting.</p>
+				<span class="file">template.yaml (alarms)</span>
+<pre><code><span class="k">ApiAliasErrorsAlarm:</span>
+  <span class="k">Type:</span> AWS::CloudWatch::Alarm
+  <span class="k">Properties:</span>
+    <span class="k">Namespace:</span> AWS/Lambda
+    <span class="k">MetricName:</span> Errors
+    <span class="k">Dimensions:</span>
+      - <span class="k">Name:</span> FunctionName
+        <span class="k">Value:</span> !Ref OrdersApiFunction
+      - <span class="k">Name:</span> Resource
+        <span class="k">Value:</span> !Sub ${OrdersApiFunction}:live
+    <span class="k">Statistic:</span> Sum
+    <span class="k">Period:</span> 60
+    <span class="k">EvaluationPeriods:</span> 2
+    <span class="k">Threshold:</span> 5
+    <span class="k">ComparisonOperator:</span> GreaterThanOrEqualToThreshold
+    <span class="k">TreatMissingData:</span> notBreaching   <span class="c"># quiet periods aren't failures</span>
+
+<span class="k">ApiAliasLatencyAlarm:</span>
+  <span class="k">Type:</span> AWS::CloudWatch::Alarm
+  <span class="k">Properties:</span>
+    <span class="k">Namespace:</span> AWS/Lambda
+    <span class="k">MetricName:</span> Duration
+    <span class="k">Dimensions:</span>
+      - <span class="k">Name:</span> FunctionName
+        <span class="k">Value:</span> !Ref OrdersApiFunction
+      - <span class="k">Name:</span> Resource
+        <span class="k">Value:</span> !Sub ${OrdersApiFunction}:live
+    <span class="k">ExtendedStatistic:</span> p99
+    <span class="k">Period:</span> 60
+    <span class="k">EvaluationPeriods:</span> 2
+    <span class="k">Threshold:</span> 800   <span class="c"># milliseconds</span>
+    <span class="k">ComparisonOperator:</span> GreaterThanThreshold
+    <span class="k">TreatMissingData:</span> notBreaching</code></pre>
+				<p>To watch only the new version during the canary, add the <code>ExecutedVersion</code> dimension with the new version number (<code>!GetAtt OrdersApiFunction.Version.Version</code>). That isolates the 10% from the 90% still served by the old version, so a small error rate on the new version isn't diluted.</p>
+				<div class="callout trap"><p>An alarm with only the <code>FunctionName</code> dimension counts every version together. During a 10% canary, a new version failing every request raises the overall error rate only slightly, and the alarm may never fire. Alarm on the <strong>alias</strong> (or the executed version) and keep thresholds tight.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Pre-traffic hook</h3>
+				<p>The hook is an ordinary Lambda function. CodeDeploy invokes it before shifting any traffic, and waits until the hook reports a result.</p>
+				<span class="file">template.yaml (hook)</span>
+<pre><code><span class="k">PreTrafficHookFunction:</span>
+  <span class="k">Type:</span> AWS::Serverless::Function
+  <span class="k">Properties:</span>
+    <span class="k">FunctionName:</span> CodeDeployHook_OrdersPreTraffic   <span class="c"># prefix required by the default role</span>
+    <span class="k">Handler:</span> hook.handler
+    <span class="k">CodeUri:</span> hooks/
+    <span class="k">DeploymentPreference:</span>
+      <span class="k">Enabled:</span> false   <span class="c"># the hook itself deploys directly</span>
+    <span class="k">Environment:</span>
+      <span class="k">Variables:</span>
+        <span class="k">NEW_VERSION:</span> !Ref OrdersApiFunction.Version
+    <span class="k">Policies:</span>
+      - <span class="k">Statement:</span>
+          - <span class="k">Effect:</span> Allow
+            <span class="k">Action:</span> codedeploy:PutLifecycleEventHookExecutionStatus
+            <span class="k">Resource:</span> "*"
+          - <span class="k">Effect:</span> Allow
+            <span class="k">Action:</span> lambda:InvokeFunction
+            <span class="k">Resource:</span> !Ref OrdersApiFunction.Version</code></pre>
+				<span class="file">hooks/hook.py</span>
+<pre><code>import json, os
+import boto3
+
+codedeploy = boto3.client("codedeploy")
+lam = boto3.client("lambda")
+
+def handler(event, context):
+    status = "Succeeded"
+    try:
+        <span class="c"># call the new version directly with a test order</span>
+        resp = lam.invoke(
+            FunctionName=os.environ["NEW_VERSION"],
+            Payload=json.dumps({"body": '{"item": "test", "qty": 1}'}),
+        )
+        result = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError") or result.get("statusCode") != 201:
+            status = "Failed"
+    except Exception:
+        status = "Failed"
+
+    <span class="c"># CodeDeploy waits for this call</span>
+    codedeploy.put_lifecycle_event_hook_execution_status(
+        deploymentId=event["DeploymentId"],
+        lifecycleEventHookExecutionId=event["LifecycleEventHookExecutionId"],
+        status=status,
+    )</code></pre>
+				<ul>
+					<li>A <code>PostTraffic</code> hook works the same way and runs after all traffic has moved, for checks that need the full load.</li>
+					<li>If the hook never reports, the deployment fails when the hook times out after one hour, so always report, even on unexpected errors.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Build specification</h3>
+				<span class="file">buildspec.yml</span>
+<pre><code><span class="k">version:</span> 0.2
+<span class="k">phases:</span>
+  <span class="k">install:</span>
+    <span class="k">runtime-versions:</span>
+      <span class="k">python:</span> 3.12
+    <span class="k">commands:</span>
+      - pip install -r requirements-dev.txt
+  <span class="k">build:</span>
+    <span class="k">commands:</span>
+      - python -m pytest tests/unit   <span class="c"># fail the build before packaging</span>
+      - sam build
+      - sam package
+          --s3-bucket tooling-artifacts-111111111111
+          --kms-key-id alias/pipeline-artifacts
+          --output-template-file packaged.yaml
+<span class="k">artifacts:</span>
+  <span class="k">files:</span>
+    - packaged.yaml
+    - params-staging.json
+    - params-prod.json</code></pre>
+				<p><code>sam package</code> uploads each function's code to the artifact bucket and rewrites the <code>CodeUri</code> values to point at it. Because both stages deploy <code>packaged.yaml</code>, production runs exactly the code that passed staging.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Pipeline stages</h3>
+				<p>Each environment uses two CloudFormation actions: create a change set, then execute it. The action-level <code>RoleArn</code> is the role the pipeline assumes in the target account; <code>Configuration.RoleArn</code> is the role CloudFormation uses to create the resources.</p>
+				<span class="file">pipeline.yaml (production stage)</span>
+<pre><code>- <span class="k">Name:</span> Production
+  <span class="k">Actions:</span>
+    - <span class="k">Name:</span> Approve
+      <span class="k">RunOrder:</span> 1
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Approval
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> Manual
+        <span class="k">Version:</span> "1"
+
+    - <span class="k">Name:</span> CreateChangeSet
+      <span class="k">RunOrder:</span> 2
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Deploy
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> CloudFormation
+        <span class="k">Version:</span> "1"
+      <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/PipelineDeployRole
+      <span class="k">InputArtifacts:</span>
+        - <span class="k">Name:</span> BuildOutput
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> CHANGE_SET_REPLACE
+        <span class="k">StackName:</span> orders
+        <span class="k">ChangeSetName:</span> orders-release
+        <span class="k">TemplatePath:</span> BuildOutput::packaged.yaml
+        <span class="k">TemplateConfiguration:</span> BuildOutput::params-prod.json
+        <span class="k">Capabilities:</span> CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+        <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/CfnExecutionRole
+
+    - <span class="k">Name:</span> ExecuteChangeSet
+      <span class="k">RunOrder:</span> 3
+      <span class="k">ActionTypeId:</span>
+        <span class="k">Category:</span> Deploy
+        <span class="k">Owner:</span> AWS
+        <span class="k">Provider:</span> CloudFormation
+        <span class="k">Version:</span> "1"
+      <span class="k">RoleArn:</span> arn:aws:iam::222222222222:role/PipelineDeployRole
+      <span class="k">Configuration:</span>
+        <span class="k">ActionMode:</span> CHANGE_SET_EXECUTE
+        <span class="k">StackName:</span> orders
+        <span class="k">ChangeSetName:</span> orders-release</code></pre>
+				<ul>
+					<li>The execute action finishes only when the stack update finishes, which includes the whole CodeDeploy canary. A rollback in CodeDeploy fails the stack update, which fails the pipeline stage.</li>
+					<li>The artifact bucket's KMS key policy and bucket policy must allow <code>PipelineDeployRole</code> and <code>CfnExecutionRole</code> in both target accounts to read the artifacts.</li>
+				</ul>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>CodeDeploy traffic shifting on the Lambda alias</td><td data-label="Why">Works for every way the function is invoked (API, queue, direct), has hooks and alarm rollback built in, and SAM sets it up with a few lines</td></tr>
+						<tr><td>Alarms on the alias, not the function</td><td data-label="Why">Separates the traffic being shifted from older versions, so the alarms react to the release</td></tr>
+						<tr><td>Same deployment preference in staging</td><td data-label="Why">Tests the rollout mechanics (hook, alarms, permissions) before production depends on them</td></tr>
+						<tr><td>Expand, then contract for data changes</td><td data-label="Why">During the canary both versions read and write the same table. Release 1 adds the new attribute and writes both formats; a later release stops reading the old one; only then is the old attribute removed</td></tr>
+						<tr><td>Provisioned concurrency on the alias</td><td data-label="Why">New versions are initialized before they receive traffic, so shifting doesn't cause a burst of cold starts</td></tr>
+						<tr><td>Retain the table</td><td data-label="Why">A stack deletion or an accidental replacement can't delete production data</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>A table property change that requires <strong>replacement</strong> (for example, changing the key schema) can't be done in place, and the table has a fixed name in many templates, so the update fails. Data model changes belong in application code and new attributes, not in table replacements during a release.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Weighted alias set manually (<code>RoutingConfig</code> on the alias)</td><td data-label="When it fits better">One-off experiments where you want to control the split yourself; there's no automatic rollback</td></tr>
+						<tr><td>API Gateway stage canary</td><td data-label="When it fits better">The change is in the API itself (new routes, mapping templates) rather than in function code; promotion is manual</td></tr>
+						<tr><td>CDK Pipelines with <code>LambdaDeploymentGroup</code></td><td data-label="When it fits better">The team writes infrastructure in CDK; the same CodeDeploy traffic shifting is available as constructs</td></tr>
+						<tr><td>Linear instead of canary</td><td data-label="When it fits better">Gradual increase matters more than a quick decision, for example with load-sensitive downstream systems</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Successful release</span><span class="desc">Deploy a harmless change and watch the CodeDeploy deployment move from 10% to 100% after five minutes.</span></li>
+				<li><span class="name">Failing hook</span><span class="desc">Make the hook's test order fail in staging. The deployment stops before any traffic moves, and the stack rolls back.</span></li>
+				<li><span class="name">Errors during the canary</span><span class="desc">Release a version that fails a share of requests, controlled by an environment variable or an AppConfig feature flag. The alias alarm fires and traffic returns to the old version.</span></li>
+				<li><span class="name">Injected faults</span><span class="desc">AWS FIS Lambda actions can add latency or errors to invocations of a chosen function, to confirm the latency alarm and rollback work.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-1.html">1.1</a> CI/CD pipelines</td><td data-label="What this architecture demonstrates">Cross-account CloudFormation change set actions, one artifact promoted through environments, manual approval</td></tr>
+						<tr><td><a href="../d1-task-1-2.html">1.2</a> Automated testing</td><td data-label="What this architecture demonstrates">Unit tests before packaging, integration tests in staging, a pre-traffic test in production</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Deployment strategies</td><td data-label="What this architecture demonstrates">Lambda canary and linear traffic shifting with hooks and alarm-based rollback</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Scalable solutions</td><td data-label="What this architecture demonstrates">Provisioned concurrency, SQS buffering with partial batch responses and a dead-letter queue</td></tr>
+						<tr><td><a href="../d4-task-4-2.html">4.2</a> Monitoring</td><td data-label="What this architecture demonstrates">Alias and version metric dimensions, percentile alarms</td></tr>
+						<tr><td><a href="../snippets/sam-deployments.html">Snippets</a></td><td data-label="What this architecture demonstrates">More SAM deployment preference, hook and pipeline examples</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Release Lambda changes to a small percentage of users first and roll back automatically on errors, with the least custom code" is <strong>SAM <code>AutoPublishAlias</code> with a CodeDeploy <code>DeploymentPreference</code> (canary or linear) and CloudWatch alarms</strong>. Hook functions add tests before or after the shift.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

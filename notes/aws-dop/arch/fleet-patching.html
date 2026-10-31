@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Fleet Patching and Compliance Across Accounts | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: patch hundreds of EC2 instances across accounts with Systems Manager patch policies and maintenance windows, find CVEs with Inspector, report compliance with Config and Security Hub, remediate automatically, and replace Auto Scaling instances from golden AMIs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Fleet patching</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Fleet patching and compliance across accounts</h1>
+		<p>Hundreds of Linux and Windows instances in many accounts are patched every month inside approved maintenance windows, critical vulnerabilities are fixed within seven days, one security account sees the compliance of the whole fleet, and noncompliant instances are fixed automatically. Instances in Auto Scaling groups are not patched in place; they're replaced from a freshly built golden AMI.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 2</span><span class="tag">Domain 6</span><span class="tag">Domain 5</span><span class="tag">Systems Manager</span><span class="tag">Patch Manager</span><span class="tag">Inspector</span><span class="tag">AWS Config</span><span class="tag">Image Builder</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Make every instance managed</a></li>
+				<li class="sub"><a href="#b2">2. Patch baselines</a></li>
+				<li class="sub"><a href="#b3">3. Patch policy or maintenance window</a></li>
+				<li class="sub"><a href="#b4">4. Vulnerability scanning</a></li>
+				<li class="sub"><a href="#b5">5. Compliance reporting</a></li>
+				<li class="sub"><a href="#b6">6. Fast fix for critical CVEs</a></li>
+				<li class="sub"><a href="#b7">7. Golden AMIs for Auto Scaling groups</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>A company runs several hundred EC2 instances, Amazon Linux 2023 and Windows Server, in many workload accounts. Some are long-lived servers; others belong to Auto Scaling groups. Auditors require monthly patching, critical CVEs fixed within seven days, and a single place to prove compliance.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Every instance can be patched, including new ones</td><td data-label="Design choice">Systems Manager manages all instances: Default Host Management Configuration (DHMC) or an instance profile</td></tr>
+						<tr><td>Same rules in every account and Region</td><td data-label="Design choice">A Quick Setup patch policy targeting the Workloads OU, with custom patch baselines</td></tr>
+						<tr><td>Patch only in approved hours</td><td data-label="Design choice">Install on a schedule (patch policy) or in a maintenance window for servers with special timing</td></tr>
+						<tr><td>Know about critical CVEs quickly</td><td data-label="Design choice">Amazon Inspector continuous scanning, enabled organization-wide</td></tr>
+						<tr><td>One place to prove compliance</td><td data-label="Design choice">Config rules and Security Hub controls, aggregated in the security account</td></tr>
+						<tr><td>Fix critical findings within seven days, automatically</td><td data-label="Design choice">EventBridge on critical Inspector findings starts an Automation runbook that patches the instance</td></tr>
+						<tr><td>Auto Scaling instances stay patched after scale-out</td><td data-label="Design choice">EC2 Image Builder rebuilds the golden AMI; an instance refresh replaces running instances</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, with workloads in us-east-1 and eu-west-1:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Management</td><td data-label="ID"><code>000000000000</code></td><td data-label="What lives there">Organizations; delegates administration of Systems Manager, Inspector, Config and Security Hub</td></tr>
+						<tr><td>Security (audit)</td><td data-label="ID"><code>555555555555</code></td><td data-label="What lives there">Delegated administrator: patch policy, Inspector, Config aggregator, Security Hub, remediation rules</td></tr>
+						<tr><td>Workloads</td><td data-label="ID"><code>222222222222</code> and others in the Workloads OU</td><td data-label="What lives there">The instances, Auto Scaling groups, Image Builder pipelines</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically inside AWS services; steps marked <span class="who">You</span> are configuration you build once.</p>
+			<ol class="flow">
+				<li class="group">Make instances manageable</li>
+				<li><span class="name">Turn on DHMC in every account and Region<span class="who">You</span></span><span class="desc">Systems Manager gives every instance with SSM Agent and IMDSv2 a default role, so no instance profile change is needed.</span></li>
+				<li class="auto"><span class="name">Instances register as managed nodes<span class="who auto">AWS</span></span><span class="desc">They appear in Fleet Manager and can be scanned and patched.</span></li>
+				<li class="group">Patch on a schedule</li>
+				<li><span class="name">Define baselines and a patch policy<span class="who">You</span></span><span class="desc">The baselines say which patches are approved; the policy targets the Workloads OU and both Regions with a daily scan and a monthly install schedule.</span></li>
+				<li class="auto"><span class="name">Daily scan<span class="who auto">AWS</span></span><span class="desc"><code>AWS-RunPatchBaseline</code> with <code>Operation: Scan</code> reports missing patches without changing anything.</span></li>
+				<li class="auto"><span class="name">Monthly install<span class="who auto">AWS</span></span><span class="desc">The same document with <code>Operation: Install</code> installs approved patches and reboots if needed.</span></li>
+				<li class="group">Find vulnerabilities</li>
+				<li class="auto"><span class="name">Inspector scans continuously<span class="who auto">AWS</span></span><span class="desc">New CVEs are matched against installed packages within hours, with findings in the security account.</span></li>
+				<li class="group">Report compliance</li>
+				<li class="auto"><span class="name">Config rules evaluate every instance<span class="who auto">AWS</span></span><span class="desc"><code>ec2-instance-managed-by-systems-manager</code> and <code>ec2-managedinstance-patch-compliance-status-check</code>; Security Hub shows them as controls SSM.1 and SSM.2.</span></li>
+				<li class="group">Remediate fast</li>
+				<li class="auto"><span class="name">A critical finding raises an event<span class="who auto">AWS</span></span><span class="desc">EventBridge in the security account matches Inspector findings with severity <code>CRITICAL</code>.</span></li>
+				<li class="auto"><span class="name">An Automation runbook patches that instance<span class="who auto">AWS</span></span><span class="desc">It runs <code>AWS-RunPatchBaseline</code> with <code>Install</code> on the affected instance, in its own account, and notifies the owner.</span></li>
+				<li class="group">Auto Scaling groups</li>
+				<li class="auto"><span class="name">Image Builder builds a new golden AMI<span class="who auto">AWS</span></span><span class="desc">On a schedule, or when updated packages are available, with tests before distribution.</span></li>
+				<li class="auto"><span class="name">An instance refresh replaces instances<span class="who auto">AWS</span></span><span class="desc">In batches, with a checkpoint and automatic rollback, so every new instance launches already patched.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Make every instance managed</h3>
+				<p><strong>Default Host Management Configuration</strong> is an account- and Region-level setting: Systems Manager supplies a default role to every instance, so teams don't need to attach instance profiles. It needs IMDSv2 on the instances and SSM Agent 3.2.582.0 or later. Run in each workload account and Region (a StackSet or a Quick Setup host-management configuration can do this for the OU):</p>
+<pre><code><span class="c"># the role DHMC gives instances</span>
+aws iam create-role \
+  --role-name AWSSystemsManagerDefaultEC2InstanceManagementRole \
+  --path /service-role/ \
+  --assume-role-policy-document file://trust-ssm.json   <span class="c"># Principal: ssm.amazonaws.com</span>
+
+aws iam attach-role-policy \
+  --role-name AWSSystemsManagerDefaultEC2InstanceManagementRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedEC2InstanceDefaultPolicy
+
+<span class="c"># turn on DHMC in this account and Region</span>
+aws ssm update-service-setting \
+  --setting-id arn:aws:ssm:us-east-1:222222222222:servicesetting/ssm/managed-instance/default-ec2-instance-management-role \
+  --setting-value service-role/AWSSystemsManagerDefaultEC2InstanceManagementRole</code></pre>
+				<div class="callout note"><p>If an instance already has an instance profile that allows <code>ssm:UpdateInstanceInformation</code>, SSM Agent uses the instance profile, not DHMC. Either way works; what matters is that every instance is managed.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Patch baselines</h3>
+				<p>A baseline approves patches by rule: here, security and bug-fix patches for Amazon Linux 2023 seven days after release, so a bad patch has time to be noticed first. A second baseline would do the same for Windows with <code>CLASSIFICATION</code> and <code>MSRC_SEVERITY</code> filters.</p>
+				<span class="file">patch-baseline.yaml</span>
+<pre><code><span class="k">Al2023Baseline:</span>
+  <span class="k">Type:</span> AWS::SSM::PatchBaseline
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> examplecorp-al2023
+    <span class="k">OperatingSystem:</span> AMAZON_LINUX_2023
+    <span class="k">DefaultBaseline:</span> true            <span class="c"># used when no other baseline applies</span>
+    <span class="k">ApprovalRules:</span>
+      <span class="k">PatchRules:</span>
+        - <span class="k">PatchFilterGroup:</span>
+            <span class="k">PatchFilters:</span>
+              - <span class="k">Key:</span> CLASSIFICATION
+                <span class="k">Values:</span> [ Security, Bugfix ]
+              - <span class="k">Key:</span> SEVERITY
+                <span class="k">Values:</span> [ Critical, Important, Medium ]
+          <span class="k">ApproveAfterDays:</span> 7          <span class="c"># auto-approve a week after release</span>
+          <span class="k">ComplianceLevel:</span> CRITICAL     <span class="c"># missing ones show as critical noncompliance</span>
+    <span class="k">ApprovedPatchesComplianceLevel:</span> HIGH   <span class="c"># for patches approved by name</span></code></pre>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Patch policy or maintenance window</h3>
+				<p><strong>Patch policies</strong> (created in Systems Manager Quick Setup, from the management account or the delegated administrator) are the recommended way to patch at scale. One policy chooses the baselines, the target OUs and Regions, a scan schedule and an install schedule, whether to reboot, and where to write logs. Quick Setup deploys it to every account in the OU, including accounts added later.</p>
+				<p>For servers that need a precise window or a specific order, a <strong>maintenance window</strong> runs the same document under your control:</p>
+				<span class="file">maintenance-window.yaml</span>
+<pre><code><span class="k">PatchWindow:</span>
+  <span class="k">Type:</span> AWS::SSM::MaintenanceWindow
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> monthly-patching
+    <span class="k">Schedule:</span> cron(0 2 ? * SUN#2 *)   <span class="c"># second Sunday, 02:00 UTC</span>
+    <span class="k">Duration:</span> 4                       <span class="c"># hours</span>
+    <span class="k">Cutoff:</span> 1                         <span class="c"># no new tasks in the last hour</span>
+    <span class="k">AllowUnassociatedTargets:</span> false
+
+<span class="k">PatchTargets:</span>
+  <span class="k">Type:</span> AWS::SSM::MaintenanceWindowTarget
+  <span class="k">Properties:</span>
+    <span class="k">WindowId:</span> !Ref PatchWindow
+    <span class="k">ResourceType:</span> INSTANCE
+    <span class="k">Targets:</span>
+      - <span class="k">Key:</span> tag:PatchWindow
+        <span class="k">Values:</span> [ monthly ]
+
+<span class="k">PatchTask:</span>
+  <span class="k">Type:</span> AWS::SSM::MaintenanceWindowTask
+  <span class="k">Properties:</span>
+    <span class="k">WindowId:</span> !Ref PatchWindow
+    <span class="k">TaskType:</span> RUN_COMMAND
+    <span class="k">TaskArn:</span> AWS-RunPatchBaseline
+    <span class="k">Priority:</span> 1
+    <span class="k">MaxConcurrency:</span> 10%               <span class="c"># patch a tenth of the targets at a time</span>
+    <span class="k">MaxErrors:</span> 5%                     <span class="c"># stop if more than 5% fail</span>
+    <span class="k">Targets:</span>
+      - <span class="k">Key:</span> WindowTargetIds
+        <span class="k">Values:</span> [ !Ref PatchTargets ]
+    <span class="k">TaskInvocationParameters:</span>
+      <span class="k">MaintenanceWindowRunCommandParameters:</span>
+        <span class="k">Parameters:</span>
+          <span class="k">Operation:</span> [ Install ]          <span class="c"># Scan only reports</span>
+          <span class="k">RebootOption:</span> [ RebootIfNeeded ]   <span class="c"># or NoReboot</span></code></pre>
+				<ul>
+					<li><strong><code>Operation</code>:</strong> <code>Scan</code> reports what's missing; <code>Install</code> installs approved patches. Compliance data is reported back to Patch Manager either way.</li>
+					<li><strong><code>RebootOption</code>:</strong> <code>RebootIfNeeded</code> (the default) reboots after installing anything. <code>NoReboot</code> leaves patches as <em>installed pending reboot</em>, and the instance shows as noncompliant until it reboots and is scanned again.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Vulnerability scanning with Inspector</h3>
+<pre><code><span class="c"># in 000000000000 (management)</span>
+aws inspector2 enable-delegated-admin-account \
+  --delegated-admin-account-id 555555555555
+
+<span class="c"># in 555555555555: turn scanning on for accounts that join later</span>
+aws inspector2 update-organization-configuration \
+  --auto-enable ec2=true,ecr=true,lambda=true
+
+<span class="c"># ...and activate existing member accounts</span>
+aws inspector2 enable \
+  --account-ids 222222222222 333333333333 \
+  --resource-types EC2 ECR LAMBDA</code></pre>
+				<p>Inspector uses the SSM Agent on managed instances (or agentless snapshot scanning for unmanaged ones), so Step 1 also improves vulnerability coverage.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Compliance reporting</h3>
+				<p>Two organization Config rules, deployed from the security account, answer the two audit questions: is every instance managed, and is every managed instance patched?</p>
+				<span class="file">patch-compliance-rules.yaml (in 555555555555)</span>
+<pre><code><span class="k">InstancesManaged:</span>
+  <span class="k">Type:</span> AWS::Config::OrganizationConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">OrganizationConfigRuleName:</span> instances-managed-by-ssm
+    <span class="k">OrganizationManagedRuleMetadata:</span>
+      <span class="k">RuleIdentifier:</span> EC2_INSTANCE_MANAGED_BY_SSM
+
+<span class="k">InstancesPatched:</span>
+  <span class="k">Type:</span> AWS::Config::OrganizationConfigRule
+  <span class="k">Properties:</span>
+    <span class="k">OrganizationConfigRuleName:</span> instances-patch-compliant
+    <span class="k">OrganizationManagedRuleMetadata:</span>
+      <span class="k">RuleIdentifier:</span> EC2_MANAGEDINSTANCE_PATCH_COMPLIANCE_STATUS_CHECK</code></pre>
+				<p>Security Hub runs the same checks as controls <strong>SSM.1</strong> (instances managed by Systems Manager) and <strong>SSM.2</strong> (patch compliance status COMPLIANT), and its cross-Region aggregation in the security account gives the auditors one dashboard. Patch Manager's own compliance reports can also be exported to S3 on a schedule for detailed, per-patch evidence.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Fast fix for critical CVEs</h3>
+				<p>Inspector findings from every member account arrive in the delegated administrator's EventBridge. A rule sends critical EC2 findings to an Automation runbook:</p>
+				<span class="file">critical-cve-rule.yaml (in 555555555555)</span>
+<pre><code><span class="k">CriticalCveRule:</span>
+  <span class="k">Type:</span> AWS::Events::Rule
+  <span class="k">Properties:</span>
+    <span class="k">EventPattern:</span>
+      <span class="k">source:</span> [ aws.inspector2 ]
+      <span class="k">detail-type:</span> [ Inspector2 Finding ]
+      <span class="k">detail:</span>
+        <span class="k">severity:</span> [ CRITICAL ]
+        <span class="k">status:</span> [ ACTIVE ]
+        <span class="k">resources:</span>
+          <span class="k">type:</span> [ AWS_EC2_INSTANCE ]
+    <span class="k">Targets:</span>
+      - <span class="k">Id:</span> patch-now
+        <span class="k">Arn:</span> !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/PatchInstanceNow:$DEFAULT
+        <span class="k">RoleArn:</span> !GetAtt EventsToAutomationRole.Arn
+        <span class="k">InputTransformer:</span>
+          <span class="k">InputPathsMap:</span>
+            <span class="k">instance:</span> $.detail.resources[0].id
+            <span class="k">account:</span> $.detail.awsAccountId
+          <span class="k">InputTemplate:</span> '{"InstanceId":["&lt;instance&gt;"],"TargetAccount":["&lt;account&gt;"]}'</code></pre>
+				<p>The <code>PatchInstanceNow</code> runbook assumes a role in the target account, runs <code>AWS-RunPatchBaseline</code> with <code>Install</code> on that instance (an <code>aws:runCommand</code> step), runs a scan, and notifies the instance owner. If the instance belongs to an Auto Scaling group, it instead starts the golden AMI pipeline from Step 7.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Golden AMIs for Auto Scaling groups</h3>
+				<p>Patching an Auto Scaling instance in place doesn't last: the next scale-out launches from the old AMI. Instead, Image Builder rebuilds the AMI and updates the launch template, and an instance refresh rolls it out.</p>
+				<span class="file">golden-ami-pipeline.yaml (in each workload account)</span>
+<pre><code><span class="k">WebAmiPipeline:</span>
+  <span class="k">Type:</span> AWS::ImageBuilder::ImagePipeline
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> web-golden-ami
+    <span class="k">ImageRecipeArn:</span> !Ref WebRecipe   <span class="c"># base AMI + components (updates, agents, hardening)</span>
+    <span class="k">InfrastructureConfigurationArn:</span> !Ref BuildInfra
+    <span class="k">DistributionConfigurationArn:</span> !Ref WebDistribution   <span class="c"># updates the launch template</span>
+    <span class="k">ImageTestsConfiguration:</span>
+      <span class="k">ImageTestsEnabled:</span> true
+    <span class="k">Schedule:</span>
+      <span class="k">ScheduleExpression:</span> cron(0 3 ? * MON *)
+      <span class="k">PipelineExecutionStartCondition:</span> EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE</code></pre>
+<pre><code><span class="c"># roll the new launch template version out to the group</span>
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name web-asg \
+  --preferences '{
+      "MinHealthyPercentage": 90,
+      "InstanceWarmup": 300,
+      "CheckpointPercentages": [20, 100],
+      "CheckpointDelay": 600,
+      "SkipMatching": true,
+      "AutoRollback": true
+    }'</code></pre>
+				<ul>
+					<li><strong><code>EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE</code></strong> builds on the schedule only when the base image or components have changed, so unchanged weeks cost nothing.</li>
+					<li><strong>Checkpoints</strong> pause after 20% of the instances so alarms can catch a bad AMI; <strong>AutoRollback</strong> returns to the previous launch template if the refresh fails.</li>
+				</ul>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Patch long-lived servers in place, replace Auto Scaling instances</td><td data-label="Why">Servers keep their state and identity; Auto Scaling instances are disposable, and only a new AMI keeps future launches patched</td></tr>
+						<tr><td>Patch policies over patch groups and per-account windows</td><td data-label="Why">One policy covers every account and Region in the OU, including new accounts; patch groups and windows must be created in each account</td></tr>
+						<tr><td>DHMC over instance profiles</td><td data-label="Why">Instances become managed without every team changing their roles; instance profiles still work where teams already use them</td></tr>
+						<tr><td><code>ApproveAfterDays: 7</code></td><td data-label="Why">A short delay lets bad patches be withdrawn before they reach production; critical CVEs are handled by the fast path instead</td></tr>
+						<tr><td>Scan daily, install monthly</td><td data-label="Why">Compliance data stays current without changing servers outside approved windows</td></tr>
+						<tr><td>Remediate from the security account</td><td data-label="Why">One rule and one runbook for all accounts, which workload teams can't switch off</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p>An instance that Systems Manager can't manage (no SSM Agent, no role, no route to the Systems Manager endpoints) <strong>doesn't appear in patch compliance at all</strong>, so it looks like nothing is wrong. That's why the <code>ec2-instance-managed-by-systems-manager</code> rule (SSM.1) is as important as the patch compliance rule.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Maintenance windows only</td><td data-label="When it fits better">A few accounts, or servers that must be patched in a strict order with pre- and post-patch tasks</td></tr>
+						<tr><td><code>AWS-RunPatchBaselineWithHooks</code></td><td data-label="When it fits better">Applications that must be stopped and started around patching</td></tr>
+						<tr><td>Config remediation with <code>AWS-RunPatchBaseline</code></td><td data-label="When it fits better">Fix any noncompliant instance automatically from the Config rule, without Inspector</td></tr>
+						<tr><td>Immutable everything (AMI pipeline for all instances)</td><td data-label="When it fits better">Fully stateless fleets, where replacing is simpler than patching</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Patch a canary group first</span><span class="desc">Target a tagged group of non-production instances a week before production, using the same baselines.</span></li>
+				<li><span class="name">Check compliance</span><span class="desc">Patch Manager's dashboard and Systems Manager Compliance show compliant, noncompliant and pending-reboot counts per account.</span></li>
+				<li><span class="name">Check the audit view</span><span class="desc">SSM.1 and SSM.2 in Security Hub, aggregated in the security account, must match what Patch Manager reports.</span></li>
+				<li><span class="name">Exercise the fast path</span><span class="desc">Start the <code>PatchInstanceNow</code> runbook by hand on a test instance, then confirm the instance becomes compliant.</span></li>
+				<li><span class="name">Rehearse rollback</span><span class="desc">For Auto Scaling groups, roll back an instance refresh to the previous launch template; for servers, restore from the pre-patch AMI or snapshot.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Where</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d2-task-2-3.html">Task 2.3</a> Automation at scale</td><td data-label="What this architecture demonstrates">Patch Manager, maintenance windows, Quick Setup patch policies, Automation runbooks</td></tr>
+						<tr><td><a href="../d5-task-5-2.html">Task 5.2</a> Configuration changes in response to events</td><td data-label="What this architecture demonstrates">EventBridge starting Automation on a finding; instance refresh to roll out a new AMI</td></tr>
+						<tr><td><a href="../d6-task-6-3.html">Task 6.3</a> Security monitoring</td><td data-label="What this architecture demonstrates">Inspector findings, Config rules and Security Hub controls for compliance evidence</td></tr>
+						<tr><td><a href="../snippets/ssm-automation.html">Automation snippets</a></td><td data-label="What this architecture demonstrates">Runbook structure, multi-account execution, starting from EventBridge</td></tr>
+						<tr><td><a href="../snippets/config-rules.html">Config rule snippets</a></td><td data-label="What this architecture demonstrates">Organization rules and automatic remediation</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Patch EC2 instances across all accounts on a schedule with the least operational overhead" is a <strong>Systems Manager patch policy</strong> (Quick Setup) with patch baselines. "Report patch compliance across the organization" is the <strong>Config patch compliance rule</strong> or <strong>Security Hub SSM.2</strong>. "Instances in an Auto Scaling group keep coming back unpatched" means the fix belongs in the <strong>AMI</strong>: Image Builder plus an instance refresh.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>

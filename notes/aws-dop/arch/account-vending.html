@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Account Vending with AWS Control Tower | AWS DOP-C02 Notes</title>
+	<meta name="description" content="End-to-end DOP-C02 architecture: teams request a new AWS account, Control Tower Account Factory creates it in the right OU with the baseline, customizations and controls apply automatically, Identity Center grants access and an EventBridge workflow finishes the setup.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../dop.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">DOP-C02</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Account vending</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">End-to-end architecture</span>
+		<h1>Account vending with AWS Control Tower</h1>
+		<p>A team asks for a new AWS account. Within the hour, without a ticket queue, the account exists in the right OU with logging, Config and guardrails already on, the company baseline deployed, the team's group able to sign in, and a budget and network ready, and the team is told it can start.</p>
+		<div class="tags"><span class="tag code">DOP-C02</span><span class="tag">Domain 2</span><span class="tag">Domain 6</span><span class="tag">Control Tower</span><span class="tag">Account Factory</span><span class="tag">CfCT</span><span class="tag">IAM Identity Center</span><span class="tag">EventBridge</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. OUs and controls</a></li>
+				<li class="sub"><a href="#b2">2. Requesting an account</a></li>
+				<li class="sub"><a href="#b3">3. Baseline customizations</a></li>
+				<li class="sub"><a href="#b4">4. Access for the team</a></li>
+				<li class="sub"><a href="#b5">5. Post-creation workflow</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>A company with a Control Tower landing zone creates several new accounts every week, one per team and environment. The platform team wants every account created the same way, governed from its first minute, with no manual steps and an audit trail of who asked for what.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Accounts created on request, the same way every time</td><td data-label="Design choice">Control Tower Account Factory, driven from code (Service Catalog API or AFT)</td></tr>
+						<tr><td>Logging, Config and guardrails from the first minute</td><td data-label="Design choice">Create the account inside a registered OU, so the Control Tower baseline and the OU's controls apply</td></tr>
+						<tr><td>Company baseline (roles, alarms, security settings) in every account</td><td data-label="Design choice">Customizations for Control Tower (CfCT) deploying StackSets to the OU</td></tr>
+						<tr><td>Team access without IAM users</td><td data-label="Design choice">IAM Identity Center group assignment with a permission set</td></tr>
+						<tr><td>Extra setup that depends on the new account ID</td><td data-label="Design choice">EventBridge rule on the <code>CreateManagedAccount</code> lifecycle event starting a Step Functions workflow</td></tr>
+						<tr><td>Audit trail of requests</td><td data-label="Design choice">Account requests kept in Git (who, why, when), plus CloudTrail and the lifecycle events</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Assume these accounts, with us-east-1 as the Control Tower home Region:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Account</th><th>ID</th><th>What lives there</th></tr></thead>
+					<tbody>
+						<tr><td>Management</td><td data-label="ID"><code>000000000000</code></td><td data-label="What lives there">Organizations, Control Tower, Account Factory, the CfCT pipeline, the post-creation workflow</td></tr>
+						<tr><td>Log Archive</td><td data-label="ID"><code>666666666666</code></td><td data-label="What lives there">CloudTrail and Config logs for every account (created by Control Tower)</td></tr>
+						<tr><td>Audit</td><td data-label="ID"><code>555555555555</code></td><td data-label="What lives there">Security tooling and cross-account audit roles (created by Control Tower)</td></tr>
+						<tr><td>New workload account</td><td data-label="ID">Assigned at creation</td><td data-label="What lives there">The team's application, in the <code>Workloads/Prod</code> or <code>Workloads/NonProd</code> OU</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> are done by Control Tower and other services; steps marked <span class="who">You build</span> are pieces the platform team creates once.</p>
+			<ol class="flow">
+				<li class="group">Request</li>
+				<li><span class="name">A team requests an account<span class="who">You build</span></span><span class="desc">A pull request adds an account request file (name, email, OU, owner, reason). Review and merge are the approval.</span></li>
+				<li><span class="name">The pipeline calls Account Factory<span class="who">You build</span></span><span class="desc">It provisions the "AWS Control Tower Account Factory" product in Service Catalog with the request's parameters.</span></li>
+				<li class="group">Create and govern</li>
+				<li class="auto"><span class="name">Organizations creates the account<span class="who auto">AWS</span></span><span class="desc">The account is placed directly in the requested OU, never in the root.</span></li>
+				<li class="auto"><span class="name">Control Tower applies its baseline<span class="who auto">AWS</span></span><span class="desc">The organization trail covers the account, Config starts recording to the Log Archive account, and Control Tower's roles are created.</span></li>
+				<li class="auto"><span class="name">The OU's controls apply<span class="who auto">AWS</span></span><span class="desc">Preventive controls (SCPs) take effect at once; detective controls (Config rules) start evaluating.</span></li>
+				<li class="auto"><span class="name">Identity Center access<span class="who auto">AWS</span></span><span class="desc">The user named in the request gets administrator access to the account through Identity Center.</span></li>
+				<li class="group">Customize</li>
+				<li class="auto"><span class="name">CfCT deploys the baseline<span class="who auto">AWS</span></span><span class="desc">The new account joins the OU's StackSets, so the company roles, alarms and settings are created.</span></li>
+				<li class="auto"><span class="name">The lifecycle event fires<span class="who auto">AWS</span></span><span class="desc">Control Tower emits <code>CreateManagedAccount</code> with the new account ID and OU when everything has finished.</span></li>
+				<li><span class="name">The post-creation workflow runs<span class="who">You build</span></span><span class="desc">Assigns the team's group, creates a budget, allocates a VPC CIDR from IPAM and creates the VPC.</span></li>
+				<li class="group">Hand over</li>
+				<li><span class="name">The team is notified<span class="who">You build</span></span><span class="desc">A message with the account ID, the sign-in portal and what the baseline contains.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>OUs and controls</h3>
+				<p>Accounts inherit governance from their OU, so the OU structure and its controls come first. Register each OU with Control Tower, then enable controls on it. Controls can be managed as code with the <code>AWS::ControlTower::EnabledControl</code> resource:</p>
+				<span class="file">workload-controls.yaml (in 000000000000)</span>
+<pre><code><span class="k">Resources:</span>
+  <span class="k">ProdDisallowRootUser:</span>   <span class="c"># preventive: an SCP behind the scenes</span>
+    <span class="k">Type:</span> AWS::ControlTower::EnabledControl
+    <span class="k">Properties:</span>
+      <span class="k">ControlIdentifier:</span> arn:aws:controltower:us-east-1::control/AWS-GR_RESTRICT_ROOT_USER
+      <span class="k">TargetIdentifier:</span> arn:aws:organizations::000000000000:ou/o-a1b2c3d4e5/ou-ab12-prod0001
+
+  <span class="k">ProdEncryptedVolumes:</span>   <span class="c"># detective: a Config rule behind the scenes</span>
+    <span class="k">Type:</span> AWS::ControlTower::EnabledControl
+    <span class="k">Properties:</span>
+      <span class="k">ControlIdentifier:</span> arn:aws:controltower:us-east-1::control/AWS-GR_ENCRYPTED_VOLUMES
+      <span class="k">TargetIdentifier:</span> arn:aws:organizations::000000000000:ou/o-a1b2c3d4e5/ou-ab12-prod0001</code></pre>
+				<ul>
+					<li><strong>Identifiers:</strong> each control's API <code>controlIdentifier</code> is shown on its details page in the Control Tower console.</li>
+					<li><strong>Per OU:</strong> stricter controls go on <code>Workloads/Prod</code>, lighter ones on <code>Sandbox</code>; every account placed in an OU gets that OU's controls.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Requesting an account</h3>
+				<p>Account Factory is a Service Catalog product in the management account. A request is a launch of that product with six parameters. From a pipeline, the request looks like this:</p>
+<pre><code>aws servicecatalog provision-product \
+  --product-id prod-abcd1234efgh5 \
+  --provisioning-artifact-id pa-abcd1234efgh5 \
+  --provisioned-product-name orders-prod \
+  --provisioning-parameters \
+    Key=AccountName,Value=orders-prod \
+    Key=AccountEmail,Value=aws+orders-prod@example.com \
+    Key=ManagedOrganizationalUnit,Value="Prod (ou-ab12-prod0001)" \
+    Key=SSOUserEmail,Value=platform-team@example.com \
+    Key=SSOUserFirstName,Value=Platform \
+    Key=SSOUserLastName,Value=Team</code></pre>
+				<ul>
+					<li><strong><code>AccountEmail</code></strong> must not already belong to an AWS account; a plus-addressed mailbox per account is common.</li>
+					<li><strong><code>SSOUserEmail</code></strong> gets administrator access to the account through Identity Center.</li>
+					<li><strong>Concurrency:</strong> up to five accounts can be provisioned at a time; requests beyond that wait.</li>
+				</ul>
+				<p>Teams using Terraform get the same result with <strong>Account Factory for Terraform (AFT)</strong>: an account request file pushed to the <code>aft-account-request</code> repository starts AFT's pipeline.</p>
+				<span class="file">aft-account-request/terraform/orders-prod.tf</span>
+<pre><code>module "orders_prod" {
+  source = "./modules/aft-account-request"
+
+  control_tower_parameters = {
+    AccountEmail              = "aws+orders-prod@example.com"
+    AccountName               = "orders-prod"
+    ManagedOrganizationalUnit = "Prod (ou-ab12-prod0001)"
+    SSOUserEmail              = "platform-team@example.com"
+    SSOUserFirstName          = "Platform"
+    SSOUserLastName           = "Team"
+  }
+
+  account_tags = {
+    "team"        = "orders"
+    "cost-center" = "1234"
+  }
+
+  change_management_parameters = {
+    change_requested_by = "orders-team"
+    change_reason       = "Production account for the orders service"
+  }
+
+  custom_fields = {
+    data_classification = "confidential"   <span class="c"># stored as SSM parameters in the new account</span>
+  }
+
+  account_customizations_name = "production"   <span class="c"># folder in aft-account-customizations</span>
+}</code></pre>
+				<div class="callout note"><p>For a nested OU, give <code>ManagedOrganizationalUnit</code> as <code>OUName (OU-ID)</code>, as above. The Control Tower parameters can't be changed while the account is being provisioned.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Baseline customizations with CfCT</h3>
+				<p>Customizations for Control Tower runs a pipeline in the management account. Its manifest lists templates and policies and where they go; new accounts that land in a target OU receive the StackSet instances automatically.</p>
+				<span class="file">manifest.yaml (CfCT configuration repository)</span>
+<pre><code><span class="k">region:</span> us-east-1   <span class="c"># Control Tower home Region</span>
+<span class="k">version:</span> 2021-03-15
+<span class="k">resources:</span>
+  - <span class="k">name:</span> baseline-roles
+    <span class="k">resource_file:</span> templates/baseline-roles.yaml
+    <span class="k">deploy_method:</span> stack_set   <span class="c"># CloudFormation StackSet</span>
+    <span class="k">deployment_targets:</span>
+      <span class="k">organizational_units:</span>
+        - Prod
+        - NonProd
+    <span class="k">regions:</span>
+      - us-east-1
+
+  - <span class="k">name:</span> security-alarms
+    <span class="k">resource_file:</span> templates/security-alarms.yaml
+    <span class="k">deploy_method:</span> stack_set
+    <span class="k">parameters:</span>
+      - <span class="k">parameter_key:</span> AlertEmail
+        <span class="k">parameter_value:</span> security@example.com
+    <span class="k">deployment_targets:</span>
+      <span class="k">organizational_units:</span>
+        - Prod
+    <span class="k">regions:</span>
+      - us-east-1
+      - eu-west-1
+
+  - <span class="k">name:</span> deny-leave-organization
+    <span class="k">resource_file:</span> policies/deny-leave-organization.json
+    <span class="k">deploy_method:</span> scp   <span class="c"># SCPs and RCPs target OUs, not accounts</span>
+    <span class="k">deployment_targets:</span>
+      <span class="k">organizational_units:</span>
+        - Workloads</code></pre>
+				<ul>
+					<li><strong>Without <code>regions</code></strong>, stack instances deploy only in the home Region.</li>
+					<li><strong>Management account:</strong> CfCT doesn't deploy stack instances there by default.</li>
+					<li><strong>Alternatives:</strong> AFT account customizations (Terraform per account or per type), or Control Tower <strong>blueprints</strong> (a Service Catalog product applied when the account is created).</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Access for the team</h3>
+				<p>The request's SSO user gets administrator access, but day-to-day access should come from the team's group with a least-privilege permission set. The workflow in step 5 creates the assignment once it knows the account ID:</p>
+				<span class="file">assignment (created by the workflow)</span>
+<pre><code><span class="k">OrdersDevelopers:</span>
+  <span class="k">Type:</span> AWS::SSO::Assignment
+  <span class="k">Properties:</span>
+    <span class="k">InstanceArn:</span> arn:aws:sso:::instance/ssoins-1234567890abcdef
+    <span class="k">PermissionSetArn:</span> arn:aws:sso:::permissionSet/ssoins-1234567890abcdef/ps-developer01
+    <span class="k">PrincipalType:</span> GROUP
+    <span class="k">PrincipalId:</span> 9067c4d2-1234-5678-9abc-def012345678   <span class="c"># Identity Center group ID</span>
+    <span class="k">TargetType:</span> AWS_ACCOUNT
+    <span class="k">TargetId:</span> "111122223333"   <span class="c"># the new account</span></code></pre>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Post-creation workflow</h3>
+				<p>Control Tower records a lifecycle event when an account is fully created and enrolled. An EventBridge rule in the management account starts the workflow:</p>
+				<span class="file">account-created-rule.json</span>
+<pre><code>{
+  "source": ["aws.controltower"],
+  "detail-type": ["AWS Service Event via CloudTrail"],
+  "detail": {
+    "eventName": ["CreateManagedAccount", "UpdateManagedAccount"]
+  }
+}</code></pre>
+				<p>The details are under <code>serviceEventDetails.createManagedAccountStatus</code> (or <code>updateManagedAccountStatus</code>): <code>state</code> (<code>SUCCEEDED</code> or <code>FAILED</code>), <code>account.accountId</code>, <code>account.accountName</code>, and the OU name and ID. The Step Functions workflow then:</p>
+				<ol class="flow">
+					<li><span class="name">Checks the result</span><span class="desc">Stops and alerts the platform team if <code>state</code> isn't <code>SUCCEEDED</code>.</span></li>
+					<li><span class="name">Reads the request metadata</span><span class="desc">Team, cost center and environment from the account tags.</span></li>
+					<li><span class="name">Assigns the team's group</span><span class="desc">Identity Center <code>CreateAccountAssignment</code> with the developer permission set.</span></li>
+					<li><span class="name">Creates a budget</span><span class="desc">An AWS Budgets budget with alerts to the team's distribution list.</span></li>
+					<li><span class="name">Allocates network space</span><span class="desc">A CIDR from the VPC IPAM pool for the environment, then a VPC attached to the Transit Gateway.</span></li>
+					<li><span class="name">Notifies the team</span><span class="desc">Account ID, sign-in portal URL and a link to the baseline documentation.</span></li>
+				</ol>
+				<div class="callout trap"><p>Lifecycle events reach EventBridge only if a <strong>CloudTrail trail with logging</strong> is active (Control Tower's organization trail does this). A retried request can end with <code>UpdateManagedAccount</code> instead of <code>CreateManagedAccount</code>, which is why the rule matches both.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Decision</th><th>Why</th></tr></thead>
+					<tbody>
+						<tr><td>Create accounts through Account Factory, not <code>organizations:CreateAccount</code></td><td data-label="Why">Account Factory enrolls the account in Control Tower, so the baseline, controls and drift detection apply; a raw Organizations account starts ungoverned</td></tr>
+						<tr><td>Place the account in its final OU at creation</td><td data-label="Why">Guardrails apply from the first minute; moving it later leaves a window without them and can cause drift</td></tr>
+						<tr><td>Requests as code in Git</td><td data-label="Why">Review is the approval, history is the audit trail, and the request can be replayed</td></tr>
+						<tr><td>Baseline per OU (CfCT StackSets), not per account</td><td data-label="Why">New accounts get it automatically; changing the template updates every account</td></tr>
+						<tr><td>Event-driven post-creation steps</td><td data-label="Why">They run only after Control Tower has finished, with the real account ID, and failures are visible in the workflow's history</td></tr>
+						<tr><td>Group-based access through Identity Center</td><td data-label="Why">No IAM users; joining or leaving the team changes access everywhere</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout trap"><p><strong>Drift:</strong> moving an enrolled account to an OU outside Control Tower, editing a Control Tower-managed SCP in Organizations, or deleting its roles makes the landing zone report drift. Move accounts and change controls through Control Tower, add your own SCPs alongside its ones, and repair the landing zone if drift appears.</p></div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>When it fits better</th></tr></thead>
+					<tbody>
+						<tr><td>Organizations plus your own scripts</td><td data-label="When it fits better">No Control Tower, or a need it can't meet; you then build logging, baselines and drift checks yourself</td></tr>
+						<tr><td>Account Factory for Terraform (AFT)</td><td data-label="When it fits better">The platform team works in Terraform; requests, global and per-account customizations all live in Git repositories</td></tr>
+						<tr><td>Customizations for Control Tower (CfCT)</td><td data-label="When it fits better">CloudFormation templates and SCPs per OU, applied to existing and new accounts by one pipeline</td></tr>
+						<tr><td>Control Tower blueprints</td><td data-label="When it fits better">A small set of account types, each defined by one Service Catalog product chosen at creation</td></tr>
+						<tr><td>Landing Zone Accelerator on AWS</td><td data-label="When it fits better">Regulated environments needing a broad, configuration-driven baseline of security services and networking</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Vend into a test OU</span><span class="desc">Request an account into a Sandbox or Policy Staging OU first, with the same controls as the target OU.</span></li>
+				<li><span class="name">Check the baseline</span><span class="desc">The account appears as enrolled in Control Tower, the CfCT stack instances are <code>CURRENT</code>, and Config is recording.</span></li>
+				<li><span class="name">Check the guardrails</span><span class="desc">Try a denied action (for example, leaving the organization) and confirm the SCP blocks it.</span></li>
+				<li><span class="name">Check the workflow</span><span class="desc">The Step Functions execution succeeded, the team's group can sign in, and the budget and VPC exist.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Multi-account automation</td><td data-label="What this architecture demonstrates">Account Factory, AFT, CfCT, OU-based controls and drift</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Reusable infrastructure</td><td data-label="What this architecture demonstrates">StackSets and Service Catalog products as the account baseline</td></tr>
+						<tr><td><a href="../d6-task-6-1.html">6.1</a> Identity at scale</td><td data-label="What this architecture demonstrates">Identity Center group assignments and permission sets instead of IAM users</td></tr>
+						<tr><td><a href="../d5-task-5-1.html">5.1</a> Event sources</td><td data-label="What this architecture demonstrates">Acting on Control Tower lifecycle events with EventBridge</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Provision new accounts with the company baseline and guardrails, with the least operational overhead" is <strong>Control Tower Account Factory</strong> (or AFT for Terraform teams) with <strong>OU-level controls and customizations</strong>. "Run extra setup after each new account is ready" is an <strong>EventBridge rule on the <code>CreateManagedAccount</code> lifecycle event</strong>.</p></div>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified DevOps Engineer &ndash; Professional (DOP-C02) exam guide.</div>
+</footer>
+
+</body>
+</html>
