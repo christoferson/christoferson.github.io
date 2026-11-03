@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.1: Scalability and Elasticity | AWS SOA-C03 Notes</title>
+	<meta name="description" content="SOA-C03 Task 2.1 study guide: EC2 Auto Scaling policies, warmup, warm pools, lifecycle hooks and mixed instances; scaling ECS, EKS and Lambda; caching with CloudFront, ElastiCache and DAX; and scaling RDS, Aurora, Aurora Serverless and DynamoDB.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="soa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SOA-C03</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Reliability and Business Continuity &middot; 22%</span>
+		<h1>Task 2.1: Implement scalability and elasticity</h1>
+		<p>Matching capacity to demand automatically: EC2 Auto Scaling policies and the settings that make them behave, scaling containers and Lambda, taking load off the backend with CloudFront, ElastiCache and DAX, and scaling databases with read replicas, Aurora Serverless and DynamoDB capacity modes.</p>
+		<div class="tags"><span class="tag code">SOA-C03</span><span class="tag">EC2 Auto Scaling</span><span class="tag">Target tracking</span><span class="tag">Lambda concurrency</span><span class="tag">ElastiCache</span><span class="tag">Aurora Serverless</span><span class="tag">DynamoDB</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Scaling compute</a></li>
+				<li><a href="#s2">Caching</a></li>
+				<li><a href="#s3">Scaling managed databases</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.1</span>
+				<p><strong>Implement scalability and elasticity.</strong></p>
+			</div>
+			<p><strong>Scalability</strong> is the ability to handle more load by adding resources; <strong>elasticity</strong> is doing it automatically in both directions, adding capacity when demand rises and removing it when demand falls, so you pay only for what the load needs. Questions describe a load pattern (a daily peak, a sudden spike, a slow-booting application, a database overwhelmed by reads) and ask for the scaling mechanism or the setting that fixes the behaviour.</p>
+			<p>The examples continue the <strong>orders</strong> application: an EC2 Auto Scaling group behind an Application Load Balancer, a payments Lambda function, an ECS service, an RDS for PostgreSQL database and a DynamoDB table of shopping carts.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.1.1</td><td data-label="What you need to be able to do">Configure and manage scaling mechanisms in compute environments</td></tr>
+						<tr><td>2.1.2</td><td data-label="What you need to be able to do">Implement caching to enhance dynamic scalability: CloudFront, ElastiCache</td></tr>
+						<tr><td>2.1.3</td><td data-label="What you need to be able to do">Configure and manage scaling in AWS managed databases: RDS, DynamoDB</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 2.1.1 -->
+			<h2 id="s1">Scaling compute</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1.1</span><span class="skill-text">Configure and manage scaling mechanisms in compute environments</span></p>
+
+				<h3>EC2 Auto Scaling: the building blocks</h3>
+				<div class="entry">
+					<h4>Group, capacity and launch template</h4>
+					<p>An Auto Scaling group keeps a number of instances running between a <strong>minimum</strong> and <strong>maximum</strong>, aiming for the <strong>desired capacity</strong>, spread across the Availability Zones of its subnets. It launches instances from a <strong>launch template</strong> (AMI, instance type, security groups, instance profile, user data). Launch templates have versions, so a change is a new version the group can adopt.</p>
+					<p class="kv"><b>Launch configurations</b>The older alternative. They support no instance types released since January 1, 2023, and accounts created on or after October 1, 2024 can't create them at all. Use launch templates.</p>
+				</div>
+
+				<h3>Scaling policies</h3>
+				<div class="entry">
+					<h4>Target tracking (the default choice)</h4>
+					<p>You pick a metric and a target value; Auto Scaling adds and removes instances to keep the metric near the target, like a thermostat. Predefined metrics are average CPU (<code>ASGAverageCPUUtilization</code>), average network in and out, and <code>ALBRequestCountPerTarget</code>, the requests each instance receives from the load balancer. Custom metrics and metric math work too, for example SQS messages per instance. AWS recommends target tracking first.</p>
+					<span class="file">Keep the orders fleet near 50% average CPU</span>
+<pre><code>aws autoscaling put-scaling-policy \
+  --auto-scaling-group-name orders \
+  --policy-name cpu-50 \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-configuration '{
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType":
+        "ASGAverageCPUUtilization"
+    },
+    "TargetValue": 50.0
+  }'</code></pre>
+					<p>Target tracking creates and manages its own CloudWatch alarms; don't edit or delete them.</p>
+				</div>
+				<div class="entry">
+					<h4>Step scaling</h4>
+					<p>Alarm-driven, with steps that add more capacity the further the metric breaches: add 1 instance at 60&ndash;80% CPU, 3 above 80%. Use it when the response must be proportional in a way target tracking can't express.</p>
+				</div>
+				<div class="entry">
+					<h4>Simple scaling</h4>
+					<p>One adjustment per alarm, then a <strong>cooldown</strong> (default 300 seconds) during which no further scaling happens. AWS advises against it: it reacts slowly to large spikes.</p>
+				</div>
+				<div class="entry">
+					<h4>Scheduled scaling</h4>
+					<p>Changes minimum, maximum or desired capacity at set times, for known patterns: raise the minimum before the 9 a.m. rush, lower it at night. Combine it with target tracking for the unexpected.</p>
+				</div>
+				<div class="entry">
+					<h4>Predictive scaling</h4>
+					<p>Forecasts load from history and launches capacity <strong>before</strong> the predicted rise, so instances are ready when traffic arrives. It needs at least 24 hours of data and works best with 14 days, forecasts hourly for the next 48 hours, and refreshes the forecast every 6 hours. Start in <strong>forecast only</strong> mode to check the forecast, then switch to <strong>forecast and scale</strong>. It only scales out; pair it with target tracking to scale in and to handle anything the forecast missed.</p>
+				</div>
+				<div class="callout tip"><p>Recurring daily or weekly peaks with slow-starting instances point to predictive scaling (or scheduled scaling for fixed times). Keeping a metric at a level points to target tracking. "Scaling reacts too slowly to a big spike" with simple scaling: switch to target tracking or step scaling.</p></div>
+
+				<h3>Settings that change how scaling behaves</h3>
+				<div class="entry">
+					<h4>Default instance warmup</h4>
+					<p>How long a new instance needs before its metrics count toward scaling decisions. Without it, a booting instance at 100% CPU makes the group launch even more instances. It isn't on by default; AWS strongly recommends setting it, starting at 300 seconds and adjusting to how long the application really takes to start.</p>
+				</div>
+				<div class="entry">
+					<h4>Health checks and the grace period</h4>
+					<p>By default the group uses <strong>EC2 status checks</strong>: an instance is replaced only if the instance itself fails. Turn on <strong>ELB health checks</strong> so instances that are running but failing the load balancer's health check are also replaced. The <strong>health check grace period</strong> stops new instances being judged before they have started. Its default is 300 seconds in the console but <strong>0</strong> when the group is created with the CLI or an SDK, a common cause of instances being terminated as soon as they launch.</p>
+				</div>
+				<div class="entry">
+					<h4>Warm pools</h4>
+					<p>A pool of pre-initialized instances kept beside the group, <strong>Stopped</strong> (cheapest: you pay only for EBS), <strong>Hibernated</strong> (memory preserved) or Running. Scale-out takes an instance from the pool instead of booting a new one, which cuts launch time for applications with long start-ups. An instance reuse policy returns scaled-in instances to the pool instead of terminating them. Warm pools don't work with Spot instances.</p>
+				</div>
+				<div class="entry">
+					<h4>Lifecycle hooks</h4>
+					<p>Pause an instance as it launches or terminates so you can do work first: install software or register it with a service when launching, copy logs off it or deregister it when terminating. The instance waits in a <code>Pending:Wait</code> or <code>Terminating:Wait</code> state until your automation (often a Lambda function or runbook triggered through EventBridge) calls <code>CompleteLifecycleAction</code>, or the heartbeat timeout expires (default 3,600 seconds, up to 7,200, extendable with heartbeats). If the timeout expires, the default result is <code>ABANDON</code>.</p>
+				</div>
+				<div class="entry">
+					<h4>Mixed instances and Spot</h4>
+					<p>A mixed instances policy lets one group use several instance types and both purchase options: an On-Demand base capacity, a percentage of On-Demand above that, and the rest as Spot. Use the <code>price-capacity-optimized</code> Spot allocation strategy and many instance types (AWS suggests at least 10), so the group can find Spot capacity. <strong>Capacity Rebalancing</strong> replaces a Spot instance proactively when it receives a rebalance recommendation, before it is interrupted.</p>
+				</div>
+				<div class="entry">
+					<h4>Scale-in: which instance goes</h4>
+					<p>Auto Scaling first keeps Availability Zones balanced, then by default terminates instances with the oldest launch template or configuration, then the one closest to its next billing hour. Other termination policies include <code>OldestInstance</code> and <code>NewestInstance</code>. <strong>Instance scale-in protection</strong> stops an instance being chosen for scale-in (for example, while it finishes a long job), but doesn't stop replacement after a failed health check.</p>
+				</div>
+
+				<h3>Containers</h3>
+				<div class="entry">
+					<h4>Amazon ECS</h4>
+					<p>Two layers scale separately:</p>
+					<ul>
+						<li><strong>Service auto scaling</strong> changes the number of tasks, through Application Auto Scaling, with target tracking (on <code>ECSServiceAverageCPUUtilization</code>, <code>ECSServiceAverageMemoryUtilization</code> or <code>ALBRequestCountPerTarget</code>), step, scheduled or predictive policies.</li>
+						<li><strong>Cluster capacity</strong>, when tasks run on EC2: a <strong>capacity provider</strong> with <strong>managed scaling</strong> grows and shrinks the Auto Scaling group to fit the tasks, aiming at a target capacity percentage (100% packs instances fully; lower keeps spare room). <strong>Managed termination protection</strong> stops instances with running tasks being removed.</li>
+					</ul>
+					<p>On <strong>Fargate</strong> only the first layer exists: there are no instances to scale.</p>
+				</div>
+				<div class="entry">
+					<h4>Amazon EKS</h4>
+					<p>Pods scale with the <strong>Horizontal Pod Autoscaler</strong> (which needs the Kubernetes Metrics Server). Nodes scale with <strong>Karpenter</strong>, which launches right-sized instances directly in under a minute, or the <strong>Cluster Autoscaler</strong>, which resizes Auto Scaling groups or managed node groups. <strong>EKS Auto Mode</strong> runs Karpenter-based node scaling for you.</p>
+				</div>
+
+				<h3>AWS Lambda</h3>
+				<div class="entry">
+					<h4>Concurrency</h4>
+					<p>Lambda scales by running more execution environments, one per concurrent request. Each function can add up to 1,000 environments every 10 seconds. The account has a Regional concurrency quota (1,000 by default, raisable). When there's no capacity left, synchronous calls get <strong>429 TooManyRequestsException</strong> (throttling) and the <code>Throttles</code> metric rises.</p>
+					<ul>
+						<li><strong>Reserved concurrency:</strong> guarantees a function a share of the account's concurrency and caps it at that number, so one function can't starve the others (or overwhelm a database). Setting it to 0 stops the function from running.</li>
+						<li><strong>Provisioned concurrency:</strong> keeps a number of environments initialized and ready, removing cold starts for latency-sensitive functions. It is set on a version or alias, costs money while configured, and can itself be scaled with Application Auto Scaling, on a schedule or by tracking <code>LambdaProvisionedConcurrencyUtilization</code>.</li>
+					</ul>
+				</div>
+				<div class="callout trap"><p>Reserved concurrency doesn't make a function faster or warm; it guarantees and limits capacity. Cold starts are removed by <strong>provisioned</strong> concurrency.</p></div>
+			</div>
+
+			<!-- Skill 2.1.2 -->
+			<h2 id="s2">Caching</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1.2</span><span class="skill-text">Implement caching by using AWS services to enhance dynamic scalability (for example, Amazon CloudFront, Amazon ElastiCache)</span></p>
+				<p>Caching scales a system by not doing work twice. Every request served from a cache is one the application servers and database never see, so the same backend handles far more users, faster.</p>
+
+				<h3>Amazon CloudFront</h3>
+				<div class="entry">
+					<h4>How it caches</h4>
+					<p>CloudFront serves content from edge locations near users. On a request it looks up the <strong>cache key</strong> (by default the URL path); a hit is served from the edge, a miss goes to the origin (an S3 bucket, a load balancer, any HTTP server) and the response is cached for its time to live.</p>
+					<ul>
+						<li><strong>Cache policy:</strong> defines the cache key (which headers, cookies and query strings make a response different) and the TTLs. Keep the cache key small: every value you add splits the cache and lowers the hit ratio.</li>
+						<li><strong>Origin request policy:</strong> sends extra headers, cookies or query strings to the origin <strong>without</strong> adding them to the cache key.</li>
+						<li><strong>TTLs:</strong> minimum, default and maximum. The origin's <code>Cache-Control</code> headers set the TTL within the minimum and maximum; without them the default applies (24 hours in the legacy settings).</li>
+						<li><strong>Origin Shield:</strong> an extra caching layer in one Region in front of the origin, so all edge locations' misses are collapsed into fewer origin requests.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Dynamic content</h4>
+					<p>CloudFront helps even with uncacheable content: connections from the edge to the origin are reused and run over the AWS network, and short TTLs (even a few seconds) on popular API responses can absorb huge spikes.</p>
+				</div>
+				<div class="entry">
+					<h4>Updating cached content</h4>
+					<p>Prefer <strong>versioned file names</strong> (<code>app.v42.js</code>) so new content gets a new cache key. <strong>Invalidations</strong> remove objects from edge caches immediately; the first 1,000 paths each month are free, and a wildcard such as <code>/images/*</code> counts as one path.</p>
+				</div>
+
+				<h3>Amazon ElastiCache</h3>
+				<div class="entry">
+					<h4>Engines</h4>
+					<ul>
+						<li><strong>Valkey</strong> (AWS's recommended engine since October 2024, the open-source fork of Redis) and <strong>Redis OSS:</strong> rich data types, replication, Multi-AZ failover, persistence, pub/sub. Use them when you need high availability or more than simple key-value caching.</li>
+						<li><strong>Memcached:</strong> simple, multi-threaded key-value cache, with no replication or failover; losing a node loses its cached data.</li>
+					</ul>
+					<p><strong>ElastiCache Serverless</strong> scales capacity automatically with no nodes to choose; node-based clusters give you control of instance types.</p>
+				</div>
+				<div class="entry">
+					<h4>Scaling node-based Valkey and Redis OSS clusters</h4>
+					<p><strong>Cluster mode disabled:</strong> one shard, a primary plus up to 5 read replicas; scale reads with replicas and writes only by a larger node type. <strong>Cluster mode enabled:</strong> data is partitioned across up to 500 shards, each with up to 5 replicas, so both reads and writes scale out. <strong>ElastiCache auto scaling</strong> can add and remove shards or replicas automatically (target tracking or scheduled) on cluster mode enabled clusters.</p>
+				</div>
+				<div class="entry">
+					<h4>Caching strategies</h4>
+					<ul>
+						<li><strong>Lazy loading (cache-aside):</strong> the application checks the cache, and on a miss reads the database and writes the result to the cache. Only requested data is cached, but the first request is slow and data can be stale.</li>
+						<li><strong>Write-through:</strong> the application writes to the cache whenever it writes to the database. Data is always fresh, but you cache data that may never be read.</li>
+						<li><strong>TTL:</strong> an expiry on each key limits staleness and stops the cache filling with dead data. Most designs combine lazy loading with a TTL.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Metrics that matter</h4>
+					<p><code>Evictions</code> rising means the cache is too small: keys are pushed out before they expire (scale up or out). <code>EngineCPUUtilization</code> (on nodes with four or more vCPUs; <code>CPUUtilization</code> on smaller ones) shows the engine's own load. Also watch <code>CurrConnections</code>, <code>SwapUsage</code>, <code>ReplicationLag</code> and memory usage, and compare cache hits with misses for the hit ratio.</p>
+				</div>
+
+				<h3>DynamoDB Accelerator (DAX)</h3>
+				<div class="entry">
+					<h4>A cache made for DynamoDB</h4>
+					<p>An in-memory cache in front of DynamoDB that reduces read latency from milliseconds to microseconds, with no application caching code: the application uses the DAX client with the same DynamoDB API calls. An item cache serves <code>GetItem</code> and a query cache serves <code>Query</code> and <code>Scan</code>; writes go through DAX to the table. DAX serves only eventually consistent reads: <strong>strongly consistent reads pass straight through</strong> to DynamoDB uncached. A cluster has up to 11 nodes; use at least three, across Availability Zones, in production.</p>
+				</div>
+				<div class="callout tip"><p>"Microsecond reads for a DynamoDB table with no code changes" points to DAX. "Cache database query results, sessions or leaderboards, with failover" points to ElastiCache for Valkey or Redis OSS. "Cache static and popular content close to users" points to CloudFront.</p></div>
+			</div>
+
+			<!-- Skill 2.1.3 -->
+			<h2 id="s3">Scaling managed databases</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1.3</span><span class="skill-text">Configure and manage scaling in AWS managed databases (for example, Amazon RDS, DynamoDB)</span></p>
+
+				<h3>Amazon RDS</h3>
+				<div class="entry">
+					<h4>Scaling up</h4>
+					<p>Change the DB instance class for more CPU and memory. It causes downtime while the instance is replaced; on a Multi-AZ deployment the standby is modified first and then failed over to, which minimizes the outage. Apply it immediately or in the next maintenance window. Storage scales separately, without downtime, including automatically with storage autoscaling (Task 1.3).</p>
+				</div>
+				<div class="entry">
+					<h4>Scaling out reads: read replicas</h4>
+					<p>A read replica is a copy kept up to date by <strong>asynchronous</strong> replication, with its own endpoint. The application sends reads (reports, searches) to replicas and writes to the primary. Each source can have up to 15 read replicas, in the same or another Region. Watch <code>ReplicaLag</code>: replicas can return slightly stale data. A replica can be <strong>promoted</strong> to a standalone database, for example for disaster recovery. RDS doesn't add replicas automatically.</p>
+					<p class="kv"><b>Not the same as Multi-AZ</b>A Multi-AZ standby exists for availability and can't serve reads (in a Multi-AZ instance deployment). Read replicas are for scaling reads (Task 2.2).</p>
+				</div>
+
+				<h3>Amazon Aurora</h3>
+				<div class="entry">
+					<h4>Aurora Replicas and Aurora Auto Scaling</h4>
+					<p>An Aurora cluster has one writer and up to 15 Aurora Replicas sharing the same storage, so replica lag is usually under 100 milliseconds. The <strong>reader endpoint</strong> spreads connections across replicas. <strong>Aurora Auto Scaling</strong> adds and removes replicas with a target tracking policy on average reader CPU (<code>RDSReaderAverageCPUUtilization</code>) or connections (<code>RDSReaderAverageDatabaseConnections</code>); the cluster needs at least one reader to start. <strong>Custom endpoints</strong> send particular workloads, such as analytics, to a chosen set of instances.</p>
+				</div>
+				<div class="entry">
+					<h4>Aurora Serverless (v2)</h4>
+					<p>Instances whose capacity scales in place, in increments as small as 0.5 <strong>Aurora capacity units</strong> (ACUs, each about 2 GiB of memory with matching CPU), within a minimum and maximum you set. The range is 0 to 256 ACUs (up to 384 on recent Aurora PostgreSQL versions). With a minimum of <strong>0 ACUs</strong> the instance <strong>pauses</strong> when idle and costs nothing for compute, at the price of a short resume delay. A cluster can mix serverless and provisioned instances. AWS's documentation now calls it simply "Aurora Serverless", since the original version reached end of life in March 2025.</p>
+					<p class="kv"><b>Fits</b>Unpredictable or spiky load, development and test databases, and many small databases.</p>
+				</div>
+
+				<h3>Amazon DynamoDB</h3>
+				<div class="entry">
+					<h4>On-demand capacity mode</h4>
+					<p>The default and recommended mode. You pay per request, with no capacity to plan; the table instantly handles up to double its previous peak, and a new table starts able to sustain 4,000 writes and 12,000 reads per second. Growth beyond double the previous peak within 30 minutes can throttle. An optional <strong>maximum throughput</strong> setting caps a table's cost.</p>
+				</div>
+				<div class="entry">
+					<h4>Provisioned capacity mode with auto scaling</h4>
+					<p>You set read and write capacity units, cheaper for steady, predictable traffic. <strong>DynamoDB auto scaling</strong> (Application Auto Scaling) adjusts them to keep consumed capacity at a target utilization between 20% and 90% (70% in the console by default), for the table and each global secondary index. It reacts over minutes, so a sudden spike can still be throttled.</p>
+				</div>
+				<div class="entry">
+					<h4>Switching and throttling</h4>
+					<p>You can switch a table from provisioned to on-demand up to four times in a rolling 24 hours, and from on-demand to provisioned at any time. Throttling shows as <code>ThrottledRequests</code>, <code>ReadThrottleEvents</code> and <code>WriteThrottleEvents</code>, and newer metrics give the cause: a hot key range, the account limit, or the table's maximum on-demand throughput. <strong>Burst capacity</strong> (up to 300 seconds of unused capacity) and <strong>adaptive capacity</strong> (shifting capacity to busy partitions) absorb some uneven load, but a single hot partition key still throttles: design keys that spread traffic.</p>
+				</div>
+				<div class="callout trap"><p>"DynamoDB is throttling during a sudden, unpredictable spike, with auto scaling enabled" is solved by on-demand mode (or DAX for read-heavy spikes), not by raising the auto scaling target: auto scaling responds too slowly for sudden spikes.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Auto Scaling groups use launch templates (launch configurations are effectively retired). Prefer target tracking; add scheduled scaling for known times and predictive scaling for recurring patterns; avoid simple scaling and its cooldown.</li>
+				<li>Set default instance warmup, use ELB health checks, and check the health check grace period (0 seconds by default from the CLI). Warm pools speed up slow boots; lifecycle hooks pause launch or termination for custom work; mixed instances with price-capacity-optimized Spot and Capacity Rebalancing cut cost.</li>
+				<li>ECS scales tasks with service auto scaling and EC2 capacity with capacity providers; EKS scales pods with HPA and nodes with Karpenter, Cluster Autoscaler or Auto Mode. Lambda reserved concurrency guarantees and caps; provisioned concurrency removes cold starts; throttling returns 429.</li>
+				<li>CloudFront caches by cache key with TTLs from the cache policy and origin headers; keep the key small, use Origin Shield to protect the origin, versioned names over invalidations.</li>
+				<li>ElastiCache: Valkey or Redis OSS for replication, failover and rich types (cluster mode enabled to scale writes); Memcached for simple multi-threaded caching. Lazy loading plus TTL is the usual pattern; rising <code>Evictions</code> means the cache is too small. DAX gives DynamoDB microsecond reads, but not for strongly consistent reads.</li>
+				<li>RDS scales up by instance class (brief downtime, minimized with Multi-AZ) and out for reads with up to 15 asynchronous read replicas. Aurora has up to 15 replicas with Aurora Auto Scaling; Aurora Serverless scales in ACUs and can pause at 0.</li>
+				<li>DynamoDB on-demand absorbs sudden spikes; provisioned with auto scaling (target 20&ndash;90%) is cheaper for steady load. Hot partition keys throttle in any mode.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-3.html"><small>Previous</small>Task 1.3: Performance optimization</a>
+				<a class="next" href="d2-task-2-2.html"><small>Next</small>Task 2.2: High availability and resilience</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified CloudOps Engineer &ndash; Associate (SOA-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
