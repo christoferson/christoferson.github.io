@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 5.2: Domains, DNS and Content Delivery | AWS SOA-C03 Notes</title>
+	<meta name="description" content="SOA-C03 Task 5.2 study guide: the Route 53 VPC Resolver, inbound and outbound endpoints, forwarding rules, private hosted zones and Profiles; Route 53 routing policies, alias records and query logging; and distributing content and services with Amazon CloudFront and AWS Global Accelerator.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="soa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SOA-C03</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">Task 5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Networking and Content Delivery &middot; 18%</span>
+		<h1>Task 5.2: Configure domains, DNS services, and content delivery</h1>
+		<p>Getting names to resolve and users to the right place: DNS inside VPCs and across hybrid networks, Route 53 records and routing policies, logging who asked what, and delivering content and services globally with CloudFront and Global Accelerator.</p>
+		<div class="tags"><span class="tag code">SOA-C03</span><span class="tag">Route 53</span><span class="tag">VPC Resolver</span><span class="tag">Routing policies</span><span class="tag">Query logging</span><span class="tag">CloudFront</span><span class="tag">Global Accelerator</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">DNS in and around VPCs</a></li>
+				<li><a href="#s2">Routing policies and logging</a></li>
+				<li><a href="#s3">CloudFront and Global Accelerator</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.2</span>
+				<p><strong>Configure domains, DNS services, and content delivery.</strong></p>
+			</div>
+			<p>DNS problems look like network problems ("the application can't reach the database") and are among the most common real outages, so expect questions on resolving names between AWS and on premises, and on picking the routing policy that meets a requirement. The delivery half is about configuring CloudFront and Global Accelerator; CloudFront caching for performance is in <a href="d2-task-2-1.html">Task 2.1</a>, Route 53 health checks in <a href="d2-task-2-2.html">Task 2.2</a>, and fixing caching problems in <a href="d5-task-5-3.html">Task 5.3</a>.</p>
+			<p>The examples use <code>example.com</code>, hosted in Route 53, with the orders VPC in us-east-1, a corporate data center using <code>corp.example.com</code>, and a second Region, eu-west-1.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>5.2.1</td><td data-label="What you need to be able to do">Configure DNS (Route 53 Resolver)</td></tr>
+						<tr><td>5.2.2</td><td data-label="What you need to be able to do">Implement Route 53 routing policies, configurations and query logging</td></tr>
+						<tr><td>5.2.3</td><td data-label="What you need to be able to do">Configure content and service distribution: CloudFront, Global Accelerator</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 5.2.1 -->
+			<h2 id="s1">DNS in and around VPCs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.1</span><span class="skill-text">Configure DNS (for example, Amazon Route 53 Resolver)</span></p>
+
+				<h3>The VPC Resolver</h3>
+				<div class="entry">
+					<h4>DNS built into every VPC</h4>
+					<p>Every VPC has a DNS resolver, now called the <strong>Route 53 VPC Resolver</strong> (formerly Route 53 Resolver; the APIs keep the old name). Instances reach it at the VPC's base address plus two (<code>10.0.0.2</code>), at <code>169.254.169.253</code>, or at <code>fd00:ec2::253</code> over IPv6. It answers for public names, private hosted zones associated with the VPC, and AWS's internal names.</p>
+					<ul>
+						<li>It needs the VPC attribute <code>enableDnsSupport</code>; private hosted zones and interface endpoints' private DNS also need <code>enableDnsHostnames</code>, which is off by default in VPCs you create.</li>
+						<li>Security groups and network ACLs can't filter traffic to it; use DNS Firewall (<a href="d5-task-5-1.html#s3">Task 5.1</a>).</li>
+						<li>Each network interface may send up to 1,024 packets per second to it (shared with the metadata service and time sync), a hard limit that busy instances can hit; cache DNS locally if so.</li>
+					</ul>
+				</div>
+
+				<h3>Hybrid DNS: Resolver endpoints</h3>
+				<div class="entry">
+					<h4>Inbound and outbound</h4>
+					<ul>
+						<li><strong>Inbound endpoint:</strong> on-premises DNS servers forward queries for AWS names (private hosted zones, instance names) to IP addresses in your VPC, over Direct Connect or VPN.</li>
+						<li><strong>Outbound endpoint</strong> plus <strong>forwarding rules:</strong> queries from the VPC for <code>corp.example.com</code> are forwarded to the data center's DNS servers.</li>
+						<li>Each endpoint has at least two IP addresses in different Availability Zones, each one a network interface; add addresses to scale (each handles up to about 10,000 queries per second). The endpoint's security group must allow DNS, TCP and UDP port 53.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Rules</h4>
+					<p>A <strong>forwarding rule</strong> covers a domain and all its subdomains. A <strong>system rule</strong> makes the Resolver answer a subdomain itself (an exception to a forward). The most specific matching rule wins. Share rules with other accounts through <strong>AWS RAM</strong>, so one outbound endpoint in a networking account serves every VPC that the rule is associated with.</p>
+					<span class="file">Forward corp.example.com to the data center</span>
+<pre><code>aws route53resolver create-resolver-rule \
+  --name corp-forward \
+  --creator-request-id corp-fwd-1 \
+  --rule-type FORWARD \
+  --domain-name corp.example.com \
+  --resolver-endpoint-id rslvr-out-0a1 \
+  --target-ips \
+    Ip=10.10.0.53 Ip=10.20.0.53
+
+<span class="c"># then associate it with each VPC</span>
+aws route53resolver \
+  associate-resolver-rule \
+  --resolver-rule-id rslvr-rr-0c3 \
+  --vpc-id vpc-0abc1234</code></pre>
+				</div>
+
+				<h3>Private hosted zones</h3>
+				<div class="entry">
+					<h4>Names only your VPCs can see</h4>
+					<p>A private hosted zone (such as <code>internal.example.com</code>) answers only for the VPCs associated with it. If a public and a private zone share a name (<strong>split-horizon</strong>), VPCs associated with the private zone get its answers and everyone else the public ones; a name missing from the private zone does <strong>not</strong> fall back to the public zone. To answer on-premises queries from a private zone, associate it with the VPC that holds the inbound endpoint.</p>
+				</div>
+				<div class="entry">
+					<h4>Associating a VPC in another account</h4>
+					<p>Not possible in the console. The zone owner authorizes the VPC, then the VPC owner associates it:</p>
+					<span class="file">Cross-account private hosted zone association</span>
+<pre><code><span class="c"># in the account that owns the zone</span>
+aws route53 \
+  create-vpc-association-authorization \
+  --hosted-zone-id Z0123ABC \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-0b2
+
+<span class="c"># in the account that owns the VPC</span>
+aws route53 \
+  associate-vpc-with-hosted-zone \
+  --hosted-zone-id Z0123ABC \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-0b2</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Route 53 Profiles</h4>
+					<p>For many VPCs and accounts, a <strong>Profile</strong> bundles DNS configuration (private hosted zones, Resolver rules, DNS Firewall rule groups, interface endpoint DNS, query logging) and is shared through RAM and associated with VPCs in one step. A VPC can have one Profile; its own direct settings win over the Profile's for the same name.</p>
+				</div>
+				<div class="entry">
+					<h4>DNSSEC</h4>
+					<p><strong>Signing</strong> a public hosted zone protects clients from forged answers. It needs a customer managed asymmetric KMS key (ECC_NIST_P256) in <strong>us-east-1</strong>, from which Route 53 creates the key-signing key, and then a DS record at the parent (the registrar). <strong>Validation</strong> of signed answers from other domains is turned on per VPC in the Resolver.</p>
+				</div>
+				<p class="kv"><b>Global Resolver</b>Route 53 Global Resolver is a newer, internet-reachable anycast resolver for on-premises, branch and remote clients, with encrypted DNS (DoH, DoT), filtering and private hosted zone resolution. It is the reason the VPC Resolver was renamed.</p>
+			</div>
+
+			<!-- Skill 5.2.2 -->
+			<h2 id="s2">Routing policies and logging</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.2</span><span class="skill-text">Implement Route 53 routing policies, configurations, and query logging</span></p>
+
+				<h3>Records</h3>
+				<div class="entry">
+					<h4>Alias or CNAME</h4>
+					<ul>
+						<li><strong>Alias records</strong> point a name at an AWS resource (load balancer, CloudFront distribution, S3 website endpoint, API Gateway, Global Accelerator, interface endpoint, or another record in the zone). They work at the <strong>zone apex</strong> (<code>example.com</code>), queries to AWS resources are free, the target's IP changes are followed automatically, and you can't set a TTL. <strong>Evaluate target health</strong> lets routing policies use the target's health without a separate health check.</li>
+						<li>A <strong>CNAME</strong> can't be used at the apex, and no other record can share its name.</li>
+					</ul>
+					<p>For non-alias records, the <strong>TTL</strong> is how long resolvers cache the answer: lower it (to 60 seconds, say) a day before a planned change, and raise it afterwards to cut query cost.</p>
+				</div>
+				<div class="entry">
+					<h4>Delegation</h4>
+					<p>A hosted zone answers only if the domain's registrar lists the zone's four name servers (from its NS record). After recreating a hosted zone, the name servers change; until the registrar is updated, the domain doesn't resolve.</p>
+				</div>
+
+				<h3>Routing policies</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Policy</th><th>Answers with</th><th>Use it when</th></tr></thead>
+						<tbody>
+							<tr><td>Simple</td><td data-label="Answers with">The one record (all its values, in random order)</td><td data-label="Use it when">One resource, no health checks</td></tr>
+							<tr><td>Weighted</td><td data-label="Answers with">Records in proportion to their weights (0 to 255)</td><td data-label="Use it when">Canary releases, gradual migration, A/B tests</td></tr>
+							<tr><td>Latency</td><td data-label="Answers with">The Region with the lowest latency for the user</td><td data-label="Use it when">Multi-Region applications, best performance</td></tr>
+							<tr><td>Failover</td><td data-label="Answers with">The primary while healthy, otherwise the secondary</td><td data-label="Use it when">Active-passive disaster recovery</td></tr>
+							<tr><td>Geolocation</td><td data-label="Answers with">The record for the user's continent, country or US state</td><td data-label="Use it when">Content or legal rules by location; needs a <strong>default</strong> record</td></tr>
+							<tr><td>Geoproximity</td><td data-label="Answers with">The nearest resource, adjusted by a bias</td><td data-label="Use it when">Shifting load between Regions by growing or shrinking their area</td></tr>
+							<tr><td>IP-based</td><td data-label="Answers with">The record for the user's IP range (CIDR collections)</td><td data-label="Use it when">Routing specific ISPs or networks to specific endpoints</td></tr>
+							<tr><td>Multivalue answer</td><td data-label="Answers with">Up to 8 healthy records at random</td><td data-label="Use it when">Simple client-side load spreading with health checks</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="entry">
+					<h4>Details that decide questions</h4>
+					<ul>
+						<li><strong>Weighted:</strong> a weight of 0 stops traffic to a record, unless every record is 0 (then they share equally) or all non-zero records are unhealthy.</li>
+						<li><strong>Geolocation:</strong> without a default record, users from unmapped locations get no answer.</li>
+						<li><strong>Latency</strong> is about network latency, not geography: a user can be sent to a farther Region.</li>
+						<li>Policies can be <strong>nested</strong>: latency between Regions, then weighted or failover within each, through alias records pointing at other records, or with a Traffic Flow policy.</li>
+					</ul>
+					<span class="file">Weighted records: send 10% to the new stack</span>
+<pre><code>{
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "api.example.com",
+      "Type": "A",
+      "SetIdentifier": "green",
+      "Weight": 10,
+      "TTL": 60,
+      "ResourceRecords": [
+        { "Value": "203.0.113.20" }
+      ]
+    }
+  }]
+}</code></pre>
+					<p>A matching record with <code>"SetIdentifier": "blue"</code> and <code>"Weight": 90</code> receives the rest. Apply each with <code>aws route53 change-resource-record-sets</code>.</p>
+				</div>
+
+				<h3>Query logging</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Aspect</th><th>Public DNS query logging</th><th>Resolver query logging</th></tr></thead>
+						<tbody>
+							<tr><td>Logs</td><td data-label="Public DNS query logging">Queries from the internet that reach Route 53 for a public hosted zone</td><td data-label="Resolver query logging">Queries made from your VPCs, through inbound and outbound endpoints, and DNS Firewall actions</td></tr>
+							<tr><td>Destination</td><td data-label="Public DNS query logging">CloudWatch Logs only, in a log group in <strong>us-east-1</strong></td><td data-label="Resolver query logging">CloudWatch Logs, S3 or Firehose, in the VPC's Region</td></tr>
+							<tr><td>Fields</td><td data-label="Public DNS query logging">Name, type, response code, edge location, resolver IP</td><td data-label="Resolver query logging">Name, type, response, source IP and instance ID, VPC, firewall action</td></tr>
+							<tr><td>Not logged</td><td data-label="Public DNS query logging">Answers served from resolvers' caches</td><td data-label="Resolver query logging">Answers served from the Resolver's cache</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="entry">
+					<h4>Turning on public query logging</h4>
+					<p>Route 53 needs a CloudWatch Logs <strong>resource policy</strong> allowing it to write to the log group; the console creates it, the CLI doesn't. A wrong Region or missing policy is the usual reason no logs appear.</p>
+					<span class="file">Log queries for the example.com zone</span>
+<pre><code><span class="c"># the log group must be in us-east-1</span>
+aws route53 create-query-logging-config \
+  --hosted-zone-id Z0123ABC \
+  --cloud-watch-logs-log-group-arn \
+    "$LOG_GROUP_ARN"</code></pre>
+				</div>
+				<div class="callout tip"><p>"Which instance is resolving a malware domain?" is Resolver query logging (it records the source instance). "How many queries does our public domain get, and from where?" is public DNS query logging.</p></div>
+			</div>
+
+			<!-- Skill 5.2.3 -->
+			<h2 id="s3">CloudFront and Global Accelerator</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.3</span><span class="skill-text">Configure content and service distribution (for example, Amazon CloudFront, AWS Global Accelerator)</span></p>
+
+				<h3>Amazon CloudFront</h3>
+				<div class="entry">
+					<h4>Origins</h4>
+					<ul>
+						<li><strong>S3 buckets</strong> with <strong>origin access control</strong> (OAC): the bucket stays private and its policy allows only the <code>cloudfront.amazonaws.com</code> service principal for your distribution (condition on <code>AWS:SourceArn</code>). OAC replaces the older origin access identity and supports SSE-KMS.</li>
+						<li><strong>Custom origins:</strong> a public load balancer or any HTTP server. Restrict the origin to CloudFront with the <code>com.amazonaws.global.cloudfront.origin-facing</code> managed prefix list in its security group, or a secret header.</li>
+						<li><strong>VPC origins:</strong> an ALB, NLB or EC2 instance in a <strong>private subnet</strong>, reachable only through CloudFront. Allow inbound traffic from the security group CloudFront creates for the VPC origin; the VPC still needs an internet gateway.</li>
+						<li><strong>Origin groups:</strong> a primary and secondary origin; on chosen error codes (such as 500, 502, 503, 504, 403, 404) or timeouts, CloudFront retries GET, HEAD and OPTIONS requests on the secondary.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Behaviors and policies</h4>
+					<p><strong>Cache behaviors</strong> match path patterns (<code>/api/*</code>, <code>/images/*</code>, default <code>*</code>) to an origin and settings: allowed methods, viewer protocol policy (redirect HTTP to HTTPS), a <strong>cache policy</strong> (TTLs and what forms the cache key), an <strong>origin request policy</strong> (what is passed to the origin without being in the key), and a <strong>response headers policy</strong> (security headers, CORS).</p>
+				</div>
+				<div class="entry">
+					<h4>Domains, access and edge code</h4>
+					<ul>
+						<li><strong>Alternate domain names</strong> (<code>www.example.com</code>) need an ACM certificate in <strong>us-east-1</strong> covering the name, and a Route 53 alias record pointing at the distribution.</li>
+						<li><strong>Private content:</strong> signed URLs (one file) or signed cookies (many files) using a trusted key group. <strong>Geographic restrictions</strong> allow or block countries.</li>
+						<li><strong>CloudFront Functions</strong> (lightweight JavaScript on viewer request and response: redirects, header changes, URL rewrites) or <strong>Lambda@Edge</strong> (Node.js or Python on all four events, with network access and longer run time, for authentication or calling other services).</li>
+						<li><strong>Logging:</strong> standard logs to S3, CloudWatch Logs or Firehose; real-time logs to Kinesis Data Streams.</li>
+					</ul>
+					<span class="file">CloudFront Function: serve index.html for folder URLs</span>
+<pre><code>function handler(event) {
+  var req = event.request;
+  // /docs/ becomes /docs/index.html
+  if (req.uri.endsWith('/')) {
+    req.uri += 'index.html';
+  }
+  return req;
+}</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Deploying changes safely</h4>
+					<p>Changes to a distribution take minutes to reach all edge locations. <strong>Continuous deployment</strong> sends a share of traffic to a staging distribution to test configuration changes before promoting them. For content, prefer <strong>versioned file names</strong> (<code>app.3f9c.js</code>) to <strong>invalidations</strong>; the first 1,000 invalidation paths each month are free.</p>
+					<span class="file">Remove changed files from the edge caches</span>
+<pre><code>aws cloudfront create-invalidation \
+  --distribution-id E1ABC2DEF3 \
+  --paths "/index.html" "/css/*"</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Cost and reach</h4>
+					<p><strong>Price classes</strong> limit which edge locations serve the distribution (all, or excluding the most expensive regions) to cut cost at the price of latency for some users. <strong>Origin Shield</strong> adds a central caching layer to reduce origin load. <strong>Flat-rate plans</strong> are an alternative to paying per GB and request.</p>
+				</div>
+
+				<h3>AWS Global Accelerator</h3>
+				<div class="entry">
+					<h4>What it does</h4>
+					<p>Gives an application two <strong>static anycast IPv4 addresses</strong> (plus two IPv6 addresses if dual-stack) announced from AWS edge locations. Users connect to the nearest edge, and traffic crosses the AWS backbone to the closest healthy endpoint: ALBs, NLBs, EC2 instances or Elastic IPs in one or more Regions. Nothing is cached.</p>
+					<ul>
+						<li><strong>Endpoint groups</strong> (one per Region) have a <strong>traffic dial</strong> (0 to 100%) to shift traffic away from a Region, for maintenance or blue/green; <strong>endpoint weights</strong> (0 to 255) divide traffic within a group.</li>
+						<li><strong>Health checks</strong> move new connections away from an unhealthy endpoint immediately, with no DNS caching delay, because the client's IP addresses never change.</li>
+						<li><strong>Client affinity</strong> set to source IP keeps a user on the same endpoint.</li>
+						<li><strong>Custom routing accelerators</strong> map users to a specific instance and port, for multiplayer games and VoIP.</li>
+					</ul>
+					<span class="file">Drain the eu-west-1 Region for maintenance</span>
+<pre><code><span class="c"># Global Accelerator API: us-west-2 only</span>
+aws globalaccelerator \
+  update-endpoint-group \
+  --region us-west-2 \
+  --endpoint-group-arn "$EU_GROUP" \
+  --traffic-dial-percentage 0</code></pre>
+				</div>
+
+				<h3>Choosing between them</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Need</th><th>CloudFront</th><th>Global Accelerator</th></tr></thead>
+						<tbody>
+							<tr><td>Protocols</td><td data-label="CloudFront">HTTP and HTTPS, WebSocket, gRPC</td><td data-label="Global Accelerator">Any TCP or UDP</td></tr>
+							<tr><td>Caching</td><td data-label="CloudFront">Yes, at the edge</td><td data-label="Global Accelerator">No</td></tr>
+							<tr><td>Static IP addresses</td><td data-label="CloudFront">Optional (Anycast static IPs, extra cost)</td><td data-label="Global Accelerator">Always, two per accelerator</td></tr>
+							<tr><td>Regional failover</td><td data-label="CloudFront">Origin groups</td><td data-label="Global Accelerator">Health checks and traffic dials, in seconds</td></tr>
+							<tr><td>Typical use</td><td data-label="CloudFront">Websites, APIs, video, downloads</td><td data-label="Global Accelerator">Gaming, IoT, VoIP, non-HTTP apps, firewall allow lists of fixed IPs</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>"Customers must allow-list our IP addresses" or "UDP game traffic needs lower latency worldwide" is Global Accelerator. "Cache static content near users and protect the origin" is CloudFront. "Failover without waiting for DNS caches to expire" points to Global Accelerator rather than Route 53 failover.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The VPC Resolver (VPC+2, 169.254.169.253) needs enableDnsSupport, and enableDnsHostnames for private zones and endpoint DNS. Inbound endpoints answer on-premises queries; outbound endpoints with forwarding rules (shared through RAM) send queries on premises.</li>
+				<li>Private hosted zones answer only associated VPCs (cross-account by CLI authorization); split-horizon doesn't fall back to the public zone. Profiles share DNS configuration across many VPCs. DNSSEC signing needs a KMS key in us-east-1.</li>
+				<li>Alias records work at the apex, are free for AWS targets and have no TTL. Know each routing policy: weighted for canaries, latency for performance, failover for active-passive, geolocation with a default record, geoproximity bias, IP-based, multivalue.</li>
+				<li>Public query logs go to CloudWatch Logs in us-east-1 with a resource policy; Resolver query logs (with source instance) go to CloudWatch Logs, S3 or Firehose.</li>
+				<li>CloudFront: S3 with OAC, VPC origins for private load balancers, origin groups for failover, behaviors with cache and origin request policies, ACM certificates in us-east-1, Functions versus Lambda@Edge, versioned names over invalidations.</li>
+				<li>Global Accelerator: two static anycast IPs, any TCP or UDP, endpoint groups with traffic dials, fast failover without DNS; choose it over CloudFront for non-HTTP traffic and fixed IPs.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-1.html"><small>Previous</small>Task 5.1: Networking and connectivity</a>
+				<a class="next" href="d5-task-5-3.html"><small>Next</small>Task 5.3: Troubleshoot network connectivity</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified CloudOps Engineer &ndash; Associate (SOA-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
