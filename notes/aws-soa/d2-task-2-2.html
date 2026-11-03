@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.2: High Availability and Resilience | AWS SOA-C03 Notes</title>
+	<meta name="description" content="SOA-C03 Task 2.2 study guide: configuring and troubleshooting Elastic Load Balancing and Route 53 health checks, cross-zone load balancing, DNS failover, ARC zonal shift, and fault-tolerant Multi-AZ designs for EC2, RDS, Aurora, ElastiCache, EFS and NAT gateways.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="soa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SOA-C03</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Reliability and Business Continuity &middot; 22%</span>
+		<h1>Task 2.2: Implement highly available and resilient environments</h1>
+		<p>Keeping a workload running when parts of it fail: how load balancer and Route 53 health checks decide what is healthy and what to do when nothing is, why they fail and how to fix them, and how to build each tier, from instances to databases to NAT, so that losing an Availability Zone doesn't take the application down.</p>
+		<div class="tags"><span class="tag code">SOA-C03</span><span class="tag">ELB health checks</span><span class="tag">Route 53 failover</span><span class="tag">Zonal shift</span><span class="tag">Multi-AZ</span><span class="tag">Aurora</span><span class="tag">Static stability</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">ELB health checks</a></li>
+				<li><a href="#s1b">Route 53 health checks</a></li>
+				<li><a href="#s2">Fault-tolerant Multi-AZ systems</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.2</span>
+				<p><strong>Implement highly available and resilient environments.</strong></p>
+			</div>
+			<p><strong>High availability</strong> means the application keeps serving users when a component fails; <strong>resilience</strong> means it recovers by itself. On AWS the unit of failure to design for is usually an <strong>Availability Zone</strong>: every tier should keep working if one zone is lost. Health checks are how the system notices failure and routes around it, which is why the skill pairs them with Multi-AZ design.</p>
+			<p>The examples continue the <strong>orders</strong> application: EC2 instances in an Auto Scaling group across three Availability Zones behind an Application Load Balancer, an RDS for PostgreSQL database, and a Route 53 record <code>shop.example.com</code> pointing at the load balancer.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.2.1</td><td data-label="What you need to be able to do">Configure and troubleshoot Elastic Load Balancing and Amazon Route 53 health checks</td></tr>
+						<tr><td>2.2.2</td><td data-label="What you need to be able to do">Configure fault-tolerant systems, such as Multi-AZ deployments</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 2.2.1 -->
+			<h2 id="s1">ELB health checks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.1</span><span class="skill-text">Configure and troubleshoot Elastic Load Balancing (ELB) and Amazon Route 53 health checks</span></p>
+
+				<h3>How a load balancer judges a target</h3>
+				<div class="entry">
+					<h4>Settings and defaults</h4>
+					<p>Each target group has its own health check. The load balancer sends a request to every target every <strong>interval</strong>; a target becomes unhealthy after the <strong>unhealthy threshold</strong> of consecutive failures and healthy again after the <strong>healthy threshold</strong> of consecutive successes. A response counts as a success if it arrives within the <strong>timeout</strong> with a code in the <strong>matcher</strong> (success codes).</p>
+					<div class="table-wrap">
+						<table class="stack labeled">
+							<thead><tr><th>Setting</th><th>Application LB</th><th>Network LB</th></tr></thead>
+							<tbody>
+								<tr><td>Protocol</td><td data-label="Application LB">HTTP or HTTPS (default HTTP)</td><td data-label="Network LB">TCP (default), HTTP or HTTPS</td></tr>
+								<tr><td>Interval</td><td data-label="Application LB">30 s (5&ndash;300)</td><td data-label="Network LB">30 s (5&ndash;300)</td></tr>
+								<tr><td>Timeout</td><td data-label="Application LB">5 s</td><td data-label="Network LB">6 s for HTTP, 10 s for TCP and HTTPS</td></tr>
+								<tr><td>Healthy / unhealthy threshold</td><td data-label="Application LB">5 / 2</td><td data-label="Network LB">5 / 2</td></tr>
+								<tr><td>Success codes</td><td data-label="Application LB">200 (any of 200&ndash;499)</td><td data-label="Network LB">200&ndash;399</td></tr>
+							</tbody>
+						</table>
+					</div>
+					<p>With the defaults, a failed target is out of service after about a minute (two failures 30 seconds apart) and needs five successes, about two and a half minutes, to come back. Point the health check at a lightweight path such as <code>/health</code> that checks the application can actually serve requests, not just that the web server answers.</p>
+					<span class="file">Tighten the orders target group's health check</span>
+<pre><code>aws elbv2 modify-target-group \
+  --target-group-arn "$TG_ARN" \
+  --health-check-path /health \
+  --health-check-interval-seconds 10 \
+  --healthy-threshold-count 3 \
+  --unhealthy-threshold-count 2 \
+  --matcher HttpCode=200</code></pre>
+				</div>
+				<div class="entry">
+					<h4>When every target is unhealthy: fail open</h4>
+					<p>If all targets in a target group fail their health checks, Application and Network Load Balancers <strong>fail open</strong>: they send traffic to all targets anyway, on the reasoning that a broken health check is more likely than every server failing at once. Gateway Load Balancers don't fail open; traffic is dropped. For an Application Load Balancer, an HTTP 503 means the target group has no registered targets, not that they are all unhealthy.</p>
+				</div>
+				<div class="entry">
+					<h4>Settings around health</h4>
+					<ul>
+						<li><strong>Deregistration delay</strong> (connection draining): how long a deregistering target keeps finishing in-flight requests before removal; default 300 seconds (0&ndash;3,600). Shorten it for fast, short requests to speed up deployments and scale-in.</li>
+						<li><strong>Slow start</strong> (Application LB): ramps traffic to a newly healthy target over 30&ndash;900 seconds, for applications that need to warm caches. Off by default.</li>
+						<li><strong>Target group health thresholds:</strong> a minimum number or percentage of healthy targets below which the load balancer fails DNS over to other zones or load balancers, rather than waiting for every target to fail.</li>
+						<li><strong>Automatic target weights</strong> (Application LB with the weighted random algorithm): with anomaly mitigation on, sends less traffic to targets returning unusually many errors even before they fail health checks.</li>
+					</ul>
+				</div>
+
+				<h3>Cross-zone load balancing</h3>
+				<div class="entry">
+					<h4>What it does and the defaults</h4>
+					<p>Without cross-zone load balancing, each load balancer node sends traffic only to targets in its own Availability Zone, so a zone with fewer healthy targets gets the same share of traffic and overloads them. With it, every node spreads traffic across all registered targets in all zones.</p>
+					<ul>
+						<li><strong>Application Load Balancer:</strong> always on at the load balancer; it can only be turned off per target group.</li>
+						<li><strong>Network and Gateway Load Balancers:</strong> off by default; turning it on for a Network Load Balancer incurs inter-AZ data transfer charges.</li>
+					</ul>
+				</div>
+
+				<h3>Troubleshooting unhealthy targets</h3>
+				<div class="entry">
+					<h4>Read the reason code first</h4>
+					<p><code>aws elbv2 describe-target-health</code> (or the target group's Targets tab and the load balancer's resource map) gives a reason code for every unhealthy target:</p>
+					<ul>
+						<li><strong><code>Target.Timeout</code>:</strong> no response in time. Usually a <strong>security group</strong> on the instance that doesn't allow the health check port from the load balancer's security group, a network ACL blocking it, or a target too overloaded to answer.</li>
+						<li><strong><code>Target.ResponseCodeMismatch</code>:</strong> the target answered with a code outside the matcher, often a 404 because the health check path doesn't exist, or a 301 redirect to HTTPS.</li>
+						<li><strong><code>Target.FailedHealthChecks</code>:</strong> the connection failed or the application isn't listening on the health check port.</li>
+						<li><strong><code>Target.NotRegistered</code>, <code>Target.NotInUse</code>:</strong> the target isn't registered, or is in an Availability Zone the load balancer isn't enabled in.</li>
+						<li><strong><code>Elb.InitialHealthChecking</code>:</strong> still being checked for the first time; wait.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>The network rules that most often cause it</h4>
+					<ul>
+						<li>The <strong>instance security group</strong> must allow traffic on the health check port from the load balancer's security group (the simplest rule: allow from the load balancer's security group).</li>
+						<li>The <strong>network ACL</strong> on the instances' subnets must allow the health check port inbound and <strong>ephemeral ports 1024&ndash;65535 outbound</strong>, because NACLs are stateless; the load balancer's subnets need the mirror image.</li>
+						<li>Some applications only answer requests for a specific host name; the health check's Host header is the target's private IP address, so a virtual host configuration may reject it.</li>
+					</ul>
+					<p>For detail on every check, turn on <strong>health check logs</strong>, delivered to S3, which record each check's result and a reason such as <code>TimedOut</code> or <code>ResponseCodeMismatch</code>.</p>
+				</div>
+				<div class="callout trap"><p>Instances behind a load balancer keep getting replaced, even though the application is fine: the Auto Scaling group uses ELB health checks and the health check path or security group is wrong, so healthy instances are judged unhealthy. Fix the health check, and set a health check grace period long enough for the application to start.</p></div>
+			</div>
+
+			<!-- Route 53 health checks (still Skill 2.2.1) -->
+			<h2 id="s1b">Route 53 health checks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.1</span><span class="skill-text">(continued) Route 53 health checks and DNS failover</span></p>
+				<p>Load balancer health checks route around failed targets inside one deployment. Route 53 health checks work one level up: they decide which <strong>DNS answer</strong> to give, so traffic can move away from a whole load balancer, Region or site.</p>
+
+				<h3>Types of health check</h3>
+				<div class="entry">
+					<h4>Endpoint health checks</h4>
+					<p>Health checkers in several AWS Regions around the world send HTTP, HTTPS or TCP requests to an IP address or domain name. For HTTP and HTTPS, the endpoint must accept a TCP connection within <strong>4 seconds</strong> and return a <strong>2xx or 3xx</strong> status within <strong>2 seconds</strong>; optionally the body must contain a given string within its first 5,120 bytes (string matching). HTTPS checks don't validate the certificate.</p>
+					<ul>
+						<li><strong>Request interval:</strong> 30 seconds, or 10 seconds (fast, extra cost, and can't be changed later).</li>
+						<li><strong>Failure threshold:</strong> consecutive failures before a checker considers the endpoint unhealthy; default 3 (1&ndash;10).</li>
+						<li><strong>Verdict:</strong> the endpoint is healthy if more than <strong>18%</strong> of the health checkers report it healthy.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Calculated health checks</h4>
+					<p>Combine other health checks: healthy if at least a set number of the child checks are healthy, for example "healthy if 2 of the 3 web servers are". Calculated checks can't contain other calculated checks.</p>
+				</div>
+				<div class="entry">
+					<h4>CloudWatch alarm health checks</h4>
+					<p>Healthy or unhealthy according to a CloudWatch alarm's state. This is how to health-check <strong>private resources</strong>: Route 53's checkers are on the internet and can't reach private, local or non-routable IP addresses, but an alarm on, say, a private database's metrics can. You choose what an alarm in INSUFFICIENT_DATA means (healthy, unhealthy or last known status).</p>
+				</div>
+				<span class="file">Create an HTTPS health check for the shop's endpoint</span>
+<pre><code>aws route53 create-health-check \
+  --caller-reference shop-2026-11-03 \
+  --health-check-config '{
+    "Type": "HTTPS",
+    "FullyQualifiedDomainName":
+      "shop.example.com",
+    "ResourcePath": "/health",
+    "RequestInterval": 30,
+    "FailureThreshold": 3
+  }'</code></pre>
+
+				<h3>Health checks in routing</h3>
+				<div class="entry">
+					<h4>Failover routing</h4>
+					<p>A <strong>primary</strong> record with a health check and a <strong>secondary</strong> record: Route 53 answers with the primary while it is healthy and the secondary when it isn't, for example a static "we'll be back soon" site in S3, or a standby stack in another Region. The secondary's health check is optional; if both are unhealthy, Route 53 returns the primary.</p>
+				</div>
+				<div class="entry">
+					<h4>Evaluate target health on alias records</h4>
+					<p>An alias record pointing at an AWS resource such as a load balancer doesn't need its own health check: turn on <strong>Evaluate target health</strong> and Route 53 uses the load balancer's target group health. The record is unhealthy if any of its target groups is unhealthy, or all are empty.</p>
+				</div>
+				<div class="entry">
+					<h4>Other routing policies</h4>
+					<p>Weighted, latency, geolocation and multivalue records skip unhealthy records when a health check is attached. Two rules surprise people: a record <strong>without</strong> a health check is always treated as healthy, and if <strong>every</strong> record in a group is unhealthy, Route 53 treats them all as healthy and keeps answering, rather than returning nothing.</p>
+				</div>
+
+				<h3>Troubleshooting Route 53 health checks</h3>
+				<ul>
+					<li><strong>Unhealthy, but the site works:</strong> the firewall or security group doesn't allow Route 53's health checkers. Allow their IP ranges, most easily with the managed prefix list <code>com.amazonaws.<em>region</em>.route53-healthchecks</code>.</li>
+					<li><strong>Health check on a private IP:</strong> it can't work; use a CloudWatch alarm health check.</li>
+					<li><strong>Can't find the metrics or alarm:</strong> Route 53 health check metrics exist only in <strong>us-east-1</strong>, so alarms on <code>HealthCheckStatus</code>, and their SNS topics, must be created there.</li>
+					<li><strong>Slow to fail over:</strong> time to failover is about interval &times; failure threshold, plus DNS caching for the record's TTL. Give non-alias failover records a short TTL (such as 60 seconds; alias records use the target's TTL), and use the fast interval if needed.</li>
+				</ul>
+
+				<h3>Amazon Application Recovery Controller (ARC)</h3>
+				<div class="entry">
+					<h4>Zonal shift and zonal autoshift</h4>
+					<p>Health checks catch failures that make targets fail. Some zone problems don't: higher latency or errors in one Availability Zone while health checks still pass. <strong>Zonal shift</strong> lets you move traffic away from one Availability Zone for a supported resource, for 1 minute up to 3 days (extendable), and then back. It works for Application and Network Load Balancers (enable it on each load balancer first), EC2 Auto Scaling groups and Amazon EKS. With <strong>zonal autoshift</strong>, AWS shifts traffic itself when its own telemetry shows a zone impairment, and runs weekly practice shifts to prove the application copes with losing a zone, so you must have capacity in the remaining zones.</p>
+				</div>
+				<div class="entry">
+					<h4>Routing control</h4>
+					<p>For multi-Region applications: on/off switches, backed by a highly reliable cluster in five Regions, that flip special Route 53 health checks and so move traffic between Regions, with safety rules that stop you switching everything off at once.</p>
+				</div>
+				<div class="callout retired"><p>ARC's <strong>readiness check</strong> feature has been in maintenance since March 31, 2026: no new customers. AWS suggests ARC Region switch instead. Zonal shift, zonal autoshift and routing control are unaffected.</p></div>
+			</div>
+
+			<!-- Skill 2.2.2 -->
+			<h2 id="s2">Fault-tolerant Multi-AZ systems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.2</span><span class="skill-text">Configure fault-tolerant systems (for example, Multi-AZ deployments)</span></p>
+
+				<h3>The principle: static stability</h3>
+				<div class="entry">
+					<h4>Have the capacity before the failure</h4>
+					<p>AWS's Well-Architected Framework calls it <strong>static stability</strong>: the system keeps working through a failure without having to make changes. Instead of planning to launch replacement instances in another zone when one fails (which depends on control plane calls succeeding during an incident), run enough capacity in each zone beforehand. With three zones, size each to carry the load if one is lost: about 50% of peak each, 150% in total.</p>
+				</div>
+
+				<h3>Compute and networking</h3>
+				<div class="entry">
+					<h4>EC2 Auto Scaling across zones</h4>
+					<p>Give the group subnets in at least two, preferably three, Availability Zones. It spreads instances evenly, replaces failed ones in the remaining zones, and <strong>rebalances</strong> when a zone recovers (launching new instances before terminating old ones). Use ELB health checks so instances that fail the application check are replaced too.</p>
+				</div>
+				<div class="entry">
+					<h4>Load balancers</h4>
+					<p>Enable the load balancer in every zone the targets are in; it places a node in each enabled zone. A target in a zone that isn't enabled receives no traffic.</p>
+				</div>
+				<div class="entry">
+					<h4>NAT gateways</h4>
+					<p>A standard NAT gateway lives in one Availability Zone. If private subnets in all zones route through one NAT gateway, losing that zone cuts every zone's outbound internet access, and cross-zone traffic costs extra. Create <strong>one NAT gateway per zone</strong> and route each zone's private subnets to its own. A newer <strong>regional NAT gateway</strong> mode spans zones automatically and doesn't need a public subnet; zonal gateways are still needed for private NAT.</p>
+				</div>
+
+				<h3>Databases</h3>
+				<div class="entry">
+					<h4>RDS Multi-AZ DB instance</h4>
+					<p>A <strong>standby</strong> in another zone, kept up to date by <strong>synchronous</strong> replication, so no committed data is lost on failover. The standby can't serve reads. On failure (host, storage or zone failure, or patching), RDS points the database's DNS name at the standby, typically in <strong>60&ndash;120 seconds</strong>; the application reconnects to the same endpoint. Test it with a reboot with failover:</p>
+					<span class="file">Force a Multi-AZ failover to test recovery</span>
+<pre><code>aws rds reboot-db-instance \
+  --db-instance-identifier orders-db \
+  --force-failover</code></pre>
+					<p>Applications must reconnect after failover and must not cache the database's IP address: a long DNS cache (such as a Java default) keeps them talking to the old primary.</p>
+				</div>
+				<div class="entry">
+					<h4>RDS Multi-AZ DB cluster</h4>
+					<p>A writer and <strong>two readable standbys</strong> in three zones, with semisynchronous replication (at least one reader confirms each write). Failover is typically <strong>under 35 seconds</strong>, and the standbys serve read traffic through a reader endpoint. Available for RDS for MySQL and RDS for PostgreSQL.</p>
+				</div>
+				<div class="entry">
+					<h4>Aurora</h4>
+					<p>Aurora's storage keeps six copies of the data across three Availability Zones, whatever the instances do. For instance failover, add <strong>Aurora Replicas in other zones</strong>: if the writer fails, a replica is promoted, typically in under 60 seconds and often under 30. Without any replica, Aurora has to recreate the writer, typically in under 10 minutes. <strong>Promotion tiers</strong> (0 is highest, 15 lowest) decide which replica is promoted.</p>
+				</div>
+				<div class="entry">
+					<h4>ElastiCache</h4>
+					<p>For Valkey and Redis OSS, Multi-AZ with automatic failover promotes a replica in another zone when the primary fails; it needs at least one replica in a different zone, and it is always on for cluster mode enabled. Memcached has no replication, so a failed node's cached data is lost and must be refilled from the database.</p>
+				</div>
+
+				<h3>Storage services that are Multi-AZ by default</h3>
+				<ul>
+					<li><strong>Amazon S3</strong> Standard, Standard-IA, Intelligent-Tiering and the Glacier classes store data in at least three zones; One Zone-IA and Express One Zone use one.</li>
+					<li><strong>DynamoDB</strong> replicates every table across three zones automatically.</li>
+					<li><strong>Amazon EFS</strong> Regional file systems span multiple zones; <strong>EFS One Zone</strong> doesn't survive a zone loss. Create a mount target in each zone the clients run in.</li>
+					<li><strong>EBS volumes</strong> are replicated within one zone only: for zone resilience, take snapshots (stored regionally) or replicate at the application level.</li>
+				</ul>
+				<div class="callout tip"><p>"Survive the loss of an Availability Zone with no data loss" for RDS points to Multi-AZ. "Scale reads" points to read replicas (Task 2.1), which are asynchronous and not a failover mechanism by default. "Fastest failover with readable standbys" points to a Multi-AZ DB cluster or Aurora with replicas.</p></div>
+				<div class="callout trap"><p>A Multi-AZ RDS deployment protects against zone failure, not against bad data: a mistaken <code>DELETE</code> is replicated to the standby instantly. Protection against that is backups and point-in-time restore (Task 2.3).</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Load balancer health checks: interval, timeout, healthy and unhealthy thresholds and success codes per target group. ALB and NLB fail open when every target is unhealthy; GWLB doesn't. Point checks at a real health path.</li>
+				<li>Troubleshoot with reason codes: <code>Target.Timeout</code> is usually a security group or NACL (allow the health check port from the load balancer, and ephemeral ports outbound), <code>Target.ResponseCodeMismatch</code> a wrong path or redirect. Health check logs give per-check detail.</li>
+				<li>Cross-zone load balancing is always on for ALB (off only per target group) and off by default for NLB and GWLB. Deregistration delay defaults to 300 seconds.</li>
+				<li>Route 53 health checks: endpoint (HTTP, HTTPS, TCP, string matching), calculated, or CloudWatch alarm for private resources; healthy if over 18% of checkers agree; allow the checkers through firewalls; metrics only in us-east-1.</li>
+				<li>Failover routing returns the secondary when the primary is unhealthy; alias records can evaluate target health; records without health checks are always healthy, and if all are unhealthy all are treated as healthy.</li>
+				<li>ARC zonal shift moves traffic away from an impaired zone (ALB, NLB, Auto Scaling, EKS); zonal autoshift lets AWS do it. Readiness check is closed to new customers.</li>
+				<li>Design for zone loss with static stability: capacity in every zone beforehand, Auto Scaling across three zones, one NAT gateway per zone (or a regional NAT gateway).</li>
+				<li>RDS Multi-AZ instance: synchronous standby, not readable, 60&ndash;120 s failover. Multi-AZ DB cluster: two readable standbys, under 35 s. Aurora: six storage copies; replicas fail over in under 60 s, no replica means up to 10 minutes. S3, DynamoDB and EFS Regional are Multi-AZ by default; EBS is single-zone.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-1.html"><small>Previous</small>Task 2.1: Scalability and elasticity</a>
+				<a class="next" href="d2-task-2-3.html"><small>Next</small>Task 2.3: Backup and restore</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified CloudOps Engineer &ndash; Associate (SOA-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
