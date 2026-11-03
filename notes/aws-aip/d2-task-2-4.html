@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.4: FM API Integrations | AWS AIP-C01 Notes</title>
+	<meta name="description" content="AIP-C01 Task 2.4 study guide: calling foundation models through Bedrock's synchronous, streaming, asynchronous and bidirectional APIs; asynchronous processing with SQS and Lambda; request validation in API Gateway; real-time delivery with WebSockets, REST response streaming, server-sent events and AppSync; resilience with backoff, throttling, fallbacks and OpenTelemetry tracing; and routing requests to the right model.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="aip.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">AIP-C01</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Implementation and Integration &middot; 26%</span>
+		<h1>Task 2.4: Implement FM API integrations</h1>
+		<p>The plumbing between applications and models: which Bedrock API to call and how, queuing work that can't wait, validating requests at the edge, getting tokens to the user as they're generated, surviving throttling and outages, and sending each request to the right model.</p>
+		<div class="tags"><span class="tag code">AIP-C01</span><span class="tag">ConverseStream</span><span class="tag">SQS</span><span class="tag">WebSockets</span><span class="tag">Response streaming</span><span class="tag">OpenTelemetry</span><span class="tag">Model routing</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Flexible model interaction</a></li>
+				<li><a href="#s2">Real-time responses</a></li>
+				<li><a href="#s3">Resilience and observability</a></li>
+				<li><a href="#s4">Model routing</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.4</span>
+				<p><strong>Implement FM API integrations.</strong></p>
+			</div>
+			<p>Model calls differ from ordinary API calls: they take seconds, produce output incrementally, are rate-limited by tokens, and fail in new ways mid-response. Integrations have to choose the right calling style (wait, stream, or queue), protect the model from bad and excessive requests, and keep working when a model is busy.</p>
+			<p>The examples continue with the retailer's support assistant (interactive chat) and its ticket summarizer (background work).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.4.1</td><td data-label="What you need to be able to do">Create flexible model interaction: synchronous Bedrock calls, SDKs and SQS for asynchronous work, API Gateway request validation</td></tr>
+						<tr><td>2.4.2</td><td data-label="What you need to be able to do">Develop real-time interaction: streaming APIs, WebSockets or server-sent events, chunked transfer through API Gateway</td></tr>
+						<tr><td>2.4.3</td><td data-label="What you need to be able to do">Create resilient systems: SDK backoff, API Gateway rate limiting, fallbacks, X-Ray observability</td></tr>
+						<tr><td>2.4.4</td><td data-label="What you need to be able to do">Develop model routing: static configuration, Step Functions content-based routing, metric-based routing, API Gateway transformations</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 2.4.1 -->
+			<h2 id="s1">Flexible model interaction</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.1</span><span class="skill-text">Create flexible model interaction systems (for example, by using Amazon Bedrock APIs to manage synchronous requests from various compute environments, language-specific AWS SDKs and Amazon SQS for asynchronous processing, Amazon API Gateway to provide custom API clients with request validation)</span></p>
+
+				<h3>The Bedrock runtime APIs</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>API</th><th>Style</th><th>Use for</th></tr></thead>
+						<tbody>
+							<tr><td><code>Converse</code>, <code>InvokeModel</code></td><td data-label="Style">Synchronous: the full response at once</td><td data-label="Use for">Short answers, back-end processing, anything parsed as a whole</td></tr>
+							<tr><td><code>ConverseStream</code>, <code>InvokeModelWithResponseStream</code></td><td data-label="Style">Streaming: tokens as they're generated</td><td data-label="Use for">Chat interfaces and long answers</td></tr>
+							<tr><td><code>StartAsyncInvoke</code></td><td data-label="Style">Asynchronous job, output written to S3</td><td data-label="Use for">Long-running generation such as video</td></tr>
+							<tr><td><code>InvokeModelWithBidirectionalStream</code></td><td data-label="Style">Two-way stream for a session of up to 8 minutes</td><td data-label="Use for">Speech-to-speech conversations (Nova Sonic), with interruptions</td></tr>
+							<tr><td>Chat Completions and Responses (OpenAI-compatible)</td><td data-label="Style">OpenAI SDK request formats on Bedrock endpoints</td><td data-label="Use for">Code written for the OpenAI SDK</td></tr>
+							<tr><td>Batch inference</td><td data-label="Style">Jobs from S3 at about half price</td><td data-label="Use for">Large offline workloads (<a href="d1-task-1-1.html#s1">Task 1.1</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>All are available in every AWS SDK (Python, JavaScript, Java, .NET, Go and others), so any compute environment (Lambda, containers, EC2, on premises) can call them. The <code>modelId</code> can be a model, an inference profile, a managed prompt, a prompt router, a provisioned or custom model deployment, or a Marketplace endpoint. The AWS CLI can't call the streaming operations.</p>
+
+				<h3>Asynchronous processing with SQS</h3>
+				<div class="entry">
+					<h4>Queue, then process</h4>
+					<p>When the caller doesn't need the answer immediately (summarize a ticket, classify an email), put the request on an <strong>SQS</strong> queue and let a Lambda function (or container workers) process it. The queue absorbs bursts, retries failures, and keeps Bedrock calls within quota by limiting how many workers run.</p>
+					<ul>
+						<li><strong>Visibility timeout</strong> at least 6 times the function timeout, so a message isn't redelivered while still being processed.</li>
+						<li><strong>Dead-letter queue</strong> after several receives (5 or more), so a message that always fails stops being retried and can be inspected.</li>
+						<li><strong>Partial batch failures</strong> (<code>ReportBatchItemFailures</code>) so only failed messages return to the queue, not the whole batch.</li>
+						<li><strong>Maximum concurrency</strong> on the event source (2 to 1,000) caps parallel model calls below the Bedrock quota.</li>
+						<li><strong>Idempotency:</strong> delivery is at least once, so processing a message twice must not do the work twice (Powertools for AWS Lambda has an idempotency utility backed by DynamoDB).</li>
+						<li><strong>FIFO queues</strong> keep order per message group, for example per customer conversation.</li>
+					</ul>
+					<span class="file">Summarizer: report only failed messages (Python)</span>
+<pre><code>def handler(event, context):
+    failed = []
+    for rec in event["Records"]:
+        try:
+            job = json.loads(rec["body"])
+            summarize(job)
+        except Exception:
+            failed.append({
+                "itemIdentifier":
+                    rec["messageId"]})
+    return {"batchItemFailures": failed}</code></pre>
+<pre><code>aws lambda create-event-source-mapping \
+  --function-name summarizer \
+  --event-source-arn "$QUEUE_ARN" \
+  --batch-size 5 \
+  --function-response-types \
+    ReportBatchItemFailures \
+  --scaling-config MaximumConcurrency=10</code></pre>
+					<p>Results go where the requester can find them (DynamoDB or S3), with a notification (SNS, an EventBridge event, or a push over a WebSocket).</p>
+				</div>
+
+				<h3>Validating requests in API Gateway</h3>
+				<div class="entry">
+					<h4>Reject bad requests before they cost tokens</h4>
+					<p>REST APIs can validate each request before it reaches your code or the model: <strong>required parameters</strong> must be present, and the <strong>body</strong> must match a <strong>model</strong> (a JSON Schema, draft 4) for its content type. Failures return 400 immediately, at no model cost. Validation is a REST API feature; HTTP APIs don't have it. Limits worth knowing: 10 MB payloads, and mapping templates (VTL) to reshape requests for the backend.</p>
+					<span class="file">Request model for POST /ask (JSON Schema)</span>
+<pre><code>{
+  "$schema":
+    "http://json-schema.org/draft-04/schema#",
+  "type": "object",
+  "required": ["question"],
+  "properties": {
+    "question": {"type": "string",
+      "minLength": 1, "maxLength": 4000},
+    "language": {"type": "string",
+      "enum": ["en", "es"]}
+  },
+  "additionalProperties": false
+}</code></pre>
+					<p>A maximum length on free text also caps how many tokens a single request can send to the model.</p>
+				</div>
+			</div>
+
+			<!-- Skill 2.4.2 -->
+			<h2 id="s2">Real-time responses</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.2</span><span class="skill-text">Develop real-time AI interaction systems to provide immediate feedback from FM (for example, by using Amazon Bedrock streaming APIs for incremental response delivery, WebSockets or server-sent events to generate text in real time, API Gateway to implement chunked transfer encoding)</span></p>
+
+				<h3>Streaming from Bedrock</h3>
+				<div class="entry">
+					<h4>Reading a ConverseStream</h4>
+					<p>The stream is a sequence of events: <code>messageStart</code>, then <code>contentBlockDelta</code> events carrying text, <code>messageStop</code> with the stop reason, and <code>metadata</code> with token usage and latency. Errors can arrive <strong>in the middle</strong> of a stream (throttling, a model stream error, service unavailable), after part of the answer was sent, so the client must handle a partial response.</p>
+					<span class="file">Forward text as it arrives (Python)</span>
+<pre><code>from botocore.exceptions import (
+    EventStreamError)
+
+resp = brt.converse_stream(
+    modelId=MODEL_ID, messages=messages)
+try:
+    for ev in resp["stream"]:
+        if "contentBlockDelta" in ev:
+            d = ev["contentBlockDelta"]
+            text = d["delta"].get("text")
+            send(text or "")
+        elif "messageStop" in ev:
+            stop = ev["messageStop"][
+                "stopReason"]
+        elif "metadata" in ev:
+            meta = ev["metadata"]
+            usage = meta["usage"]
+except EventStreamError:
+    <span class="c"># part of the answer was sent:</span>
+    <span class="c"># tell the client, offer a retry</span>
+    send_error("interrupted")</code></pre>
+				</div>
+
+				<h3>Getting tokens to the browser</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>How it works</th><th>Limits and notes</th></tr></thead>
+						<tbody>
+							<tr><td>API Gateway REST response streaming</td><td data-label="How it works">Set the integration's response transfer mode to <code>STREAM</code>; a Lambda (or HTTP) proxy integration sends chunks as produced</td><td data-label="Limits and notes">Up to 15 minutes, beyond the 10 MB and 29-second limits; proxy integrations only; no caching or response mapping templates; newer (November 2025)</td></tr>
+							<tr><td>Lambda function URL streaming</td><td data-label="How it works">The function streams its response directly, often as server-sent events</td><td data-label="Limits and notes">Up to 200 MB; native on Node.js; no streaming from inside a VPC</td></tr>
+							<tr><td>API Gateway WebSocket API</td><td data-label="How it works">A persistent two-way connection; the backend pushes each chunk to the connection</td><td data-label="Limits and notes">Connections last up to 2 hours (10 minutes idle); 128 KB messages, 32 KB frames; authorize on <code>$connect</code></td></tr>
+							<tr><td>AWS AppSync</td><td data-label="How it works">GraphQL subscriptions or AppSync Events channels push updates to subscribed clients</td><td data-label="Limits and notes">Its direct Bedrock resolver is synchronous and must finish within 10 seconds; for longer answers, a Lambda function streams and publishes</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="entry">
+					<h4>Server-sent events</h4>
+					<p><strong>Server-sent events</strong> (SSE) are a simple one-way stream over an ordinary HTTP response (<code>Content-Type: text/event-stream</code>), with each chunk on a <code>data:</code> line and a blank line between events. Browsers read them natively, and the OpenAI-compatible streaming APIs use this format. Use SSE when only the server sends; use WebSockets when the client also sends during the session (interrupting, follow-up messages).</p>
+					<span class="file">What an SSE response body looks like</span>
+<pre><code>data: {"text": "To descale"}
+
+data: {"text": " the K200,"}
+
+data: {"text": " fill it with..."}
+
+event: done
+data: {"stopReason": "end_turn"}</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Pushing over a WebSocket</h4>
+					<p>The backend posts each chunk to the client's connection through the API Gateway management API (<code>@connections</code>). A connection that has closed returns <code>GoneException</code>: stop generating, and don't pay for tokens nobody will read.</p>
+					<span class="file">Push chunks to a WebSocket client (Python)</span>
+<pre><code>api = boto3.client(
+    "apigatewaymanagementapi",
+    endpoint_url=WS_CALLBACK_URL)
+
+def send(text):
+    api.post_to_connection(
+        ConnectionId=connection_id,
+        Data=text.encode())</code></pre>
+				</div>
+				<div class="callout tip"><p>"Users wait several seconds for a blank screen" points to streaming. "One-way token stream to a browser" points to SSE (REST response streaming or a function URL). "Bidirectional chat with interruptions" points to WebSockets. "Live speech conversation" points to the bidirectional streaming API.</p></div>
+			</div>
+
+			<!-- Skill 2.4.3 -->
+			<h2 id="s3">Resilience and observability</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.3</span><span class="skill-text">Create resilient FM systems to ensure reliable operations (for example, by using the AWS SDK for exponential backoff, API Gateway to manage rate limiting, fallback mechanisms for graceful degradation, AWS X-Ray to provide observability across service boundaries)</span></p>
+
+				<h3>Errors and what to do about them</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Error</th><th>Meaning</th><th>Response</th></tr></thead>
+						<tbody>
+							<tr><td>429 <code>ThrottlingException</code></td><td data-label="Meaning">Your requests or tokens per minute are used up</td><td data-label="Response">Back off and retry; cap concurrency; cross-Region inference; a quota increase or reserved capacity</td></tr>
+							<tr><td>529 overloaded</td><td data-label="Meaning">Temporary capacity shortage, not your quota</td><td data-label="Response">Back off with jitter, honour <code>Retry-After</code>; another Region or profile</td></tr>
+							<tr><td>503 service unavailable</td><td data-label="Meaning">Service-side problem</td><td data-label="Response">Retry; fall back to another Region, profile or model</td></tr>
+							<tr><td>408 model timeout, 424 model error</td><td data-label="Meaning">The model failed to produce a response</td><td data-label="Response">Retry once; shorten input; fall back</td></tr>
+							<tr><td>400 validation</td><td data-label="Meaning">Bad request (too long, wrong format)</td><td data-label="Response">Don't retry; fix the request</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The SDKs retry transient errors with exponential backoff and jitter (standard retry mode); fallbacks and circuit breakers are covered in <a href="d1-task-1-2.html#s3">Task 1.2</a>, with an example.</p>
+				<div class="entry">
+					<h4>Long requests and idle connections</h4>
+					<p>NAT gateways, interface VPC endpoints and Network Load Balancers drop TCP connections idle for 350 seconds. A long reasoning call or a slow stream can be cut silently. Turn on TCP keepalive in the SDK (and set the operating system's keepalive interval below 350 seconds), and raise the SDK read timeout for long calls.</p>
+					<span class="file">Client for long calls behind a NAT gateway (Python)</span>
+<pre><code>brt = boto3.client(
+    "bedrock-runtime",
+    config=Config(
+        tcp_keepalive=True,
+        read_timeout=900,
+        retries={"mode": "standard"}))</code></pre>
+				</div>
+
+				<h3>Rate limiting at the API</h3>
+				<p>API Gateway throttles at several levels, applied in order: per client (usage plans with API keys, including quotas per day or month), per stage and method, the account limit per Region (10,000 requests per second with a 5,000 burst by default), and AWS's own limits. Excess requests get 429. Set per-client limits so one team or customer can't use up the shared model quota, and keep the API's limits aligned with the Bedrock quota behind it.</p>
+
+				<h3>Tracing across services</h3>
+				<div class="entry">
+					<h4>X-Ray and OpenTelemetry</h4>
+					<p>A request crosses API Gateway, Lambda, a queue, Step Functions and Bedrock. <strong>Distributed tracing</strong> follows it end to end, showing where time goes (often the model call) and where errors start. API Gateway REST APIs (not HTTP APIs), Lambda and Step Functions can send traces to X-Ray, viewed in CloudWatch.</p>
+					<p>The X-Ray SDKs and daemon entered <strong>maintenance mode in February 2026</strong>; AWS recommends <strong>OpenTelemetry</strong> instead: the AWS Distro for OpenTelemetry or OpenTelemetry SDKs to instrument code, the OpenTelemetry Lambda layer (which also feeds CloudWatch Application Signals), and the CloudWatch agent or OpenTelemetry Collector in place of the daemon. CloudWatch <strong>Transaction Search</strong> stores all spans as logs so any single request can be found.</p>
+				</div>
+				<div class="callout tip"><p>Add the model ID, token counts and prompt version as trace attributes (or <code>requestMetadata</code> on the call), so a slow or expensive request can be tied to the model and prompt that caused it (<a href="d4-task-4-3.html">Task 4.3</a>).</p></div>
+			</div>
+
+			<!-- Skill 2.4.4 -->
+			<h2 id="s4">Model routing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.4</span><span class="skill-text">Develop intelligent model routing systems to optimize model selection (for example, by using application code to implement static routing configurations, Step Functions for dynamic content-based routing to specialized FMs, intelligent model routing based on metrics, API Gateway with request transformations for routing logic)</span></p>
+
+				<h3>Ways to route</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Approach</th><th>Decides by</th><th>Fits</th></tr></thead>
+						<tbody>
+							<tr><td>Static configuration</td><td data-label="Decides by">A table of task type to model, in AppConfig or code</td><td data-label="Fits">Known task types with known best models</td></tr>
+							<tr><td>Content-based (Step Functions)</td><td data-label="Decides by">A classifier step labels the request; a Choice state sends it to a specialized model or flow</td><td data-label="Fits">Mixed requests needing different models or tools</td></tr>
+							<tr><td>Bedrock intelligent prompt routing</td><td data-label="Decides by">Predicted response quality, between two models of one family</td><td data-label="Fits">Saving cost on easy questions without building a classifier (English only)</td></tr>
+							<tr><td>Metric-based</td><td data-label="Decides by">Live latency, error and throttle metrics per model or Region</td><td data-label="Fits">Moving traffic away from a slow or throttled model</td></tr>
+							<tr><td>API Gateway</td><td data-label="Decides by">Routing rules on custom domains (headers, base path), stage variables, mapping templates</td><td data-label="Fits">Routing by API version, client tier or header, without code</td></tr>
+							<tr><td>Model gateway</td><td data-label="Decides by">The requested model name, mapped to a provider (AgentCore Gateway inference targets, or a LiteLLM-based gateway)</td><td data-label="Fits">One endpoint across Bedrock and other providers</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">Static routing table read from configuration (Python)</span>
+<pre><code>ROUTES = {
+    "classify":
+        "us.amazon.nova-micro-v1:0",
+    "answer": "us.amazon.nova-pro-v1:0",
+    "image": "us.amazon.nova-lite-v1:0",
+}
+
+def model_for(task):
+    default = ROUTES["answer"]
+    return ROUTES.get(task, default)</code></pre>
+				<div class="entry">
+					<h4>Content-based routing with Step Functions</h4>
+					<ol class="flow">
+						<li><b>Classify</b>A small model (Bedrock <code>InvokeModel</code> task) labels the request: <code>order</code>, <code>how_to</code>, <code>complaint</code>.</li>
+						<li><b>Choose</b>A Choice state branches on the label.</li>
+						<li><b>Specialize</b>Orders go to an agent with order tools; how-to questions to a knowledge base query with a mid-size model; complaints to a stronger model and a human review queue.</li>
+						<li><b>Default</b>Unrecognized labels go to the general path.</li>
+					</ol>
+				</div>
+				<div class="entry">
+					<h4>Metric-based routing</h4>
+					<p>Publish per-model latency, error rate and throttles (Bedrock's own CloudWatch metrics, plus your own), and let the router prefer the healthiest option: if the primary model's throttles or latency alarm fires, AppConfig flips the route to an alternative profile or Region until it recovers.</p>
+				</div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Pick the API by style: Converse or InvokeModel to wait, the streaming versions for chat, StartAsyncInvoke for long jobs to S3, bidirectional streaming for speech, OpenAI-compatible endpoints for OpenAI SDK code; any SDK and compute can call them.</li>
+				<li>Queue background work in SQS: visibility timeout of 6 times the function timeout, a dead-letter queue, partial batch failures, maximum concurrency below the model quota, idempotent processing.</li>
+				<li>Validate at the edge with API Gateway REST request validators and JSON Schema models (400 before any tokens are spent); cap input length.</li>
+				<li>Stream to users: ConverseStream events (deltas, stop reason, metadata, mid-stream errors); REST response streaming, function URL SSE, WebSockets with @connections, or AppSync subscriptions.</li>
+				<li>Resilience: retry 429, 529 and 503 with backoff and jitter, don't retry 400s, fall back to other models or Regions, enable TCP keepalive for long calls, throttle per client with usage plans; trace with OpenTelemetry (X-Ray SDKs are in maintenance).</li>
+				<li>Route by static configuration, a classifier and Choice state, intelligent prompt routing, live metrics, API Gateway rules, or a model gateway.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-3.html"><small>Previous</small>Task 2.3: Enterprise integration</a>
+				<a class="next" href="d2-task-2-5.html"><small>Next</small>Task 2.5: Integration patterns and dev tools</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Generative AI Developer &ndash; Professional (AIP-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
