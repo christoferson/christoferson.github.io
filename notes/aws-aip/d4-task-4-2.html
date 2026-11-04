@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 4.2: Optimize Application Performance | AWS AIP-C01 Notes</title>
+	<meta name="description" content="AIP-C01 Task 4.2 study guide: making generative AI applications fast on AWS with streaming, pre-computation, parallel requests and latency-optimized Bedrock inference, benchmarking time to first token and output speed, tuning retrieval and hybrid scoring, managing concurrency and batch inference, choosing temperature and top-p, A/B testing, planning token capacity, scaling endpoints, and profiling the whole request path.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="aip.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">AIP-C01</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">Task 4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Operational Efficiency and Optimization for GenAI Applications &middot; 12%</span>
+		<h1>Task 4.2: Optimize application performance</h1>
+		<p>Making a generative AI application feel fast and stay fast under load: showing the first words sooner, doing less work per request, retrieving the right passages quickly, keeping many requests in flight without throttling, and finding where the time actually goes.</p>
+		<div class="tags"><span class="tag code">AIP-C01</span><span class="tag">Latency</span><span class="tag">Streaming</span><span class="tag">Retrieval tuning</span><span class="tag">Concurrency</span><span class="tag">Inference parameters</span><span class="tag">Profiling</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Responsive systems</a></li>
+				<li><a href="#s2">Retrieval performance</a></li>
+				<li><a href="#s3">Throughput</a></li>
+				<li><a href="#s4">Inference parameters</a></li>
+				<li><a href="#s5">Resource allocation</a></li>
+				<li><a href="#s6">System performance</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.2</span>
+				<p><strong>Optimize application performance.</strong></p>
+			</div>
+			<p>A model call has two phases. In <strong>prefill</strong> the model reads the whole prompt; its length sets the <strong>time to first token</strong> (TTFT). In <strong>decode</strong> the model writes the answer one token at a time; output length divided by the <strong>output tokens per second</strong> (OTPS) sets the rest. So total latency is roughly TTFT plus output tokens &divide; OTPS. Every technique on this page shortens one of those terms, hides it from the user, or stops requests from waiting in a queue first.</p>
+			<p>The examples follow the retailer from earlier tasks: a <strong>customer support assistant</strong> that answers questions about products (the K200 kettle and others) from a knowledge base of manuals, and a <strong>nightly job</strong> that summarizes support tickets. Cost-focused versions of some levers (caching, quotas, Provisioned Throughput) are in <a href="d4-task-4-1.html">Task 4.1</a>; here the goal is speed.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>4.2.1</td><td data-label="What you need to be able to do">Create responsive systems: pre-computation, latency-optimized models, parallel requests, streaming, benchmarking</td></tr>
+						<tr><td>4.2.2</td><td data-label="What you need to be able to do">Enhance retrieval performance: index optimization, query preprocessing, hybrid search with custom scoring</td></tr>
+						<tr><td>4.2.3</td><td data-label="What you need to be able to do">Optimize throughput: token processing, batch inference, concurrent invocation management</td></tr>
+						<tr><td>4.2.4</td><td data-label="What you need to be able to do">Enhance FM performance: model-specific parameters, A/B testing, temperature and top-k/top-p</td></tr>
+						<tr><td>4.2.5</td><td data-label="What you need to be able to do">Allocate resources: token capacity planning, prompt and completion monitoring, auto scaling for GenAI traffic</td></tr>
+						<tr><td>4.2.6</td><td data-label="What you need to be able to do">Optimize system performance: API call profiling, vector query optimization, LLM latency reduction, service communication</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 4.2.1 -->
+			<h2 id="s1">Responsive systems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.1</span><span class="skill-text">Create responsive AI systems to address latency-cost tradeoffs and improve the user experience with FMs (for example, by using pre-computation to perform predictable queries, latency-optimized Amazon Bedrock models for time-sensitive applications, parallel requests for complex workflows, response streaming, performance benchmarking)</span></p>
+
+				<h3>The levers and what they cost</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Lever</th><th>Shortens</th><th>Trade-off</th></tr></thead>
+						<tbody>
+							<tr><td>Streaming</td><td data-label="Shortens">Perceived wait: text appears after TTFT, not after the last token</td><td data-label="Trade-off">Total time unchanged; output filters and validation must work on partial text</td></tr>
+							<tr><td>Pre-computation</td><td data-label="Shortens">Everything: the answer is ready before the question</td><td data-label="Trade-off">Only for predictable queries; answers go stale and need refreshing</td></tr>
+							<tr><td>Smaller or faster model</td><td data-label="Shortens">TTFT and decode</td><td data-label="Trade-off">May lower quality; check with evaluations</td></tr>
+							<tr><td>Latency-optimized inference</td><td data-label="Shortens">Decode and TTFT on supported models</td><td data-label="Trade-off">Preview, few models, higher price</td></tr>
+							<tr><td>Priority tier</td><td data-label="Shortens">Queueing under load</td><td data-label="Trade-off">Premium price per token</td></tr>
+							<tr><td>Parallel requests</td><td data-label="Shortens">Multi-step workflows: independent steps overlap</td><td data-label="Trade-off">Uses more concurrent quota at once</td></tr>
+							<tr><td>Shorter prompts and answers</td><td data-label="Shortens">Prefill (prompt) and decode (answer)</td><td data-label="Trade-off">Less context; risk of truncated answers</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Streaming</h3>
+				<p>For a chat interface, streaming is the first fix: the user starts reading after the time to first token, typically well under the full response time. Use <code>ConverseStream</code> (or <code>InvokeModelWithResponseStream</code>) and forward each text delta to the browser over server-sent events or a WebSocket (the transport options are in <a href="d2-task-2-4.html">Task 2.4</a>). The stream's final <code>metadata</code> event carries token usage and the total latency, which is also how you measure TTFT from the client:</p>
+				<span class="file">Measuring time to first token (Python)</span>
+<pre><code>import time
+import boto3
+
+brt = boto3.client("bedrock-runtime")
+
+t0 = time.monotonic()
+resp = brt.converse_stream(
+    modelId=MODEL_ID,
+    messages=msgs,
+)
+ttft = None
+for ev in resp["stream"]:
+    if "contentBlockDelta" in ev:
+        if ttft is None:
+            ttft = time.monotonic() - t0
+        block = ev["contentBlockDelta"]
+        d = block["delta"]
+        send(d.get("text", ""))
+    if "metadata" in ev:
+        meta = ev["metadata"]
+        usage = meta["usage"]
+        metrics = meta["metrics"]
+        total_ms = metrics["latencyMs"]</code></pre>
+				<p><code>send</code> stands for your code that pushes text to the client. A non-streaming <code>Converse</code> response has the same <code>metrics.latencyMs</code> field.</p>
+
+				<h3>Pre-computation</h3>
+				<p>Many questions are predictable: "how do I descale the K200", "what is the return window", the summary of a product's reviews. Generate those answers ahead of time, for example with a nightly batch inference job over the top questions and every product page, store them in DynamoDB or S3 keyed by question or product, and serve them in milliseconds. Pre-compute other expensive inputs too: document summaries, embeddings and extracted metadata at ingestion time rather than per query. Regenerate when the source changes (an S3 event or a knowledge base sync) and set an age limit so stale answers expire.</p>
+
+				<h3>Latency-optimized inference</h3>
+				<p>Bedrock can run some models on faster infrastructure when the request sets <code>performanceConfig</code> to <code>optimized</code> (the default is <code>standard</code>). It works with Converse, ConverseStream and InvokeModel, only through cross-Region inference profiles, and only for a short list of models and Regions. When the latency-optimized usage quota is used up, Bedrock quietly serves the request at standard latency and price, so read the setting the response reports back:</p>
+				<span class="file">Requesting latency-optimized inference (Python)</span>
+<pre><code>resp = brt.converse(
+    modelId=PROFILE_ID,
+    messages=msgs,
+    performanceConfig={
+        "latency": "optimized"},
+)
+<span class="c"># "standard" here means it fell back</span>
+perf = resp["performanceConfig"]
+used = perf["latency"]</code></pre>
+				<div class="callout note"><p>This feature is still marked <strong>preview</strong>, and its model list has stayed with older model generations (Nova Pro, Claude 3.5 Haiku, Llama 3.1). Learn the pattern and the parameter name; check the current list before relying on it. For queueing delay under heavy load, the <strong>Priority</strong> service tier (<code>serviceTier</code> set to <code>priority</code>) serves requests ahead of Standard and Flex for a premium.</p></div>
+
+				<h3>Parallel requests</h3>
+				<p>When a workflow has independent steps, run them at the same time. To answer "Compare the K200 and K300 for a small kitchen", the assistant can retrieve and summarize each product concurrently, then make one final call to compare. Total time becomes the slowest branch plus the final step instead of the sum. Step Functions <strong>Parallel</strong> and <strong>Map</strong> states do the same in orchestrated workflows, and agent frameworks can call several tools at once.</p>
+				<span class="file">Independent calls in parallel (Python)</span>
+<pre><code>from concurrent.futures import (
+    ThreadPoolExecutor)
+
+def summarize(product):
+    msgs = [{"role": "user", "content": [
+        {"text": prompt_for(product)}]}]
+    r = brt.converse(modelId=MODEL_ID,
+                     messages=msgs)
+    out = r["output"]["message"]
+    return out["content"][0]["text"]
+
+with ThreadPoolExecutor(2) as pool:
+    notes = list(pool.map(
+        summarize, ["K200", "K300"]))
+answer = compare(notes)</code></pre>
+				<p>A boto3 client can be shared across threads; create it once. Parallel branches each use quota at the same moment, so they need the concurrency limits described under <a href="#s3">Throughput</a>.</p>
+
+				<h3>Benchmarking</h3>
+				<p>Measure before and after every change, with realistic prompts (real lengths, real retrieved context) and realistic concurrency, because a model that is fast for one user can queue under fifty.</p>
+				<ol class="flow">
+					<li><b>Define the workload</b>Sample real prompts and record their input and output token distributions and the expected number of concurrent users.</li>
+					<li><b>Choose the metrics</b>TTFT and total latency at p50 and p90 or p99, output tokens per second, requests per minute sustained, error and throttle rate, and cost per request.</li>
+					<li><b>Run the load</b>Ramp concurrency in steps, changing one thing at a time (model, tier, prompt length, Region profile).</li>
+					<li><b>Compare against quality</b>A faster configuration only wins if its answers still pass your evaluations.</li>
+				</ol>
+				<p>AWS's open-source <strong>LLMeter</strong> library (awslabs) runs latency and throughput tests against Bedrock and other endpoints. For self-hosted models, SageMaker AI's <strong>inference recommendations</strong> benchmark a model on real instances and report TTFT, inter-token latency, latency percentiles, throughput and cost (see <a href="#s5">Resource allocation</a>).</p>
+				<div class="callout tip"><p>"Users wait too long before seeing anything" points to streaming. "The same questions are asked all day" points to pre-computation or caching. "A multi-part request runs its steps one after another" points to parallel requests. "Time-sensitive application, supported model" points to latency-optimized inference.</p></div>
+			</div>
+
+			<!-- Skill 4.2.2 -->
+			<h2 id="s2">Retrieval performance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.2</span><span class="skill-text">Enhance retrieval performance to improve the relevance and speed of retrieved information for FM context augmentation (for example, by using index optimization, query preprocessing, hybrid search implementation with custom scoring)</span></p>
+				<p>In a RAG application, retrieval runs before the model sees anything, so its latency adds straight to TTFT, and its quality decides how much context you need to send. Better retrieval is usually faster overall: fewer, better passages mean a shorter prompt and a shorter prefill.</p>
+
+				<h3>Index optimization</h3>
+				<p>Vector indexes use approximate nearest-neighbor search, most often an <strong>HNSW</strong> graph. Its settings trade recall against speed and memory:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Setting</th><th>Raise it for</th><th>Cost of raising it</th></tr></thead>
+						<tbody>
+							<tr><td><code>m</code> (links per node)</td><td data-label="Raise it for">Recall on large or high-dimension indexes</td><td data-label="Cost of raising it">More memory, slower build; fixed at build time</td></tr>
+							<tr><td><code>ef_construction</code></td><td data-label="Raise it for">A better-quality graph</td><td data-label="Cost of raising it">Slower indexing; fixed at build time</td></tr>
+							<tr><td><code>ef_search</code></td><td data-label="Raise it for">Recall per query</td><td data-label="Cost of raising it">Slower queries; tunable at query time</td></tr>
+							<tr><td>Compression (quantization)</td><td data-label="Raise it for">Lower memory, bigger indexes per node</td><td data-label="Cost of raising it">Some recall, recovered by rescoring</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>In OpenSearch the defaults are <code>m</code> 16, <code>ef_construction</code> 100 and <code>ef_search</code> 100, with the <strong>faiss</strong> engine (the older nmslib engine is deprecated). To fit large indexes in less memory, set <code>mode</code> to <code>on_disk</code>: vectors are compressed (32&times; by default) for a fast first pass, then the best candidates are rescored with full-precision vectors from disk. Other options are fp16 or byte vectors. In Aurora PostgreSQL with pgvector, prefer an HNSW index to IVFFlat for its better speed-recall balance, and tune <code>hnsw.ef_search</code> (default 40) per transaction.</p>
+				<span class="file">Disk-based vector field (OpenSearch)</span>
+<pre><code>PUT manuals-v2
+{
+  "settings": {"index.knn": true},
+  "mappings": {"properties": {
+    "embedding": {
+      "type": "knn_vector",
+      "dimension": 1024,
+      "space_type": "innerproduct",
+      "mode": "on_disk",
+      "compression_level": "32x"
+    },
+    "product_line": {"type": "keyword"}
+  }}
+}</code></pre>
+				<p>Other index-level speedups: use a smaller embedding dimension if the model offers one (Titan Text Embeddings V2 supports 256, 512 or 1024), keep shards sized sensibly, and split very different content into separate indexes so each search scans less. For the newest OpenSearch Serverless vector collections, AWS manages engine and compression settings for you.</p>
+
+				<h3>Query preprocessing</h3>
+				<p>Clean and shape the query before searching. Cheap steps cost almost nothing: normalize spacing and case, strip greetings and signatures, and pull out exact identifiers (order numbers, model codes such as K200) for a keyword or metadata filter. Model-based steps (rewriting a follow-up into a standalone question, decomposing a comparison into sub-questions) improve relevance but add a model call each; use a small, fast model, run sub-queries in parallel, and cache rewrites of frequent questions. Knowledge bases offer decomposition through the <code>QUERY_DECOMPOSITION</code> query transformation, which trades some latency for accuracy on multi-part questions. The full set of rewriting techniques is in <a href="d1-task-1-5.html#s5">Task 1.5</a>.</p>
+				<p>Metadata filters are also a speed tool: filtering on <code>product_line</code> or document date shrinks the candidate set before ranking. In a knowledge base, keep <code>numberOfResults</code> as low as quality allows (1 to 100, default 5).</p>
+
+				<h3>Hybrid search with custom scoring</h3>
+				<p>Hybrid search runs a keyword (BM25) query and a vector query and merges the results, which handles both exact codes and paraphrases. The scores live on different scales, so merging needs a scoring method, and that is where you customize:</p>
+				<div class="entry">
+					<h4>Normalize and combine</h4>
+					<p>An OpenSearch <strong>normalization processor</strong> rescales each list (<code>min_max</code>, <code>l2</code> or <code>z_score</code>) and combines them by arithmetic, geometric or harmonic mean, with weights per query that sum to 1. Tune the weights on a labeled test set: more keyword weight for catalogs full of part numbers, more vector weight for free-text questions.</p>
+				</div>
+				<div class="entry">
+					<h4>Reciprocal rank fusion</h4>
+					<p>A <strong>score ranker processor</strong> with RRF (OpenSearch 2.19 and later) ignores raw scores and adds 1 &divide; (rank constant + rank) for each list a document appears in. It needs no score tuning, which makes it a robust starting point.</p>
+				</div>
+				<span class="file">RRF search pipeline (OpenSearch)</span>
+<pre><code>PUT _search/pipeline/hybrid-rrf
+{
+  "phase_results_processors": [{
+    "score-ranker-processor": {
+      "combination": {
+        "technique": "rrf",
+        "rank_constant": 60
+      }
+    }
+  }]
+}</code></pre>
+				<p>Use the pipeline with a <code>hybrid</code> query that contains the keyword and vector sub-queries (<code>?search_pipeline=hybrid-rrf</code>). In a Bedrock knowledge base you set <code>overrideSearchType</code> to <code>HYBRID</code> (Aurora, OpenSearch Serverless and MongoDB stores) and the service does the merging. A reranker can then reorder the merged list; retrieving 20 and reranking to 5 improves relevance but adds a model call, so measure its latency.</p>
+				<div class="callout tip"><p>"Recall is fine but searches are slow and memory is high" points to compression or disk-based mode. "Missed results, latency to spare" points to a higher <code>ef_search</code>. "Exact codes missed" points to hybrid search. "Combine keyword and vector scores without tuning" points to RRF.</p></div>
+			</div>
+
+			<!-- Skill 4.2.3 -->
+			<h2 id="s3">Throughput</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.3</span><span class="skill-text">Implement FM throughput optimization to address the specific throughput challenges of GenAI workloads (for example, by using token processing optimization, batch inference strategies, concurrent model invocation management)</span></p>
+				<p>Generative AI throughput is limited by tokens, not just requests: Bedrock enforces tokens per minute and requests per minute per model, a single request can hold thousands of tokens of quota for many seconds, and long outputs keep a request open. A throughput plan has to manage all three.</p>
+
+				<h3>Token processing</h3>
+				<ul>
+					<li><strong>Set a realistic <code>maxTokens</code>.</strong> Bedrock reserves input plus <code>maxTokens</code> against the quota when a request starts, so an oversized value blocks other requests even though you're only billed for what's generated (<a href="d4-task-4-1.html#s3">Task 4.1</a> has AWS's worked example).</li>
+					<li><strong>Shorter prompts finish prefill faster</strong> and use less quota: trim history, send fewer retrieved passages, and put static instructions first so prompt caching can skip re-reading them.</li>
+					<li><strong>Shorter outputs finish decode faster</strong>: ask for concise or structured answers and use stop sequences.</li>
+				</ul>
+
+				<h3>Concurrent invocation management</h3>
+				<p>Unlimited concurrency doesn't raise throughput past the quota; it just turns the excess into <code>ThrottlingException</code> (HTTP 429) errors and retry storms. AWS's guidance for scaling Bedrock traffic:</p>
+				<ol class="flow">
+					<li><b>Bound concurrency</b>Cap requests in flight per process with a semaphore or worker pool, and queue the rest in a bounded queue (SQS for asynchronous work).</li>
+					<li><b>Limit by tokens, not just requests</b>A client-side limiter that counts expected tokens (input plus <code>maxTokens</code>) keeps you under the tokens-per-minute quota; a requests-only limiter doesn't.</li>
+					<li><b>Retry with backoff and jitter</b>Retry throttles with exponential backoff and jitter within a fixed retry budget. HTTP 503 means service capacity rather than your quota, and also deserves a backoff.</li>
+					<li><b>Set timeouts carefully</b>Make connect and read timeouts longer than a valid long generation, so the client doesn't give up and resend work the model is still doing.</li>
+					<li><b>Add capacity</b>Cross-Region inference profiles spread load across Regions (geographic profiles keep data in one geography; global profiles use any commercial Region). Provisioned Throughput or the Reserved tier gives dedicated capacity for sustained load. Ramp traffic up gradually.</li>
+				</ol>
+				<span class="file">Bounded concurrency with retries (Python)</span>
+<pre><code>import threading
+import boto3
+from botocore.config import Config
+
+cfg = Config(
+    retries={"total_max_attempts": 6,
+             "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=120,
+    max_pool_connections=32,
+)
+brt = boto3.client("bedrock-runtime",
+                   config=cfg)
+<span class="c"># at most 16 calls in flight</span>
+slots = threading.BoundedSemaphore(16)
+
+def ask(msgs):
+    with slots:
+        return brt.converse(
+            modelId=PROFILE_ID,
+            messages=msgs,
+            inferenceConfig={
+                "maxTokens": 400},
+        )</code></pre>
+				<p>The <code>standard</code> retry mode backs off with jitter and retries throttling errors. Keep the connection pool at least as large as the number of concurrent calls.</p>
+
+				<h3>Batch inference strategies</h3>
+				<p>Work that doesn't need an answer now (the nightly ticket summaries, pre-computed FAQ answers, re-tagging a catalog) belongs in <strong>batch inference</strong>: <code>CreateModelInvocationJob</code> reads a JSONL file from S3 in which each line has a <code>recordId</code> and a <code>modelInput</code> (in InvokeModel or Converse format), and writes results to S3. Batch runs outside your on-demand quota at a lower price, so it doesn't slow the live assistant.</p>
+				<ul>
+					<li>Jobs have per-model quotas: a minimum and maximum number of records per job, and size limits per file and per job. Split large workloads into several jobs and stay under the in-progress job limit.</li>
+					<li>Output order isn't guaranteed: match results by <code>recordId</code>.</li>
+					<li>Set the job timeout (24 to 168 hours) and react to completion through EventBridge state-change events rather than polling.</li>
+					<li>For small or urgent batches below the job minimum, use bounded concurrent on-demand calls or the Flex tier instead.</li>
+				</ul>
+				<span class="file">One batch record (JSONL, Converse format)</span>
+<pre><code>{"recordId": "T-20261103-0001",
+ "modelInput": {
+  "messages": [{
+   "role": "user",
+   "content": [{
+    "text": "Summarize: TICKET"}]}],
+  "inferenceConfig": {
+   "maxTokens": 300}}}</code></pre>
+				<p>Shown across lines for reading; in the file each record is one line, and <code>TICKET</code> stands for the full ticket text.</p>
+				<div class="callout tip"><p>"Thousands of documents overnight, cost matters, no user waiting" points to batch inference. "Throttling at peak, real-time traffic" points to bounded concurrency with backoff, then cross-Region inference or reserved capacity. "Requests throttled though few tokens are generated" points to an oversized <code>maxTokens</code>.</p></div>
+			</div>
+
+			<!-- Skill 4.2.4 -->
+			<h2 id="s4">Inference parameters</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.4</span><span class="skill-text">Enhance FM performance to achieve optimal results for specific GenAI use cases (for example, by using model-specific parameter configurations, A/B testing to evaluate improvements, appropriate temperature and top-k/top-p selection based on requirements)</span></p>
+
+				<h3>What the parameters do</h3>
+				<p>At each step the model scores every possible next token. Sampling parameters decide how it picks one:</p>
+				<p class="kv"><b>Temperature</b>Sharpens or flattens the probabilities. Low values (near 0) make the model pick the likeliest tokens, giving consistent, repeatable output; high values (toward 1) make less likely tokens more common, giving variety. Range 0 to 1 in Converse.</p>
+				<p class="kv"><b>Top-p</b>Samples only from the smallest set of tokens whose probabilities add up to p (0.9 keeps the top 90% of probability mass). Lower values cut off unlikely tokens.</p>
+				<p class="kv"><b>Top-k</b>Samples only from the k likeliest tokens. Not every model supports it.</p>
+				<p class="kv"><b>Max tokens and stop sequences</b>Don't change how tokens are chosen, but cap the length. These are the parameters that affect speed: decode time grows with output length, while temperature and top-p barely change it.</p>
+
+				<h3>Choosing values by use case</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Use case</th><th>Starting point</th><th>Why</th></tr></thead>
+						<tbody>
+							<tr><td>Classification, extraction, JSON output</td><td data-label="Starting point">Temperature 0 to 0.2, short max tokens, stop sequence</td><td data-label="Why">The same input should give the same, parseable output</td></tr>
+							<tr><td>Grounded answers (RAG support assistant)</td><td data-label="Starting point">Low temperature (about 0.2 to 0.3)</td><td data-label="Why">Stay close to the retrieved passages; fewer invented details</td></tr>
+							<tr><td>Code generation</td><td data-label="Starting point">Low temperature</td><td data-label="Why">Correctness matters more than variety</td></tr>
+							<tr><td>Marketing copy, brainstorming</td><td data-label="Starting point">Higher temperature (0.7 to 1)</td><td data-label="Why">Variety is the point; generate several and pick</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>These are starting points: defaults and sensible ranges differ per model, so tune with evaluations. Change one sampling parameter at a time; the usual advice is to adjust temperature or top-p, not both.</p>
+				<p>Converse's <code>inferenceConfig</code> has four common fields: <code>maxTokens</code>, <code>stopSequences</code>, <code>temperature</code> and <code>topP</code>. Model-specific parameters, such as Claude's <code>top_k</code>, go in <code>additionalModelRequestFields</code>:</p>
+				<span class="file">Common and model-specific parameters (Python)</span>
+<pre><code>resp = brt.converse(
+    modelId=MODEL_ID,
+    messages=msgs,
+    inferenceConfig={
+        "temperature": 0.2,
+        "maxTokens": 300,
+        "stopSequences": ["&lt;/answer&gt;"],
+    },
+    additionalModelRequestFields={
+        "top_k": 50},
+)</code></pre>
+				<div class="callout trap"><p>Some newer models reject requests that set both <code>temperature</code> and <code>topP</code> (Claude Sonnet 4.5 and Haiku 4.5 accept one or the other). Code that worked with an older model can fail after a model upgrade; check each model's parameter page.</p></div>
+
+				<h3>A/B testing</h3>
+				<p>A parameter, prompt or model change is an improvement only if it measurably helps on real traffic or a representative test set. Test offline first, then online:</p>
+				<ol class="flow">
+					<li><b>Offline comparison</b>Bedrock Prompt Management stores prompt <strong>variants</strong> (different text, model or parameters) and the console compares up to three side by side. A Bedrock evaluation job (automatic metrics, LLM-as-a-judge or human review) scores each candidate on the same dataset.</li>
+					<li><b>Online split</b>Route a share of live traffic to the candidate with a feature flag. AWS AppConfig supports multi-variant feature flags, and <strong>AppConfig experimentation</strong> adds A/B and multivariate tests with gradual rollouts.</li>
+					<li><b>Measure</b>Tag each request with its variant (for example in <code>requestMetadata</code>) and compare quality signals (thumbs up, resolution rate, judge scores), latency and token cost per variant.</li>
+					<li><b>Decide</b>Promote the winner as a new prompt version or flag value; roll back by switching the flag.</li>
+				</ol>
+				<div class="callout retired"><p><strong>Amazon CloudWatch Evidently</strong>, AWS's earlier service for feature flags and A/B experiments, was discontinued on October 17, 2025. Use <strong>AWS AppConfig</strong> feature flags and AppConfig experimentation instead.</p></div>
+			</div>
+
+			<!-- Skill 4.2.5 -->
+			<h2 id="s5">Resource allocation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.5</span><span class="skill-text">Create efficient resource allocation systems specifically for FM workloads (for example, by using capacity planning for token processing requirements, utilization monitoring for prompt and completion patterns, auto-scaling configurations that are optimized for GenAI traffic patterns)</span></p>
+
+				<h3>Planning capacity in tokens</h3>
+				<p>Requests per second alone is a poor capacity unit for generative AI: a request with a 10,000-token prompt and a 1,000-token answer needs far more capacity than a one-line question. Plan in tokens:</p>
+				<ol class="flow">
+					<li><b>Measure the shape</b>From invocation logs, find input and output tokens per request at p50 and p95, per feature.</li>
+					<li><b>Find the peak</b>Requests per minute at the busiest minute, not the daily average.</li>
+					<li><b>Convert</b>Peak tokens per minute is roughly peak requests per minute &times; (input + output tokens at p95). Compare with the model's tokens-per-minute and requests-per-minute quotas (some models count output tokens several times over).</li>
+					<li><b>Check concurrency</b>Concurrent requests are roughly requests per second &times; average latency in seconds; long outputs mean more requests open at once.</li>
+					<li><b>Choose the capacity</b>On-demand with a quota increase, cross-Region profiles, Provisioned Throughput or the Reserved tier for a steady base, or a self-hosted endpoint sized by benchmark.</li>
+				</ol>
+				<span class="file">Prompt and completion sizes per minute (Logs Insights)</span>
+<pre><code>fields input.inputTokenCount as inT,
+  output.outputTokenCount as outT
+| stats count() as calls,
+  pct(inT, 95) as in95,
+  pct(outT, 95) as out95,
+  sum(inT) + sum(outT) as tokens
+  by bin(1m)
+| sort tokens desc
+| limit 20</code></pre>
+				<p>The top rows are the busiest minutes: their token totals are the number to compare with the tokens-per-minute quota.</p>
+
+				<h3>Monitoring prompt and completion patterns</h3>
+				<p>Watch for drift in the shape of traffic, not just its volume. Prompts that grow week by week (longer histories, more retrieved chunks) push up TTFT and quota use; answers that grow push up decode time. Useful signals in the <code>AWS/Bedrock</code> namespace are <code>InputTokenCount</code>, <code>OutputTokenCount</code>, <code>Invocations</code>, <code>InvocationThrottles</code>, <code>InvocationLatency</code> and <code>TimeToFirstToken</code>. <code>EstimatedTPMQuotaUsage</code> approximates quota consumption, but AWS warns not to rely on it alone for capacity planning. With service tiers, the <code>ResolvedServiceTier</code> dimension shows which tier actually served each request.</p>
+
+				<h3>Auto scaling for GenAI traffic</h3>
+				<p>Bedrock on-demand scales for you within quota. Self-hosted models on SageMaker AI endpoints need scaling built for GenAI traffic, which differs from web traffic in three ways: each request keeps an accelerator busy for seconds, so CPU use is a poor signal; scaling out is slow, because a new instance must load many gigabytes of weights; and traffic is often bursty or idle overnight.</p>
+				<ul>
+					<li><strong>Scale on concurrency.</strong> Target-tracking policies on <code>ConcurrentRequestsPerModel</code> (or <code>ConcurrentRequestsPerCopy</code> with inference components) react to load faster than invocation counts.</li>
+					<li><strong>Make scale-out faster.</strong> Fast model loading streams pre-sharded weights from S3 straight to the accelerators, and ahead-of-time compilation avoids compiling at startup.</li>
+					<li><strong>Scale to zero</strong> for idle models: with inference components, the minimum copy count can be 0; scaling back out from zero needs a step scaling policy driven by a CloudWatch alarm, and the first requests wait minutes or fail until capacity returns, so use it only where that's acceptable.</li>
+					<li><strong>Pre-scale with scheduled actions</strong> before known peaks such as a sale launch.</li>
+				</ul>
+				<p>To pick the instance type and configuration in the first place, SageMaker AI <strong>inference recommendations</strong> take the model, your token distributions, your concurrency and a goal (lowest cost, lowest latency or highest throughput), benchmark up to three instance types on real hardware, and return deployable configurations with TTFT, inter-token latency, latency percentiles, throughput and cost.</p>
+				<div class="callout trap"><p>Scaling a self-hosted LLM on CPU utilization or on a short cooldown tuned for web servers leads to late scale-out and thrashing. Scale on concurrent requests, allow for minutes of model loading, and keep a minimum capacity if users can't wait.</p></div>
+			</div>
+
+			<!-- Skill 4.2.6 -->
+			<h2 id="s6">System performance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.6</span><span class="skill-text">Optimize FM system performance for GenAI workflows (for example, by using API call profiling for prompt-completion patterns, vector database query optimization for retrieval augmentation, latency reduction techniques specific to LLM inference, efficient service communication patterns)</span></p>
+
+				<h3>Profiling API calls</h3>
+				<p>Before optimizing, find where the time goes. Trace a request end to end: API Gateway, the application, retrieval, each model call, tool calls, and the response. The CloudWatch <strong>generative AI observability</strong> views show model invocations and AgentCore agents with end-to-end traces; AgentCore Observability emits OpenTelemetry data (latency, duration, tokens, errors per session and step), and your own code can add spans with the AWS Distro for OpenTelemetry (ADOT).</p>
+				<p>For the model calls themselves, separate "the model got slower" from "the answers got longer". Bedrock publishes <code>InvocationLatency</code> and, for streaming calls, <code>TimeToFirstToken</code>, but no output-speed metric. AWS documents computing output tokens per second with metric math:</p>
+				<span class="file">Output tokens per second (Python, CloudWatch metric math)</span>
+<pre><code>def q(i, name):
+    m = {"Namespace": "AWS/Bedrock",
+         "MetricName": name,
+         "Dimensions": [{
+             "Name": "ModelId",
+             "Value": MODEL_ID}]}
+    stat = {"Metric": m, "Period": 300,
+            "Stat": "Average"}
+    return {"Id": i, "ReturnData": False,
+            "MetricStat": stat}
+
+otps = {"Id": "otps",
+        "Expression":
+        "1000 * outT / (lat - ttft)"}
+cw.get_metric_data(
+    MetricDataQueries=[
+        q("outT", "OutputTokenCount"),
+        q("lat", "InvocationLatency"),
+        q("ttft", "TimeToFirstToken"),
+        otps],
+    StartTime=start, EndTime=end)</code></pre>
+				<p>Here <code>cw</code> is a CloudWatch client. The formula is only meaningful for streaming traffic, because only streaming calls report TTFT. AWS suggests alarming when output speed drops below about 80% of its baseline, or using anomaly detection. A rising TTFT with steady output speed points at longer prompts or queueing; falling output speed points at the model or capacity.</p>
+
+				<h3>Optimizing vector queries</h3>
+				<ul>
+					<li><strong>Filter early.</strong> Metadata filters narrow the search, but with HNSW a strict filter can leave too few matches among the nearest neighbors. pgvector 0.8 and later can keep scanning (<code>hnsw.iterative_scan</code>) until enough rows pass the filter.</li>
+					<li><strong>Return only what you need.</strong> Ask for a sensible k, and leave the vectors themselves out of the response; just the text and metadata.</li>
+					<li><strong>Tune effort per query.</strong> Raise <code>ef_search</code> only for queries that need high recall.</li>
+					<li><strong>Pick the store for the query rate.</strong> S3 Vectors is cheap for large, rarely queried indexes (sub-second queries, about 100 ms when queried frequently); for high query rates or hybrid search, use OpenSearch.</li>
+				</ul>
+				<span class="file">Filtered HNSW query with iterative scan (PostgreSQL)</span>
+<pre><code>BEGIN;
+SET LOCAL hnsw.ef_search = 80;
+SET LOCAL hnsw.iterative_scan
+  = relaxed_order;
+SELECT id, chunks
+FROM kb.manuals
+WHERE custom_metadata
+      @&gt; '{"product_line": "kitchen"}'
+ORDER BY embedding &lt;=&gt; $1
+LIMIT 5;
+COMMIT;</code></pre>
+				<p><code>SET LOCAL</code> keeps the settings to this transaction. With <code>relaxed_order</code>, results may come back slightly out of distance order; re-sort them if exact order matters.</p>
+
+				<h3>Reducing LLM inference latency</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Technique</th><th>Where</th><th>Effect</th></tr></thead>
+						<tbody>
+							<tr><td>Prompt caching</td><td data-label="Where">Bedrock</td><td data-label="Effect">A cached prefix skips most of the prefill: lower TTFT on long, repeated prompts</td></tr>
+							<tr><td>Shorter prompts and outputs</td><td data-label="Where">Any</td><td data-label="Effect">Less prefill and decode time</td></tr>
+							<tr><td>Smaller or distilled model</td><td data-label="Where">Any</td><td data-label="Effect">Faster per token, if quality holds</td></tr>
+							<tr><td>Latency-optimized inference, Priority tier</td><td data-label="Where">Bedrock</td><td data-label="Effect">Faster serving, less queueing</td></tr>
+							<tr><td>Quantization (INT4-AWQ, FP8, INT8)</td><td data-label="Where">SageMaker AI optimization jobs</td><td data-label="Effect">Less memory traffic, faster tokens, smaller instances</td></tr>
+							<tr><td>Speculative decoding</td><td data-label="Where">SageMaker AI optimization jobs</td><td data-label="Effect">A small draft model proposes tokens and the large model verifies several at once</td></tr>
+							<tr><td>Compilation (TensorRT-LLM, Neuron)</td><td data-label="Where">SageMaker AI</td><td data-label="Effect">Faster kernels and faster startup</td></tr>
+							<tr><td>Continuous batching, tensor parallelism</td><td data-label="Where">LMI containers (vLLM, TensorRT-LLM)</td><td data-label="Effect">Higher throughput per GPU; large models split across GPUs</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Efficient service communication</h3>
+				<p class="kv"><b>Reuse clients</b>Create SDK clients once (outside the Lambda handler) so connections are reused instead of repeating TLS handshakes on every call.</p>
+				<p class="kv"><b>Stay close</b>Put the application, the vector store and the model endpoint in the same Region where data rules allow, and reach Bedrock through VPC interface endpoints (<code>bedrock-runtime</code>, <code>bedrock-agent-runtime</code>) to keep traffic private on the AWS network.</p>
+				<p class="kv"><b>Stream end to end</b>Streaming from the model is wasted if a later hop buffers the whole answer. Lambda response streaming (native on Node.js runtimes; Python needs a custom runtime or the Lambda Web Adapter) and API Gateway REST API response streaming (<code>responseTransferMode</code> set to <code>STREAM</code>, up to 15 minutes, not compatible with API caching) pass tokens through as they arrive.</p>
+				<p class="kv"><b>Respect timeouts</b>API Gateway's REST integration timeout defaults to 29 seconds; it can be raised for Regional and private APIs, or avoided with streaming or an asynchronous pattern (accept the request, queue it, return the result later through polling, a WebSocket or a callback).</p>
+				<p class="kv"><b>Go asynchronous for long work</b>Agent runs and document processing that take minutes belong behind SQS or Step Functions, not in a synchronous HTTP call.</p>
+				<div class="callout retired"><p>The <strong>AWS X-Ray SDKs and daemon</strong> entered maintenance mode on February 25, 2026 (security fixes only). Instrument new code with OpenTelemetry through ADOT; traces still appear in X-Ray and CloudWatch.</p></div>
+				<div class="callout tip"><p>"TTFT grew while output speed stayed the same" points to longer prompts or queueing. "Streaming enabled but users still wait for the whole answer" points to a buffering hop (a non-streaming Lambda or API). "Long repeated system prompt, slow first token" points to prompt caching.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Latency is roughly TTFT (prompt length, queueing) plus output tokens &divide; output speed. Stream to hide the wait, pre-compute predictable answers, run independent steps in parallel, and use latency-optimized inference (preview, few models) or the Priority tier where it matters.</li>
+				<li>Benchmark with real prompts and concurrency: TTFT and total latency percentiles, output tokens per second, throttles and cost, alongside quality.</li>
+				<li>Retrieval: tune HNSW (<code>ef_search</code> per query; <code>m</code> and <code>ef_construction</code> at build), compress with disk-based mode, filter on metadata, keep k low, preprocess queries cheaply, and merge hybrid results with weighted normalization or RRF.</li>
+				<li>Throughput is a token budget: realistic <code>maxTokens</code>, bounded and token-aware concurrency, backoff with jitter, cross-Region profiles or reserved capacity, and batch inference for work nobody waits for.</li>
+				<li>Low temperature for factual and structured output, higher for creative work; change temperature or top-p, not both; top-k goes in model-specific fields. A/B test offline with Prompt Management variants and evaluations, online with AppConfig (Evidently is discontinued).</li>
+				<li>Plan capacity in tokens from p95 prompt and completion sizes at peak; watch prompt growth; scale SageMaker endpoints on concurrent requests with fast model loading, scheduled pre-scaling and scale to zero only where cold starts are acceptable.</li>
+				<li>Profile end to end with OpenTelemetry and the CloudWatch generative AI views; compute output speed with metric math; reuse clients, stay in-Region with VPC endpoints, stream through every hop, and go asynchronous for long work.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-1.html"><small>Previous</small>Task 4.1: Cost optimization and resource efficiency</a>
+				<a class="next" href="d4-task-4-3.html"><small>Next</small>Task 4.3: Monitoring systems</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Generative AI Developer &ndash; Professional (AIP-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
