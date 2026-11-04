@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 5.2: Troubleshoot GenAI Applications | AWS AIP-C01 Notes</title>
+	<meta name="description" content="AIP-C01 Task 5.2 study guide: troubleshooting generative AI applications on AWS: context window overflow and truncation, stop reasons and token counting, Bedrock API errors and request validation, prompt testing and version comparison, retrieval failures from parsing, chunking and embeddings, and prompt maintenance with logs, traces and schema validation.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="aip.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">AIP-C01</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">Task 5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Testing, Validation, and Troubleshooting &middot; 11%</span>
+		<h1>Task 5.2: Troubleshoot GenAI applications</h1>
+		<p>Finding and fixing what goes wrong in generative AI applications: content that doesn't fit or gets cut off, API calls that fail, prompts that give inconsistent answers, retrieval that returns the wrong passages, and prompts that degrade as the application changes around them.</p>
+		<div class="tags"><span class="tag code">AIP-C01</span><span class="tag">Context window</span><span class="tag">API errors</span><span class="tag">Prompt testing</span><span class="tag">Retrieval issues</span><span class="tag">Schema validation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Content handling</a></li>
+				<li><a href="#s2">FM integration issues</a></li>
+				<li><a href="#s3">Prompt engineering problems</a></li>
+				<li><a href="#s4">Retrieval issues</a></li>
+				<li><a href="#s5">Prompt maintenance</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.2</span>
+				<p><strong>Troubleshoot GenAI applications.</strong></p>
+			</div>
+			<p>Generative AI failures are often silent: a request succeeds but the answer is cut off, ignores half the document, cites the wrong manual, or comes back in a slightly different JSON shape that breaks the next step. Troubleshooting starts with evidence (the stop reason, the request ID, the exact prompt sent, the passages retrieved, the trace) rather than guesses, and changes one thing at a time.</p>
+			<p>The examples follow the retailer from earlier tasks: a <strong>customer support assistant</strong> grounded in a knowledge base of product manuals, with order and returns tools, and a <strong>nightly job</strong> that summarizes support tickets. Where to find logs and traces is covered in <a href="d2-task-2-5.html#s6">Task 2.5</a> and <a href="d4-task-4-3.html">Task 4.3</a>; this page is about reading them to find causes.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>5.2.1</td><td data-label="What you need to be able to do">Resolve content handling issues: context window overflow, dynamic chunking, prompt design, truncation</td></tr>
+						<tr><td>5.2.2</td><td data-label="What you need to be able to do">Diagnose FM integration issues: error logging, request validation, response analysis</td></tr>
+						<tr><td>5.2.3</td><td data-label="What you need to be able to do">Troubleshoot prompt problems: testing frameworks, version comparison, systematic refinement</td></tr>
+						<tr><td>5.2.4</td><td data-label="What you need to be able to do">Troubleshoot retrieval: relevance, embedding quality, drift, vectorization, chunking and preprocessing, search performance</td></tr>
+						<tr><td>5.2.5</td><td data-label="What you need to be able to do">Troubleshoot prompt maintenance: template tests, logs, prompt observability, schema validation, refinement workflows</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 5.2.1 -->
+			<h2 id="s1">Content handling</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.1</span><span class="skill-text">Resolve content handling issues to ensure that necessary information is processed completely in FM interactions (for example, by using context window overflow diagnostics, dynamic chunking strategies, prompt design optimization, truncation-related error analysis)</span></p>
+
+				<h3>Reading the stop reason</h3>
+				<p>Every Converse response says why the model stopped. It is the first thing to check when an answer looks incomplete or odd:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>stopReason</th><th>Meaning</th><th>Fix</th></tr></thead>
+						<tbody>
+							<tr><td><code>end_turn</code></td><td data-label="Meaning">The model finished normally</td><td data-label="Fix">If the answer is still incomplete, the prompt or context is the problem</td></tr>
+							<tr><td><code>max_tokens</code></td><td data-label="Meaning">Output hit <code>maxTokens</code> and was cut off</td><td data-label="Fix">Raise <code>maxTokens</code>, ask for shorter output, or split the task; with structured output the JSON is incomplete</td></tr>
+							<tr><td><code>model_context_window_exceeded</code></td><td data-label="Meaning">Input plus output didn't fit the model's context window</td><td data-label="Fix">Send less: trim history, fewer or smaller chunks, summarize, or use a longer-context model</td></tr>
+							<tr><td><code>stop_sequence</code></td><td data-label="Meaning">A stop sequence was generated</td><td data-label="Fix">Expected, unless the sequence also appears inside normal answers</td></tr>
+							<tr><td><code>tool_use</code></td><td data-label="Meaning">The model wants a tool result</td><td data-label="Fix">Run the tool and continue the loop</td></tr>
+							<tr><td><code>guardrail_intervened</code>, <code>content_filtered</code></td><td data-label="Meaning">A guardrail or content filter blocked it</td><td data-label="Fix">Check the guardrail trace (<a href="#s5">below</a>)</td></tr>
+							<tr><td><code>malformed_model_output</code>, <code>malformed_tool_use</code></td><td data-label="Meaning">The model produced output or a tool call that couldn't be parsed</td><td data-label="Fix">Retry; simplify the tool schema or use strict tools</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>If the input is too long before generation even starts, the call fails with a <code>ValidationException</code> (HTTP 400) saying the input is too long. Either way, the fix is to measure what you send. The <strong>CountTokens</strong> API (free, for supported models) returns the exact input token count the model would bill, so you can check before calling:</p>
+				<span class="file">Check the prompt fits before calling (Python)</span>
+<pre><code>LIMIT = CONTEXT_WINDOW - MAX_OUTPUT
+
+def fits(msgs, system):
+    r = brt.count_tokens(
+        modelId=MODEL_ID,
+        input={"converse": {
+            "messages": msgs,
+            "system": system}},
+    )
+    return r["inputTokens"] &lt;= LIMIT
+
+while not fits(msgs, system):
+    msgs = drop_oldest_turn(msgs)</code></pre>
+				<p><code>drop_oldest_turn</code> removes the oldest user and assistant pair (keeping tool use and tool result blocks together). Counting needs the <code>bedrock:CountTokens</code> permission; token counts differ between models, so count with the model you'll call.</p>
+
+				<h3>Fixing overflow and truncation</h3>
+				<div class="entry">
+					<h4>Long conversations</h4>
+					<p>Keep the system prompt fixed and trim or compress history: a sliding window of recent turns, or a running summary of older ones. Strands Agents does this with conversation managers: the default sliding-window manager keeps recent messages and truncates the oldest tool results first; the summarizing manager replaces older messages with a summary while keeping the most recent ones. Store long-term facts in a memory store (AgentCore Memory) instead of the transcript.</p>
+				</div>
+				<div class="entry">
+					<h4>Large documents</h4>
+					<p>Don't paste a 200-page manual into a prompt. Retrieve the relevant chunks (RAG), or process it in pieces: summarize each section, then summarize the summaries (map-reduce), or extract fields section by section. For very long single documents, a model with a larger context window works, but Claude's 1M-token context is a beta feature and requests over 200,000 input tokens are billed at a higher long-context rate for the whole request.</p>
+				</div>
+				<div class="entry">
+					<h4>Large tool results</h4>
+					<p>A tool that returns a full order history or a raw web page can fill the context in one step. Return only the fields the model needs, paginate, or summarize tool output before passing it back.</p>
+				</div>
+				<div class="entry">
+					<h4>Embedding input limits</h4>
+					<p>Embedding models have their own input limits, much smaller than chat models for some: Titan Text Embeddings V2 accepts up to 8,192 tokens, Cohere Embed v3 only 512 tokens per text. Cohere truncates over-long input by default (the end is dropped) unless <code>truncate</code> is set to <code>NONE</code>, which returns an error instead. Silent truncation means the end of a long chunk never makes it into the vector: keep chunks well within the limit.</p>
+				</div>
+
+				<h3>Dynamic chunking strategies</h3>
+				<p>When content is processed in pieces, the chunk size should follow the content, not one fixed number. In knowledge bases:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Symptom</th><th>Likely cause</th><th>Try</th></tr></thead>
+						<tbody>
+							<tr><td>Answers miss details spread over neighboring paragraphs</td><td data-label="Likely cause">Chunks too small; context split</td><td data-label="Try">Hierarchical chunking (small child chunks for search, the larger parent returned) or more overlap</td></tr>
+							<tr><td>Retrieved chunks are long and mostly irrelevant</td><td data-label="Likely cause">Chunks too large</td><td data-label="Try">Smaller fixed size, or semantic chunking that splits at topic changes</td></tr>
+							<tr><td>Tables and procedures arrive broken in half</td><td data-label="Likely cause">Fixed-size split ignores structure</td><td data-label="Try">Advanced parsing (Bedrock Data Automation or a foundation model parser), semantic chunking, or a custom Lambda chunker that splits on headings</td></tr>
+							<tr><td>Fewer results than <code>numberOfResults</code></td><td data-label="Likely cause">Hierarchical chunking: several children share a parent</td><td data-label="Try">Expected; raise the number if needed</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Changing the chunking strategy of an existing data source requires re-ingesting it; chunking options are in <a href="d1-task-1-5.html#s1">Task 1.5</a>.</p>
+
+				<h3>Prompt design for complete processing</h3>
+				<ul>
+					<li>Put long documents first and the question and instructions last; models handle "the question after the material" better on long inputs.</li>
+					<li>Wrap each document in tags with an ID (<code>&lt;doc id="manual-k200"&gt;</code>) and ask the model to cite them, so you can see which ones it used.</li>
+					<li>Ask for a structure that forces coverage: "for each of the five sections, list...". Then check every section appears.</li>
+					<li>For lists of items (all 40 tickets), process in batches and assemble the results in code rather than trusting one long generation.</li>
+				</ul>
+				<div class="callout tip"><p>"Answers end mid-sentence" points to <code>max_tokens</code>. "Long conversations start failing" points to context window overflow: trim or summarize history. "The end of long documents is never found in search" points to embedding input truncation or oversized chunks.</p></div>
+			</div>
+
+			<!-- Skill 5.2.2 -->
+			<h2 id="s2">FM integration issues</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.2</span><span class="skill-text">Diagnose and resolve FM integration issues to identify and fix API integration problems specific to GenAI services (for example, by using error logging, request validation, response analysis)</span></p>
+
+				<h3>Bedrock Runtime errors</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Error (HTTP)</th><th>Usual cause</th><th>Action</th></tr></thead>
+						<tbody>
+							<tr><td><code>ValidationException</code> (400)</td><td data-label="Usual cause">Malformed request: bad message structure, unsupported parameter, input too long, invalid schema</td><td data-label="Action">Fix the request; don't retry</td></tr>
+							<tr><td><code>AccessDeniedException</code> (403)</td><td data-label="Usual cause">IAM, SCP or model access prerequisites</td><td data-label="Action">See the checklist below; don't retry</td></tr>
+							<tr><td><code>ResourceNotFoundException</code> (404)</td><td data-label="Usual cause">Wrong model or profile ID, or the model isn't offered in this Region</td><td data-label="Action">Check the ID and Region</td></tr>
+							<tr><td><code>ModelTimeoutException</code> (408)</td><td data-label="Usual cause">The model took too long</td><td data-label="Action">Retry; shorten the request or stream</td></tr>
+							<tr><td><code>ModelErrorException</code> (424)</td><td data-label="Usual cause">The model failed processing this request</td><td data-label="Action">Retry; check the input</td></tr>
+							<tr><td><code>ThrottlingException</code> (429)</td><td data-label="Usual cause">Your quota (requests or tokens per minute) exceeded</td><td data-label="Action">Back off with jitter, bound concurrency, request a quota increase, cross-Region inference</td></tr>
+							<tr><td><code>ModelNotReadyException</code> (429)</td><td data-label="Usual cause">The model isn't ready to serve yet</td><td data-label="Action">The SDK retries automatically</td></tr>
+							<tr><td><code>InternalServerException</code> (500), <code>ServiceUnavailableException</code> (503)</td><td data-label="Usual cause">Service-side; 503 is capacity, not your quota</td><td data-label="Action">Retry with backoff; cross-Region inference</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>With <code>ConverseStream</code>, errors can also arrive <em>inside</em> the stream after it has started (a <code>modelStreamErrorException</code>, throttling or validation event). Handle them in the event loop: discard the partial answer or tell the user, and retry. Long calls through a NAT gateway, VPC endpoint or Network Load Balancer can be cut by their 350-second idle timeout; enable TCP keepalive in the client and the operating system, or stream.</p>
+
+				<h3>Access denied checklist</h3>
+				<p>Bedrock now enables serverless models automatically on first use (since October 2025), so "model access not granted" is no longer the usual cause. Check instead:</p>
+				<ol class="flow">
+					<li><b>IAM and SCPs</b>Does the caller's policy allow the action (<code>bedrock:InvokeModel</code> also covers Converse; <code>InvokeModelWithResponseStream</code> covers ConverseStream) on this resource? Does an SCP deny the Region or model? CloudTrail shows the denied call and often the policy type.</li>
+					<li><b>Inference profiles</b>Calling through a cross-Region profile needs permission on the <strong>profile ARN and the foundation model ARN in every Region</strong> the profile routes to.</li>
+					<li><b>Conditions</b>A condition such as <code>aws:SourceIp</code> fails for calls through a VPC endpoint, where the source IP isn't a public address.</li>
+					<li><b>First-use prerequisites</b>Third-party models need AWS Marketplace subscribe permissions for the first call, a valid payment method, and for Anthropic models a submitted use-case form.</li>
+				</ol>
+
+				<h3>Error logging</h3>
+				<p>Log enough to reproduce: the error code and message, the AWS request ID, the model or profile ID, the operation, input token count, the stop reason, your conversation ID and prompt version. Not the full prompt text in application logs if it holds personal data; the invocation logs, with their access controls, hold that.</p>
+				<span class="file">Classify and log Bedrock errors (Python)</span>
+<pre><code>from botocore import exceptions
+
+RETRYABLE = {
+    "ThrottlingException",
+    "ModelTimeoutException",
+    "ModelErrorException",
+    "ServiceUnavailableException",
+    "InternalServerException",
+}
+
+def call(**kwargs):
+    try:
+        return brt.converse(**kwargs)
+    except exceptions.ClientError as e:
+        err = e.response["Error"]
+        resp = e.response
+        md = resp["ResponseMetadata"]
+        log.error("bedrock_error", extra={
+            "code": err["Code"],
+            "message": err["Message"],
+            "request_id": md["RequestId"],
+            "model": kwargs["modelId"],
+            "conv": CONV_ID,
+        })
+        if err["Code"] in RETRYABLE:
+            raise RetryLater() from e
+        raise</code></pre>
+				<p>The SDK's standard retry mode already retries throttling and transient errors a few times; <code>RetryLater</code> stands for your next layer (requeue to SQS, fall back to another model, or return a friendly message). Validation and access errors are bugs to fix, not to retry.</p>
+
+				<h3>Request validation</h3>
+				<p>Catch malformed requests before they reach the model, especially when messages are assembled from stored history:</p>
+				<ul>
+					<li>Roles are <code>user</code> and <code>assistant</code>; the conversation starts with a user message and normally alternates. Instructions go in <code>system</code>.</li>
+					<li>Every <code>toolUse</code> block from the assistant must be answered by a <code>toolResult</code> block in the next user message with the same <code>toolUseId</code>; trimming history must never separate them.</li>
+					<li>Images and documents go only in user messages: up to 20 images (3.75 MB each) and 5 documents (4.5 MB each) per request; a document needs its <code>format</code> and a text block alongside it.</li>
+					<li>When the model ID is a Prompt Management prompt ARN, the prompt supplies the model settings, so the request can't also set <code>inferenceConfig</code>, <code>system</code> or <code>toolConfig</code>.</li>
+					<li>At the API edge, validate user input length and type (API Gateway request validation or the Lambda handler) before it costs tokens.</li>
+				</ul>
+
+				<h3>Response analysis</h3>
+				<p>A successful response still needs checking: the stop reason, whether the output parses and matches the expected schema (<a href="#s5">below</a>), token usage compared with normal (a sudden jump suggests a loop or prompt growth), and latency. Log anomalies with the request ID so you can open the invocation log record for the exact request and response.</p>
+				<div class="callout trap"><p>Retrying every error makes things worse: validation and access errors fail again every time, and retrying throttles without backoff deepens the throttling. Classify first: fix 400 and 403 errors, back off on 429, retry 5xx a bounded number of times.</p></div>
+			</div>
+
+			<!-- Skill 5.2.3 -->
+			<h2 id="s3">Prompt engineering problems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.3</span><span class="skill-text">Troubleshoot prompt engineering problems to improve FM response quality and consistency beyond basic prompt adjustments (for example, by using prompt testing frameworks, version comparison, systematic refinement)</span></p>
+
+				<h3>Symptoms and causes</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Symptom</th><th>Common causes</th></tr></thead>
+						<tbody>
+							<tr><td>Ignores an instruction</td><td data-label="Common causes">Buried in a long prompt, contradicted elsewhere, phrased as a suggestion, or placed before a long document</td></tr>
+							<tr><td>Inconsistent format</td><td data-label="Common causes">Format described but not shown; no example; high temperature; no schema enforcement</td></tr>
+							<tr><td>Different answers each run</td><td data-label="Common causes">High temperature, ambiguous instructions, missing context the model fills in by guessing</td></tr>
+							<tr><td>Invented details</td><td data-label="Common causes">No instruction to answer only from the context and say when it doesn't know; context missing the fact</td></tr>
+							<tr><td>Worked before, broke now</td><td data-label="Common causes">Prompt edit, model version change, new retrieved content, a variable filled with unexpected text</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Prompt testing frameworks</h3>
+				<p>Treat a prompt like code: a test suite of inputs with checks, run on every change. Checks range from cheap to expensive: does it parse, does it contain required fields or phrases, does it avoid forbidden ones, is it under a length, and finally an LLM judge or comparison with a reference answer. Bedrock evaluation jobs run the judge part at scale (<a href="d5-task-5-1.html#s4">Task 5.1</a>); open-source harnesses run assertion-style tests in CI. Include the inputs that broke before, edge cases (empty context, a question in another language, an angry customer) and adversarial inputs.</p>
+
+				<h3>Version comparison</h3>
+				<p>When quality changes, find what changed. Bedrock <strong>Prompt Management</strong> keeps immutable versions of each prompt; in the console you can select two versions and compare them side by side (fields added or removed are highlighted), then fill in test variables and run each. In code, call a specific version by passing its ARN as the model ID in Converse with <code>promptVariables</code>, so the test suite can run old and new versions on the same inputs and diff the results.</p>
+
+				<h3>Systematic refinement</h3>
+				<ol class="flow">
+					<li><b>Collect failures</b>Gather failing examples from feedback, low judge scores and logs, and group them by error type.</li>
+					<li><b>Form a hypothesis</b>"The model ignores the return window because the policy text comes after the 3,000-token manual."</li>
+					<li><b>Change one thing</b>Move the instruction, add an example, add a rule, tighten the format, or lower the temperature.</li>
+					<li><b>Test on everything</b>Run the fix on the failing cases and the whole suite, since fixes often break something else.</li>
+					<li><b>Version and release</b>Save a new prompt version with a note on what changed and why, and roll it out behind a flag.</li>
+				</ol>
+				<p>Bedrock can help with the rewriting. <strong>Prompt optimization</strong> rewrites a single prompt for a chosen model. <strong>Advanced Prompt Optimization</strong> (May 2026) goes further: given a template, sample inputs, optional ground truth and one evaluation method (steering criteria, an LLM judge or a Lambda function), it generates optimized versions for up to five models and reports scores, latency and time to first token for each against the original. Treat its output as a candidate that still goes through your tests.</p>
+				<div class="callout tip"><p>"Find what changed between the prompt that worked and the one that doesn't" points to Prompt Management version comparison. "Improve a prompt and compare it across several models with evaluation data" points to Advanced Prompt Optimization. "Stop regressions from prompt edits" points to a prompt test suite in CI.</p></div>
+			</div>
+
+			<!-- Skill 5.2.4 -->
+			<h2 id="s4">Retrieval issues</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.4</span><span class="skill-text">Troubleshoot retrieval system issues to identify and resolve problems that affect information retrieval effectiveness for FM augmentation (for example, by using model response relevance analysis, embedding quality diagnostics, drift monitoring, vectorization issue resolution, chunking and preprocessing remediation, vector search performance optimization)</span></p>
+
+				<h3>Locate the failure first</h3>
+				<p>For a bad RAG answer, look at what was retrieved before blaming the model. Call <code>Retrieve</code> with the same question and settings: each result has its text, source location, metadata and a relevance score.</p>
+				<ol class="flow">
+					<li><b>Is the answer in the source documents at all?</b>If not, it's a content gap: add or fix the document.</li>
+					<li><b>Was the document ingested?</b>Check the sync results and the knowledge base logs for that file.</li>
+					<li><b>Is the right chunk retrieved?</b>If not, it's a retrieval problem: parsing, chunking, embeddings, search settings or filters.</li>
+					<li><b>Is it retrieved but ranked low?</b>Raise the number of results, add hybrid search or reranking.</li>
+					<li><b>Retrieved and ranked well, answer still wrong?</b>It's a generation problem: the prompt or model (see <a href="#s3">prompt problems</a>).</li>
+				</ol>
+				<span class="file">Inspect what a question retrieves (Python)</span>
+<pre><code>kb = boto3.client("bedrock-agent-runtime")
+cfg = {"vectorSearchConfiguration":
+       {"numberOfResults": 10}}
+r = kb.retrieve(
+    knowledgeBaseId=KB_ID,
+    retrievalQuery={"text": question},
+    retrievalConfiguration=cfg,
+)
+for x in r["retrievalResults"]:
+    loc = x["location"]["s3Location"]
+    print(round(x["score"], 3),
+          loc["uri"],
+          x.get("metadata", {}),
+          x["content"]["text"][:80])</code></pre>
+				<p>Compare the scores and sources with what you expected. Run it with and without your metadata filter: if the right chunk only appears without the filter, its metadata is wrong or missing.</p>
+
+				<h3>Ingestion and preprocessing</h3>
+				<p>Sync results report documents scanned, indexed, modified, deleted, skipped and failed. For the reason per file, deliver the knowledge base's application logs to CloudWatch Logs and query them:</p>
+				<span class="file">Files that failed to embed or index (Logs Insights)</span>
+<pre><code>fields @timestamp,
+  event.document_location.s3_location.uri
+    as file,
+  event.status as status,
+  event.status_reasons as why
+| filter status in ["EMBEDDING_FAILED",
+    "INDEXING_FAILED",
+    "PARTIALLY_INDEXED",
+    "RESOURCE_IGNORED"]
+| sort @timestamp desc</code></pre>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Cause</th><th>Fix</th></tr></thead>
+						<tbody>
+							<tr><td>Unsupported file type, or file over the size limit (50 MB for text files)</td><td data-label="Fix">Convert or split the file</td></tr>
+							<tr><td>Scanned PDFs, tables or charts lost by the default text-only parser</td><td data-label="Fix">Advanced parsing with Bedrock Data Automation or a foundation model parser (charged per page or per token)</td></tr>
+							<tr><td>Metadata file ignored</td><td data-label="Fix">It must be named <code>FILE.metadata.json</code> in the same folder, valid JSON, and at most 10 KB</td></tr>
+							<tr><td>Boilerplate (headers, footers, legal text) dominating chunks</td><td data-label="Fix">Clean it in a custom transformation Lambda or before upload</td></tr>
+							<tr><td>Outdated answers</td><td data-label="Fix">The source changed but the data source wasn't re-synced; schedule or trigger syncs</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Embedding quality and vectorization issues</h3>
+				<p class="kv"><b>Model mismatch</b>Queries must be embedded with the same model, version and dimension as the documents. A knowledge base can't switch its embedding model (it can't be updated); create a new knowledge base and re-ingest. In a self-managed index, a vector of the wrong dimension is rejected at indexing or query time.</p>
+				<p class="kv"><b>Index configuration</b>An OpenSearch index for a knowledge base must use the faiss engine and the embedding model's dimension (Titan V2: 1024, 512 or 256), with the vector, text and metadata field names the knowledge base was given.</p>
+				<p class="kv"><b>Weak embeddings for the domain</b>Product codes, internal jargon and other languages may embed poorly. Diagnose with known pairs: embed questions and the passages that answer them, and check that each question's passage is its nearest neighbor. Fix with hybrid search (keywords catch codes), a better or multilingual embedding model, or including metadata in the embedded text.</p>
+				<p class="kv"><b>Truncated input</b>Chunks longer than the embedding model's limit lose their ends (see <a href="#s1">content handling</a>).</p>
+
+				<h3>Drift monitoring</h3>
+				<p>Retrieval quality decays even without code changes: new products whose manuals weren't added, users asking about topics the documents don't cover, wording that shifts (customers start saying "pod" for a capsule). Watch for it with a retrieval canary set run after every sync (recall of known passages), the average top relevance score of live queries (a falling score means questions match the documents less well), the share of "I don't know" answers, and clusters of low-scoring live questions, which show the content gaps to fill.</p>
+
+				<h3>Vector search performance</h3>
+				<p>Slow or failing searches usually come from the index rather than the query: k-NN graphs that don't fit in memory (circuit breaker trips, evictions), too high an <code>ef_search</code> or result count, restrictive filters that force extra scanning, or under-provisioned capacity. The metrics to watch and the tuning options are in <a href="d4-task-4-3.html#s5">Task 4.3</a> and <a href="d4-task-4-2.html#s2">Task 4.2</a>.</p>
+				<div class="callout tip"><p>"The right document exists but is never retrieved" points to checking ingestion logs, parsing and metadata. "Results got worse after switching embedding models" points to a mismatch: re-embed everything into a new index. "Tables in PDFs come back garbled" points to advanced parsing. "Quality falls as the catalog grows" points to drift: canary sets and content gap analysis.</p></div>
+			</div>
+
+			<!-- Skill 5.2.5 -->
+			<h2 id="s5">Prompt maintenance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.5</span><span class="skill-text">Troubleshoot prompt maintenance issues to continuously improve the performance of FM interactions (for example, by using template testing and CloudWatch Logs to diagnose prompt confusion, X-Ray to implement prompt observability pipelines, schema validation to detect format inconsistencies, systematic prompt refinement workflows)</span></p>
+				<p>Prompts degrade as everything around them changes: variables start carrying longer or odder values, new retrieved content conflicts with instructions, a new tool's description overlaps an old one, a model upgrade reads instructions differently. Maintenance means testing templates, seeing the final prompt actually sent, and validating outputs continuously.</p>
+
+				<h3>Template testing</h3>
+				<p>A template is only as good as what fills it. Test each Prompt Management template (variables written <code>{{name}}</code>) with realistic and extreme values: empty strings, very long values, text containing instructions ("ignore the above"), other languages, and special characters. Check that every variable is filled (a literal <code>{{order_id}}</code> in a sent prompt means rendering failed) and that the rendered prompt stays within budget.</p>
+
+				<h3>Diagnosing prompt confusion with CloudWatch Logs</h3>
+				<p>"Prompt confusion" is the model misreading what the prompt asks: answering the wrong question, mixing up two products, following text in a retrieved document as if it were an instruction. The cause is visible only in the prompt that was actually sent, which invocation logs record. Query them by feature or prompt version (tagged in <code>requestMetadata</code>) and read the failing requests:</p>
+				<span class="file">Prompts behind bad answers for one prompt version (Logs Insights)</span>
+<pre><code>fields @timestamp, requestId,
+  input.inputTokenCount as inT,
+  output.outputBodyJson.stopReason
+    as stop
+| filter requestMetadata.prompt_ver
+    = "returns-v12"
+| filter inT &gt; 6000 or stop != "end_turn"
+| sort inT desc
+| limit 50</code></pre>
+				<p>Unusually long prompts and abnormal stop reasons are good first suspects; open those records to read the full input body. Look for duplicated context, conflicting instructions, variables filled with the wrong content, and instructions placed after very long material.</p>
+
+				<h3>Prompt observability pipelines</h3>
+				<p>Traces show how a prompt was built and what happened next across services. The X-Ray SDKs are in maintenance mode, so instrument with <strong>OpenTelemetry</strong> through ADOT; traces still appear in the X-Ray and CloudWatch trace views. Add spans for each stage (template render, retrieval, model call, output validation, tool calls) with attributes such as the prompt ID and version, variable sizes, retrieved chunk IDs, model ID and token usage. Agent frameworks such as Strands emit standard <code>gen_ai.*</code> attributes (model, operation, tool name, input and output tokens) for you. For Bedrock Flows, validate the definition before deploying (<code>ValidateFlowDefinition</code>) and invoke with <code>enableTrace</code> to see each node's inputs and outputs and which condition branch was taken.</p>
+
+				<h3>Schema validation for format inconsistencies</h3>
+				<p>Downstream code breaks when the model returns JSON in a slightly different shape: a missing field, a number as a string, extra prose before the JSON. Two layers fix it:</p>
+				<ul>
+					<li><strong>Constrain</strong>: Bedrock structured outputs (generally available February 2026, now for all Claude models) constrain the response to a JSON Schema you supply through <code>outputConfig</code>, or strict tool definitions (<a href="d1-task-1-3.html#s3">Task 1.3</a> has the request). An unsupported schema fails immediately with a 400, for example when an object doesn't set <code>additionalProperties</code> to false or has too many optional properties.</li>
+					<li><strong>Validate</strong>: still validate every response in code, because not every model supports constrained output, a <code>max_tokens</code> stop leaves the JSON incomplete, and the values can be valid JSON but wrong. Count validation failures per prompt version as a metric.</li>
+				</ul>
+				<span class="file">Validate and count format failures (Python)</span>
+<pre><code>from jsonschema import validate
+from jsonschema import ValidationError
+
+def parse_ticket(resp):
+    if resp["stopReason"] == "max_tokens":
+        raise Truncated()
+    msg = resp["output"]["message"]
+    text = msg["content"][0]["text"]
+    try:
+        data = json.loads(text)
+        validate(data, TICKET_SCHEMA)
+        return data
+    except (ValueError,
+            ValidationError) as e:
+        emit_metric("FormatError",
+                    prompt_ver=PROMPT_VER)
+        raise BadFormat(str(e)) from e</code></pre>
+				<p><code>emit_metric</code> stands for an embedded metric format writer. A rise in <code>FormatError</code> after a release identifies the prompt version that broke the format; retrying once with the validation error added to the prompt often repairs it.</p>
+
+				<h3>Guardrail interventions</h3>
+				<p>When answers are unexpectedly blocked, enable the guardrail trace (<code>trace</code> set to <code>enabled</code> or <code>enabled_full</code> in <code>guardrailConfig</code>). The response's <code>trace.guardrail</code> shows the input and output assessments: which policy (content filter, denied topic, word filter, sensitive information, contextual grounding, automated reasoning) acted and why. A grounding threshold set too high, or a denied topic defined too broadly, are common causes of false blocks.</p>
+
+				<h3>A refinement workflow that sticks</h3>
+				<ol class="flow">
+					<li><b>Detect</b>Alarms on format errors, judge scores, guardrail interventions and feedback per prompt version.</li>
+					<li><b>Diagnose</b>Open the traces and invocation logs of failing requests; classify the failure.</li>
+					<li><b>Fix and test</b>Change the template, then run the template tests and the prompt test suite.</li>
+					<li><b>Release</b>Publish a new version, roll it out gradually, and keep the previous version one switch away.</li>
+					<li><b>Learn</b>Add the failing inputs to the test suite.</li>
+				</ol>
+				<div class="callout tip"><p>"See the exact prompt that produced a bad answer" points to model invocation logs. "Trace prompt construction across services" points to OpenTelemetry (ADOT) spans viewed in X-Ray or CloudWatch. "Downstream parser fails intermittently" points to structured outputs plus schema validation. "Answers blocked unexpectedly" points to the guardrail trace.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Start from evidence: stop reason, request ID, the exact prompt (invocation logs), retrieved passages and the trace. Change one thing at a time.</li>
+				<li><code>max_tokens</code> means the output was cut off; <code>model_context_window_exceeded</code> or a "too long" <code>ValidationException</code> means the input didn't fit. Count tokens with CountTokens, trim or summarize history, retrieve instead of pasting, and keep chunks within embedding limits.</li>
+				<li>Classify API errors: fix 400 and 403, back off on 429, retry 5xx with limits; handle errors inside streams. Access denied is now usually IAM, SCPs, inference profile permissions or first-use prerequisites, not model access.</li>
+				<li>Validate requests (roles, tool use and result pairs, attachment limits) and responses (stop reason, schema, token usage); log the request ID and prompt version.</li>
+				<li>Prompt problems: test suites in CI, Prompt Management version comparison, a hypothesis-driven refinement loop, and prompt optimization (Advanced Prompt Optimization compares up to five models).</li>
+				<li>Retrieval: check retrieved results and scores first; then ingestion logs, parsing, metadata files, chunking and embedding model consistency (changing it means a new knowledge base); monitor drift with canary sets and relevance scores.</li>
+				<li>Maintenance: test templates with extreme values, read failing prompts in invocation logs, trace prompt construction with OpenTelemetry, constrain and validate JSON output, and use the guardrail trace for unexpected blocks.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-1.html"><small>Previous</small>Task 5.1: Evaluation systems</a>
+				<a class="next" href="index.html"><small>Next</small>AIP-C01 overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Generative AI Developer &ndash; Professional (AIP-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
