@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 1.2: Develop Code for AWS Lambda | AWS DVA-C03 Notes</title>
+	<meta name="description" content="DVA-C03 Task 1.2 study guide: connecting Lambda functions to VPCs, configuring memory, timeout, runtimes, environment variables, layers, extensions, versions, aliases and concurrency, handling errors with destinations and dead-letter queues, and integrating Lambda with API Gateway, DynamoDB Streams, SQS and other services through event source mappings and permissions.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dva.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DVA-C03</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">Task 1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Development with AWS Services &middot; 30%</span>
+		<h1>Task 1.2: Develop code for AWS Lambda</h1>
+		<p>Building Lambda functions that are configured well, reach the resources they need, handle failures without losing events, and plug into the services that trigger them.</p>
+		<div class="tags"><span class="tag code">DVA-C03</span><span class="tag">Lambda</span><span class="tag">VPC</span><span class="tag">Concurrency</span><span class="tag">Destinations</span><span class="tag">Event source mappings</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">VPC access</a></li>
+				<li><a href="#s2">Configuration</a></li>
+				<li><a href="#s3">Errors and event lifecycles</a></li>
+				<li><a href="#s4">Integrations</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.2</span>
+				<p><strong>Develop code for AWS Lambda.</strong></p>
+			</div>
+			<p>Lambda runs your code in response to events without servers to manage. Each function runs in <strong>execution environments</strong>: Lambda creates one (the <em>init</em> phase loads the runtime and your code, outside the handler), reuses it for later requests while it's warm, and adds more as concurrent requests grow. Code outside the handler runs once per environment, which is why SDK clients and database connections are created there.</p>
+			<p>The examples follow the food-ordering application from <a href="d1-task-1-1.html">Task 1.1</a>: an order API backed by Lambda, a payment function that reads a database in a VPC, and functions triggered by the order queue and by changes to the orders table.</p>
+			<div class="callout note"><p>The Lambda documentation now calls standard functions <strong>Lambda Event Functions</strong> (renamed in October 2026; the APIs, CLI and templates are unchanged), and lists newer options beside them: <strong>Lambda Managed Instances</strong> (functions on Lambda-managed EC2 instances in your account, November 2025), <strong>durable functions</strong> (long-running, checkpointed workflows written in code, December 2025), <strong>Lambda MicroVMs</strong> (isolated environments for running generated code, June 2026) and <strong>Lambda Web Functions</strong> (Node.js web servers, October 2026). This page covers standard functions, which is what the exam's skills describe.</p></div>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>1.2.1</td><td data-label="What you need to be able to do">Give functions access to private resources in a VPC</td></tr>
+						<tr><td>1.2.2</td><td data-label="What you need to be able to do">Configure environment variables and settings: memory, concurrency, timeout, runtime, handler, layers, extensions</td></tr>
+						<tr><td>1.2.3</td><td data-label="What you need to be able to do">Handle event lifecycles and errors with destinations and dead-letter queues</td></tr>
+						<tr><td>1.2.4</td><td data-label="What you need to be able to do">Integrate with services through code, event source mappings and destinations</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 1.2.1 -->
+			<h2 id="s1">VPC access</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.1</span><span class="skill-text">Grant Lambda functions access to private resources in VPCs.</span></p>
+
+				<h3>How it works</h3>
+				<p>By default a function runs in a Lambda-owned network with internet access but no route into your VPCs. To reach an RDS database, an ElastiCache cluster or an internal service in private subnets, attach the function to the VPC with a <strong>VPC configuration</strong>: subnets (use at least two Availability Zones) and security groups.</p>
+				<ol class="flow">
+					<li><b>Configure</b>Set <code>VpcConfig</code> with subnet IDs and security group IDs.</li>
+					<li><b>Lambda creates network interfaces</b>Lambda creates a Hyperplane elastic network interface for each subnet and security group combination, shared by functions with the same combination. The function is <code>Pending</code> until it's ready (it can take minutes), then <code>Active</code>.</li>
+					<li><b>Traffic flows</b>Requests from the function leave through those interfaces with the function's security groups; the database's security group must allow inbound traffic from them.</li>
+				</ol>
+				<p>The execution role needs permission to manage the network interfaces (<code>ec2:CreateNetworkInterface</code>, <code>ec2:DescribeNetworkInterfaces</code>, <code>ec2:DeleteNetworkInterface</code> and related actions), most simply through the AWS managed policy <code>AWSLambdaVPCAccessExecutionRole</code>.</p>
+				<span class="file">Attach a function to two private subnets (AWS CLI)</span>
+<pre><code>aws lambda update-function-configuration \
+  --function-name charge-order \
+  --vpc-config SubnetIds=subnet-0a1,subnet-0b2,SecurityGroupIds=sg-0c3</code></pre>
+				<p>The <code>--vpc-config</code> value is one shorthand argument and can't be split (a JSON file passed with <code>file://</code> works too). An empty subnet and security group list detaches the function.</p>
+
+				<h3>Reaching other services from the VPC</h3>
+				<p>Once attached, the function's traffic follows the VPC's routes, so it loses the default internet access:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>To reach</th><th>Use</th></tr></thead>
+						<tbody>
+							<tr><td>The internet or a public API</td><td data-label="Use">Private subnets with a route to a NAT gateway in a public subnet. A function in a public subnet still gets no public IP and no internet access</td></tr>
+							<tr><td>S3 or DynamoDB</td><td data-label="Use">A gateway VPC endpoint (no charge)</td></tr>
+							<tr><td>Other AWS services (Secrets Manager, SQS, Bedrock&hellip;)</td><td data-label="Use">Interface VPC endpoints (AWS PrivateLink), with private DNS enabled</td></tr>
+							<tr><td>A relational database at high concurrency</td><td data-label="Use">Amazon RDS Proxy, which pools connections so thousands of environments don't exhaust the database's connections</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p>A function that was moved into a VPC and now times out calling S3, Secrets Manager or a third-party API has no route out. Adding an internet gateway or a public subnet doesn't help; add a NAT gateway route for private subnets, or VPC endpoints for AWS services.</p></div>
+				<div class="callout tip"><p>"Function must reach an RDS database in a private subnet" points to a VPC configuration with the right security groups. "Too many database connections from Lambda" points to RDS Proxy. "Require all functions to be in a VPC" points to IAM conditions on <code>lambda:VpcIds</code> or <code>lambda:SubnetIds</code>.</p></div>
+			</div>
+
+			<!-- Skill 1.2.2 -->
+			<h2 id="s2">Configuration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.2</span><span class="skill-text">Configure Lambda functions by defining environment variables and parameters (for example, memory, concurrency, timeout, runtime, handler, layers, extensions).</span></p>
+
+				<h3>Core settings</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Setting</th><th>Range or default</th><th>Notes</th></tr></thead>
+						<tbody>
+							<tr><td>Memory</td><td data-label="Range or default">128 MB to 10,240 MB (default 128 MB)</td><td data-label="Notes">CPU scales with memory (1,769 MB gives one vCPU); more memory often makes CPU-bound code faster and cheaper</td></tr>
+							<tr><td>Timeout</td><td data-label="Range or default">Default 3 seconds, up to 900 seconds (15 minutes)</td><td data-label="Notes">Set it just above the slowest normal run; longer work belongs in Step Functions or durable functions</td></tr>
+							<tr><td>Ephemeral storage (<code>/tmp</code>)</td><td data-label="Range or default">512 MB to 10,240 MB</td><td data-label="Notes">Kept while the environment is warm; not shared between environments</td></tr>
+							<tr><td>Runtime</td><td data-label="Range or default">For example <code>python3.13</code>, <code>nodejs22.x</code>, <code>java21</code>, or <code>provided.al2023</code> for custom runtimes</td><td data-label="Notes">Deprecated runtimes stop getting patches and later block updates</td></tr>
+							<tr><td>Handler</td><td data-label="Range or default"><code>file.function</code> in Python and Node.js (<code>app.handler</code>); <code>package.Class::method</code> in Java</td><td data-label="Notes">The entry point Lambda calls with <code>(event, context)</code></td></tr>
+							<tr><td>Architecture</td><td data-label="Range or default"><code>x86_64</code> or <code>arm64</code> (Graviton)</td><td data-label="Notes">arm64 usually gives better price-performance; native dependencies must be built for it</td></tr>
+							<tr><td>Package</td><td data-label="Range or default">Zip: 50 MB for direct upload, 250 MB unzipped including layers. Container image: up to 10 GB</td><td data-label="Notes">Larger zips upload through S3</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Environment variables</h3>
+				<p>Environment variables pass configuration to code without changing it: the table name, a log level, a feature flag. They total up to 4 KB, are encrypted at rest (with a customer managed KMS key if you set one), and some names are reserved, such as <code>AWS_REGION</code> and <code>AWS_LAMBDA_FUNCTION_NAME</code>. Don't store secrets in plain environment variables; keep them in Secrets Manager or Parameter Store and read them at init (the Parameters and Secrets Lambda extension caches them locally).</p>
+				<span class="file">Memory, timeout and environment (AWS CLI)</span>
+<pre><code>aws lambda update-function-configuration \
+  --function-name charge-order \
+  --memory-size 1024 \
+  --timeout 30 \
+  --environment file://env.json</code></pre>
+				<span class="file">env.json</span>
+<pre><code>{"Variables": {
+  "TABLE": "orders",
+  "LOG_LEVEL": "INFO"
+}}</code></pre>
+				<span class="file">Read configuration once per environment (Python)</span>
+<pre><code>import os
+import boto3
+
+TABLE = os.environ["TABLE"]
+table = boto3.resource(
+    "dynamodb").Table(TABLE)
+
+def handler(event, context):
+    item = table.get_item(
+        Key={"orderId": event["orderId"]})
+    return item.get("Item")</code></pre>
+
+				<h3>Layers and extensions</h3>
+				<p class="kv"><b>Layers</b>Zip archives of libraries, a custom runtime or shared code, extracted to <code>/opt</code> and added to the function. Up to 5 layers per function, counted in the 250 MB unzipped limit; each layer version is immutable. Use them to share dependencies across functions or keep the deployment package small. Container image functions don't use layers; build dependencies into the image.</p>
+				<p class="kv"><b>Extensions</b>Companion code that runs alongside the function for monitoring, security or configuration. <strong>External</strong> extensions are separate processes (shipped in a layer under <code>/opt/extensions</code>) that start before the function and can keep working after each invocation, for example sending telemetry. <strong>Internal</strong> extensions run inside the runtime process. Examples: CloudWatch Lambda Insights, the AWS Distro for OpenTelemetry, the Parameters and Secrets extension.</p>
+
+				<h3>Versions and aliases</h3>
+				<p>Publishing creates an immutable, numbered <strong>version</strong> of the code and configuration; <code>$LATEST</code> is the editable one. An <strong>alias</strong> (<code>prod</code>, <code>beta</code>) is a named pointer to a version; callers use the alias ARN, so releasing means moving the alias. An alias can split traffic between two versions (for example 90% and 10%) for a canary release, which CodeDeploy can automate (<a href="d3-task-3-3.html">Task 3.3</a>).</p>
+
+				<h3>Concurrency</h3>
+				<p>Concurrency is the number of requests being handled at the same moment. Each concurrent request needs its own environment.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Control</th><th>What it does</th><th>Use it to</th></tr></thead>
+						<tbody>
+							<tr><td>Account limit</td><td data-label="What it does">1,000 concurrent executions per Region by default (can be raised), shared by all functions</td><td data-label="Use it to">Know when functions start throttling</td></tr>
+							<tr><td>Reserved concurrency</td><td data-label="What it does">Sets aside concurrency for one function and caps it at that number; 0 stops all invocations</td><td data-label="Use it to">Guarantee capacity for a critical function, or protect a downstream database by limiting a function</td></tr>
+							<tr><td>Provisioned concurrency</td><td data-label="What it does">Keeps a number of environments initialized on a version or alias (not <code>$LATEST</code>); billed while configured; can be scaled with Application Auto Scaling</td><td data-label="Use it to">Remove cold starts for latency-sensitive APIs</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Each function can scale out by 1,000 execution environments every 10 seconds. Requests beyond the available concurrency are <strong>throttled</strong>: synchronous callers get HTTP 429 (<code>TooManyRequestsException</code>), while asynchronous events and event source mappings are retried.</p>
+				<span class="file">Reserved and provisioned concurrency (AWS CLI)</span>
+<pre><code>aws lambda put-function-concurrency \
+  --function-name charge-order \
+  --reserved-concurrent-executions 50
+
+aws lambda put-provisioned-concurrency-config \
+  --function-name order-api \
+  --qualifier prod \
+  --provisioned-concurrent-executions 20</code></pre>
+
+				<h3>Cold starts and SnapStart</h3>
+				<p>A <strong>cold start</strong> is the init time of a new environment: downloading code, starting the runtime and running your init code. Reduce it by keeping packages small, initializing only what you need, and choosing provisioned concurrency for steady latency-sensitive traffic. <strong>SnapStart</strong> (Java 11 and later, Python 3.12 and later, .NET 8 and later) snapshots an initialized environment when you publish a version and restores from it; code that creates unique values (IDs, random seeds) or connections during init should refresh them after restore with the runtime hooks. SnapStart can't be combined with provisioned concurrency.</p>
+
+				<h3>Other settings worth knowing</h3>
+				<p class="kv"><b>Function URLs</b>A dedicated HTTPS endpoint for a function, with <code>AWS_IAM</code> or <code>NONE</code> authentication and CORS settings. Since October 2025, new function URLs require callers to have both <code>lambda:InvokeFunctionUrl</code> and <code>lambda:InvokeFunction</code>.</p>
+				<p class="kv"><b>Logging</b>Logs go to the CloudWatch Logs group <code>/aws/lambda/&lt;function&gt;</code> by default, or a group you choose. JSON log format with application and system log levels lets you filter noise without code changes.</p>
+				<p class="kv"><b>Recursive loop detection</b>Lambda stops a function that keeps triggering itself through SQS, SNS, S3 or EventBridge custom buses after about 16 invocations in a chain (on by default). It doesn't cover every service, such as DynamoDB.</p>
+				<div class="callout tip"><p>"CPU-bound function is slow" points to more memory. "Cold starts on a latency-sensitive API" points to provisioned concurrency (or SnapStart for supported runtimes). "A function overwhelms the database" or "must always have capacity" points to reserved concurrency. "Share libraries across functions" points to layers. "Same code, different settings per environment" points to environment variables with aliases.</p></div>
+			</div>
+
+			<!-- Skill 1.2.3 -->
+			<h2 id="s3">Errors and event lifecycles</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.3</span><span class="skill-text">Handle event lifecycles and errors (for example, by using Lambda destinations, dead-letter queues).</span></p>
+				<p>What happens to a failed event depends on how the function was invoked. Getting this right is the difference between a retried order and a lost one.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Invocation</th><th>On error</th><th>Where failures go</th></tr></thead>
+						<tbody>
+							<tr><td>Synchronous (API Gateway, function URL, SDK <code>RequestResponse</code>)</td><td data-label="On error">The error goes back to the caller (the response has an <code>X-Amz-Function-Error</code> header); Lambda doesn't retry</td><td data-label="Where failures go">The caller decides: retry, return an error to the user</td></tr>
+							<tr><td>Asynchronous (S3, SNS, EventBridge, SDK <code>Event</code>)</td><td data-label="On error">Lambda retries up to 2 more times (configurable 0 to 2) and keeps events up to 6 hours (configurable 60 seconds to 6 hours)</td><td data-label="Where failures go">An on-failure destination or a dead-letter queue</td></tr>
+							<tr><td>Event source mapping, queue (SQS)</td><td data-label="On error">The batch's messages become visible again and are retried</td><td data-label="Where failures go">The queue's own dead-letter queue (redrive policy)</td></tr>
+							<tr><td>Event source mapping, stream (Kinesis, DynamoDB Streams, Kafka)</td><td data-label="On error">The batch is retried until it succeeds or expires, blocking the shard</td><td data-label="Where failures go">An on-failure destination on the mapping (SQS, SNS or S3)</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Destinations for asynchronous invocations</h3>
+				<p>A <strong>destination</strong> receives a record of each asynchronous invocation's outcome: <strong>on success</strong> and/or <strong>on failure</strong> (after retries are exhausted or the event is too old). Targets are an SQS queue, an SNS topic, another Lambda function, an EventBridge bus, or (on failure) an S3 bucket. The record includes the original event (<code>requestPayload</code>), the function's response or error (<code>responsePayload</code>), and context such as why it failed (<code>condition</code>: <code>RetriesExhausted</code> or <code>EventAgeExceeded</code>) and how many times it ran. The execution role needs permission to send to the target.</p>
+				<span class="file">Retries, event age and destinations (AWS CLI)</span>
+<pre><code>aws lambda put-function-event-invoke-config \
+  --function-name send-receipt \
+  --maximum-retry-attempts 1 \
+  --maximum-event-age-in-seconds 3600 \
+  --destination-config file://dest.json</code></pre>
+				<span class="file">dest.json</span>
+<pre><code>{
+  "OnSuccess": {
+    "Destination": "SUCCESS_TOPIC_ARN"
+  },
+  "OnFailure": {
+    "Destination": "FAILED_QUEUE_ARN"
+  }
+}</code></pre>
+				<p>Destinations must be standard (not FIFO) queues and topics.</p>
+
+				<h3>Dead-letter queues</h3>
+				<p>A function's <strong>dead-letter queue</strong> (an SQS queue or SNS topic, set with <code>--dead-letter-config</code>) is the older mechanism for failed asynchronous events. It receives only failures, and only the event itself plus error attributes. Destinations carry more context and also cover success, so they are the better choice for new designs; a function can have both.</p>
+				<div class="callout trap"><p>For an SQS-triggered function, a dead-letter queue or destination on the <em>function</em> does nothing: the function is invoked synchronously by the event source mapping. Configure a redrive policy with a dead-letter queue on the <em>source queue</em> (a <code>maxReceiveCount</code> of at least 5 is recommended), and set the queue's visibility timeout to at least six times the function timeout.</p></div>
+
+				<h3>Partial batch failures</h3>
+				<p>With batches, one bad message shouldn't make the whole batch fail and repeat. Enable <code>ReportBatchItemFailures</code> on the mapping and return the IDs of the failed items; only those are retried. For SQS the identifier is the <code>messageId</code>; for streams it's the sequence number (<a href="d1-task-1-1.html#s6">Task 1.1</a> shows the Kinesis version).</p>
+				<span class="file">Partial batch response for SQS (Python)</span>
+<pre><code>def handler(event, context):
+    failed = []
+    for rec in event["Records"]:
+        body = rec["body"]
+        try:
+            prepare(json.loads(body))
+        except Exception:
+            failed.append(
+                {"itemIdentifier":
+                 rec["messageId"]})
+    return {"batchItemFailures": failed}</code></pre>
+				<p>All event sources deliver at least once, so make processing idempotent: a retried or duplicated event must not create a second order or charge.</p>
+				<div class="callout tip"><p>"Capture failed asynchronous events with the error details" points to an on-failure destination. "Trigger the next step when an asynchronous invocation succeeds" points to an on-success destination. "Failed SQS messages" points to the source queue's redrive policy. "One bad record stops a stream" points to on-failure destinations, bisecting and partial batch responses.</p></div>
+			</div>
+
+			<!-- Skill 1.2.4 -->
+			<h2 id="s4">Integrations</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.4</span><span class="skill-text">Integrate Lambda functions with AWS services by using code, event source mappings, and destinations (for example, API Gateway, Amazon DynamoDB).</span></p>
+
+				<h3>Three ways in, one way out</h3>
+				<p class="kv"><b>Services push events</b>API Gateway, function URLs, Application Load Balancers and Cognito triggers invoke synchronously; S3, SNS, EventBridge and CloudWatch Logs invoke asynchronously. The service needs permission in the function's <strong>resource-based policy</strong>.</p>
+				<p class="kv"><b>Lambda polls a source</b>An <strong>event source mapping</strong> is a Lambda-side poller that reads SQS, Kinesis, DynamoDB Streams, Amazon MSK, self-managed Kafka, Amazon MQ or DocumentDB, batches records and invokes the function synchronously. The <strong>execution role</strong> needs permission to read the source.</p>
+				<p class="kv"><b>Your code calls services</b>The function uses the SDK with its execution role's permissions, for example writing to DynamoDB or publishing to SNS.</p>
+				<p class="kv"><b>Results flow on</b>Destinations pass asynchronous outcomes to the next service without code.</p>
+				<div class="callout trap"><p>Two different policies: the <strong>resource-based policy</strong> says who may invoke the function (for example <code>apigateway.amazonaws.com</code> for one API). The <strong>execution role</strong> says what the function may do. "API Gateway gets permission denied invoking the function" is the first; "the function can't read the queue or write the table" is the second.</p></div>
+				<span class="file">Let one API invoke the function (AWS CLI)</span>
+<pre><code>aws lambda add-permission \
+  --function-name order-api \
+  --statement-id apigw-orders \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:us-east-1:111111111111:a1b2c3/*/POST/orders"</code></pre>
+				<p>The source ARN (an unsplittable token) limits the permission to one API, stage pattern, method and path. Since August 2026 a function can also have a full IAM resource-based policy (<code>put-resource-policy</code>), which replaces the whole policy rather than adding a statement.</p>
+
+				<h3>API Gateway</h3>
+				<p>With a Lambda proxy integration, the function receives the whole HTTP request as the event (method, path, headers, query string parameters, and <code>body</code> as a string) and must return a response object. HTTP APIs offer payload format 1.0 (the REST API shape) or 2.0 (simpler: <code>rawPath</code>, a <code>cookies</code> list, and a plain returned object becomes a 200 JSON response).</p>
+				<span class="file">A proxy integration handler (Python)</span>
+<pre><code>def handler(event, context):
+    try:
+        order = json.loads(event["body"])
+    except (TypeError, ValueError):
+        return {"statusCode": 400,
+                "body": "invalid JSON"}
+    order_id = place(order)
+    return {
+        "statusCode": 201,
+        "headers": {
+            "Content-Type":
+                "application/json"},
+        "body": json.dumps(
+            {"orderId": order_id}),
+    }</code></pre>
+				<p>A function that returns anything else (no <code>statusCode</code>, a non-string body) causes a 502 "Malformed Lambda proxy response" from a REST API.</p>
+
+				<h3>DynamoDB Streams</h3>
+				<p>A DynamoDB stream records item changes for 24 hours. With an event source mapping, Lambda reads each shard in order and invokes the function with batches (default 100 records). The stream's view type decides what each record holds: <code>KEYS_ONLY</code>, <code>NEW_IMAGE</code>, <code>OLD_IMAGE</code> or <code>NEW_AND_OLD_IMAGES</code>. Typical uses: send a notification when an order's status changes, keep a search index or cache in sync, or aggregate totals.</p>
+				<span class="file">React to order status changes (Python)</span>
+<pre><code>def handler(event, context):
+    for rec in event["Records"]:
+        if rec["eventName"] != "MODIFY":
+            continue
+        ddb = rec["dynamodb"]
+        new = ddb["NewImage"]["status"]
+        old = ddb["OldImage"]["status"]
+        if new["S"] != old["S"]:
+            notify(ddb["Keys"], new["S"])</code></pre>
+				<p>Stream records use DynamoDB's typed JSON (<code>{"S": ...}</code>), and the old image needs the <code>NEW_AND_OLD_IMAGES</code> view type.</p>
+
+				<h3>Event source mapping settings</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Setting</th><th>Effect</th></tr></thead>
+						<tbody>
+							<tr><td>Batch size and batching window</td><td data-label="Effect">Records per invocation (SQS default 10, streams 100) and how long to wait to fill a batch (up to 300 seconds)</td></tr>
+							<tr><td>Starting position (streams)</td><td data-label="Effect"><code>TRIM_HORIZON</code> (oldest available), <code>LATEST</code> (new only) or a timestamp</td></tr>
+							<tr><td>Filter criteria</td><td data-label="Effect">Event patterns that drop records before invoking (5 filters by default); unmatched SQS messages are deleted, so you pay for fewer invocations</td></tr>
+							<tr><td>Maximum concurrency (SQS)</td><td data-label="Effect">Caps how many invocations one queue's mapping runs (2 to 1,000), to protect a downstream system</td></tr>
+							<tr><td>Provisioned mode (SQS, Kafka)</td><td data-label="Effect">Dedicated pollers for faster scaling and higher throughput, at extra cost</td></tr>
+							<tr><td>Failure handling</td><td data-label="Effect">Retries, record age, bisecting, partial batch responses and on-failure destinations (<a href="#s3">above</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">Only process paid orders from the stream (AWS CLI)</span>
+<pre><code>aws lambda create-event-source-mapping \
+  --function-name kitchen-ticket \
+  --event-source-arn STREAM_ARN \
+  --starting-position TRIM_HORIZON \
+  --batch-size 100 \
+  --filter-criteria file://filter.json</code></pre>
+				<span class="file">filter.json (the pattern is a JSON string)</span>
+<pre><code>{"Filters": [{"Pattern":
+  "{\"dynamodb\": {\"NewImage\": {\"status\": {\"S\": [\"PAID\"]}}}}"
+}]}</code></pre>
+				<p>The pattern string is one unsplittable value; it matches records whose new image has <code>status</code> set to <code>PAID</code>.</p>
+
+				<h3>In AWS SAM</h3>
+				<p>Templates usually declare all of this together on the function: <code>Events</code> (API, SQS, DynamoDB, schedule triggers), <code>VpcConfig</code>, <code>Layers</code>, <code>Environment</code>, <code>ReservedConcurrentExecutions</code>, <code>ProvisionedConcurrencyConfig</code> with <code>AutoPublishAlias</code>, <code>EventInvokeConfig</code> (retries and destinations) and <code>DeadLetterQueue</code>.</p>
+				<span class="file">A queue-triggered function (AWS SAM, YAML)</span>
+<pre><code>KitchenFunction:
+  Type: AWS::Serverless::Function
+  Properties:
+    Handler: app.handler
+    Runtime: python3.13
+    MemorySize: 512
+    Timeout: 30
+    Environment:
+      Variables:
+        TABLE: !Ref OrdersTable
+    Events:
+      Orders:
+        Type: SQS
+        Properties:
+          Queue: !GetAtt OrderQueue.Arn
+          BatchSize: 10
+          FunctionResponseTypes:
+            - ReportBatchItemFailures</code></pre>
+				<p>SAM adds the queue permissions to the execution role for SQS events. The queue's visibility timeout should be at least 180 seconds here (six times the 30-second timeout).</p>
+				<div class="callout tip"><p>"Process changes to a DynamoDB table" points to DynamoDB Streams with an event source mapping. "Invoke only for some messages" points to filter criteria. "Limit how fast a queue drains into a database" points to maximum concurrency on the mapping (or reserved concurrency). "502 from API Gateway" points to a malformed proxy response.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>VPC access: subnets and security groups, network interfaces created by Lambda (role needs the EC2 network interface permissions). No internet without a NAT gateway; use VPC endpoints for AWS services and RDS Proxy for databases.</li>
+				<li>Configure memory (CPU follows it), timeout (max 15 minutes), <code>/tmp</code>, runtime, handler, architecture and environment variables (4 KB, encrypted; secrets in Secrets Manager). Initialize clients outside the handler.</li>
+				<li>Layers share libraries (up to 5, <code>/opt</code>); extensions add monitoring and caching alongside the function. Versions are immutable; aliases point to them and can split traffic.</li>
+				<li>Concurrency: 1,000 per Region by default; reserved concurrency guarantees and caps; provisioned concurrency removes cold starts; SnapStart speeds up init for Java, Python and .NET.</li>
+				<li>Errors: synchronous errors return to the caller; asynchronous events retry (0 to 2 times, up to 6 hours) then go to on-failure destinations or a DLQ; SQS failures go to the queue's DLQ; stream failures to the mapping's on-failure destination; use partial batch responses and idempotency.</li>
+				<li>Integrations: push services need resource-based policy permission; event source mappings poll SQS, streams, Kafka, MQ and DocumentDB with batch, filter and concurrency settings; your code uses the execution role. Proxy handlers must return <code>statusCode</code>, <code>headers</code> and a string <code>body</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-1.html"><small>Previous</small>Task 1.1: Develop code for applications hosted on AWS</a>
+				<a class="next" href="d1-task-1-3.html"><small>Next</small>Task 1.3: Use data stores</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Developer &ndash; Associate (DVA-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
