@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.1: Prepare Application Artifacts | AWS DVA-C03 Notes</title>
+	<meta name="description" content="DVA-C03 Task 3.1 study guide: packaging code with its dependencies for Lambda and containers, building and managing images in Amazon ECR with tags, scanning and lifecycle policies, connecting code repositories with CodeConnections, managing environment-specific configuration with AppConfig, Parameter Store, Secrets Manager, stage variables and Lambda aliases, and using API Gateway stages, endpoint types and custom domains.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dva.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DVA-C03</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Testing and Deployment &middot; 22%</span>
+		<h1>Task 3.1: Prepare application artifacts to be deployed to AWS</h1>
+		<p>Getting code ready to ship: bundling it with the right dependencies, building and storing container images, keeping source in repositories that pipelines can read, separating configuration from code for each environment, and exposing APIs through the right stages and endpoints.</p>
+		<div class="tags"><span class="tag code">DVA-C03</span><span class="tag">Packaging</span><span class="tag">Amazon ECR</span><span class="tag">CodeConnections</span><span class="tag">AppConfig</span><span class="tag">API Gateway stages</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Dependencies</a></li>
+				<li><a href="#s2">Container images</a></li>
+				<li><a href="#s3">Code repositories</a></li>
+				<li><a href="#s4">Environment configuration</a></li>
+				<li><a href="#s5">API Gateway stages and endpoints</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.1</span>
+				<p><strong>Prepare application artifacts to be deployed to AWS.</strong></p>
+			</div>
+			<p>An <strong>artifact</strong> is what a deployment ships: a zip file for Lambda, a container image, a template. A good artifact is built once, contains everything the code needs to run, and is the same in every environment; only configuration (table names, endpoints, feature flags) changes between dev, test and prod. This task is about getting that separation right. Deploying the artifacts is <a href="d3-task-3-3.html">Task 3.3</a>.</p>
+			<p>The examples follow the food-ordering application: Python Lambda functions for the order API, a containerized kitchen service on ECS, source code on GitHub, and dev, test and prod environments.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>3.1.1</td><td data-label="What you need to be able to do">Manage dependencies within packages: environment variables, configuration files, container images</td></tr>
+						<tr><td>3.1.2</td><td data-label="What you need to be able to do">Build and manage container images: ECR, Dockerfiles, tags, lifecycle policies</td></tr>
+						<tr><td>3.1.3</td><td data-label="What you need to be able to do">Use code repositories in deployment environments</td></tr>
+						<tr><td>3.1.4</td><td data-label="What you need to be able to do">Manage environment-specific configuration: AppConfig, Parameter Store, Secrets Manager, API Gateway, Lambda</td></tr>
+						<tr><td>3.1.5</td><td data-label="What you need to be able to do">Use API Gateway stage URLs and endpoints</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 3.1.1 -->
+			<h2 id="s1">Dependencies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1.1</span><span class="skill-text">Manage dependencies for code modules (for example, environment variables, configuration files, container images) within packages.</span></p>
+
+				<h3>What goes in the package</h3>
+				<p class="kv"><b>Code and libraries</b>Everything the code imports, at pinned versions (a lock file or exact versions in <code>requirements.txt</code>), so every build produces the same artifact.</p>
+				<p class="kv"><b>Static configuration files</b>Settings that are the same everywhere (logging format, defaults) can ship in the package.</p>
+				<p class="kv"><b>Not in the package</b>Anything that differs per environment (table names, URLs, flags) and every secret: these come from environment variables, AppConfig, Parameter Store or Secrets Manager at runtime (<a href="#s4">below</a>).</p>
+
+				<h3>Lambda zip packages by language</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Runtime</th><th>How to package</th></tr></thead>
+						<tbody>
+							<tr><td>Python</td><td data-label="How to package">Install dependencies into a folder (<code>pip install --target</code>) and zip them with the code. Packages with native code need wheels built for Lambda's Linux and architecture</td></tr>
+							<tr><td>Node.js and TypeScript</td><td data-label="How to package">Bundle with esbuild into one file, which also removes unused code; or zip <code>node_modules</code></td></tr>
+							<tr><td>Java</td><td data-label="How to package">A single "uber" JAR with all dependencies (Maven Shade plugin), or a zip with dependency JARs in <code>lib/</code></td></tr>
+							<tr><td>Container image</td><td data-label="How to package">Dependencies installed in the image from an AWS Lambda base image (up to 10 GB)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">Install Linux arm64 wheels for a Python 3.13 function (shell)</span>
+<pre><code>pip install \
+  --target ./package \
+  --platform manylinux_2_28_aarch64 \
+  --implementation cp \
+  --python-version 3.13 \
+  --only-binary=:all: \
+  -r requirements.txt
+cd package &amp;&amp; zip -r ../function.zip .
+cd .. &amp;&amp; zip function.zip app.py</code></pre>
+				<p>Python 3.12 and later run on Amazon Linux 2023 (use <code>manylinux_2_28</code> wheels); earlier versions run on Amazon Linux 2 (<code>manylinux2014</code>). Use <code>x86_64</code> instead of <code>aarch64</code> for x86 functions. A dependency bundled in the package takes precedence over the copy in the runtime, so bundling one SDK component without the others can cause version mismatches.</p>
+
+				<h3>Build tools</h3>
+				<p class="kv"><b>AWS SAM</b><code>sam build</code> installs each function's dependencies and prepares the artifacts. <code>--use-container</code> builds inside a Lambda-like Docker image, which is the simple fix for native dependencies built on a Mac or Windows laptop; <code>--cached</code> and <code>--parallel</code> speed it up.</p>
+				<p class="kv"><b>AWS CDK</b><code>NodejsFunction</code> bundles TypeScript with esbuild using your lock file; the Python construct installs requirements in a Lambda-compatible container.</p>
+				<p class="kv"><b>Layers</b>Shared libraries can live in a Lambda layer (up to 5 per function, extracted to <code>/opt</code>, counted in the 250 MB unzipped limit) instead of every function's zip.</p>
+				<p class="kv"><b>AWS CodeArtifact</b>A private package repository for pip, npm, Maven, NuGet and others. It can proxy and cache public registries (PyPI, npm) through upstream repositories and external connections, and hold your own internal packages. <code>aws codeartifact login --tool pip</code> configures the package manager with a token (12 hours by default).</p>
+				<div class="callout trap"><p>"The function works locally but fails in Lambda with an import error for a compiled library" is a native dependency built for the wrong operating system or architecture. Build with <code>sam build --use-container</code>, download matching wheels, or use a container image.</p></div>
+			</div>
+
+			<!-- Skill 3.1.2 -->
+			<h2 id="s2">Container images</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1.2</span><span class="skill-text">Build and manage container images for deployment (for example, by using Amazon ECR, Docker files, container image tagging, lifecycle policies).</span></p>
+
+				<h3>Dockerfiles</h3>
+				<p>Put all dependencies in the image, run one process per container, log to standard output, and handle the stop signal (<code>SIGTERM</code>) so tasks shut down cleanly. Keep images small with slim base images and multi-stage builds (compile in one stage, copy only the result into the final one), exclude local files with <code>.dockerignore</code>, and run as a non-root user.</p>
+				<span class="file">Kitchen service image, multi-stage (Dockerfile)</span>
+<pre><code>FROM python:3.13 AS build
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --prefix=/install \
+    -r requirements.txt
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=build /install /usr/local
+COPY src/ ./src/
+USER 1000
+CMD ["python", "-m", "src.kitchen"]</code></pre>
+				<span class="file">A Lambda function as a container image (Dockerfile)</span>
+<pre><code>FROM public.ecr.aws/lambda/python:3.13
+COPY requirements.txt ${LAMBDA_TASK_ROOT}
+RUN pip install -r requirements.txt
+COPY app.py ${LAMBDA_TASK_ROOT}
+CMD ["app.handler"]</code></pre>
+				<p>AWS base images include the runtime interface client that connects the code to Lambda; other base images need it added. A Lambda image must be built for one architecture, and its file system is read-only except <code>/tmp</code>. Test it locally with the runtime interface emulator included in the base image.</p>
+
+				<h3>Amazon ECR</h3>
+				<p>Amazon Elastic Container Registry stores images in private repositories. Images are addressed as <code>ACCOUNT.dkr.ecr.REGION.amazonaws.com/REPO:TAG</code>, or by digest (<code>@sha256:...</code>) for an exact, unchangeable reference.</p>
+				<span class="file">Build for x86 and push to ECR (shell)</span>
+<pre><code>REG=111111111111.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password \
+  --region us-east-1 |
+  docker login --username AWS \
+  --password-stdin $REG
+
+TAG=$(git rev-parse --short HEAD)
+docker buildx build \
+  --platform linux/amd64 \
+  -t $REG/kitchen:$TAG .
+docker push $REG/kitchen:$TAG</code></pre>
+				<p>The registry host name can't be split. The login token is valid for 12 hours. For Lambda images, add <code>--provenance=false</code> so the build produces a single-architecture manifest Lambda accepts.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>ECR feature</th><th>What it does</th></tr></thead>
+						<tbody>
+							<tr><td>Tag immutability</td><td data-label="What it does">Prevents pushing a different image under an existing tag (<code>ImageTagAlreadyExistsException</code>); since 2025 you can exclude tags such as <code>latest</code> by filter</td></tr>
+							<tr><td>Image scanning</td><td data-label="What it does">Basic scanning finds operating system vulnerabilities on push or on demand; enhanced scanning (Amazon Inspector) also covers language packages and rescans continuously</td></tr>
+							<tr><td>Lifecycle policies</td><td data-label="What it does">Expire old or untagged images automatically, or move rarely used ones to the archive storage class (2025)</td></tr>
+							<tr><td>Pull-through cache</td><td data-label="What it does">Caches images from public registries (ECR Public, Docker Hub, Quay, GitHub, others) in your account</td></tr>
+							<tr><td>Replication</td><td data-label="What it does">Copies images to other Regions or accounts</td></tr>
+							<tr><td>Repository creation templates</td><td data-label="What it does">Settings for repositories ECR creates automatically, including on first push (since December 2025)</td></tr>
+							<tr><td>Signing</td><td data-label="What it does">Sign images with AWS Signer, including automatic managed signing on push (2025)</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Tagging and lifecycle policies</h3>
+				<p>Tag each image with something that identifies its source, such as the git commit SHA or a release version, and deploy that tag (or the digest). <code>latest</code> moves with every push, so it can't tell you what's running or let you roll back; with immutable tags, a tag always means the same image.</p>
+				<span class="file">Keep the newest 20 release images, delete untagged after 7 days (lifecycle policy)</span>
+<pre><code>{"rules": [
+  {"rulePriority": 1,
+   "description": "untagged",
+   "selection": {
+     "tagStatus": "untagged",
+     "countType": "sinceImagePushed",
+     "countUnit": "days",
+     "countNumber": 7},
+   "action": {"type": "expire"}},
+  {"rulePriority": 2,
+   "description": "releases",
+   "selection": {
+     "tagStatus": "tagged",
+     "tagPrefixList": ["v"],
+     "countType": "imageCountMoreThan",
+     "countNumber": 20},
+   "action": {"type": "expire"}}
+]}</code></pre>
+				<p>Rules are evaluated by priority (lowest number first), actions happen within about 24 hours, and the console can preview which images a policy would remove before you apply it.</p>
+				<div class="callout tip"><p>"Prevent an image tag from being overwritten" points to tag immutability. "Repository storage keeps growing" points to a lifecycle policy. "Find vulnerabilities in images, including application libraries" points to enhanced scanning. "Docker Hub rate limits during builds" points to a pull-through cache rule.</p></div>
+			</div>
+
+			<!-- Skill 3.1.3 -->
+			<h2 id="s3">Code repositories</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1.3</span><span class="skill-text">Use code repositories in deployment environments.</span></p>
+				<p>Pipelines start from a repository: a push or merge to a branch triggers a build and deployment. AWS services reach third-party Git hosts through <strong>AWS CodeConnections</strong> (renamed from AWS CodeStar Connections in 2024): GitHub, GitHub Enterprise Server, GitLab (cloud and self-managed), Bitbucket Cloud and Azure DevOps.</p>
+				<ol class="flow">
+					<li><b>Create the connection</b>In the console, CLI or CloudFormation. A connection created outside the console stays <code>PENDING</code>.</li>
+					<li><b>Authorize it</b>Complete the handshake in the console, installing the provider's app (for example the AWS Connector for GitHub) for the chosen repositories. This step can't be done from the CLI.</li>
+					<li><b>Use it</b>CodePipeline's source action (provider <code>CodeStarSourceConnection</code>, with the connection ARN, <code>owner/repo</code> and branch) and CodeBuild projects read the repository, and pushes trigger pipelines. Connections can be shared across accounts with AWS RAM.</li>
+				</ol>
+				<p class="kv"><b>Build settings in the repository</b>Keep <code>buildspec.yml</code> (CodeBuild), the SAM or CDK app, Dockerfiles and <code>appspec.yml</code> (CodeDeploy) in the repository with the code, so changes to the build are reviewed and versioned too.</p>
+				<p class="kv"><b>Branches per environment</b>A common pattern maps branches to environments (feature branches to previews, <code>main</code> to production). Amplify Hosting deploys each connected branch as its own environment and can create previews for pull requests.</p>
+				<p class="kv"><b>Pipeline source artifact</b>By default the source action passes a zip of the code; the <code>CODEBUILD_CLONE_REF</code> output format passes a full Git clone reference to CodeBuild when the build needs Git history or tags.</p>
+				<div class="callout note"><p><strong>AWS CodeCommit</strong> closed to new customers in July 2024 and became generally available to new customers again in November 2025; it isn't on the DVA-C03 in-scope list. Its repositories are reached over HTTPS with Git credentials, SSH, or <code>git-remote-codecommit</code> (which uses IAM and temporary credentials).</p></div>
+				<div class="callout tip"><p>"Trigger CodePipeline from a GitHub repository" points to a CodeConnections connection and the source action. "Connection created by CloudFormation doesn't work" points to the pending handshake. "Separate environment per branch for a web front end" points to Amplify branch deployments.</p></div>
+			</div>
+
+			<!-- Skill 3.1.4 -->
+			<h2 id="s4">Environment configuration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1.4</span><span class="skill-text">Manage environment-specific application configuration by using AWS services (for example, AWS AppConfig, AWS Systems Manager Parameter Store, AWS Secrets Manager, Amazon API Gateway, AWS Lambda).</span></p>
+				<p>The same artifact runs in every environment; what it connects to and how it behaves comes from configuration chosen at deploy or run time.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Where</th><th>Best for</th><th>Per-environment pattern</th></tr></thead>
+						<tbody>
+							<tr><td>Lambda environment variables</td><td data-label="Best for">Small, non-secret settings read at startup</td><td data-label="Per-environment pattern">Set per function by the template; they're part of a published version, so an alias points each environment at a version with its values</td></tr>
+							<tr><td>Parameter Store</td><td data-label="Best for">Configuration values and SecureStrings, shared across services</td><td data-label="Per-environment pattern">A hierarchy such as <code>/orders/prod/...</code>; read a whole level with <code>GetParametersByPath</code></td></tr>
+							<tr><td>Secrets Manager</td><td data-label="Best for">Credentials and keys that rotate</td><td data-label="Per-environment pattern">One secret per environment, named by convention (<code>prod/orders/db</code>)</td></tr>
+							<tr><td>AWS AppConfig</td><td data-label="Best for">Settings and feature flags changed often at runtime, validated and rolled out gradually</td><td data-label="Per-environment pattern">An AppConfig environment per stage, each with its own deployments</td></tr>
+							<tr><td>API Gateway stage variables</td><td data-label="Best for">Per-stage backend targets</td><td data-label="Per-environment pattern">A variable pointing each stage at a Lambda alias or backend URL</td></tr>
+							<tr><td>Templates</td><td data-label="Best for">Values fixed at deploy time</td><td data-label="Per-environment pattern">CloudFormation parameters, mappings and conditions; SAM <code>samconfig.toml</code> sections per environment</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">Read every prod setting under one path (Python)</span>
+<pre><code>ssm = boto3.client("ssm")
+pages = ssm.get_paginator(
+    "get_parameters_by_path")
+config = {}
+for page in pages.paginate(
+        Path="/orders/prod/",
+        Recursive=True,
+        WithDecryption=True):
+    for p in page["Parameters"]:
+        key = p["Name"].rsplit("/", 1)[-1]
+        config[key] = p["Value"]</code></pre>
+
+				<h3>AWS AppConfig</h3>
+				<p>AppConfig manages configuration that changes without a code deployment, safely: an <strong>application</strong> has <strong>environments</strong> and <strong>configuration profiles</strong>. A profile is either a <strong>feature flag</strong> profile or a <strong>freeform</strong> configuration stored in AppConfig's hosted store or in S3, Parameter Store or Secrets Manager. Each change becomes a version that you <strong>deploy</strong> to an environment:</p>
+				<ol class="flow">
+					<li><b>Validate</b>A JSON Schema or a Lambda validator rejects a bad configuration before it's deployed.</li>
+					<li><b>Roll out gradually</b>A <strong>deployment strategy</strong> controls how fast clients receive it: <code>AppConfig.Linear20PercentEvery6Minutes</code> (recommended for production), <code>AppConfig.Canary10Percent20Minutes</code>, <code>AppConfig.AllAtOnce</code>, or your own.</li>
+					<li><b>Bake and roll back</b>During the rollout and a bake time afterwards, AppConfig watches CloudWatch alarms and rolls back automatically if one fires.</li>
+				</ol>
+				<p>Applications read configuration with the AppConfig Data API: <code>StartConfigurationSession</code> returns a token, and <code>GetLatestConfiguration</code> returns the configuration and the next token (the older <code>GetConfiguration</code> API is deprecated). In Lambda and containers, the <strong>AppConfig Agent</strong> (a Lambda extension or a sidecar) polls in the background and serves the latest configuration locally, which is simpler and cheaper because AppConfig charges per configuration request.</p>
+				<span class="file">Read a feature flag from the AppConfig Lambda extension (Python)</span>
+<pre><code>import urllib.request
+
+FLAGS = ("http://localhost:2772"
+         "/applications/orders"
+         "/environments/prod"
+         "/configurations/flags")
+
+def flags():
+    req = urllib.request.urlopen(FLAGS)
+    with req as r:
+        return json.loads(r.read())
+
+def handler(event, context):
+    express = flags()["express-delivery"]
+    if express["enabled"]:
+        offer_express(event)</code></pre>
+				<p>The extension (added as a layer) refreshes the cached configuration every 45 seconds by default, so a flag change reaches all functions within a minute without redeploying them.</p>
+
+				<h3>Stage variables and Lambda aliases</h3>
+				<p>An API Gateway integration can name its Lambda function as <code>order-api:${stageVariables.alias}</code>, so the <code>dev</code> stage (with <code>alias=dev</code>) calls the dev alias and <code>prod</code> calls prod. Because the function name isn't fixed, you must add the Lambda permission for each alias yourself. Stage variables aren't for secrets.</p>
+				<span class="file">samconfig.toml with two environments</span>
+<pre><code>version = 0.1
+
+[default.deploy.parameters]
+stack_name = "orders-dev"
+parameter_overrides = "Stage=dev"
+
+[prod.deploy.parameters]
+stack_name = "orders-prod"
+parameter_overrides = "Stage=prod"
+confirm_changeset = true</code></pre>
+				<p><code>sam deploy --config-env prod</code> deploys the same template with the prod settings.</p>
+				<div class="callout tip"><p>"Change a feature flag without redeploying, roll it out gradually and roll back on errors" points to AppConfig with a deployment strategy and alarms. "Validate configuration before it's used" points to AppConfig validators. "Hierarchical configuration per environment" points to Parameter Store paths. "Each API stage calls a different function version" points to stage variables with Lambda aliases.</p></div>
+			</div>
+
+			<!-- Skill 3.1.5 -->
+			<h2 id="s5">API Gateway stages and endpoints</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1.5</span><span class="skill-text">Use API Gateway features and resources (for example, stage-specific URLs, endpoints).</span></p>
+
+				<h3>Deployments and stages</h3>
+				<p>A REST API's changes take effect only after you create a <strong>deployment</strong> (a snapshot) and point a <strong>stage</strong> at it; forgetting to redeploy is a classic "my change didn't work". Each stage has its own URL, <code>https://API_ID.execute-api.REGION.amazonaws.com/STAGE/</code>, its own stage variables, and its own logging, throttling, caching and canary settings. HTTP APIs can deploy automatically, and their <code>$default</code> stage is served at the base URL with no stage name.</p>
+				<span class="file">Deploy the REST API to the test stage (AWS CLI)</span>
+<pre><code>aws apigateway create-deployment \
+  --rest-api-id a1b2c3 \
+  --stage-name test \
+  --description "build 1234"</code></pre>
+				<p>A REST stage can also run a <strong>canary</strong>: a percentage of its traffic goes to a new deployment, with its own stage variable overrides, before you promote it.</p>
+
+				<h3>Endpoint types</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Type</th><th>Reached through</th><th>Use it for</th></tr></thead>
+						<tbody>
+							<tr><td>Edge-optimized (REST default)</td><td data-label="Reached through">CloudFront points of presence</td><td data-label="Use it for">Clients spread around the world</td></tr>
+							<tr><td>Regional</td><td data-label="Reached through">The Region directly</td><td data-label="Use it for">Clients in the same Region, or your own CloudFront distribution in front. The only type for HTTP APIs</td></tr>
+							<tr><td>Private (REST)</td><td data-label="Reached through">An interface VPC endpoint for <code>execute-api</code></td><td data-label="Use it for">Internal APIs; a resource policy must allow the VPC or endpoint</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Custom domain names</h3>
+				<p>Clients should call <code>api.example.com</code>, not the generated URL. A custom domain needs an ACM certificate (in us-east-1 for edge-optimized domains, in the API's Region for Regional ones) and a DNS record. <strong>API mappings</strong> connect paths to APIs and stages (<code>/orders</code> to the orders API's prod stage). For REST APIs, <strong>routing rules</strong> (2025, now recommended over mappings) route by headers and base path, for example sending requests with a version header to a new API. Private APIs can have private custom domain names (since November 2024). Once clients use the custom domain, you can turn off the default <code>execute-api</code> endpoint (<code>disableExecuteApiEndpoint</code>) so all traffic goes through it.</p>
+				<span class="file">Private API resource policy: only through one VPC endpoint</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "execute-api:Invoke",
+    "Resource": "execute-api:/*",
+    "Condition": {"StringEquals": {
+      "aws:SourceVpce": "vpce-0abc1234"}}
+  }]
+}</code></pre>
+				<p>Export a stage's definition as OpenAPI (<code>aws apigateway get-export --export-type oas30</code>) to share it with client teams or generate SDKs.</p>
+				<div class="callout tip"><p>"Changes to a REST API don't appear" points to a missing deployment. "API only reachable from inside the VPC" points to a private endpoint type with a VPC endpoint and resource policy. "Global clients, lower latency" points to edge-optimized. "Friendly URL for several APIs" points to a custom domain with API mappings or routing rules.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Build one artifact with pinned dependencies; keep per-environment values and secrets out of it. Native Python dependencies need wheels for Lambda's Linux and architecture (<code>sam build --use-container</code> helps); bundle Node.js with esbuild; uber JARs for Java; layers and CodeArtifact for shared packages.</li>
+				<li>Container images: small multi-stage Dockerfiles, one process, stdout logs; push to ECR with commit-based tags or digests; tag immutability, enhanced scanning, lifecycle policies (expire or archive), pull-through cache, replication.</li>
+				<li>Repositories: CodeConnections to GitHub, GitLab, Bitbucket and Azure DevOps (complete the handshake in the console); build files in the repository; branches per environment.</li>
+				<li>Configuration: Lambda environment variables with versions and aliases, Parameter Store hierarchies, Secrets Manager per environment, AppConfig for validated, gradual, alarm-protected changes and feature flags (read through the agent), stage variables, template parameters and <code>samconfig.toml</code>.</li>
+				<li>API Gateway: deploy REST changes to a stage; stage URLs, variables, settings and canaries; edge-optimized, Regional or private endpoints; custom domains with ACM certificates and API mappings or routing rules.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-3.html"><small>Previous</small>Task 2.3: Security risks of AI services</a>
+				<a class="next" href="d3-task-3-2.html"><small>Next</small>Task 3.2: Application testing</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Developer &ndash; Associate (DVA-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
