@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.3: Manage the Lifecycle of Data | AWS DEA-C01 Notes</title>
+	<meta name="description" content="DEA-C01 Task 2.3 study guide: Redshift COPY, auto-copy jobs, MERGE and UNLOAD with S3, S3 Lifecycle transitions and storage classes, expiration of current and noncurrent versions, S3 versioning, Object Lock and DynamoDB TTL, deleting data for legal requirements, and resiliency with S3 replication, DynamoDB PITR and global tables, RDS and Aurora, Redshift snapshots and AWS Backup.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dea.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DEA-C01</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Data Store Management &middot; 26%</span>
+		<h1>Task 2.3: Manage the lifecycle of data</h1>
+		<p>Data is born, moved, cooled, kept for as long as the rules say and then destroyed &mdash; and it must survive failures throughout. This task covers moving data between S3 and Redshift, tiering and expiring S3 objects, versioning and TTL, deleting data on demand, and keeping it available.</p>
+		<div class="tags"><span class="tag code">DEA-C01</span><span class="tag">Redshift COPY</span><span class="tag">UNLOAD</span><span class="tag">S3 Lifecycle</span><span class="tag">S3 Versioning</span><span class="tag">DynamoDB TTL</span><span class="tag">S3 Replication</span><span class="tag">AWS Backup</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Load and unload</a></li>
+				<li><a href="#s2">Lifecycle transitions</a></li>
+				<li><a href="#s3">Expiration</a></li>
+				<li><a href="#s4">Versioning and TTL</a></li>
+				<li><a href="#s5">Deleting data</a></li>
+				<li><a href="#s6">Resiliency</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.3</span>
+				<p><strong>Manage the lifecycle of data.</strong></p>
+			</div>
+			<p>Six skills, heavy on S3. The exam likes exact behaviour here: which lifecycle actions work on which bucket state, how long an archive restore takes, what a replication rule does <em>not</em> copy, and which backup still holds data you thought you deleted.</p>
+			<p>The examples continue the <strong>retail analytics platform</strong> in account 111111111111: the <code>sales</code> table in Redshift, raw and curated zones in the <code>retail-lake</code> bucket, and the DynamoDB <code>loyalty</code> table.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.3.1</td><td data-label="What you need to be able to do">Load data from S3 into Redshift and unload it back</td></tr>
+						<tr><td>2.3.2</td><td data-label="What you need to be able to do">Move S3 data between storage classes with Lifecycle rules</td></tr>
+						<tr><td>2.3.3</td><td data-label="What you need to be able to do">Expire S3 data at a given age</td></tr>
+						<tr><td>2.3.4</td><td data-label="What you need to be able to do">Manage S3 versioning and DynamoDB TTL</td></tr>
+						<tr><td>2.3.5</td><td data-label="What you need to be able to do">Delete data for business and legal requirements</td></tr>
+						<tr><td>2.3.6</td><td data-label="What you need to be able to do">Protect data with resiliency and availability</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout note"><p>Neighbouring topics are elsewhere. Iceberg snapshot expiry and S3 Tables maintenance are on <a href="d2-task-2-1.html#s7">Task 2.1</a>; Redshift Spectrum and zero-ETL are on <a href="d2-task-2-1.html#s5">Task 2.1</a>; encryption keys, Region restrictions on backups and PII discovery are Domain 4.</p></div>
+
+			<!-- ===== 2.3.1 ===== -->
+			<h2 id="s1">Load and unload</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.1</span><span class="skill-text">Perform load and unload operations to move data between Amazon S3 and Amazon Redshift.</span></p>
+				<p>Redshift moves bulk data with two commands: <code>COPY</code> loads from S3 (and from DynamoDB, EMR or remote hosts over SSH) and <code>UNLOAD</code> writes query results to S3. Both run in parallel on every slice. AWS's guidance is blunt: COPY "loads large amounts of data much more efficiently than using INSERT statements" &mdash; row-by-row <code>INSERT</code> is the wrong answer for bulk loads.</p>
+
+				<h3>COPY basics</h3>
+				<div class="code"><span class="file">Load gzipped CSV parts</span>
+<pre><code>COPY sales
+FROM 's3://retail-lake/curated/sales/'
+IAM_ROLE default
+CSV IGNOREHEADER 1 GZIP
+MAXERROR 10;</code></pre></div>
+				<ul>
+					<li><strong>Formats</strong>: CSV, delimited text (pipe by default), fixed-width, JSON, Avro, Parquet and ORC. For JSON, <code>'auto'</code> matches keys to column names case-sensitively, <code>'auto ignorecase'</code> ignores case, and a <strong>JSONPaths file</strong> maps nested fields explicitly.</li>
+					<li><strong>Authorization</strong>: <code>IAM_ROLE 'arn...'</code>, or <code>IAM_ROLE default</code> for the role set as default on the cluster or namespace. To load from another account, chain roles: <code>'arn:...:role/RoleA,arn:...:role/RoleB'</code>, no spaces.</li>
+					<li><strong>Other Region</strong>: add <code>REGION</code> when the bucket is in another Region (data transfer charges apply).</li>
+					<li><strong>Errors</strong>: <code>MAXERROR</code> (default 0) tolerates bad rows, and <code>NOLOAD</code> validates without loading. Look in <strong><code>SYS_LOAD_ERROR_DETAIL</code></strong>; the older <code>STL_LOAD_ERRORS</code> covers only main provisioned clusters, not Serverless or concurrency scaling.</li>
+					<li><strong>Housekeeping</strong>: <code>COMPUPDATE</code> chooses column encodings (by default only when the table is empty) and <code>STATUPDATE</code> refreshes statistics.</li>
+				</ul>
+				<div class="code"><span class="file">Why did the load fail? (works on Serverless)</span>
+<pre><code>SELECT file_name, line_number,
+       column_name, error_message
+FROM sys_load_error_detail
+ORDER BY start_time DESC
+LIMIT 10;</code></pre></div>
+
+				<h3>Splitting files for parallel load</h3>
+				<p>COPY gives files to slices, so a single large file loads on one slice while the rest of the cluster waits. Redshift <strong>automatically splits uncompressed CSV, Parquet and ORC files of 128 MB or more</strong>. Files it cannot split &mdash; JSON, and CSV compressed with gzip and similar codecs &mdash; should be split by the producer into files "close in size, from 1 MB to 1 GB after compression", with the file count "a multiple of the number of slices in your cluster".</p>
+
+				<h3>Prefixes and manifests</h3>
+				<p>The <code>FROM</code> path is a <strong>key prefix</strong>: <code>sales/2026-11</code> also matches <code>sales/2026-11.bak</code> and <code>sales/2026-11-old/</code>. A <strong>manifest</strong> lists exactly which files to load, and <code>"mandatory": true</code> makes COPY fail if one is missing &mdash; the fix for "COPY loaded a stray file" and "COPY silently skipped a late file".</p>
+				<div class="code"><span class="file">pos.manifest</span>
+<pre><code>{
+  "entries": [
+    {"url":
+      "s3://retail-lake/in/pos-1.csv.gz",
+     "mandatory": true},
+    {"url":
+      "s3://retail-lake/in/pos-2.csv.gz",
+     "mandatory": true}
+  ]
+}</code></pre></div>
+				<div class="code"><span class="file">Load exactly those files</span>
+<pre><code>COPY sales
+FROM 's3://retail-lake/in/pos.manifest'
+IAM_ROLE default
+CSV GZIP
+MANIFEST;</code></pre></div>
+				<p>Manifest files can point to several buckets, but all must be in the cluster's Region. A file listed twice is loaded twice. For Parquet and ORC, each entry also needs <code>"meta": {"content_length": n}</code>.</p>
+
+				<h3>Columnar COPY has its own rules</h3>
+				<div class="callout trap"><p><strong>COPY from Parquet or ORC</strong> maps columns <strong>by position</strong> (the column counts must match), requires the bucket to be in the <strong>same Region</strong>, and supports only a short list of options &mdash; no <code>REGION</code>, no <code>MAXERROR</code>, no <code>IGNOREALLERRORS</code>, no automatic compression. Any bad row fails the whole load.</p></div>
+				<div class="code"><span class="file">Load Parquet</span>
+<pre><code>COPY sales
+FROM 's3://retail-lake/curated/pq/'
+IAM_ROLE default
+FORMAT AS PARQUET;</code></pre></div>
+
+				<h3>Auto-copy jobs</h3>
+				<p>A <strong>COPY JOB</strong> (generally available since October 30, 2024, on Serverless and RA3) watches an S3 prefix and loads each new file once, automatically. It needs an <strong>S3 event integration</strong> between the bucket and the warehouse first, created with <code>aws redshift create-integration</code>.</p>
+				<div class="code"><span class="file">Load every new POS file as it lands</span>
+<pre><code>COPY public.pos_events
+FROM 's3://retail-lake/in/pos/'
+IAM_ROLE
+  'arn:aws:iam::111111111111:role/rs-load'
+FORMAT AS JSON 'auto'
+JOB CREATE pos_events_job
+AUTO ON;</code></pre></div>
+				<div class="callout trap"><p>A COPY JOB <strong>does not load files that were already in the prefix</strong> when it was created, does not accept <code>IAM_ROLE default</code>, <code>MAXERROR</code> or manifests, and job names cannot contain a hyphen. Monitor it in <code>SYS_COPY_JOB</code> and <code>SYS_COPY_JOB_DETAIL</code>.</p></div>
+
+				<h3>Upserts: stage, then MERGE</h3>
+				<p>COPY only appends. To apply changes, load them into a staging table and <code>MERGE</code> them into the target. The target must not match more than one source row ("Found multiple matches to update the same tuple"), so deduplicate the staging table first. When source and target have the same columns, the short form <code>REMOVE DUPLICATES</code> updates matches, inserts the rest, and performs better.</p>
+				<div class="code"><span class="file">Apply a day's corrections</span>
+<pre><code>COPY sales_staging
+FROM 's3://retail-lake/in/fixes/'
+IAM_ROLE default
+FORMAT AS PARQUET;
+
+MERGE INTO sales
+USING sales_staging s
+  ON sales.order_id = s.order_id
+REMOVE DUPLICATES;</code></pre></div>
+
+				<h3>UNLOAD</h3>
+				<p><code>UNLOAD</code> runs a query and writes the result to S3, by default one or more files per slice in parallel. AWS says Parquet is "up to 2x faster to unload and consumes up to 6x less storage" than text.</p>
+				<div class="code"><span class="file">Export sales as partitioned Parquet</span>
+<pre><code>UNLOAD ('SELECT order_id, store_id,
+          amount,
+          TRUNC(sold_at) AS sale_date
+         FROM sales')
+TO 's3://retail-lake/export/sales/'
+IAM_ROLE default
+FORMAT AS PARQUET
+PARTITION BY (sale_date)
+MAXFILESIZE 256 MB
+CLEANPATH;</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>Behaviour</th></tr></thead>
+						<tbody>
+							<tr><td><code>PARTITION BY</code></td><td data-label="Behaviour">Hive-style <code>sale_date=.../</code> folders. Partition columns are left out of the files unless you add <code>INCLUDE</code>. It does <strong>not</strong> register partitions in the Glue catalog</td></tr>
+							<tr><td><code>MAXFILESIZE</code></td><td data-label="Behaviour">5 MB to 6.2 GB; the default and maximum file size is <strong>6.2 GB</strong></td></tr>
+							<tr><td><code>PARALLEL OFF</code></td><td data-label="Behaviour">Writes serially, for a single ordered output (still split at the size limit)</td></tr>
+							<tr><td><code>CLEANPATH</code> / <code>ALLOWOVERWRITE</code></td><td data-label="Behaviour">UNLOAD fails if files exist. CLEANPATH deletes them first; ALLOWOVERWRITE overwrites. They cannot be combined</td></tr>
+							<tr><td><code>MANIFEST</code>, <code>HEADER</code></td><td data-label="Behaviour">A list of written files; a header row for text formats</td></tr>
+							<tr><td><code>ENCRYPTED</code>, <code>KMS_KEY_ID</code></td><td data-label="Behaviour">SSE-S3 is the default; Parquet with <code>ENCRYPTED</code> supports SSE-KMS only</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Parquet UNLOAD cannot take <code>HEADER</code></strong>, delimiters or compression options (row groups are always Snappy-compressed), and the outer <code>SELECT</code> cannot have a <code>LIMIT</code> &mdash; nest it in a subquery. Client-side encryption for COPY and UNLOAD was removed after April 30, 2026; use SSE-S3 or SSE-KMS.</p></div>
+
+				<h3>Running loads from a pipeline</h3>
+				<p>Lambda functions and Step Functions run COPY and UNLOAD through the <strong>Redshift Data API</strong>: asynchronous HTTPS calls with no drivers or open connections, authenticated with IAM or a Secrets Manager secret. <code>batch-execute-statement</code> runs several statements in one transaction. Pass a <code>ClientToken</code> so a retried call does not load twice.</p>
+				<div class="code"><span class="file">Start a load from the CLI or a function</span>
+<pre><code>aws redshift-data execute-statement \
+  --workgroup-name retail \
+  --database dev \
+  --sql file://load_sales.sql</code></pre></div>
+			</div>
+
+			<!-- ===== 2.3.2 ===== -->
+			<h2 id="s2">Lifecycle transitions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.2</span><span class="skill-text">Manage S3 Lifecycle policies to change the storage tier of S3 data.</span></p>
+				<p>S3 storage classes trade storage price against retrieval cost and speed. A <strong>Lifecycle configuration</strong> moves objects to cheaper classes as they age, automatically. Every class has eleven nines of durability; they differ in availability, Availability Zones, minimum storage duration and retrieval.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Class</th><th>Availability</th><th>Minimum duration</th><th>Retrieval</th></tr></thead>
+						<tbody>
+							<tr><td>Standard</td><td data-label="Availability">99.99%, 3+ AZs</td><td data-label="Minimum duration">None</td><td data-label="Retrieval">Milliseconds</td></tr>
+							<tr><td>Intelligent-Tiering</td><td data-label="Availability">99.9%, 3+ AZs</td><td data-label="Minimum duration">None</td><td data-label="Retrieval">Milliseconds (hours for optional archive tiers); no retrieval fees, a per-object monitoring fee</td></tr>
+							<tr><td>Standard-IA</td><td data-label="Availability">99.9%, 3+ AZs</td><td data-label="Minimum duration">30 days</td><td data-label="Retrieval">Milliseconds, per-GB fee</td></tr>
+							<tr><td>One Zone-IA</td><td data-label="Availability">99.5%, <strong>1 AZ</strong></td><td data-label="Minimum duration">30 days</td><td data-label="Retrieval">Milliseconds, per-GB fee</td></tr>
+							<tr><td>Glacier Instant Retrieval</td><td data-label="Availability">99.9%, 3+ AZs</td><td data-label="Minimum duration">90 days</td><td data-label="Retrieval">Milliseconds, higher per-GB fee</td></tr>
+							<tr><td>Glacier Flexible Retrieval</td><td data-label="Availability">99.99% after restore</td><td data-label="Minimum duration">90 days</td><td data-label="Retrieval">Restore first: minutes to 12 hours</td></tr>
+							<tr><td>Glacier Deep Archive</td><td data-label="Availability">99.99% after restore</td><td data-label="Minimum duration">180 days</td><td data-label="Retrieval">Restore first: 12 to 48 hours</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The IA classes and Glacier Instant Retrieval bill a <strong>minimum object size of 128 KB</strong>. Glacier Flexible Retrieval and Deep Archive add about <strong>40 KB of metadata per object</strong> (8 KB billed at the Standard rate). Both rules make archiving many small files expensive.</p>
+
+				<h3>How transitions work</h3>
+				<ul>
+					<li><strong>Downhill only.</strong> Transitions go to colder classes: Standard to anything; Standard-IA to Intelligent-Tiering, One Zone-IA or any Glacier class; Glacier Flexible Retrieval only to Deep Archive. Nothing transitions <em>out</em> of Deep Archive &mdash; restore and copy instead.</li>
+					<li><strong>Small objects stay put.</strong> Since September 2024, lifecycle by default <strong>does not transition objects smaller than 128 KB</strong> to any class. Override this with an <code>ObjectSizeGreaterThan</code>/<code>ObjectSizeLessThan</code> filter or the default-minimum-size setting.</li>
+					<li><strong>Minimum durations chain.</strong> One rule cannot move an object out of a class before that class's minimum duration: Glacier Instant Retrieval at day 30 means Deep Archive no earlier than day 120.</li>
+					<li><strong>Each transition is a billed request</strong>, and moving or deleting an object before its minimum duration is charged for the rest of that duration.</li>
+					<li><strong>Asynchronous.</strong> Lifecycle actions can lag by days, but billing changes as soon as an object becomes eligible (transitions into Intelligent-Tiering bill once complete).</li>
+					<li><strong>Filters</strong>: one prefix, any number of tags (combined with <code>And</code>) and object size. There is no exclude filter; use tags. A bucket holds up to <strong>1,000 rules</strong> (not adjustable), and a PUT replaces the whole configuration.</li>
+				</ul>
+				<div class="code"><span class="file">lc.json: tier raw POS files as they age</span>
+<pre><code>{
+  "Rules": [{
+    "ID": "tier-raw-pos",
+    "Status": "Enabled",
+    "Filter": {
+      "And": {
+        "Prefix": "raw/pos/",
+        "ObjectSizeGreaterThan": 131072
+      }
+    },
+    "Transitions": [
+      {"Days": 30,
+       "StorageClass": "STANDARD_IA"},
+      {"Days": 90,
+       "StorageClass": "GLACIER_IR"},
+      {"Days": 365,
+       "StorageClass": "DEEP_ARCHIVE"}
+    ]
+  }]
+}</code></pre></div>
+				<div class="code"><span class="file">Apply it (replaces existing rules)</span>
+<pre><code>aws s3api put-bucket-lifecycle-configuration \
+  --bucket retail-lake \
+  --lifecycle-configuration file://lc.json</code></pre></div>
+
+				<h3>Intelligent-Tiering instead of rules</h3>
+				<p>When access patterns are <strong>unknown or changing</strong>, Intelligent-Tiering moves each object for you: to Infrequent Access after 30 days without access, Archive Instant Access after 90, and &mdash; only if you activate them &mdash; Archive Access (90 to 730 days) and Deep Archive Access (180 to 730 days). An access moves the object back to Frequent. Objects under 128 KB are never monitored and stay in Frequent Access. Lifecycle rules win when the pattern is known ("raw files are never read after a month"); Intelligent-Tiering wins when it is not.</p>
+				<div class="callout tip"><p>To decide, use <strong>Storage Class Analysis</strong>, which watches access for about 30 days or more but recommends <strong>only Standard to Standard-IA</strong> transitions, and <strong>S3 Storage Lens</strong> dashboards, which show the effect of rules (noncurrent bytes, delete markers, incomplete multipart uploads).</p></div>
+
+				<h3>Restoring archived objects</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tier</th><th>Glacier Flexible Retrieval</th><th>Deep Archive</th></tr></thead>
+						<tbody>
+							<tr><td>Expedited</td><td data-label="Glacier Flexible Retrieval">1&ndash;5 minutes (objects under 250 MB)</td><td data-label="Deep Archive">Not available</td></tr>
+							<tr><td>Standard</td><td data-label="Glacier Flexible Retrieval">3&ndash;5 hours</td><td data-label="Deep Archive">Within 12 hours</td></tr>
+							<tr><td>Bulk</td><td data-label="Glacier Flexible Retrieval">5&ndash;12 hours</td><td data-label="Deep Archive">Within 48 hours</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A restore creates a <strong>temporary copy</strong> for the number of days you ask for, billed at the Standard rate on top of the archive. The object's storage class does not change; to bring it back permanently, copy it over itself into another class. Watch for the <code>s3:ObjectRestore:Completed</code> event or check <code>head-object</code>.</p>
+				<div class="code"><span class="file">Restore last year's POS file for a week</span>
+<pre><code>aws s3api restore-object \
+  --bucket retail-lake \
+  --key raw/pos/2025/11/07.csv.gz \
+  --restore-request '{"Days": 7,
+    "GlacierJobParameters":
+      {"Tier": "Bulk"}}'</code></pre></div>
+				<div class="callout retired"><p>The original vault-based service, now called <strong>Amazon Glacier</strong>, is no longer accepting new customers; AWS points to the <strong>S3 Glacier storage classes</strong> instead. Objects in those classes are not visible through the vault API. An answer that creates a Glacier vault for new archives is out of date.</p></div>
+			</div>
+
+			<!-- ===== 2.3.3 ===== -->
+			<h2 id="s3">Expiration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.3</span><span class="skill-text">Expire data when it reaches a specific age by using S3 Lifecycle policies.</span></p>
+				<p>Expiration is the lifecycle action that deletes. It is how retention policies such as "delete raw clickstream after 13 months" are enforced without a cleanup job.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Action</th><th>What it does</th></tr></thead>
+						<tbody>
+							<tr><td><code>Expiration</code> (<code>Days</code> or <code>Date</code>)</td><td data-label="What it does">Expires the <strong>current</strong> version at an age, or from a date onwards (midnight UTC; not both in one rule)</td></tr>
+							<tr><td><code>NoncurrentVersionExpiration</code></td><td data-label="What it does">Permanently deletes <strong>old versions</strong> <code>NoncurrentDays</code> after they were replaced; <code>NewerNoncurrentVersions</code> (1&ndash;100) keeps the latest few</td></tr>
+							<tr><td><code>ExpiredObjectDeleteMarker</code></td><td data-label="What it does">Removes delete markers that have no versions left behind them</td></tr>
+							<tr><td><code>AbortIncompleteMultipartUpload</code></td><td data-label="What it does">Deletes the parts of uploads never completed <code>DaysAfterInitiation</code> days after they started</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>What "expire" means depends on versioning</h3>
+				<ul>
+					<li><strong>Unversioned bucket</strong>: the object is permanently removed.</li>
+					<li><strong>Versioning enabled</strong>: S3 adds a <strong>delete marker</strong> and the object becomes a noncurrent version &mdash; still stored and still billed until <code>NoncurrentVersionExpiration</code> removes it.</li>
+					<li><strong>Versioning suspended</strong>: S3 adds a delete marker with a <code>null</code> version ID, which replaces any existing null version.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Expiring objects in a versioned bucket makes the object count go up</strong>, not down: every expiration adds a delete marker and keeps the data. A retention rule on a versioned bucket needs both <code>Expiration</code> and <code>NoncurrentVersionExpiration</code>, plus a cleanup of expired delete markers.</p></div>
+
+				<h3>Timing and billing</h3>
+				<p>S3 counts from the object's creation time and rounds <strong>up to the next midnight UTC</strong>: an object created on January 15 at 10:30 with a 3-day rule becomes eligible on January 19 at 00:00 UTC. Deletion happens asynchronously afterwards, but "you are not charged for expiration or the storage time associated with an object that has expired". Expiring an IA object before 30 days, or a Glacier object before 90 or 180, still bills the minimum duration.</p>
+				<div class="code"><span class="file">Retention for a versioned log prefix</span>
+<pre><code>{
+  "Rules": [
+    {
+      "ID": "expire-clicks",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "raw/clicks/"},
+      "Expiration": {"Days": 395},
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 30,
+        "NewerNoncurrentVersions": 3
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    },
+    {
+      "ID": "clean-markers",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "tmp/"},
+      "Expiration": {
+        "ExpiredObjectDeleteMarker": true
+      }
+    }
+  ]
+}</code></pre></div>
+				<p>The marker cleanup is a separate rule because <code>ExpiredObjectDeleteMarker</code> cannot sit in the same <code>Expiration</code> as <code>Days</code>; rules with <code>Days</code> clean up their own expired markers anyway.</p>
+				<div class="callout trap"><p>Three restrictions catch people. <strong><code>ExpiredObjectDeleteMarker</code> and <code>AbortIncompleteMultipartUpload</code> cannot be used in a rule with a tag filter</strong>. <code>Expiration</code> does <strong>not</strong> remove incomplete multipart uploads &mdash; only the abort action does, and those hidden parts are billed. And bucket-policy <code>Deny</code> statements do <strong>not</strong> stop lifecycle actions.</p></div>
+				<div class="callout tip"><p>For <strong>deadline-bound legal deletions</strong>, AWS advises not to rely on lifecycle timing alone. Use <strong>S3 Inventory</strong>, whose report includes each object's lifecycle expiration date, to find stragglers and delete them yourself.</p></div>
+			</div>
+
+			<!-- ===== 2.3.4 ===== -->
+			<h2 id="s4">Versioning and TTL</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.4</span><span class="skill-text">Manage S3 versioning and DynamoDB TTL.</span></p>
+				<p>Two opposite tools. S3 versioning <em>keeps</em> data you overwrite or delete, so mistakes can be undone. DynamoDB TTL <em>removes</em> data automatically once it is no longer needed.</p>
+
+				<h3>S3 Versioning</h3>
+				<ul>
+					<li>A bucket is <strong>unversioned</strong> (the default), <strong>enabled</strong> or <strong>suspended</strong>. Once enabled, it can <strong>never return to unversioned</strong>; suspending stops new versions but keeps existing ones.</li>
+					<li>Every overwrite creates a new version with its own ID. Objects that existed before versioning have version ID <code>null</code>.</li>
+					<li>A <code>DELETE</code> without a version ID adds a <strong>delete marker</strong>, so the object seems gone but can be recovered by deleting the marker. A <code>DELETE</code> with a version ID removes that version permanently.</li>
+					<li><strong>Every version is a full, billed object</strong>: three versions of a 1 GB file are 3 GB. Pair versioning with <code>NoncurrentVersionExpiration</code>.</li>
+					<li>Versioning is required for <strong>replication</strong> and for <strong>Object Lock</strong>.</li>
+				</ul>
+				<div class="code"><span class="file">Turn on versioning, then list versions</span>
+<pre><code>aws s3api put-bucket-versioning \
+  --bucket retail-lake \
+  --versioning-configuration \
+    Status=Enabled
+
+aws s3api list-object-versions \
+  --bucket retail-lake \
+  --prefix curated/sales/</code></pre></div>
+				<div class="callout trap"><p><strong>MFA Delete</strong> requires an MFA code to change the versioning state or permanently delete a version. Only the <strong>bucket owner's root user</strong> can enable it, only through the <strong>CLI or API</strong>, and it <strong>cannot be used on a bucket with a lifecycle configuration</strong>. For most data lakes, Object Lock or replication to a locked-down account is the more practical protection.</p></div>
+
+				<h3>S3 Object Lock</h3>
+				<p>Object Lock makes object versions <strong>write-once-read-many</strong> (WORM), and has been assessed for SEC 17a-4, CFTC and FINRA requirements. It can be enabled on existing buckets, but once on it cannot be turned off and versioning cannot be suspended.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Protection</th><th>Who can remove it</th></tr></thead>
+						<tbody>
+							<tr><td>Governance mode</td><td data-label="Who can remove it">Users with <code>s3:BypassGovernanceRetention</code> who send the bypass header &mdash; protection against accidents, not against administrators</td></tr>
+							<tr><td>Compliance mode</td><td data-label="Who can remove it"><strong>Nobody</strong>, including the root user; the retention cannot be shortened. AWS: the only way to delete such objects early is to delete the account</td></tr>
+							<tr><td>Legal hold</td><td data-label="Who can remove it">Anyone with <code>s3:PutObjectLegalHold</code>. It has <strong>no expiry</strong> and is independent of retention periods</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Lifecycle rules respect locks: S3 takes no action on locked noncurrent versions, and expiring a locked current version only adds a delete marker.</p>
+
+				<h3>DynamoDB TTL</h3>
+				<p>Time to Live deletes items after a timestamp you store in each item. The retail platform puts an <code>expireAt</code> attribute on short-lived loyalty offers.</p>
+				<ul>
+					<li>The TTL attribute must be a <strong>Number holding Unix epoch seconds</strong>. Other types, or values more than five years in the past, are ignored.</li>
+					<li>Expired items are deleted "<strong>typically within a few days</strong>" &mdash; not at the exact second &mdash; and TTL deletes <strong>consume no write capacity</strong>. They are removed from indexes too.</li>
+					<li><strong>Expired items still appear in reads</strong> and still count towards storage until deleted, so filter them out with a condition such as <code>expireAt &gt; :now</code>.</li>
+					<li>One TTL attribute per table. Enabling takes about an hour, and a repeated call within that hour fails.</li>
+					<li>Global tables: in the default multi-Region eventual-consistency mode, the delete replicates and each replica Region pays for the replicated write. <strong>Multi-Region strong consistency tables do not support TTL.</strong></li>
+				</ul>
+				<div class="code"><span class="file">Enable TTL on the loyalty table</span>
+<pre><code>aws dynamodb update-time-to-live \
+  --table-name loyalty \
+  --time-to-live-specification \
+    "Enabled=true, AttributeName=expireAt"</code></pre></div>
+				<p>TTL deletes appear in <strong>DynamoDB Streams</strong> as <code>REMOVE</code> records with <code>userIdentity.type</code> of <code>Service</code> and principal <code>dynamodb.amazonaws.com</code>, which separates them from deletes your users make. That is the standard way to <strong>archive expired items to S3</strong> before they are gone. The stream needs a view type that includes old images.</p>
+				<div class="code"><span class="file">Archive only TTL deletes (Lambda, Python)</span>
+<pre><code>def is_ttl_delete(r):
+    who = r.get("userIdentity", {})
+    removed = r["eventName"] == "REMOVE"
+    by_ttl = who.get("type") == "Service"
+    return removed and by_ttl
+
+def handler(event, context):
+    for r in event["Records"]:
+        if not is_ttl_delete(r):
+            continue
+        <span class="c"># item as it was before deletion</span>
+        archive(r["dynamodb"]["OldImage"])</code></pre></div>
+				<div class="callout note"><p>TTL deletes are identifiable this way only in the Region where the deletion happened, not in global-table replica Regions.</p></div>
+			</div>
+
+			<!-- ===== 2.3.5 ===== -->
+			<h2 id="s5">Deleting data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.5</span><span class="skill-text">Delete data to meet business and legal requirements.</span></p>
+				<p>Two kinds of requirement drive deletion. <strong>Retention limits</strong> ("keep transactions seven years, then delete") are age-based and suit lifecycle rules and TTL. <strong>Erasure requests</strong> ("delete everything about customer 48213 within 30 days") target specific records scattered across many files and stores, and are much harder. Both must reach every copy &mdash; including old versions, replicas and backups.</p>
+
+				<h3>Erasing records in a data lake</h3>
+				<p>S3 objects are immutable, so removing one customer's rows means rewriting every file that contains them.</p>
+				<ul>
+					<li><strong>Iceberg tables</strong> make it a SQL statement: <code>DELETE</code>, then compaction and snapshot expiry so the old files that still contain the rows are physically removed (see <a href="d2-task-2-1.html#s7">Task 2.1</a>). Until the old snapshots expire, time travel can still read the deleted rows.</li>
+					<li><strong>Plain Parquet or CSV</strong> needs a rewrite job. AWS's <strong>Amazon S3 Find and Forget</strong> solution shows the pattern: Athena finds the objects containing the identifiers, Fargate workers rewrite them without the matching rows, Step Functions orchestrates, and the old object versions are deleted so the erasure cannot be undone.</li>
+					<li><strong>S3 Batch Operations has no "delete objects" operation.</strong> Its operations include copy, tagging, restore, Object Lock settings, replication and <em>Invoke Lambda</em>; bulk deletes go through a Lambda function or lifecycle expiration.</li>
+				</ul>
+				<div class="code"><span class="file">Erase a customer from an Iceberg table (Athena)</span>
+<pre><code>DELETE FROM retail.customer_events
+WHERE customer_id = 48213;
+
+<span class="c">-- rewrite files, then expire snapshots</span>
+OPTIMIZE retail.customer_events
+REWRITE DATA USING BIN_PACK;
+VACUUM retail.customer_events;</code></pre></div>
+
+				<h3>Deleting in Redshift and DynamoDB</h3>
+				<p>Redshift <code>DELETE</code> only marks rows; the space is reclaimed by a vacuum. Redshift runs a <strong>DELETE ONLY vacuum automatically</strong> in the background, but it pauses under load, so a compliance job can run one explicitly. To empty a table, <code>TRUNCATE</code> is much faster and needs no vacuum &mdash; but it commits the current transaction.</p>
+				<div class="code"><span class="file">Redshift: delete and reclaim</span>
+<pre><code>DELETE FROM sales
+WHERE customer_id = 48213;
+
+VACUUM DELETE ONLY sales TO 95 PERCENT;</code></pre></div>
+				<p>In DynamoDB, <code>DeleteItem</code> removes an item immediately and TTL removes it within days. Neither touches backups.</p>
+
+				<h3>Copies that outlive the delete</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Copy</th><th>How long it keeps deleted data</th></tr></thead>
+						<tbody>
+							<tr><td>S3 noncurrent versions</td><td data-label="How long it keeps deleted data">Until a version-ID delete or <code>NoncurrentVersionExpiration</code></td></tr>
+							<tr><td>S3 replicas</td><td data-label="How long it keeps deleted data">Version-ID deletes are <strong>never replicated</strong>; delete the replica separately</td></tr>
+							<tr><td>DynamoDB PITR</td><td data-label="How long it keeps deleted data">Up to 35 days of history; deleting a PITR-enabled table leaves a system backup for 35 days</td></tr>
+							<tr><td>DynamoDB on-demand backups</td><td data-label="How long it keeps deleted data">Until you delete the backup</td></tr>
+							<tr><td>RDS automated backups</td><td data-label="How long it keeps deleted data">0&ndash;35 days (default 1 day through the API and CLI, 7 in the console)</td></tr>
+							<tr><td>RDS and Redshift manual snapshots</td><td data-label="How long it keeps deleted data">Until deleted &mdash; they survive deletion of the instance or cluster</td></tr>
+							<tr><td>CloudWatch Logs</td><td data-label="How long it keeps deleted data"><strong>Forever by default</strong>; set a log group retention (1 day to 10 years)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>A common design is to <strong>keep backups short</strong> (for example 35 days) and document that erased data ages out of them within that window, rather than editing backups. Retention settings are then part of the compliance answer, not an afterthought.</p></div>
+
+				<h3>Preventing deletion</h3>
+				<p>Legal requirements sometimes forbid deletion. <strong>S3 Object Lock</strong> in compliance mode and <strong>legal holds</strong> (see <a href="#s4">versioning</a>) block deletes in S3. For backups, <strong>AWS Backup Vault Lock</strong> does the same:</p>
+				<ul>
+					<li><strong>Governance mode</strong> can be removed by users with the right IAM permissions.</li>
+					<li><strong>Compliance mode</strong> has a grace period of at least <strong>72 hours</strong> (<code>ChangeableForDays</code>, 3 to 36,500). After it ends the lock is <strong>immutable</strong> &mdash; not even AWS can remove it.</li>
+					<li>Minimum and maximum retention settings make backup jobs that do not comply fail.</li>
+				</ul>
+				<div class="code"><span class="file">Lock a backup vault: 7 to 35 days, compliance</span>
+<pre><code>aws backup put-backup-vault-lock-configuration \
+  --backup-vault-name retail-vault \
+  --changeable-for-days 3 \
+  --min-retention-days 7 \
+  --max-retention-days 35</code></pre></div>
+				<div class="callout trap"><p>Deleting Glacier Flexible Retrieval or Deep Archive objects before 90 or 180 days incurs a pro-rated <strong>early-deletion charge</strong>. A legal deletion is still required, but budget for it.</p></div>
+			</div>
+
+			<!-- ===== 2.3.6 ===== -->
+			<h2 id="s6">Resiliency</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3.6</span><span class="skill-text">Protect data with appropriate resiliency and availability.</span></p>
+				<p>Start with two numbers from the AWS disaster recovery whitepaper. <strong>RPO</strong> (recovery point objective) is the "maximum acceptable amount of time since the last data recovery point" &mdash; how much data you can lose. <strong>RTO</strong> (recovery time objective) is the "maximum acceptable delay between the interruption of service and restoration of service" &mdash; how long you can be down. Lower numbers cost more.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Strategy</th><th>What runs in the recovery Region</th><th>RPO / RTO</th></tr></thead>
+						<tbody>
+							<tr><td>Backup and restore</td><td data-label="What runs in the recovery Region">Backups only</td><td data-label="RPO / RTO">Hours; cheapest</td></tr>
+							<tr><td>Pilot light</td><td data-label="What runs in the recovery Region">Data replicated and live; compute switched off</td><td data-label="RPO / RTO">Minutes / tens of minutes</td></tr>
+							<tr><td>Warm standby</td><td data-label="What runs in the recovery Region">A scaled-down but working copy that can take traffic at once</td><td data-label="RPO / RTO">Seconds / minutes</td></tr>
+							<tr><td>Multi-site active/active</td><td data-label="What runs in the recovery Region">Full capacity serving traffic</td><td data-label="RPO / RTO">Near zero; most expensive</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>Replication protects against losing a Region, not against <strong>bad data</strong>: a corrupting job or accidental delete replicates too. Even active/active designs need point-in-time backups.</p></div>
+
+				<h3>Amazon S3</h3>
+				<p>S3 Standard is designed for 99.99% availability across at least three Availability Zones. One Zone-IA (99.5%) and S3 Express One Zone keep data in <strong>one AZ</strong> and lose it if that AZ is destroyed &mdash; use them only for data you can recreate.</p>
+				<p><strong>S3 Replication</strong> copies objects to another bucket in the same Region (SRR) or another Region (CRR), keeping metadata and version IDs. Both buckets need versioning, and S3 needs an IAM role.</p>
+				<ul>
+					<li><strong>Existing objects are not replicated</strong> by a new rule; use <strong>S3 Batch Replication</strong> for them and for objects that failed.</li>
+					<li><strong>Replication Time Control</strong> replicates "99.9 percent" of objects within <strong>15 minutes</strong>, backed by an SLA, with metrics and missed-threshold events.</li>
+					<li><strong>Not replicated</strong>: lifecycle actions (including lifecycle delete markers), version-ID deletes, objects in Glacier Flexible Retrieval or Deep Archive, and bucket settings. Delete markers replicate only if delete marker replication is enabled.</li>
+					<li><strong>Replica modification sync</strong> copies tag, ACL and Object Lock changes back from the replica, for two-way setups. <strong>Multi-Region Access Points</strong> give one global endpoint that routes to the nearest bucket and supports failover.</li>
+				</ul>
+				<div class="code"><span class="file">repl.json: curated zone to the DR Region</span>
+<pre><code>{
+  "Role":
+    "arn:aws:iam::111111111111:role/s3-repl",
+  "Rules": [{
+    "ID": "dr-curated",
+    "Status": "Enabled",
+    "Priority": 1,
+    "Filter": {"Prefix": "curated/"},
+    "DeleteMarkerReplication":
+      {"Status": "Enabled"},
+    "Destination": {
+      "Bucket":
+        "arn:aws:s3:::retail-lake-dr",
+      "StorageClass": "STANDARD_IA",
+      "ReplicationTime": {
+        "Status": "Enabled",
+        "Time": {"Minutes": 15}},
+      "Metrics": {
+        "Status": "Enabled",
+        "EventThreshold": {"Minutes": 15}}
+    }
+  }]
+}</code></pre></div>
+				<div class="code"><span class="file">Apply it</span>
+<pre><code>aws s3api put-bucket-replication \
+  --bucket retail-lake \
+  --replication-configuration \
+    file://repl.json</code></pre></div>
+
+				<h3>DynamoDB</h3>
+				<ul>
+					<li><strong>Point-in-time recovery</strong> restores to any second in the recovery window, up to about five minutes ago. Since January 2025 the window is <strong>configurable from 1 to 35 days</strong> (default 35), but a shorter window does not lower the price. A restore <strong>always creates a new table</strong>, without the original's tags, TTL setting or stream.</li>
+					<li><strong>On-demand backups</strong> are kept until you delete them. Copying DynamoDB backups to another Region or account needs AWS Backup's advanced DynamoDB features.</li>
+					<li><strong>Global tables</strong> raise the availability SLA to 99.999%. The default mode (multi-Region eventual consistency) replicates "typically within a second" with last-writer-wins conflicts. <strong>Multi-Region strong consistency</strong> (GA June 2025) gives an RPO of zero across exactly three Regions, but no TTL, LSIs or transactions.</li>
+				</ul>
+				<div class="code"><span class="file">PITR with a two-week window, then a restore</span>
+<pre><code>aws dynamodb update-continuous-backups \
+  --table-name loyalty \
+  --point-in-time-recovery-specification \
+    '{"PointInTimeRecoveryEnabled": true,
+      "RecoveryPeriodInDays": 14}'
+
+aws dynamodb restore-table-to-point-in-time \
+  --source-table-name loyalty \
+  --target-table-name loyalty-restored \
+  --restore-date-time 2026-11-07T08:00:00Z</code></pre></div>
+
+				<h3>RDS and Aurora</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Feature</th><th>What it protects against</th><th>Detail</th></tr></thead>
+						<tbody>
+							<tr><td>Multi-AZ DB instance</td><td data-label="What it protects against">AZ failure</td><td data-label="Detail">One synchronous standby that <strong>cannot serve reads</strong></td></tr>
+							<tr><td>Multi-AZ DB cluster</td><td data-label="What it protects against">AZ failure, with read scaling</td><td data-label="Detail">A writer and <strong>two readable standbys</strong> in three AZs</td></tr>
+							<tr><td>Automated backups and PITR</td><td data-label="What it protects against">Bad changes</td><td data-label="Detail">Logs shipped to S3 every 5 minutes; a restore creates a new instance</td></tr>
+							<tr><td>Cross-Region backup replication</td><td data-label="What it protects against">Region loss</td><td data-label="Detail">Copies snapshots and logs to another Region</td></tr>
+							<tr><td>Aurora storage</td><td data-label="What it protects against">Disk and AZ failure</td><td data-label="Detail">Copies of the data across three AZs, behind every Aurora cluster</td></tr>
+							<tr><td>Aurora Backtrack</td><td data-label="What it protects against">Bad changes, fast</td><td data-label="Detail"><strong>Aurora MySQL only</strong>; rewinds the cluster in place, up to 72 hours</td></tr>
+							<tr><td>Aurora Global Database</td><td data-label="What it protects against">Region loss</td><td data-label="Detail">Up to 10 secondary Regions, lag typically under a second; RPO in seconds and RTO in minutes on failover</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Redshift</h3>
+				<ul>
+					<li><strong>Automated snapshots</strong> are taken about every 8 hours or 5 GB per node of change, and kept <strong>1 day by default</strong> (1&ndash;35). On RA3 and RG they cannot be disabled. <strong>Manual snapshots</strong> are kept until you delete them.</li>
+					<li><strong>Cross-Region snapshot copy</strong> sends snapshots to one other Region; copied automated snapshots are kept 7 days by default. Redshift is in AWS Backup, but AWS Backup cannot copy Redshift backups across Regions or accounts, so use this native feature.</li>
+					<li><strong>Serverless recovery points</strong> are created every 30 minutes and kept for <strong>24 hours</strong>; take snapshots for anything longer.</li>
+					<li><strong>Relocation</strong> moves a cluster to another AZ in the same Region, keeping its endpoint; Multi-AZ (<a href="d2-task-2-1.html#s2">Task 2.1</a>) keeps it running through an AZ failure.</li>
+				</ul>
+				<div class="code"><span class="file">Copy warehouse snapshots to the DR Region</span>
+<pre><code>aws redshift enable-snapshot-copy \
+  --cluster-identifier retail-dw \
+  --destination-region us-west-2 \
+  --retention-period 7</code></pre></div>
+
+				<h3>Streams, EMR and AWS Backup</h3>
+				<ul>
+					<li><strong>Kinesis Data Streams</strong> "synchronously replicates data across three Availability Zones". <strong>MSK Replicator</strong> copies topics, configuration, ACLs and consumer offsets to another MSK cluster in the same account, in the same or another Region.</li>
+					<li><strong>EMR</strong> clusters run in one AZ; keep durable data in S3 so a lost cluster costs only compute time.</li>
+					<li><strong>AWS Backup</strong> centralizes backup plans, retention and cross-Region and cross-account copies for S3, DynamoDB, RDS, Aurora, Redshift, DocumentDB, Neptune and Timestream. A <strong>logically air-gapped vault</strong> adds built-in compliance locking and can be shared with a recovery account.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>COPY, not INSERT, for bulk loads. Split unsplittable files (JSON, gzip CSV) to 1 MB&ndash;1 GB compressed, in a multiple of the slice count; uncompressed CSV, Parquet and ORC of 128 MB or more split automatically. Use a <strong>manifest</strong> to load exactly the right files, and <strong><code>SYS_LOAD_ERROR_DETAIL</code></strong> to see errors on Serverless.</li>
+				<li><strong>Parquet/ORC COPY</strong> maps by position, same Region only, no <code>MAXERROR</code>. <strong>COPY JOB</strong> auto-loads new files only (not existing ones), needs an S3 event integration and an explicit role. Upsert by staging and <code>MERGE</code>.</li>
+				<li>UNLOAD: Parquet is smaller and faster; <code>PARTITION BY</code> writes Hive folders but does not update the catalog; files cap at <strong>6.2 GB</strong>; no <code>HEADER</code> with Parquet; <code>CLEANPATH</code> or <code>ALLOWOVERWRITE</code> if files exist. Pipelines call the Redshift Data API.</li>
+				<li>Storage class minimums: IA 30 days, Glacier Instant and Flexible 90, Deep Archive 180; IA classes bill at least 128 KB per object. Transitions only go colder, and <strong>objects under 128 KB do not transition by default</strong> (since September 2024). Up to 1,000 rules per bucket.</li>
+				<li>Restores: Flexible Retrieval Expedited 1&ndash;5 minutes, Standard 3&ndash;5 hours, Bulk 5&ndash;12; Deep Archive Standard within 12 hours, Bulk within 48, no Expedited. A restore is a temporary copy. Intelligent-Tiering suits unknown access patterns.</li>
+				<li>Expiration rounds up to the next midnight UTC and stops billing when eligible. In a versioned bucket it <strong>only adds a delete marker</strong> &mdash; add <code>NoncurrentVersionExpiration</code>. <code>AbortIncompleteMultipartUpload</code> is the only cleanup for orphaned parts, and it and <code>ExpiredObjectDeleteMarker</code> cannot use tag filters.</li>
+				<li>Versioning can be suspended but never removed, and every version is billed. MFA Delete is root-only, CLI-only and incompatible with lifecycle rules. Object Lock compliance mode cannot be bypassed by anyone; legal holds have no expiry.</li>
+				<li>DynamoDB TTL: epoch seconds in a Number attribute, deletes "within a few days" at no write cost, expired items still readable until then. TTL deletes show in Streams as <code>Service</code> / <code>dynamodb.amazonaws.com</code> &mdash; the hook to archive them. Strongly consistent global tables cannot use TTL.</li>
+				<li>Erasure must reach every copy: Iceberg <code>DELETE</code> plus snapshot expiry, rewrite jobs (S3 Find and Forget) for plain files, old versions, replicas, backups and logs. <strong>S3 Batch Operations cannot delete objects</strong> directly. Redshift reclaims deleted rows with (automatic) <code>VACUUM DELETE ONLY</code>.</li>
+				<li>Vault Lock compliance mode becomes immutable after a grace period of at least 72 hours. CloudWatch Logs never expire unless you set retention.</li>
+				<li>Resiliency: replication does not protect against bad data, so keep point-in-time backups. S3 replication skips existing objects (use Batch Replication), lifecycle actions and version-ID deletes; RTC covers 99.9% within 15 minutes.</li>
+				<li>DynamoDB PITR is 1&ndash;35 days and restores to a new table; global tables give 99.999%, with strong consistency in exactly three Regions. RDS Multi-AZ instance standbys cannot serve reads, Multi-AZ clusters have two readable standbys; Backtrack is Aurora MySQL only. Redshift automated snapshots keep 1 day by default, Serverless recovery points 24 hours; copy across Regions with native snapshot copy.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-2.html"><small>Previous</small>Task 2.2: Understand data cataloging systems</a>
+				<a class="next" href="d2-task-2-4.html"><small>Next</small>Task 2.4: Design data models and schema evolution</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Data Engineer &ndash; Associate (DEA-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

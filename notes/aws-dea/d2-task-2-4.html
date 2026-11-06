@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.4: Design Data Models and Schema Evolution | AWS DEA-C01 Notes</title>
+	<meta name="description" content="DEA-C01 Task 2.4 study guide: schema design for Redshift, DynamoDB and Lake Formation data lakes, handling schema evolution in Athena, Iceberg, Redshift and Glue, slowly changing dimensions, schema conversion with AWS DMS Schema Conversion and AWS SCT, data lineage with SageMaker ML Lineage Tracking and SageMaker Catalog, partitioning, bucketing and compression best practices, and vectorization with Amazon Bedrock knowledge bases.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dea.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DEA-C01</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Data Store Management &middot; 26%</span>
+		<h1>Task 2.4: Design data models and schema evolution</h1>
+		<p>How data is shaped decides how fast and cheaply it can be used. This task covers designing schemas for the warehouse, the key-value store and the lake, coping when the data changes shape, converting schemas between engines, tracing where data came from, laying files out for speed, and turning text into vectors for search.</p>
+		<div class="tags"><span class="tag code">DEA-C01</span><span class="tag">Amazon Redshift</span><span class="tag">DynamoDB</span><span class="tag">Schema evolution</span><span class="tag">DMS Schema Conversion</span><span class="tag">Data lineage</span><span class="tag">Bedrock knowledge bases</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Schema design</a></li>
+				<li><a href="#s2">Changing data</a></li>
+				<li><a href="#s3">Schema conversion</a></li>
+				<li><a href="#s4">Data lineage</a></li>
+				<li><a href="#s5">Optimization</a></li>
+				<li><a href="#s6">Vectorization</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.4</span>
+				<p><strong>Design data models and schema evolution.</strong></p>
+			</div>
+			<p>Six skills spanning modelling, migration, governance and AI. This page completes Domain 2, which is 26% of the scored exam. Expect questions that hinge on a single rule: which <code>ALTER TABLE</code> Redshift allows, which column change breaks a Parquet table in Athena, which index pattern spreads a hot DynamoDB key, or which chunking setting cannot be changed later.</p>
+			<p>The examples continue the <strong>retail analytics platform</strong> in account 111111111111: a Redshift sales star schema, the DynamoDB <code>loyalty</code> table, the <code>retail-lake</code> bucket, a legacy Oracle orders database moving to Aurora PostgreSQL, and a product-documentation knowledge base.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.4.1</td><td data-label="What you need to be able to do">Design schemas for Redshift, DynamoDB and Lake Formation</td></tr>
+						<tr><td>2.4.2</td><td data-label="What you need to be able to do">Handle changes in the characteristics of data</td></tr>
+						<tr><td>2.4.3</td><td data-label="What you need to be able to do">Convert schemas with AWS SCT and DMS Schema Conversion</td></tr>
+						<tr><td>2.4.4</td><td data-label="What you need to be able to do">Establish data lineage with SageMaker tools</td></tr>
+						<tr><td>2.4.5</td><td data-label="What you need to be able to do">Apply indexing, partitioning and compression best practices</td></tr>
+						<tr><td>2.4.6</td><td data-label="What you need to be able to do">Describe vectorization concepts, such as Bedrock knowledge bases</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout note"><p>Redshift distribution and sort keys and DynamoDB index rules are on <a href="d2-task-2-1.html#s2">Task 2.1</a>, vector index types (HNSW, IVF) are on <a href="d2-task-2-1.html#s8">Task 2.1</a>, and the Glue Schema Registry's compatibility modes are on <a href="d1-task-1-4.html#s8">Task 1.4</a>. This page builds on them rather than repeating them.</p></div>
+
+			<!-- ===== 2.4.1 ===== -->
+			<h2 id="s1">Schema design</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.1</span><span class="skill-text">Design schemas for Amazon Redshift, DynamoDB, and Lake Formation.</span></p>
+				<p>The three stores ask for opposite habits. Redshift rewards a modelled warehouse with wide fact tables and compact columns. DynamoDB rewards designing backwards from the queries, often in a single table. A data lake rewards a clear layering of buckets and a predictable folder layout.</p>
+
+				<h3>Redshift: facts, dimensions and columns</h3>
+				<p>Redshift "is designed to work effectively with whatever schema design you choose", and AWS's distribution guidance uses a <strong>star schema</strong> &mdash; a fact table of events surrounded by dimension tables &mdash; as its example. Distribute the fact table and its <strong>largest dimension</strong> on their common join column so matching rows sit together, and let smaller dimensions use AUTO or ALL.</p>
+				<div class="code"><span class="file">Sales star schema: fact and largest dimension</span>
+<pre><code>CREATE TABLE dim_customer (
+  customer_id  BIGINT NOT NULL,
+  tier         VARCHAR(16),
+  region       CHAR(2),
+  PRIMARY KEY (customer_id)
+)
+DISTKEY (customer_id);
+
+CREATE TABLE fact_sales (
+  order_id     BIGINT NOT NULL,
+  customer_id  BIGINT NOT NULL,
+  store_id     INT,
+  sold_at      TIMESTAMP,
+  amount       DECIMAL(12,2),
+  basket       SUPER
+)
+DISTKEY (customer_id)
+SORTKEY (sold_at);</code></pre></div>
+				<ul>
+					<li><strong>Column sizes</strong>: "Don't make it a practice to use the maximum column size for convenience." <code>CHAR</code> holds single-byte characters only (up to 4,096 bytes, blank-padded); <code>VARCHAR</code> holds multibyte characters, up to 65,535 bytes, and defaults to 256 when no length is given. Use real date and time types for dates.</li>
+					<li><strong>Compression</strong>: <code>ENCODE AUTO</code> is the default. <strong>Specifying an encoding on any column turns ENCODE AUTO off for the whole table.</strong> Without it, sort key columns get RAW, numbers, dates and timestamps get AZ64, and strings get LZO. <code>ANALYZE COMPRESSION</code> only <em>recommends</em> encodings, and takes an exclusive lock while it does.</li>
+					<li><strong>Constraints</strong>: primary, foreign and unique keys are "informational only" &mdash; not enforced, but used by the query planner. AWS advises not declaring them unless your loads guarantee them, because wrong constraints can give wrong results.</li>
+					<li><strong><code>IDENTITY</code></strong> columns generate unique (not consecutive or ordered) values for <code>INT</code> or <code>BIGINT</code> surrogate keys.</li>
+				</ul>
+
+				<h3>Semi-structured data: SUPER</h3>
+				<p>The <code>SUPER</code> type stores JSON-like nested data &mdash; the basket of items in each sale &mdash; up to <strong>16 MB per value</strong>, and PartiQL navigates and unnests it in SQL. Set <code>enable_case_sensitive_super_attribute</code> when JSON keys differ only by case.</p>
+				<div class="code"><span class="file">Unnest the basket array</span>
+<pre><code>SELECT f.order_id, item.sku, item.qty
+FROM fact_sales AS f,
+     f.basket AS item
+WHERE item.qty &gt; 1;</code></pre></div>
+				<div class="callout trap"><p><strong>Redshift Spectrum external tables can only be referenced in a late-binding view</strong> &mdash; a view created <code>WITH NO SCHEMA BINDING</code>, with every table name schema-qualified. A normal view over an external table fails.</p></div>
+				<div class="code"><span class="file">Recent sales plus the lake archive</span>
+<pre><code>CREATE VIEW all_sales AS
+SELECT order_id, amount
+FROM public.fact_sales
+UNION ALL
+SELECT order_id, amount
+FROM lake.sales_archive
+WITH NO SCHEMA BINDING;</code></pre></div>
+
+				<h3>DynamoDB: design from the access patterns</h3>
+				<p>AWS's rule: "You shouldn't start designing your schema&hellip; until you know the questions it will need to answer." List the access patterns first, then choose keys that answer each one with a <code>GetItem</code> or <code>Query</code>, and "maintain as few tables as possible". A <strong>single table</strong> can hold several entity types, distinguished by key prefixes.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>pk</th><th>sk</th><th>Holds</th></tr></thead>
+						<tbody>
+							<tr><td><code>CUST#48213</code></td><td data-label="sk"><code>PROFILE</code></td><td data-label="Holds">Name, tier, join date</td></tr>
+							<tr><td><code>CUST#48213</code></td><td data-label="sk"><code>ORDER#2026-11-07#9001</code></td><td data-label="Holds">One order; <code>begins_with(sk, "ORDER#2026-11")</code> lists a month</td></tr>
+							<tr><td><code>CUST#48213</code></td><td data-label="sk"><code>OFFER#BF26</code></td><td data-label="Holds">A loyalty offer with an <code>expireAt</code> TTL</td></tr>
+							<tr><td><code>STORE#12</code></td><td data-label="sk"><code>CUST#48213</code></td><td data-label="Holds">An edge: customer shops at store (adjacency list)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Pattern</th><th>Solves</th></tr></thead>
+						<tbody>
+							<tr><td>Composite sort key</td><td data-label="Solves">Hierarchies such as <code>ORDER#date#id</code>, queried with <code>begins_with</code> and <code>between</code></td></tr>
+							<tr><td>Adjacency list</td><td data-label="Solves">Many-to-many relationships: each edge is an item, and a GSI on the sort key gives the reverse lookup. For multi-hop graph queries AWS points to Neptune</td></tr>
+							<tr><td>Sparse index</td><td data-label="Solves">Only items that have the index key appear in a GSI, so an index on <code>open_ticket</code> holds only open tickets</td></tr>
+							<tr><td>GSI overloading</td><td data-label="Solves">One GSI on a generic attribute serves several entity types, staying within the 20-GSI quota</td></tr>
+							<tr><td>Write sharding</td><td data-label="Solves">A hot key such as today's date: add a random or calculated suffix to spread writes</td></tr>
+							<tr><td>Table per period</td><td data-label="Solves">Time series: a new table each period, older tables scaled down and moved to Standard-IA</td></tr>
+							<tr><td>Vertical partitioning or S3 pointer</td><td data-label="Solves">Items near the 400 KB limit: split across sort keys, or store the object in S3</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Write sharding matters because each partition is "designed to deliver a maximum capacity of <strong>3,000 read units per second and 1,000 write units per second</strong>". Burst capacity keeps up to five minutes of unused capacity, and adaptive capacity can isolate a hot item onto its own partition &mdash; but not beyond those per-partition limits.</p>
+				<div class="code"><span class="file">Calculated shard suffix (Python)</span>
+<pre><code>import zlib
+
+SHARDS = 10
+
+def shard_key(day, order_id):
+    <span class="c"># same order always maps to same shard</span>
+    n = zlib.crc32(order_id.encode())
+    return f"{day}#{n % SHARDS + 1}"</code></pre></div>
+				<div class="callout note"><p>Since November 2025, a GSI's partition and sort keys can each have <strong>up to four attributes</strong>, so you no longer need synthetic <code>A#B#C</code> strings for index keys. Sort key attributes are matched left to right. Base-table keys are still single attributes.</p></div>
+
+				<h3>Lake Formation: the data lake's shape</h3>
+				<p>Lake Formation governs databases and tables in the Glue Data Catalog, so "designing a schema for Lake Formation" means designing the lake those tables describe. AWS Prescriptive Guidance recommends at least three <strong>layers, each in its own bucket</strong>:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Layer</th><th>Holds</th></tr></thead>
+						<tbody>
+							<tr><td>Landing (optional)</td><td data-label="Holds">Incoming data containing PII, masked before it reaches raw</td></tr>
+							<tr><td>Raw</td><td data-label="Holds">Data in its original format, with versioning on</td></tr>
+							<tr><td>Stage</td><td data-label="Holds">Cleaned and converted (for example CSV to Parquet), cataloged</td></tr>
+							<tr><td>Analytics</td><td data-label="Holds">Aggregated, consumption-ready tables</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Within each layer, use Hive-style <code>key=value</code> folders with lower-case names, one table per folder tree, and Iceberg for tables that need updates. Separate buckets per layer make Lake Formation grants and lifecycle rules simple: analysts get the analytics layer, only pipelines touch raw.</p>
+				<div class="callout retired"><p><strong>Lake Formation governed tables</strong> (ACID tables managed by Lake Formation) no longer have user-guide documentation. Use <strong>Apache Iceberg</strong> for transactional lake tables.</p></div>
+			</div>
+
+			<!-- ===== 2.4.2 ===== -->
+			<h2 id="s2">Changing data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.2</span><span class="skill-text">Address changes to the characteristics of data.</span></p>
+				<p>Data changes shape (new or renamed columns, new types), meaning (a customer moves region), and size or speed (volume doubles before the holidays). Each needs a different response.</p>
+
+				<h3>Schema changes in Athena tables</h3>
+				<p>Whether a change is safe depends on how the format matches columns. By default <strong>Parquet is read by name</strong> and <strong>ORC is read by index</strong> (position), which makes them safe for opposite changes.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Change</th><th>Parquet (by name)</th><th>ORC (by index)</th><th>CSV / TSV</th><th>JSON, Avro</th></tr></thead>
+						<tbody>
+							<tr><td>Add column at end</td><td data-label="Parquet (by name)">Safe</td><td data-label="ORC (by index)">Safe</td><td data-label="CSV / TSV">Safe</td><td data-label="JSON, Avro">Safe</td></tr>
+							<tr><td>Add column in the middle</td><td data-label="Parquet (by name)">Safe</td><td data-label="ORC (by index)">Breaks</td><td data-label="CSV / TSV">Breaks</td><td data-label="JSON, Avro">Safe</td></tr>
+							<tr><td>Drop column</td><td data-label="Parquet (by name)">Safe</td><td data-label="ORC (by index)">Breaks</td><td data-label="CSV / TSV">Breaks</td><td data-label="JSON, Avro">Safe</td></tr>
+							<tr><td>Reorder columns</td><td data-label="Parquet (by name)">Safe</td><td data-label="ORC (by index)">Breaks</td><td data-label="CSV / TSV">Breaks</td><td data-label="JSON, Avro">Safe</td></tr>
+							<tr><td>Rename column</td><td data-label="Parquet (by name)">Breaks</td><td data-label="ORC (by index)">Safe</td><td data-label="CSV / TSV">Safe</td><td data-label="JSON, Avro">Breaks</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Adding columns at the end is safe everywhere. Type changes are allowed in every format but need testing; for Parquet and ORC they work only on partitioned tables.</p>
+				<p><strong>Iceberg</strong> removes most of this worry: add, drop, rename and reorder are metadata-only changes that never rewrite data. Type promotion is limited to <strong>int to bigint, float to double, and a higher decimal precision</strong>, and Athena does not support <code>REPLACE COLUMNS</code> on Iceberg tables.</p>
+				<div class="code"><span class="file">Evolve an Iceberg table (Athena)</span>
+<pre><code>ALTER TABLE retail.orders_ice
+ADD COLUMNS (channel string);
+
+<span class="c">-- rename and move in one statement</span>
+ALTER TABLE retail.orders_ice
+CHANGE status order_status string
+AFTER order_id;</code></pre></div>
+
+				<h3>Schema changes in Redshift</h3>
+				<div class="callout trap"><p>Redshift's <code>ALTER TABLE</code> is narrow. <code>ADD COLUMN</code> takes <strong>one column per statement</strong> and cannot add a distribution key, sort key or identity column. <code>DROP COLUMN</code> cannot drop the distribution key or a sort key column. And <strong><code>ALTER COLUMN ... TYPE</code> only changes the size of a <code>VARCHAR</code></strong> &mdash; any other type change means adding a new column, copying data and dropping the old one, or rebuilding the table.</p></div>
+				<div class="code"><span class="file">What Redshift allows</span>
+<pre><code>ALTER TABLE dim_customer
+ADD COLUMN email VARCHAR(320);
+
+ALTER TABLE dim_customer
+ALTER COLUMN tier TYPE VARCHAR(32);
+
+ALTER TABLE dim_customer
+RENAME COLUMN region TO region_code;</code></pre></div>
+
+				<h3>Inconsistent types in Glue</h3>
+				<p>When one field has different types in different records &mdash; <code>amount</code> is a number in most files and a string in some &mdash; a Glue DynamicFrame keeps both as a <strong>choice type</strong> instead of failing. <code>resolveChoice</code> settles it: <code>cast:type</code> converts, <code>make_cols</code> splits into <code>amount_double</code> and <code>amount_string</code>, <code>make_struct</code> keeps both in a struct, <code>project:type</code> keeps one type and drops the rest, and <code>match_catalog</code> casts to the catalog table's types.</p>
+				<div class="code"><span class="file">Resolve choice types (Glue PySpark)</span>
+<pre><code><span class="c"># one field: force a numeric type</span>
+fixed = dyf.resolveChoice(
+    specs=[("amount", "cast:double")])
+
+<span class="c"># every choice: keep both as columns</span>
+split = dyf.resolveChoice(
+    choice="make_cols")</code></pre></div>
+
+				<h3>Changes in meaning: slowly changing dimensions</h3>
+				<p>When a customer moves from the <code>WA</code> to the <code>CA</code> region, should last year's sales report the old region or the new one?</p>
+				<ul>
+					<li><strong>Type 1</strong> overwrites the value. History is lost, which is fine for corrections. A <code>MERGE</code> upsert does it.</li>
+					<li><strong>Type 2</strong> keeps history: close the current row with an end timestamp and insert a new current row. Facts join to the row that was valid at the time.</li>
+				</ul>
+				<div class="code"><span class="file">Type 2 change in one transaction (Redshift)</span>
+<pre><code>BEGIN;
+
+<span class="c">-- close rows whose region changed</span>
+UPDATE dim_customer_hist d
+SET valid_to = s.change_ts,
+    is_current = FALSE
+FROM stg_customer s
+WHERE d.customer_id = s.customer_id
+  AND d.is_current
+  AND d.region &lt;&gt; s.region;
+
+<span class="c">-- add a current row where none exists</span>
+INSERT INTO dim_customer_hist
+SELECT s.customer_id, s.region,
+       s.change_ts, '2999-12-31', TRUE
+FROM stg_customer s
+LEFT JOIN dim_customer_hist d
+  ON d.customer_id = s.customer_id
+ AND d.is_current
+WHERE d.customer_id IS NULL;
+
+END;</code></pre></div>
+
+				<h3>Changes in volume and quality</h3>
+				<ul>
+					<li><strong>Redshift resize</strong>: <strong>elastic resize</strong> adds or removes nodes or changes node type in about ten minutes on average, within limits (generally up to four times larger or a quarter the size). <strong>Classic resize</strong> handles bigger changes and keeps the cluster readable and writable while it runs in the background. Serverless simply scales RPUs.</li>
+					<li><strong>Partitioning</strong> chosen for last year's volume may be too fine or too coarse now; Iceberg's partition evolution changes it without rewriting old data.</li>
+					<li><strong>Drift detection</strong>: Glue Data Quality rules such as <code>ColumnCount</code>, <code>SchemaMatch</code> and <code>ColumnDataType</code> catch shape changes. <strong>Dynamic rules</strong> compare with recent runs (<code>last(k)</code>, supported in Glue ETL only), and <strong>anomaly detection</strong> learns trend and seasonality after at least three data points. Data quality is covered in depth in Domain 3.</li>
+				</ul>
+				<div class="code"><span class="file">DQDL: alert when the data changes shape</span>
+<pre><code>Rules = [
+  ColumnCount = 6,
+  RowCount &gt; avg(last(3)) * 0.5,
+  DistinctValuesCount "store_id"
+    between min(last(10)) - 1
+    and max(last(10)) + 1
+]</code></pre></div>
+			</div>
+
+			<!-- ===== 2.4.3 ===== -->
+			<h2 id="s3">Schema conversion</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.3</span><span class="skill-text">Perform schema conversion (for example, by using AWS SCT and AWS DMS Schema Conversion).</span></p>
+				<p>Moving between <em>different</em> database engines (heterogeneous migration) needs two things: the schema and code objects rewritten for the target, and the data copied. AWS splits these: <strong>schema conversion</strong> handles tables, views, stored procedures and functions; <strong>AWS DMS</strong> moves the rows. The retail platform is converting its legacy Oracle orders database to Aurora PostgreSQL.</p>
+
+				<h3>DMS Schema Conversion</h3>
+				<p><strong>DMS Schema Conversion</strong> (DMS SC) is a "fully managed, web-based feature that builds on the AWS SCT conversion engine", run from the DMS console or API. It converts schema, not data. It uses three resources:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Resource</th><th>Holds</th></tr></thead>
+						<tbody>
+							<tr><td>Instance profile</td><td data-label="Holds">Network (VPC and subnets), security and encryption settings for the conversion</td></tr>
+							<tr><td>Data provider</td><td data-label="Holds">Connection details for the source or the target database</td></tr>
+							<tr><td>Migration project</td><td data-label="Holds">Source and target data providers, the instance profile, and the Secrets Manager secrets with credentials</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ol class="steps">
+					<li><strong>Assess.</strong> The assessment report shows what converts automatically and lists <strong>action items</strong> needing manual work, exportable as PDF or CSV.</li>
+					<li><strong>Convert.</strong> DMS SC converts the selected objects, applying any transformation rules. An <strong>extension pack</strong> emulates source features the target lacks. A <strong>virtual target</strong> lets you convert before the target database exists.</li>
+					<li><strong>Apply or export.</strong> Apply the converted code to the target, or save it as SQL in S3 for review.</li>
+					<li><strong>Move the data.</strong> A DMS task (full load plus CDC) copies rows into the converted schema.</li>
+				</ol>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Source</th><th>Targets in DMS SC</th></tr></thead>
+						<tbody>
+							<tr><td>Oracle</td><td data-label="Targets in DMS SC">Aurora/RDS PostgreSQL, Aurora/RDS MySQL, Amazon Redshift</td></tr>
+							<tr><td>SQL Server</td><td data-label="Targets in DMS SC">Aurora/RDS PostgreSQL, Aurora/RDS MySQL</td></tr>
+							<tr><td>Db2 LUW, SAP ASE</td><td data-label="Targets in DMS SC">Aurora/RDS PostgreSQL</td></tr>
+							<tr><td>Db2 for z/OS</td><td data-label="Targets in DMS SC">Aurora/RDS PostgreSQL, RDS for Db2 (API and CLI only)</td></tr>
+							<tr><td>PostgreSQL / MySQL</td><td data-label="Targets in DMS SC">Aurora/RDS MySQL / Aurora/RDS PostgreSQL</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p><strong>Generative AI conversion</strong> (generally available since December 2024) uses Bedrock models to convert code that rules cannot, such as complex procedures. It now covers the Oracle, SQL Server, Db2 and SAP ASE paths to PostgreSQL, but not triggers, dynamic SQL, indexes, constraints or column types.</p>
+				<div class="code"><span class="file">Describe the Oracle source</span>
+<pre><code>aws dms create-data-provider \
+  --data-provider-name orders-oracle \
+  --engine oracle \
+  --settings file://oracle.json</code></pre></div>
+				<div class="code"><span class="file">oracle.json</span>
+<pre><code>{
+  "OracleSettings": {
+    "ServerName": "db.example.com",
+    "Port": 1521,
+    "DatabaseName": "ORDERS",
+    "SslMode": "verify-full",
+    "CertificateArn":
+      "arn:aws:dms:us-east-1:111111111111:cert:EXAMPLE"
+  }
+}</code></pre></div>
+				<div class="code"><span class="file">Assess, then convert, the SALES schema</span>
+<pre><code>aws dms start-metadata-model-assessment \
+  --migration-project-identifier \
+    "$PROJECT_ARN" \
+  --selection-rules file://rules.json
+
+aws dms start-metadata-model-conversion \
+  --migration-project-identifier \
+    "$PROJECT_ARN" \
+  --selection-rules file://rules.json</code></pre></div>
+				<div class="code"><span class="file">rules.json</span>
+<pre><code>{
+  "rules": [{
+    "rule-type": "selection",
+    "rule-id": "1",
+    "rule-name": "1",
+    "object-locator": {
+      "server-name": "db.example.com",
+      "schema-name": "SALES"
+    },
+    "rule-action": "explicit"
+  }]
+}</code></pre></div>
+				<p><code>PROJECT_ARN</code> holds the ARN of the migration project created with <code>aws dms create-migration-project</code>, which links the two data providers, the instance profile and the secrets.</p>
+
+				<h3>AWS SCT</h3>
+				<p>The <strong>AWS Schema Conversion Tool</strong> is the desktop application DMS SC grew out of, and it is still published. AWS notes that "AWS SCT supports more source and target databases than DMS Schema Conversion". Reach for it when DMS SC does not cover the path:</p>
+				<ul>
+					<li><strong>Data warehouses to Redshift</strong>: Teradata, Oracle, Netezza, Greenplum, Vertica, Snowflake, BigQuery, Azure Synapse and SQL Server data warehouses, with <strong>data extraction agents</strong> that pull data in parallel. SCT can also recommend Redshift sort and distribution keys.</li>
+					<li><strong>ETL and application code</strong>: SSIS packages to Glue, Teradata BTEQ scripts to RSQL, and embedded SQL in applications.</li>
+					<li><strong>NoSQL</strong>: Apache Cassandra to DynamoDB.</li>
+				</ul>
+				<div class="callout note"><p>The exam guide's in-scope service list names DMS but <strong>not AWS SCT</strong>, while skill 2.4.3 names both. Expect DMS SC for managed, console-based conversions between relational engines, and SCT for warehouse migrations to Redshift and the less common paths.</p></div>
+
+				<h3>When no conversion is needed</h3>
+				<ul>
+					<li><strong>Homogeneous migrations</strong> (Oracle to RDS for Oracle, PostgreSQL to Aurora PostgreSQL) need no conversion. DMS <strong>homogeneous data migrations</strong> use native database tools and carry secondary objects such as functions and procedures with the data.</li>
+					<li><strong>Babelfish for Aurora PostgreSQL</strong> accepts SQL Server's wire protocol and T-SQL on port 1433, so SQL Server applications can move "with few code changes" instead of a full conversion.</li>
+				</ul>
+			</div>
+
+			<!-- ===== 2.4.4 ===== -->
+			<h2 id="s4">Data lineage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.4</span><span class="skill-text">Establish data lineage by using AWS tools (for example, Amazon SageMaker ML Lineage Tracking and Amazon SageMaker Catalog).</span></p>
+				<p><strong>Lineage</strong> records where data came from and what was done to it: this report reads <code>daily_sales</code>, which a Glue job built from <code>raw_pos</code>, which a crawler cataloged from S3. It answers "which dashboards break if I change this table?" (downstream) and "why is this number wrong?" (upstream), and it is evidence for auditors.</p>
+
+				<h3>SageMaker Catalog lineage</h3>
+				<p>SageMaker Catalog (built on Amazon DataZone) captures and draws <strong>OpenLineage-compatible</strong> lineage for data assets, including <strong>column-level</strong> lineage. Lineage is <strong>versioned per event</strong>, so you can view the graph as it was at a point in time and compare versions.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Source</th><th>How lineage is captured</th></tr></thead>
+						<tbody>
+							<tr><td>Glue crawlers</td><td data-label="How lineage is captured">Automatically</td></tr>
+							<tr><td>Amazon Redshift</td><td data-label="How lineage is captured">Automatically, by parsing the queries recorded in system tables</td></tr>
+							<tr><td>Visual ETL in Unified Studio</td><td data-label="How lineage is captured">Automatically in compatibility mode (not fine-grained mode)</td></tr>
+							<tr><td>Glue jobs</td><td data-label="How lineage is captured">Opt in: tick "Generate lineage events" and give the domain ID. <strong>Glue 5.0 or later</strong></td></tr>
+							<tr><td>Amazon EMR</td><td data-label="How lineage is captured">Opt in through Spark configuration (the OpenLineage listener); EMR Serverless 7.5, EMR on EC2 7.11, EMR on EKS 7.12 or later</td></tr>
+							<tr><td>Anything else</td><td data-label="How lineage is captured">Post OpenLineage <strong>RunEvents</strong> with the <code>PostLineageEvent</code> API (up to 300 KB each)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p>Spark lineage capture covers <strong>Spark DataFrames only &mdash; not Glue DynamicFrames</strong>. A Glue job written entirely with DynamicFrames produces no lineage even with the option ticked, until it converts to DataFrames for the transformations.</p></div>
+				<div class="code"><span class="file">run-event.json: a custom job's lineage</span>
+<pre><code>{
+  "eventType": "COMPLETE",
+  "eventTime": "2026-11-07T10:15:30Z",
+  "producer":
+    "https://example.com/retail-etl",
+  "schemaURL":
+    "https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/RunEvent",
+  "run": {
+    "runId":
+      "d2e7c111-8f3c-4f5b-9ebd-cb1d7995082a"
+  },
+  "job": {
+    "namespace": "retail",
+    "name": "build_daily_sales"
+  },
+  "inputs": [
+    {"namespace": "retail",
+     "name": "raw_pos"}
+  ],
+  "outputs": [
+    {"namespace": "retail",
+     "name": "daily_sales"}
+  ]
+}</code></pre></div>
+				<div class="code"><span class="file">Send it to the domain</span>
+<pre><code>aws datazone post-lineage-event \
+  --domain-identifier dzd_4p9n6sw4qt9xgn \
+  --event fileb://run-event.json</code></pre></div>
+
+				<h3>SageMaker ML Lineage Tracking</h3>
+				<p>ML Lineage Tracking records the steps of a machine learning workflow &mdash; which dataset trained which model, which model is behind which endpoint &mdash; for reproducibility and audit. SageMaker creates the entities <strong>automatically</strong> for training, processing and transform jobs, model packages and endpoints. AWS documents it as a Studio Classic feature, and Studio Classic is closed to new onboarding.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Entity</th><th>Represents</th></tr></thead>
+						<tbody>
+							<tr><td>Trial component</td><td data-label="Represents">A processing, training or transform job</td></tr>
+							<tr><td>Artifact</td><td data-label="Represents">A URI-addressable object, such as an S3 dataset or a container image</td></tr>
+							<tr><td>Action</td><td data-label="Represents">Something done, such as a model deployment or approval</td></tr>
+							<tr><td>Context</td><td data-label="Represents">A logical grouping, such as an endpoint or a model package group</td></tr>
+							<tr><td>Association</td><td data-label="Represents">A link between two entities, typed <code>ContributedTo</code>, <code>AssociatedWith</code>, <code>DerivedFrom</code>, <code>Produced</code> or <code>SameAs</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Query the graph with the <code>QueryLineage</code> API or the SageMaker SDK, upstream (<code>ASCENDANTS</code>), downstream (<code>DESCENDANTS</code>) or both, to a <strong>maximum depth of 10</strong>. S3 artifacts are tracked by the URI you passed, not by object content, so overwriting a dataset in place breaks the trail &mdash; write each version to a new path.</p>
+				<div class="code"><span class="file">Which datasets fed this endpoint's model?</span>
+<pre><code>from sagemaker.lineage.query import (
+    LineageQuery, LineageFilter,
+    LineageEntityEnum,
+    LineageSourceEnum,
+    LineageQueryDirectionEnum,
+)
+
+flt = LineageFilter(
+    entities=[LineageEntityEnum.ARTIFACT],
+    sources=[LineageSourceEnum.DATASET])
+
+up = LineageQueryDirectionEnum.ASCENDANTS
+result = LineageQuery(session).query(
+    start_arns=[endpoint_context_arn],
+    query_filter=flt,
+    direction=up,
+    include_edges=False)</code></pre></div>
+				<div class="callout tip"><p>Match the tool to the question. <strong>Data pipeline lineage</strong> (tables, jobs, columns, dashboards) &rarr; SageMaker Catalog. <strong>ML model lineage</strong> (datasets, training jobs, models, endpoints) &rarr; ML Lineage Tracking. Teams building their own lineage store have used Neptune as the graph, but the managed answer is SageMaker Catalog.</p></div>
+			</div>
+
+			<!-- ===== 2.4.5 ===== -->
+			<h2 id="s5">Optimization</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.5</span><span class="skill-text">Describe best practices for indexing, partitioning strategies, compression, and other data optimization techniques.</span></p>
+				<p>Almost every lake and warehouse optimization is a way to <strong>read less data</strong>: skip partitions, skip files, skip row groups, skip columns, or read compressed bytes. The techniques differ by store.</p>
+
+				<h3>Partitioning</h3>
+				<ul>
+					<li><strong>Partition on what queries filter on</strong>, at the grain they filter: AWS warns not to partition by hour when queries span days, and to sort by timestamp inside partitions instead.</li>
+					<li><strong>Do not over-partition.</strong> "Too many partition keys can result in fragmented datasets with too many files and files that are too small." High-cardinality columns such as customer ID make poor partition keys.</li>
+					<li>Filter partitions with equality where possible, remove old and empty partitions, and keep files flat inside each partition folder.</li>
+					<li>Spread hot prefixes: S3 supports at least <strong>3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second per partitioned prefix</strong>, with no limit on the number of prefixes. Exceeding it returns 503 <code>SlowDown</code>.</li>
+				</ul>
+
+				<h3>File size and the small-files problem</h3>
+				<p>Thousands of tiny files cost more in S3 requests and per-file overhead than in reading data. Compact them: Glue can group small input files (<code>groupFiles</code>), jobs can write fewer larger files, and Iceberg tables use <code>OPTIMIZE</code> or managed compaction (<a href="d2-task-2-1.html#s7">Task 2.1</a>). Inside Parquet and ORC files, Athena's defaults are <strong>128 MB row groups and 64 MB stripes</strong>, and AWS does not recommend going below them.</p>
+
+				<h3>Bucketing</h3>
+				<p><strong>Bucketing</strong> hashes rows into a fixed number of files by a column. Use it for <strong>high-cardinality, evenly distributed columns queried by single values</strong> &mdash; the customer ID that makes a poor partition key. A query for one customer then reads one bucket per partition. Athena does not support <code>INSERT INTO</code> on bucketed tables, and Iceberg uses a <code>bucket(n, col)</code> partition transform instead.</p>
+
+				<h3>Compression and formats</h3>
+				<p>Columnar formats (Parquet, ORC) read only the columns a query needs and skip row groups using min/max statistics &mdash; which works best when files are sorted by the filter column. Compression then shrinks what is read.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Athena writes</th><th>Default compression</th></tr></thead>
+						<tbody>
+							<tr><td>Parquet and text (Hive tables)</td><td data-label="Default compression"><strong>GZIP</strong></td></tr>
+							<tr><td>ORC</td><td data-label="Default compression"><strong>ZLIB</strong></td></tr>
+							<tr><td>Iceberg tables</td><td data-label="Default compression"><strong>ZSTD</strong> (level 3)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Athena also supports Snappy, LZ4, BZIP2 and others, set with <code>write_compression</code>. <strong>CTAS</strong> (<code>CREATE TABLE AS SELECT</code>) is the quick way to convert raw CSV or JSON into a partitioned, compressed Parquet table; its default format is Parquet, partition columns must come last in the <code>SELECT</code>, and one CTAS or <code>INSERT INTO</code> can write at most <strong>100 partitions</strong>.</p>
+				<div class="code"><span class="file">Rewrite raw sales as optimized Parquet</span>
+<pre><code>CREATE TABLE retail.sales_opt
+WITH (
+  format = 'PARQUET',
+  write_compression = 'ZSTD',
+  external_location =
+    's3://retail-lake/cur/sales_opt/',
+  partitioned_by = ARRAY['sale_date'],
+  bucketed_by = ARRAY['customer_id'],
+  bucket_count = 8
+) AS
+SELECT order_id, customer_id, amount,
+       sale_date
+FROM retail.sales_raw;</code></pre></div>
+
+				<h3>Indexing across stores</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Store</th><th>How it avoids full scans</th></tr></thead>
+						<tbody>
+							<tr><td>Amazon Redshift</td><td data-label="How it avoids full scans">No secondary indexes: sort keys plus block min/max metadata, chosen automatically by automatic table optimization</td></tr>
+							<tr><td>DynamoDB</td><td data-label="How it avoids full scans">Key design plus GSIs and LSIs (sparse and overloaded)</td></tr>
+							<tr><td>S3 data lake</td><td data-label="How it avoids full scans">Partitions, Glue partition indexes, bucketing, columnar statistics</td></tr>
+							<tr><td>Aurora and RDS</td><td data-label="How it avoids full scans">Conventional relational indexes; pgvector HNSW for vectors</td></tr>
+							<tr><td>OpenSearch</td><td data-label="How it avoids full scans">Inverted indexes for text and k-NN indexes for vectors</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Let the engines tune themselves</h3>
+				<ul>
+					<li><strong>Redshift automatic table optimization</strong> watches queries and applies sort and distribution keys "within hours" &mdash; but setting an explicit key takes the table out of it. Automatic <code>VACUUM DELETE</code>, automatic table sort and automatic <code>ANALYZE</code> run in the background.</li>
+					<li><strong>Redshift result caching</strong> (on by default) answers repeated queries from the leader node, but not for Spectrum tables or tables that changed.</li>
+					<li><strong>Athena query result reuse</strong> returns a previous result within the same workgroup, for up to 60 minutes by default (7 days maximum), but not for Lake Formation-governed data or non-deterministic functions.</li>
+				</ul>
+			</div>
+
+			<!-- ===== 2.4.6 ===== -->
+			<h2 id="s6">Vectorization</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4.6</span><span class="skill-text">Describe vectorization concepts (for example, Amazon Bedrock knowledge base).</span></p>
+				<p><strong>Embeddings</strong> are, in AWS's words, "numerical representations of real-world objects" that "capture inherent properties and relationships". An embedding model turns a piece of text (or an image) into a vector of numbers, and texts with similar meanings land close together. Search then means finding the stored vectors nearest to the query's vector &mdash; with an index type from <a href="d2-task-2-1.html#s8">Task 2.1</a>.</p>
+
+				<h3>How a Bedrock knowledge base builds vectors</h3>
+				<ol class="steps">
+					<li><strong>Connect a data source</strong>, such as an S3 prefix of product documents.</li>
+					<li><strong>Parse</strong> each file: the default text parser, a foundation model for documents with tables and images, or Bedrock Data Automation.</li>
+					<li><strong>Chunk</strong> the text into passages.</li>
+					<li><strong>Embed</strong> each chunk with the chosen embedding model.</li>
+					<li><strong>Store</strong> the vectors, chunk text and metadata in a vector store, mapped back to the source file.</li>
+					<li><strong>Sync</strong> when the source changes. Ingestion is <strong>incremental</strong>: only added, changed or deleted files are processed.</li>
+				</ol>
+
+				<h3>Chunking</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Strategy</th><th>How it splits</th></tr></thead>
+						<tbody>
+							<tr><td>Default</td><td data-label="How it splits">About 300 tokens, respecting sentence boundaries</td></tr>
+							<tr><td>Fixed size</td><td data-label="How it splits"><code>maxTokens</code> per chunk with an <code>overlapPercentage</code> between neighbours</td></tr>
+							<tr><td>Hierarchical</td><td data-label="How it splits">Two levels: small child chunks are searched, their larger parent chunks are returned for context</td></tr>
+							<tr><td>Semantic</td><td data-label="How it splits">Splits where meaning shifts, using a foundation model (costs more); tuned by buffer size and breakpoint threshold</td></tr>
+							<tr><td>None</td><td data-label="How it splits">One chunk per file; you lose page-level citations</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The trade-off, in AWS's words: "Small text embeddings are more precise, but retrieval aims for comprehensive context." Hierarchical chunking exists to get both. A Lambda function can apply custom chunking.</p>
+				<div class="callout trap"><p><strong>The chunking configuration cannot be changed after the data source is created.</strong> Neither can the knowledge base's embedding model. Changing either means a new data source or knowledge base and a full re-ingestion.</p></div>
+
+				<h3>Embedding models and dimensions</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Model</th><th>Dimensions</th><th>Vector types</th></tr></thead>
+						<tbody>
+							<tr><td>Amazon Titan Text Embeddings V2</td><td data-label="Dimensions">256, 512 or 1,024 (default)</td><td data-label="Vector types">Float or binary</td></tr>
+							<tr><td>Cohere Embed English / Multilingual v3</td><td data-label="Dimensions">1,024</td><td data-label="Vector types">Float or binary</td></tr>
+							<tr><td>Amazon Titan Multimodal Embeddings G1</td><td data-label="Dimensions">1,024</td><td data-label="Vector types">Float</td></tr>
+							<tr><td>Amazon Nova Multimodal Embeddings</td><td data-label="Dimensions">1,024</td><td data-label="Vector types">Float</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Fewer dimensions and binary vectors cut storage and cost, at some loss of accuracy. Titan V2 normalizes vectors by default and takes up to 8,192 tokens of input. The query must be embedded with the <strong>same model and dimensions</strong> as the documents, because the index is built for one vector size. <strong>Binary vectors</strong> can only be stored in OpenSearch Serverless or OpenSearch managed clusters.</p>
+
+				<h3>Vector stores</h3>
+				<p>A knowledge base can store vectors in <strong>OpenSearch Serverless</strong>, <strong>OpenSearch managed clusters</strong>, <strong>S3 Vectors</strong> (lowest cost, float vectors only), <strong>Aurora PostgreSQL</strong> (pgvector), <strong>Neptune Analytics</strong> (for GraphRAG), or the third-party Pinecone, Redis Enterprise Cloud and MongoDB Atlas. <strong>Hybrid search</strong> (keyword plus semantic) works only with Aurora/RDS, OpenSearch Serverless and MongoDB stores that have a filterable text field.</p>
+
+				<h3>Metadata filtering</h3>
+				<p>Put a <code>&lt;file&gt;.metadata.json</code> file (up to 10 KB) next to each source file, and queries can filter on its attributes before ranking by similarity &mdash; for example, only documents about shoes.</p>
+				<div class="code"><span class="file">sizing-guide.pdf.metadata.json</span>
+<pre><code>{
+  "metadataAttributes": {
+    "category": "shoes",
+    "season": 2026
+  }
+}</code></pre></div>
+				<div class="code"><span class="file">Retrieval configuration with a filter</span>
+<pre><code>{
+  "vectorSearchConfiguration": {
+    "numberOfResults": 5,
+    "filter": {
+      "equals": {
+        "key": "category",
+        "value": "shoes"
+      }
+    }
+  }
+}</code></pre></div>
+
+				<h3>Creating the data source</h3>
+				<div class="code"><span class="file">S3 data source with fixed-size chunks</span>
+<pre><code>aws bedrock-agent create-data-source \
+  --knowledge-base-id KB12345678 \
+  --name product-docs \
+  --data-source-configuration \
+    file://s3-ds.json \
+  --vector-ingestion-configuration \
+    file://chunking.json</code></pre></div>
+				<div class="code"><span class="file">s3-ds.json</span>
+<pre><code>{
+  "type": "S3",
+  "s3Configuration": {
+    "bucketArn":
+      "arn:aws:s3:::retail-kb-docs",
+    "inclusionPrefixes": ["products/"]
+  }
+}</code></pre></div>
+				<div class="code"><span class="file">chunking.json</span>
+<pre><code>{
+  "chunkingConfiguration": {
+    "chunkingStrategy": "FIXED_SIZE",
+    "fixedSizeChunkingConfiguration": {
+      "maxTokens": 300,
+      "overlapPercentage": 20
+    }
+  }
+}</code></pre></div>
+				<div class="code"><span class="file">Embed and index the documents</span>
+<pre><code>aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id KB12345678 \
+  --data-source-id DS12345678</code></pre></div>
+
+				<h3>Beyond plain vectors</h3>
+				<ul>
+					<li><strong>Structured knowledge bases</strong> skip vectors altogether: Bedrock translates questions into SQL run by <strong>Redshift</strong>, against Redshift tables or Lake Formation-governed Glue tables.</li>
+					<li><strong>GraphRAG</strong> on Neptune Analytics links chunks through extracted entities; S3 is its only data source.</li>
+					<li><strong>Reranking models</strong> reorder retrieved chunks by relevance at query time.</li>
+				</ul>
+				<div class="callout retired"><p>From <strong>September 30, 2026</strong>, new Confluence, SharePoint, Salesforce and web crawler connectors can no longer be created on customer-managed knowledge bases (existing ones keep working). AWS now points to the <strong>Bedrock Managed Knowledge Base</strong> (March 2026), where Bedrock manages the vector store, embedding model and reranker. For a customer-managed knowledge base, the data sources are S3 and custom.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Redshift: star schemas with the fact table and largest dimension on a shared distribution key; smallest sensible column sizes; <strong>specifying any encoding turns <code>ENCODE AUTO</code> off for the table</strong>. Primary and foreign keys are not enforced but the planner trusts them. <code>SUPER</code> holds up to 16 MB of nested data, and Spectrum tables appear only in late-binding views.</li>
+				<li>DynamoDB: access patterns first, few tables, composite sort keys, adjacency lists, sparse and overloaded GSIs. Each partition tops out at <strong>3,000 RCU and 1,000 WCU</strong>, so shard hot keys with a suffix. GSIs can now use up to four attributes per key.</li>
+				<li>Data lake: raw, stage and analytics layers in separate buckets (plus a landing zone for PII), Hive-style lower-case folders, Iceberg for updatable tables. Lake Formation governed tables are no longer documented.</li>
+				<li>Athena schema changes: <strong>Parquet reads by name</strong> (add, drop and reorder are safe, rename breaks); <strong>ORC reads by index</strong> (rename is safe, drop and reorder break); adding at the end is always safe. Iceberg changes are metadata-only, with type promotion limited to int&rarr;bigint, float&rarr;double and wider decimals.</li>
+				<li>Redshift <code>ALTER TABLE</code>: one column per <code>ADD COLUMN</code>, no new distribution or sort key columns, and <strong><code>ALTER COLUMN TYPE</code> only resizes a <code>VARCHAR</code></strong>. Glue resolves mixed types with <code>resolveChoice</code> (<code>cast</code>, <code>make_cols</code>, <code>make_struct</code>, <code>project</code>, <code>match_catalog</code>).</li>
+				<li>Slowly changing dimensions: Type 1 overwrites (MERGE upsert), Type 2 closes the old row and inserts a new one. Elastic resize for most capacity changes, classic resize beyond its limits; Glue Data Quality dynamic rules and anomaly detection catch drift.</li>
+				<li>Schema conversion: <strong>DMS Schema Conversion converts schema and code, not data</strong>, using an instance profile, data providers and a migration project; generative AI conversion targets PostgreSQL. AWS SCT covers more paths, including warehouses to Redshift with extraction agents. Homogeneous migrations and Babelfish avoid conversion.</li>
+				<li>Lineage: SageMaker Catalog captures OpenLineage lineage automatically from crawlers, Redshift and visual ETL; Glue jobs need Glue 5.0+ and <strong>DataFrames, not DynamicFrames</strong>; custom tools post RunEvents. ML Lineage Tracking links datasets, jobs, models and endpoints, queried to a depth of 10.</li>
+				<li>Optimization: partition on common filters at the right grain, do not over-partition, compact small files, bucket high-cardinality lookup columns. Athena defaults: GZIP for Parquet and text, ZLIB for ORC, ZSTD for Iceberg; CTAS writes at most 100 partitions. S3 handles 3,500 writes and 5,500 reads per second per prefix.</li>
+				<li>Vectorization: parse, chunk, embed, store, sync incrementally. <strong>Chunking and the embedding model cannot be changed later.</strong> Titan V2 offers 256, 512 or 1,024 dimensions; binary vectors need OpenSearch; hybrid search needs Aurora/RDS, OpenSearch Serverless or MongoDB; metadata files are up to 10 KB.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-3.html"><small>Previous</small>Task 2.3: Manage the lifecycle of data</a>
+				<a class="next" href="d3-task-3-1.html"><small>Next</small>Task 3.1: Automate data processing by using AWS services</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Data Engineer &ndash; Associate (DEA-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
