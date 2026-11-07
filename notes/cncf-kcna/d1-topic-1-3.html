@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.3: Scheduling | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 1.3, Kubernetes scheduling: how kube-scheduler filters and scores nodes, resource requests and limits, QoS classes, nodeSelector, node and pod affinity, topology spread constraints, taints and tolerations, priority and preemption, node-pressure eviction, scheduling gates, DRA and autoscaling, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Kubernetes Fundamentals &middot; 44%</span>
+		<h1>1.3: Scheduling</h1>
+		<p>How Kubernetes&reg; decides which node runs each Pod: resource requests, rules that attract Pods to nodes or keep them away, priorities when the cluster is full, and what happens when a node runs short.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">kube-scheduler</span><span class="tag">Requests</span><span class="tag">Affinity</span><span class="tag">Taints</span><span class="tag">Preemption</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How the scheduler decides</a></li>
+				<li><a href="#s2">Requests, limits and QoS</a></li>
+				<li><a href="#s3">Choosing nodes</a></li>
+				<li><a href="#s4">Taints and tolerations</a></li>
+				<li><a href="#s5">Priority and preemption</a></li>
+				<li><a href="#s6">Eviction under pressure</a></li>
+				<li><a href="#s7">Newer features and autoscaling</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 1.3</span>
+				<p><strong>Scheduling.</strong></p>
+			</div>
+			<p>"In Kubernetes, scheduling refers to making sure that Pods are matched to Nodes so that the kubelet can run them." This page takes the topic to cover how the scheduler chooses, the <strong>resource requests</strong> it relies on, the ways to <strong>steer</strong> Pods towards or away from nodes, <strong>priority and preemption</strong>, and <strong>eviction</strong> when nodes run short. Autoscaling gets a brief mention; it belongs mainly to topic 4.2.</p>
+			<p>Definitions are quoted from the <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/">Kubernetes documentation</a> (&copy; The Kubernetes Authors, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>) for Kubernetes v1.37.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop runs on four nodes: three general nodes, two with fast SSDs, and one GPU node reserved for a recommendation model. <code>shop-web</code> must survive a node failure, <code>shop-db</code> needs SSD storage, and a log collector runs on every node.</p></div>
+
+			<!-- ===== Scheduler ===== -->
+			<h2 id="s1">How the scheduler decides</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Following how kube-scheduler picks a node for a new Pod, and recognizing what happens when no node fits.</span></p>
+				<p>"A scheduler watches for newly created Pods that have no Node assigned" and becomes "responsible for finding the best Node for that Pod to run on." <strong>kube-scheduler</strong> is "the default scheduler for Kubernetes and runs as part of the control plane." It works in two steps:</p>
+				<ol class="flow">
+					<li><b>Filtering</b>Find the <em>feasible</em> nodes, those that meet all the Pod's requirements. For example, a resource check removes nodes without enough free CPU or memory for the Pod's requests.</li>
+					<li><b>Scoring</b>Rank the feasible nodes using the active scoring rules, and pick the highest. Ties are broken "at random".</li>
+					<li><b>Binding</b>The scheduler "notifies the API server about this decision in a process called binding". The kubelet on that node then starts the Pod.</li>
+				</ol>
+				<p>If no node is feasible, "the Pod remains unscheduled until a place can be found", in the <code>Pending</code> phase, and the scheduler records an event each time it fails:</p>
+				<div class="code"><span class="file">A Pod that cannot be placed</span>
+<pre><code>kubectl describe pod shop-db-0
+...
+Events:
+  Type     Reason
+  Warning  FailedScheduling
+  0/4 nodes are available:
+  4 Insufficient memory.</code></pre></div>
+				<p>Typical reasons in the message include <code>Insufficient cpu</code>, <code>node(s) had untolerated taint(s)</code> and <code>node(s) didn't match Pod's node affinity/selector</code>, each pointing to one of the sections below. Once placed, a Pod's node shows in the NODE column of <code>kubectl get pods -o wide</code>.</p>
+
+				<h3>Other schedulers, and skipping the scheduler</h3>
+				<ul>
+					<li>The scheduler is built on a pluggable <strong>scheduling framework</strong>, and can run several <strong>profiles</strong>. A Pod picks one with <code>spec.schedulerName</code>; the default is <code>default-scheduler</code>. A Pod naming a scheduler that is not running "remains in 'Pending' state forever".</li>
+					<li>Setting <code>spec.nodeName</code> skips scheduling entirely: "the scheduler ignores the Pod and the kubelet on the named node tries to place the Pod on that node." If that node lacks resources, the Pod fails with a reason such as <code>OutOfmemory</code> or <code>OutOfcpu</code>. It is meant for custom schedulers, not everyday use.</li>
+				</ul>
+				<div class="callout retired"><p><strong>Scheduling policies are gone.</strong> Older material describes configuring the scheduler with "predicates and priorities" policy files. That method "is not supported since Kubernetes v1.23"; scheduler configuration now uses profiles and plugins.</p></div>
+			</div>
+
+			<!-- ===== Resources ===== -->
+			<h2 id="s2">Requests, limits and QoS</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Telling the scheduler how much CPU and memory each container needs, and knowing what happens when a container uses more.</span></p>
+				<p>"When you specify the resource <em>request</em> for containers in a Pod, the kube-scheduler uses this information to decide which node to place the Pod on. When you specify a resource <em>limit</em> for a container, the kubelet enforces those limits".</p>
+				<div class="code"><span class="file">Container resources in a Pod template</span>
+<pre><code>containers:
+- name: api
+  image: nginx:1.14.2
+  resources:
+    requests:
+      cpu: 250m       <span class="c"># 0.25 CPU</span>
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi</code></pre></div>
+				<ul>
+					<li><strong>CPU</strong> is measured in cores: <code>1</code> is one physical or virtual core, and <code>100m</code> ("one hundred millicpu") equals <code>0.1</code>.</li>
+					<li><strong>Memory</strong> is in bytes, with suffixes <code>M</code>, <code>G</code> (powers of ten) or <code>Mi</code>, <code>Gi</code> (powers of two).</li>
+					<li>The scheduler places a Pod only where the sum of requests fits the node's <strong>allocatable</strong> resources (capacity minus what system daemons reserve), shown by <code>kubectl describe node</code>. It does this "although actual memory or CPU resource usage on nodes is very low".</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Exceeding</th><th>What happens</th></tr></thead>
+						<tbody>
+							<tr><td>The CPU limit</td><td data-label="What happens">The container is <strong>throttled</strong>: "container runtimes don't terminate Pods or containers for excessive CPU usage"</td></tr>
+							<tr><td>The memory limit</td><td data-label="What happens">The kernel may kill it: the container restarts with reason <code>OOMKilled</code> and exit code 137</td></tr>
+							<tr><td>The memory request, on a node short of memory</td><td data-label="What happens">The Pod is likely to be evicted (see <a href="#s6">eviction</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Two unit and default traps.</strong> "'M' means megabytes, while 'm' means millibytes. If you request <code>400m</code> of memory, this is a request for 0.4 bytes." And if you set a limit with no request, Kubernetes "copies the limit you specified and uses it as the requested value".</p></div>
+
+				<h3>Quality of Service classes</h3>
+				<p>From its requests and limits, every Pod gets a QoS class:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Class</th><th>Rule</th><th>Web shop example</th></tr></thead>
+						<tbody>
+							<tr><td>Guaranteed</td><td data-label="Rule">Every container has CPU and memory requests and limits, and each limit equals its request</td><td data-label="Web shop example"><code>shop-db</code></td></tr>
+							<tr><td>Burstable</td><td data-label="Rule">Not Guaranteed, but at least one container has a CPU or memory request or limit</td><td data-label="Web shop example"><code>shop-api</code> (requests lower than limits)</td></tr>
+							<tr><td>BestEffort</td><td data-label="Rule">No container has any CPU or memory request or limit</td><td data-label="Web shop example">A throwaway debug Pod</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>"The kubelet prefers to evict <code>BestEffort</code> Pods if the node comes under resource pressure." Requests can also be set for a whole Pod in <code>spec.resources</code> (beta and on by default since v1.34), and since v1.35 a running container's CPU and memory can be resized in place.</p>
+			</div>
+
+			<!-- ===== Node selection ===== -->
+			<h2 id="s3">Choosing nodes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Attracting Pods to nodes with the right labels, and spreading copies of an app across nodes and zones.</span></p>
+				<p>"Often, you do not need to set any such constraints; the scheduler will automatically do a reasonable placement". When you do, all these rules work on <strong>node labels</strong>. Kubernetes sets some on every node, such as <code>kubernetes.io/hostname</code>, <code>kubernetes.io/os</code>, <code>kubernetes.io/arch</code> and, in clouds, <code>topology.kubernetes.io/zone</code>.</p>
+
+				<h3>nodeSelector</h3>
+				<p>"<code>nodeSelector</code> is the simplest recommended form of node selection constraint": the Pod runs only on nodes "that have each of the labels you specify".</p>
+				<div class="code"><span class="file">Label the SSD nodes, then select them</span>
+<pre><code>kubectl label nodes node-2 disktype=ssd
+kubectl get nodes --show-labels
+
+<span class="c"># in the shop-db Pod template</span>
+spec:
+  nodeSelector:
+    disktype: ssd</code></pre></div>
+
+				<h3>Node affinity</h3>
+				<p>Node affinity does the same with more expressive rules (operators <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>, <code>Gt</code>, <code>Lt</code>), in two strengths:</p>
+				<ul>
+					<li><code>requiredDuringSchedulingIgnoredDuringExecution</code>: "The scheduler can't schedule the Pod unless the rule is met."</li>
+					<li><code>preferredDuringSchedulingIgnoredDuringExecution</code>: the scheduler tries, but "if a matching node is not available, the scheduler still schedules the Pod". Each preference has a <code>weight</code> from 1 to 100.</li>
+				</ul>
+				<div class="record">
+					<div class="record-title">Require SSD nodes: node affinity fields</div>
+					<dl>
+						<dt>Under the Pod spec</dt><dd><code>affinity</code> &rarr; <code>nodeAffinity</code></dd>
+						<dt>Rule strength</dt><dd><code>requiredDuringScheduling<wbr>IgnoredDuringExecution</code></dd>
+						<dt>Then</dt><dd><code>nodeSelectorTerms</code> &rarr; <code>matchExpressions</code></dd>
+						<dt>Expression</dt><dd><code>key: disktype</code>, <code>operator: In</code>, <code>values: [ssd]</code></dd>
+					</dl>
+				</div>
+				<p>The full YAML is in the <a href="https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#node-affinity">kubernetes.io node affinity example</a>. Several <code>nodeSelectorTerms</code> are ORed; expressions inside one term are ANDed.</p>
+				<div class="callout trap"><p><strong>"IgnoredDuringExecution" means running Pods stay put.</strong> It means "if the node labels change after Kubernetes schedules the Pod, the Pod continues to run." Affinity only affects scheduling decisions. If you set both <code>nodeSelector</code> and node affinity, both must be satisfied.</p></div>
+
+				<h3>Pod affinity and anti-affinity</h3>
+				<p>These rules look at the <strong>Pods already running</strong> rather than node labels: "this Pod should (or, in the case of anti-affinity, should not) run in an X if that X is already running one or more Pods that meet rule Y", where X is a topology domain named by a <code>topologyKey</code>, such as a node (<code>kubernetes.io/hostname</code>) or a zone. Anti-affinity on <code>app: shop-web</code> with <code>topologyKey: kubernetes.io/hostname</code> keeps two frontend replicas off the same node, so one node failure cannot take them all down. The docs warn these rules need "substantial amounts of processing" in large clusters.</p>
+
+				<h3>Topology spread constraints</h3>
+				<p>Stable since v1.19, these "control how Pods are spread across your cluster among failure-domains such as regions, zones, nodes".</p>
+				<div class="code"><span class="file">Spread shop-web evenly across zones</span>
+<pre><code>topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app: shop-web</code></pre></div>
+				<p><code>maxSkew</code> is how uneven the spread may be (here, zones may differ by at most one Pod). <code>whenUnsatisfiable</code> is <code>DoNotSchedule</code> (the default) or <code>ScheduleAnyway</code>. The constraint is checked only at scheduling time: "scaling down a Deployment may result in imbalanced Pods distribution."</p>
+			</div>
+
+			<!-- ===== Taints ===== -->
+			<h2 id="s4">Taints and tolerations</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Keeping Pods off nodes unless they are explicitly allowed there, and reserving special nodes for the workloads that need them.</span></p>
+				<p>"Node affinity is a property of Pods that <em>attracts</em> them to a set of nodes ... <em>Taints</em> are the opposite -- they allow a node to repel a set of pods." A taint is set on a node as <code>key=value:effect</code> (the value is optional). A <strong>toleration</strong> on a Pod lets it ignore a matching taint.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Effect</th><th>New Pods without a toleration</th><th>Pods already running</th></tr></thead>
+						<tbody>
+							<tr><td><code>NoSchedule</code></td><td data-label="New Pods without a toleration">Not scheduled</td><td data-label="Pods already running">Stay ("not evicted")</td></tr>
+							<tr><td><code>PreferNoSchedule</code></td><td data-label="New Pods without a toleration">Avoided if possible; "not guaranteed"</td><td data-label="Pods already running">Stay</td></tr>
+							<tr><td><code>NoExecute</code></td><td data-label="New Pods without a toleration">Not scheduled</td><td data-label="Pods already running">"Evicted immediately", or after <code>tolerationSeconds</code> if the toleration sets it</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Reserve the GPU node</span>
+<pre><code><span class="c"># taint the node</span>
+kubectl taint nodes node-4 \
+  gpu=true:NoSchedule
+
+<span class="c"># remove the taint again (trailing -)</span>
+kubectl taint nodes node-4 \
+  gpu=true:NoSchedule-</code></pre></div>
+				<div class="code"><span class="file">Toleration in the model's Pod template</span>
+<pre><code>tolerations:
+- key: gpu
+  operator: Equal   <span class="c"># or Exists</span>
+  value: "true"
+  effect: NoSchedule</code></pre></div>
+				<div class="callout trap"><p><strong>A toleration allows, it does not attract.</strong> "Tolerations allow scheduling but don't guarantee scheduling": the recommendation Pods may still land on ordinary nodes. To reserve node-4 <em>and</em> make the model run only there, combine the taint with a node label and node affinity, as the documentation's "dedicated nodes" example does.</p></div>
+
+				<h3>Built-in taints</h3>
+				<ul>
+					<li>The control plane taints nodes when conditions arise: <code>node.kubernetes.io/not-ready</code>, <code>unreachable</code>, <code>memory-pressure</code>, <code>disk-pressure</code>, <code>pid-pressure</code> and <code>unschedulable</code> (set by <code>kubectl cordon</code>). "The scheduler checks taints, not node conditions, when it makes scheduling decisions."</li>
+					<li>Pods automatically tolerate <code>not-ready</code> and <code>unreachable</code> for 300 seconds, so they "remain bound to Nodes for 5 minutes after one of these problems is detected" before being evicted.</li>
+					<li>DaemonSet Pods tolerate those two taints with no time limit, so they "are never evicted due to these problems".</li>
+					<li>kubeadm taints control plane nodes with <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, which is why ordinary Pods do not run there. The older <code>node-role.kubernetes.io/master</code> taint is deprecated.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Priority ===== -->
+			<h2 id="s5">Priority and preemption</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Deciding which Pods matter most, so important Pods can displace less important ones when the cluster is full.</span></p>
+				<p>"Priority indicates the importance of a Pod relative to other Pods. If a Pod cannot be scheduled, the scheduler tries to preempt (evict) lower priority Pods to make scheduling of the pending Pod possible." Priorities come from a <strong>PriorityClass</strong>, a cluster-wide object mapping a name to a number: the higher the value, the higher the priority.</p>
+				<div class="code"><span class="file">priority.yaml (PriorityClass)</span>
+<pre><code>apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: shop-critical
+value: 1000000
+globalDefault: false
+description: "Checkout path"</code></pre></div>
+				<p>A Pod uses it with <code>spec.priorityClassName: shop-critical</code>. Pods without a class get the <code>globalDefault</code> class if one exists, otherwise priority zero. Two built-in classes, <code>system-cluster-critical</code> and <code>system-node-critical</code>, protect essential components such as DNS. Pending Pods are also queued for scheduling in priority order.</p>
+				<div class="callout trap"><p><strong>Preemption is not polite.</strong> Respecting PodDisruptionBudgets during preemption "is best effort": if no other choice exists, "lower priority Pods will be removed despite their PDBs being violated." Preemption also "does not consider QoS": priority and QoS class are separate features. A class with <code>preemptionPolicy: Never</code> jumps the queue but never evicts other Pods.</p></div>
+			</div>
+
+			<!-- ===== Eviction ===== -->
+			<h2 id="s6">Eviction under pressure</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Recognizing when a node removes Pods to protect itself, and how that differs from an eviction someone asks for.</span></p>
+				<p>"The kubelet monitors resources like memory, disk space, and filesystem inodes on your cluster's nodes. When one or more of these resources reach specific consumption levels, the kubelet can proactively fail one or more pods on the node to reclaim resources and prevent starvation." It first tries to free space itself, for example by deleting unused images.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th></th><th>Node-pressure eviction</th><th>API-initiated eviction</th></tr></thead>
+						<tbody>
+							<tr><td>Triggered by</td><td data-label="Node-pressure eviction">The kubelet, when a signal such as <code>memory.available</code> or <code>nodefs.available</code> crosses a threshold</td><td data-label="API-initiated eviction">A request to the Eviction API, for example by <code>kubectl drain</code></td></tr>
+							<tr><td>PodDisruptionBudgets</td><td data-label="Node-pressure eviction">Ignored</td><td data-label="API-initiated eviction">Respected</td></tr>
+							<tr><td>Grace period</td><td data-label="Node-pressure eviction">Ignored; hard thresholds kill with a 0 s grace period</td><td data-label="API-initiated eviction">Respected</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Thresholds are <strong>hard</strong> (act immediately; defaults include <code>memory.available&lt;100Mi</code> and <code>nodefs.available&lt;10%</code> on Linux) or <strong>soft</strong> (act only after a grace period). Under pressure the node reports a condition, <code>MemoryPressure</code>, <code>DiskPressure</code> or <code>PIDPressure</code>, and is tainted so no new Pods arrive.</p>
+				<div class="callout tip"><p><strong>Who goes first.</strong> The kubelet ranks Pods by whether their usage exceeds their requests, then by Pod priority, then by how far usage exceeds requests. The documentation notes the kubelet "does not use the pod's QoS class" directly, but the effect is similar: BestEffort Pods (which request nothing) usually go first, Guaranteed Pods last. Setting realistic requests is the best protection.</p></div>
+			</div>
+
+			<!-- ===== Newer ===== -->
+			<h2 id="s7">Newer features and autoscaling</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Recognizing newer scheduling features by name, and how autoscalers change what there is to schedule.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Feature</th><th>What it does</th><th>State in v1.37</th></tr></thead>
+						<tbody>
+							<tr><td>Scheduling gates</td><td data-label="What it does"><code>spec.schedulingGates</code> holds a Pod back from scheduling until each gate is removed; it shows as <code>SchedulingGated</code></td><td data-label="State in v1.37">Stable since v1.30</td></tr>
+							<tr><td>Pod overhead</td><td data-label="What it does">Counts the resources the Pod sandbox itself uses (set by its RuntimeClass) on top of container requests</td><td data-label="State in v1.37">Stable since v1.24</td></tr>
+							<tr><td>Dynamic Resource Allocation (DRA)</td><td data-label="What it does">Lets workloads claim devices such as GPUs from device classes; the scheduler places Pods where the devices are</td><td data-label="State in v1.37">Stable since v1.34</td></tr>
+							<tr><td>Gang scheduling (Workload API)</td><td data-label="What it does">Schedules a group of Pods "all-or-nothing", for example for distributed training</td><td data-label="State in v1.37">Beta, off by default</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Autoscaling in brief</h3>
+				<ul>
+					<li>The <strong>HorizontalPodAutoscaler</strong> (<code>autoscaling/v2</code>) adds or removes replicas to match demand, using metrics from metrics-server. It cannot scale a DaemonSet. Scaling to zero replicas on custom or external metrics became beta, on by default, in v1.37.</li>
+					<li>The <strong>VerticalPodAutoscaler</strong> adjusts requests; it is an add-on, not part of Kubernetes itself.</li>
+					<li><strong>Node autoscalers</strong> add and remove nodes: "Cluster Autoscaler and Karpenter are the two Node autoscalers currently sponsored by SIG Autoscaling." Pending Pods that fit nowhere are what trigger them to add nodes.</li>
+					<li><strong>KEDA</strong>, a CNCF graduated project, scales workloads on events such as queue length; it would suit <code>shop-worker</code>.</li>
+				</ul>
+				<p>Autoscaling as a cloud native principle is covered in topic 4.2.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>kube-scheduler <strong>filters</strong> to feasible nodes, <strong>scores</strong> them, then <strong>binds</strong> the Pod. If nothing fits, the Pod stays <code>Pending</code> with a <code>FailedScheduling</code> event. <code>nodeName</code> bypasses the scheduler.</li>
+				<li>The scheduler uses <strong>requests</strong>, not limits or actual usage, against node allocatable. Over the CPU limit = throttled; over the memory limit = <code>OOMKilled</code>. A limit without a request sets the request. <code>400m</code> memory means 0.4 bytes.</li>
+				<li>QoS: <strong>Guaranteed</strong> (limits equal requests for CPU and memory), <strong>Burstable</strong> (some requests or limits), <strong>BestEffort</strong> (none; evicted first in practice).</li>
+				<li>Attract with <code>nodeSelector</code> or node affinity (required or preferred; IgnoredDuringExecution). Place relative to other Pods with pod affinity and anti-affinity on a <code>topologyKey</code>; spread with topology spread constraints (<code>maxSkew</code>, default <code>DoNotSchedule</code>).</li>
+				<li><strong>Taints repel, tolerations permit</strong> but do not attract. Effects: <code>NoSchedule</code>, <code>PreferNoSchedule</code>, <code>NoExecute</code> (evicts running Pods). Pods tolerate not-ready and unreachable nodes for 300 s; control plane nodes carry a NoSchedule taint.</li>
+				<li>PriorityClasses order Pods; higher priority can <strong>preempt</strong> lower, with PDBs respected only on a best-effort basis and QoS ignored.</li>
+				<li>Node-pressure eviction (kubelet) ignores PDBs and grace periods; API eviction (drain) respects both.</li>
+				<li>Newer: scheduling gates (stable 1.30), DRA (stable 1.34), gang scheduling (beta, off). Autoscalers: HPA, VPA (add-on), Cluster Autoscaler and Karpenter, KEDA.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d1-topic-1-2.html"><small>Previous</small>1.2: Administration</a>
+				<a class="next" href="index.html"><small>Next</small>KCNA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Quotes from kubernetes.io &copy; The Kubernetes Authors, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
