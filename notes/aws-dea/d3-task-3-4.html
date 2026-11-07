@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.4: Ensure Data Quality | AWS DEA-C01 Notes</title>
+	<meta name="description" content="DEA-C01 Task 3.4 study guide: data quality checks in Glue ETL jobs with EvaluateDataQuality and quarantining failed rows, DQDL rules and DataBrew rulesets, investigating consistency with cross-dataset rules, DMS validation and reconciliation queries, sampling with Athena TABLESAMPLE, Redshift and Spark, and handling data skew in Spark, Redshift, DynamoDB and Kinesis.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dea.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DEA-C01</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Data Operations and Support &middot; 22%</span>
+		<h1>Task 3.4: Ensure data quality</h1>
+		<p>Bad data that reaches a dashboard costs far more than bad data stopped at the door. This task covers checking data inside the pipeline, writing the rules those checks enforce, confirming that copies agree with their sources, sampling sensibly, and dealing with data that piles up unevenly.</p>
+		<div class="tags"><span class="tag code">DEA-C01</span><span class="tag">Glue Data Quality</span><span class="tag">DQDL</span><span class="tag">Glue DataBrew</span><span class="tag">AWS DMS</span><span class="tag">Apache Spark</span><span class="tag">Data skew</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Checks during processing</a></li>
+				<li><a href="#s2">Defining rules</a></li>
+				<li><a href="#s3">Data consistency</a></li>
+				<li><a href="#s4">Sampling</a></li>
+				<li><a href="#s5">Data skew</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.4</span>
+				<p><strong>Ensure data quality.</strong></p>
+			</div>
+			<p>Five skills, and the last task of Domain 3, which is 22% of the scored exam. The central service is <strong>AWS Glue Data Quality</strong> and its rule language, DQDL; DataBrew appears as the no-code alternative. Expect questions about where a check runs, what happens to failing rows, and what a rule really tests.</p>
+			<p>The examples continue the <strong>retail analytics platform</strong> in account 111111111111: the <code>orders</code> table in the <code>retail_raw</code> and <code>retail</code> Glue databases, a <code>customers</code> reference table, and the <code>orders-etl</code> Glue job.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>3.4.1</td><td data-label="What you need to be able to do">Run data quality checks while processing data</td></tr>
+						<tr><td>3.4.2</td><td data-label="What you need to be able to do">Define data quality rules</td></tr>
+						<tr><td>3.4.3</td><td data-label="What you need to be able to do">Investigate data consistency</td></tr>
+						<tr><td>3.4.4</td><td data-label="What you need to be able to do">Describe data sampling techniques</td></tr>
+						<tr><td>3.4.5</td><td data-label="What you need to be able to do">Implement mechanisms for data skew</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout note"><p>Earlier pages cover the neighbours: DataBrew profile statistics on <a href="d3-task-3-2.html#s1">Task 3.2</a>, DQDL dynamic rules and anomaly detection for drift on <a href="d2-task-2-4.html#s2">Task 2.4</a>, and Spark's adaptive skew join on <a href="d1-task-1-2.html#s7">Task 1.2</a>.</p></div>
+
+			<!-- ===== 3.4.1 ===== -->
+			<h2 id="s1">Checks during processing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.1</span><span class="skill-text">Run data quality checks while processing the data (for example, checking for empty fields).</span></p>
+				<p>Glue Data Quality is serverless, "built on top of the open-source DeeQu framework", and runs in two places:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Where</th><th>Use it for</th><th>Notes</th></tr></thead>
+						<tbody>
+							<tr><td><strong>In a Glue ETL job</strong></td><td data-label="Use it for">Stopping or quarantining bad data <em>before</em> it is loaded</td><td data-label="Notes">Only ETL identifies the individual failing rows. No separate fee: you pay for the extra job time</td></tr>
+							<tr><td><strong>On a Data Catalog table</strong></td><td data-label="Use it for">Checking data at rest on a schedule, and generating rule recommendations</td><td data-label="Notes">Billed per DPU-hour, minimum 2 DPUs and 1 minute</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>The EvaluateDataQuality transform</h3>
+				<p>In a Glue Studio job, an <strong>Evaluate Data Quality</strong> node takes a DQDL ruleset and produces two outputs:</p>
+				<ul>
+					<li><strong><code>ruleOutcomes</code></strong>: one row per rule with its outcome, failure reason and measured value.</li>
+					<li><strong><code>rowLevelOutcomes</code></strong>: the original data plus four columns &mdash; <code>DataQualityRulesPass</code>, <code>DataQualityRulesFail</code>, <code>DataQualityRulesSkip</code> and <code>DataQualityEvaluationResult</code> (<code>Passed</code> or <code>Failed</code>).</li>
+				</ul>
+				<p>Dataset-level rules such as <code>RowCount</code>, <code>ColumnCount</code>, <code>CustomSql</code> and <code>RowCountMatch</code> cannot mark individual rows, so they appear under "skip" at row level. A row can be <code>Passed</code> while the ruleset as a whole fails.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>On ruleset failure</th><th>What happens</th></tr></thead>
+						<tbody>
+							<tr><td>None (default)</td><td data-label="What happens">The job continues and loads everything</td></tr>
+							<tr><td>Fail job after loading data to target</td><td data-label="What happens">The job fails; set an S3 location to keep the quality results</td></tr>
+							<tr><td>Fail job without loading to target data</td><td data-label="What happens">The job fails immediately and writes nothing, not even the results</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>Quarantining bad rows</h3>
+				<p>Failing the whole job is often too blunt: one bad row stops a million good ones. The usual pattern evaluates each row, lets passing rows continue, and writes failing rows to a quarantine prefix for review.</p>
+				<div class="code"><span class="file">Check orders, split good and bad (Glue PySpark)</span>
+<pre><code>from awsgluedq.transforms import (
+    EvaluateDataQuality)
+from awsglue.transforms import (
+    SelectFromCollection)
+
+ruleset = """Rules = [
+  IsComplete "order_id",
+  ColumnValues "email" != EMPTY,
+  ColumnValues "qty" &gt; 0
+]"""
+
+opts = {
+    "dataQualityEvaluationContext":
+        "orders_dq",
+    "enableDataQualityCloudWatchMetrics":
+        True,
+    "enableDataQualityResultsPublishing":
+        True,
+}
+
+dq = EvaluateDataQuality().process_rows(
+    frame=orders_dyf,
+    ruleset=ruleset,
+    publishing_options=opts,
+)
+
+rows = SelectFromCollection.apply(
+    dfc=dq, key="rowLevelOutcomes",
+    transformation_ctx="rows").toDF()
+
+result = rows.DataQualityEvaluationResult
+good = rows.filter(result == "Passed")
+bad = rows.filter(result == "Failed")
+
+bad.write.mode("append").parquet(
+    "s3://retail-lake/quarantine/orders/")</code></pre></div>
+
+				<h3>Checking for empty fields</h3>
+				<div class="callout trap"><p><strong>An empty string is not null.</strong> In a CSV file, a blank value in a <em>string</em> column is read as <code>""</code>, so it <strong>passes <code>IsComplete</code> and <code>Completeness</code></strong>, which only count nulls. (In a numeric column a blank becomes NULL and fails.) To catch empty text, add <code>ColumnValues "email" != EMPTY</code>; DQDL also has the keywords <code>NULL</code> and <code>WHITESPACES_ONLY</code>.</p></div>
+				<ul>
+					<li><code>IsComplete "c"</code> requires 100% non-null; <code>Completeness "c" &gt; 0.95</code> allows up to 5% nulls.</li>
+					<li>Most <code>ColumnValues</code> rules fail NULL rows, but <code>!=</code> and <code>not in</code> let NULLs pass. To fail them, add <code>NULL</code> to the list: <code>ColumnValues "status" not in ["X", NULL]</code>.</li>
+				</ul>
+
+				<h3>Alerts from quality results</h3>
+				<p>Results publish to CloudWatch as <code>glue.data.quality.rules.passed</code> and <code>glue.data.quality.rules.failed</code>, and to EventBridge as <code>Data Quality Evaluation Results Available</code> events carrying the score. AWS recommends EventBridge for alerting.</p>
+				<div class="callout trap"><p>EventBridge events are published <strong>only if the CloudWatch metrics option stays on</strong>. In the PySpark API, <code>enableDataQualityCloudWatchMetrics</code> defaults to <code>False</code> (the console default is on), so a code-only job may produce no events at all.</p></div>
+				<div class="code"><span class="file">Alert when the quality score drops below 0.7</span>
+<pre><code>{
+  "source": ["aws.glue-dataquality"],
+  "detail-type": [
+    "Data Quality Evaluation Results Available"
+  ],
+  "detail": {
+    "score": [{"numeric": ["&lt;=", 0.7]}]
+  }
+}</code></pre></div>
+
+				<h3>Checking tables at rest</h3>
+				<p>On a Data Catalog table, a <strong>recommendation run</strong> profiles the data and proposes rules (completeness, uniqueness, allowed values, length ranges) to accept as a starting ruleset; an <strong>ADVANCED</strong> mode added in 2026 uses Amazon Bedrock on a sample of rows. An <strong>evaluation run</strong> then scores the table &mdash; the percentage of rules that passed &mdash; on demand or on a schedule, optionally limited to recent partitions.</p>
+				<div class="code"><span class="file">Score the orders table (CLI)</span>
+<pre><code>aws glue \
+  start-data-quality-ruleset-evaluation-run \
+  --data-source file://orders-table.json \
+  --role GlueDQRole \
+  --ruleset-names orders_rules \
+  --additional-run-options \
+    '{"CloudWatchMetricsEnabled": true}'</code></pre></div>
+				<div class="code"><span class="file">orders-table.json</span>
+<pre><code>{
+  "GlueTable": {
+    "DatabaseName": "retail",
+    "TableName": "orders"
+  }
+}</code></pre></div>
+				<p>Other in-pipeline options: a Step Functions <code>Choice</code> state that routes on the quality score, a Lambda check on each arriving file (<a href="d3-task-3-2.html#s2">Task 3.2</a>), and Deequ (the open-source library Glue Data Quality is built on) in Spark on EMR.</p>
+			</div>
+
+			<!-- ===== 3.4.2 ===== -->
+			<h2 id="s2">Defining rules</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.2</span><span class="skill-text">Define data quality rules (for example, DataBrew).</span></p>
+				<p>A rule turns an expectation ("every order has a customer") into something a machine can test. Two AWS rule systems appear on the exam: <strong>DQDL</strong> in Glue Data Quality, and <strong>rulesets</strong> in DataBrew.</p>
+
+				<h3>DQDL rule types</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Checks</th><th>Rules</th></tr></thead>
+						<tbody>
+							<tr><td>Completeness</td><td data-label="Rules"><code>IsComplete</code>, <code>Completeness</code></td></tr>
+							<tr><td>Uniqueness</td><td data-label="Rules"><code>IsUnique</code>, <code>Uniqueness</code>, <code>IsPrimaryKey</code>, <code>UniqueValueRatio</code>, <code>DistinctValuesCount</code></td></tr>
+							<tr><td>Values and formats</td><td data-label="Rules"><code>ColumnValues</code> (lists, ranges, regex with <code>matches</code>, dates), <code>ColumnLength</code>, <code>ColumnDataType</code></td></tr>
+							<tr><td>Statistics</td><td data-label="Rules"><code>Mean</code>, <code>Sum</code>, <code>StandardDeviation</code>, <code>Entropy</code>, <code>ColumnCorrelation</code></td></tr>
+							<tr><td>Shape</td><td data-label="Rules"><code>RowCount</code>, <code>ColumnCount</code>, <code>ColumnExists</code>, <code>ColumnNamesMatchPattern</code></td></tr>
+							<tr><td>Freshness</td><td data-label="Rules"><code>DataFreshness</code>, <code>FileFreshness</code></td></tr>
+							<tr><td>Across datasets</td><td data-label="Rules"><code>ReferentialIntegrity</code>, <code>DatasetMatch</code>, <code>RowCountMatch</code>, <code>AggregateMatch</code>, <code>SchemaMatch</code></td></tr>
+							<tr><td>Files</td><td data-label="Rules"><code>FileMatch</code>, <code>FileSize</code>, <code>FileUniqueness</code></td></tr>
+							<tr><td>Custom and learned</td><td data-label="Rules"><code>CustomSql</code>, <code>DetectAnomalies</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Orders ruleset (DQDL)</span>
+<pre><code>Rules = [
+  # completeness
+  IsComplete "order_id",
+  Completeness "email" &gt; 0.95,
+  ColumnValues "email" != EMPTY,
+  # uniqueness
+  IsPrimaryKey "order_id",
+  # allowed values and formats
+  ColumnValues "status" in
+    ["NEW", "PAID", "SHIPPED"],
+  ColumnValues "sku" matches
+    "[A-Z]{3}-[0-9]{4}",
+  # ranges
+  ColumnValues "qty" between 0 and 1000,
+  ColumnValues "price" &gt; 0
+    with threshold &gt; 0.99,
+  # every order's customer exists
+  ReferentialIntegrity "customer_id"
+    "customers.customer_id" = 1.0,
+  # data arrived in the last day
+  DataFreshness "order_date"
+    &lt;= 24 hours
+]</code></pre></div>
+
+				<h3>DQDL syntax to know</h3>
+				<ul>
+					<li>Rules live in <code>Rules = [ ... ]</code>, separated by commas; DQDL is case sensitive; <code>#</code> starts a comment.</li>
+					<li><strong><code>with threshold</code></strong> (only on <code>ColumnValues</code>, <code>ColumnDataType</code> and <code>CustomSql</code>) passes the rule if enough rows comply: <code>with threshold &gt; 0.99</code> allows 1% exceptions.</li>
+					<li><strong><code>between</code> is exclusive</strong> of its bounds; <code>not between</code> is inclusive.</li>
+					<li><strong><code>where</code></strong> applies a rule to a subset (a Spark SQL condition), written before any threshold: <code>ColumnValues "state" in ["CA","WA"] where "country = 'US'"</code>.</li>
+					<li><strong>Composite rules</strong> join parenthesized rules with <code>and</code> or <code>or</code>.</li>
+					<li><strong>Cross-dataset rules</strong> refer to other data by an alias (<code>customers</code> above) supplied when the ruleset runs.</li>
+					<li><strong>Labels</strong> tag rules for reporting and <strong>constants</strong> reuse values, both new in late 2025; labels, dynamic rules and analyzers work in ETL jobs only, not on Data Catalog runs.</li>
+				</ul>
+
+				<h3>DataBrew rulesets</h3>
+				<p>A DataBrew <strong>ruleset</strong> is tied to one dataset and runs <strong>only as part of a profile job</strong> &mdash; recipe jobs do not evaluate rules. If any rule fails, the ruleset fails.</p>
+				<ul>
+					<li>A <strong>rule</strong> has one or more <strong>checks</strong>, and passes when all (or any) checks pass. It can apply to one column, several, or columns matched by a regex selector.</li>
+					<li><strong>Aggregate checks</strong> test the dataset or a column as a whole: row count, duplicate rows, missing, distinct or unique value counts and percentages, statistics, Z-score outliers.</li>
+					<li><strong>Value checks</strong> test each row (in a list, between two values, string matches, length) and take a <strong>threshold</strong> as a count or percentage of rows. A single rule cannot mix the two kinds.</li>
+					<li>The console offers <strong>recommended rules</strong> from the profile. Profile jobs sample 20,000 rows by default, so percentage thresholds apply to that sample unless you profile the full dataset.</li>
+				</ul>
+				<div class="code"><span class="file">rules.json for aws databrew create-ruleset</span>
+<pre><code>{
+  "Name": "orders-dq",
+  "TargetArn":
+    "arn:aws:databrew:us-east-1:111111111111:dataset/orders",
+  "Rules": [
+    {
+      "Name": "few-duplicate-rows",
+      "CheckExpression":
+        "AGG(DUPLICATE_ROWS_PERCENTAGE) &lt; :v",
+      "SubstitutionMap": {":v": "1"}
+    },
+    {
+      "Name": "ids-present",
+      "ColumnSelectors": [
+        {"Regex": ".*_id"}],
+      "CheckExpression":
+        "AGG(MISSING_VALUES_PERCENTAGE) &lt; :v",
+      "SubstitutionMap": {":v": "5"}
+    },
+    {
+      "Name": "qty-in-range",
+      "CheckExpression":
+        ":col IS_BETWEEN :lo and :hi",
+      "SubstitutionMap": {
+        ":col": "`qty`",
+        ":lo": "0", ":hi": "1000"},
+      "Threshold": {
+        "Value": 95,
+        "Type": "GREATER_THAN_OR_EQUAL",
+        "Unit": "PERCENTAGE"}
+    }
+  ]
+}</code></pre></div>
+				<div class="callout tip"><p>Choose by who writes the rules and what must happen to bad data. <strong>Glue Data Quality</strong>: engineers, rules inside pipelines, row-level quarantine, cross-dataset and anomaly rules. <strong>DataBrew</strong>: analysts working visually, validation reports from profile jobs, no row-level routing.</p></div>
+			</div>
+
+			<!-- ===== 3.4.3 ===== -->
+			<h2 id="s3">Data consistency</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.3</span><span class="skill-text">Investigate data consistency (for example, DataBrew).</span></p>
+				<p>Data is <strong>consistent</strong> when the same fact looks the same everywhere: formats agree across sources, every reference points to something that exists, a copy has the same rows and totals as its source, and no key has two conflicting values. Investigating it means comparing &mdash; within a dataset, and between a dataset and its source.</p>
+
+				<h3>Within a dataset: DataBrew</h3>
+				<p>A DataBrew profile is the quick first look: duplicate row counts, distinct and unique value counts, the most common values, value distributions, and minimum and maximum string lengths that expose mixed formats (dates written two ways, codes with and without padding). Rule checks then pin these down: duplicate-row percentages, values matching a regular expression, lengths in a range. DataBrew does not document a feature for comparing two datasets; use Glue Data Quality for that.</p>
+
+				<h3>Between datasets: Glue Data Quality</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Rule</th><th>Compares</th></tr></thead>
+						<tbody>
+							<tr><td><code>RowCountMatch</code></td><td data-label="Compares">Row counts, as a ratio of primary to reference</td></tr>
+							<tr><td><code>AggregateMatch</code></td><td data-label="Compares">A <code>sum</code> or <code>avg</code> on both sides (only those two); NULLs ignored</td></tr>
+							<tr><td><code>DatasetMatch</code></td><td data-label="Compares">Rows joined on key columns, optionally comparing value columns. <strong>Keys must be unique and non-null</strong>; otherwise use <code>AggregateMatch</code></td></tr>
+							<tr><td><code>SchemaMatch</code></td><td data-label="Compares">Column names and types, in any order</td></tr>
+							<tr><td><code>ReferentialIntegrity</code></td><td data-label="Compares">Whether every value in one dataset exists in another</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Reconcile the curated table with raw (DQDL)</span>
+<pre><code>Rules = [
+  RowCountMatch "src" = 1.0,
+  AggregateMatch "sum(amount)"
+    "sum(src.amount)" = 1.0,
+  DatasetMatch "src" "order_id"
+    &gt;= 0.99,
+  SchemaMatch "src" = 1.0
+]</code></pre></div>
+				<p>The alias <code>src</code> is supplied at run time: as an extra input node with an alias in Glue Studio, or with <code>--additional-data-sources</code> on a Data Catalog evaluation run.</p>
+				<div class="code"><span class="file">Run it with raw.orders as src</span>
+<pre><code>aws glue \
+  start-data-quality-ruleset-evaluation-run \
+  --data-source file://orders-table.json \
+  --additional-data-sources \
+    file://src.json \
+  --role GlueDQRole \
+  --ruleset-names orders_recon</code></pre></div>
+				<div class="code"><span class="file">src.json</span>
+<pre><code>{
+  "src": {
+    "GlueTable": {
+      "DatabaseName": "retail_raw",
+      "TableName": "orders"
+    }
+  }
+}</code></pre></div>
+
+				<h3>After a migration: DMS validation</h3>
+				<p>AWS DMS can <strong>validate</strong> a migration by comparing every source row with its target row, after the full load and then for ongoing changes. It needs a <strong>primary key or unique index</strong> on each table, adds query load on both databases, and stops after 10,000 failed records by default. A <strong>validation-only</strong> task checks data already migrated without moving anything.</p>
+				<div class="code"><span class="file">Task settings: validate without migrating</span>
+<pre><code>"ValidationSettings": {
+  "EnableValidation": true,
+  "ValidationOnly": true,
+  "ThreadCount": 10,
+  "HandleCollationDiff": true,
+  "FailureMaxCount": 10000
+}</code></pre></div>
+				<p>Mismatches appear in the table statistics (<code>ValidationFailed</code>, <code>ValidationSuspended</code>) and in the <code>awsdms_validation_failures_v1</code> table on the target, with a failure type such as <code>RECORD_DIFF</code>, <code>MISSING_SOURCE</code> or <code>MISSING_TARGET</code> and the differing values.</p>
+
+				<h3>By hand: reconciliation queries</h3>
+				<div class="code"><span class="file">Rows in raw that never reached curated (Athena)</span>
+<pre><code>SELECT order_id, amount
+FROM retail_raw.orders
+EXCEPT
+SELECT order_id, amount
+FROM retail.orders;</code></pre></div>
+				<p>Run it in both directions to find missing and extra rows; Redshift supports <code>EXCEPT</code> (and <code>MINUS</code>) the same way.</p>
+			</div>
+
+			<!-- ===== 3.4.4 ===== -->
+			<h2 id="s4">Sampling</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.4</span><span class="skill-text">Describe data sampling techniques.</span></p>
+				<p>Sampling examines a subset so profiling, development and testing are fast and cheap. The risk is <strong>bias</strong>: a sample that does not look like the whole leads to wrong conclusions.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Technique</th><th>How</th><th>Watch out for</th></tr></thead>
+						<tbody>
+							<tr><td>Simple random</td><td data-label="How">Every row has the same chance</td><td data-label="Watch out for">Rare groups may be missed</td></tr>
+							<tr><td>Stratified</td><td data-label="How">Sample within each group (region, class) at chosen rates</td><td data-label="Watch out for">Needs the grouping column; keeps rare groups represented</td></tr>
+							<tr><td>Systematic</td><td data-label="How">Every k-th row</td><td data-label="Watch out for">Patterns that repeat every k rows</td></tr>
+							<tr><td>Cluster</td><td data-label="How">Whole blocks, files or partitions</td><td data-label="Watch out for">Rows in a block are alike, so variety is lower</td></tr>
+							<tr><td>First N</td><td data-label="How">The top of the file or table</td><td data-label="Watch out for">Often the oldest or one source &mdash; biased</td></tr>
+							<tr><td>Reservoir</td><td data-label="How">A fixed-size random sample from a stream of unknown length</td><td data-label="Watch out for">Streaming use</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>In SQL</h3>
+				<div class="code"><span class="file">Athena: row-level or segment-level samples</span>
+<pre><code><span class="c">-- each row kept with 10% probability</span>
+SELECT * FROM retail.orders
+TABLESAMPLE BERNOULLI (10);
+
+<span class="c">-- whole segments kept or skipped</span>
+SELECT * FROM retail.orders
+TABLESAMPLE SYSTEM (10);</code></pre></div>
+				<div class="callout trap"><p><strong><code>TABLESAMPLE BERNOULLI</code> still scans every block</strong> of the table &mdash; it reduces the rows returned, not the data scanned or the bill. <code>SYSTEM</code> keeps or drops whole segments, which is cheaper but clumpy (a cluster sample). To cut Athena cost, filter on partitions instead.</p></div>
+				<p><strong>Redshift has no <code>TABLESAMPLE</code>.</strong> Use <code>ORDER BY RANDOM() LIMIT n</code> for a random sample; <code>SET SEED</code> makes <code>RANDOM()</code> repeatable per slice, but results across slices are still not deterministic.</p>
+				<div class="code"><span class="file">Redshift: 1,000 random orders</span>
+<pre><code>SELECT *
+FROM orders
+ORDER BY RANDOM()
+LIMIT 1000;</code></pre></div>
+
+				<h3>In Spark</h3>
+				<div class="code"><span class="file">Random and stratified samples (PySpark)</span>
+<pre><code><span class="c"># about 5%, repeatable with the seed</span>
+dev = df.sample(fraction=0.05, seed=42)
+
+<span class="c"># stratified: keep rare returns</span>
+strat = df.sampleBy(
+    "is_return",
+    fractions={0: 0.02, 1: 0.5},
+    seed=42)</code></pre></div>
+				<p><code>sample</code> returns roughly, not exactly, the fraction asked for. <code>sampleBy</code> samples each value of a column at its own rate; values missing from <code>fractions</code> are dropped.</p>
+
+				<h3>Sampling inside AWS services</h3>
+				<ul>
+					<li><strong>DataBrew projects</strong> sample the first N, last N or random rows (up to 5,000). <strong>Profile jobs</strong> sample 20,000 rows by default, or the full dataset if you choose.</li>
+					<li><strong>Glue crawlers</strong> can sample 1&ndash;249 files per folder to speed up schema discovery.</li>
+					<li><strong>Glue Data Quality</strong> ADVANCED recommendations look at a random sample of rows.</li>
+				</ul>
+				<div class="callout tip"><p>For rules that must hold on <em>every</em> row &mdash; a primary key, no negative amounts &mdash; sampling can miss the one bad row. Sample for exploration and profiling; check the full data for rules that guard a load.</p></div>
+			</div>
+
+			<!-- ===== 3.4.5 ===== -->
+			<h2 id="s5">Data skew</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.5</span><span class="skill-text">Implement data skew mechanisms.</span></p>
+				<p><strong>Skew</strong> is uneven distribution: one partition, key, slice or shard gets far more data or traffic than the rest, so the whole job waits for the busiest worker while the others sit idle. The cure is always to spread the load &mdash; but each service exposes skew differently.</p>
+
+				<h3>Spark on Glue and EMR</h3>
+				<p>In the Spark UI, skew shows as one task running far longer than the others in a stage (maximum duration well above the 75th percentile). Glue 4.0+ publishes <strong><code>glue.driver.skewness.stage</code></strong> and <code>glue.driver.skewness.job</code>, based on the ratio of maximum to median task time against a factor of 5. Adaptive Query Execution splits skewed join partitions automatically when they are big enough (<a href="d1-task-1-2.html#s7">Task 1.2</a>); otherwise:</p>
+				<ul>
+					<li><strong>Broadcast</strong> the small table so the big one is not shuffled at all.</li>
+					<li><strong>Use a better key</strong>: higher cardinality, or composite.</li>
+					<li><strong>Isolate hot keys</strong>: process the few heavy keys separately and union the results.</li>
+					<li><strong>Salt</strong> the key: add a random number to it on the big side, and copy the small side once per salt value, so one hot key becomes many smaller partitions.</li>
+				</ul>
+				<div class="code"><span class="file">Salting a skewed join (PySpark)</span>
+<pre><code>from pyspark.sql import functions as F
+
+N = 16  <span class="c"># salt values</span>
+
+<span class="c"># big side: a random salt per row</span>
+big_s = orders.withColumn(
+    "salt",
+    (F.rand(7) * N).cast("int"))
+
+<span class="c"># small side: one copy per salt value</span>
+salts = F.array(
+    *[F.lit(i) for i in range(N)])
+small_s = customers.withColumn(
+    "salt", F.explode(salts))
+
+joined = big_s.join(
+    small_s, ["customer_id", "salt"]
+).drop("salt")</code></pre></div>
+				<div class="callout note"><p>Glue <strong>job run insights</strong> write root-cause analysis only for <strong>failed</strong> runs. A run that succeeds slowly because of skew produces no insight &mdash; use the skewness metrics and the Spark UI.</p></div>
+
+				<h3>Amazon Redshift</h3>
+				<p>A distribution key with few values, or one dominant value, puts most rows on a few slices. <code>SVV_TABLE_INFO.skew_rows</code> is the ratio of rows in the fullest slice to the emptiest; values far above 1 mean skew. The fixes are a higher-cardinality <code>DISTKEY</code>, <code>EVEN</code>, or AWS's recommendation, <code>DISTSTYLE AUTO</code> (<a href="d2-task-2-1.html#s2">Task 2.1</a>).</p>
+				<div class="code"><span class="file">The most skewed tables</span>
+<pre><code>SELECT "schema", "table", diststyle,
+       skew_rows, skew_sortkey1,
+       tbl_rows
+FROM svv_table_info
+ORDER BY skew_rows DESC
+LIMIT 10;</code></pre></div>
+
+				<h3>DynamoDB and Kinesis</h3>
+				<ul>
+					<li><strong>DynamoDB</strong>: a hot partition key is throttled at the per-partition limit. <strong>CloudWatch Contributor Insights for DynamoDB</strong> lists the most accessed and most throttled keys; its <code>THROTTLED_KEYS</code> mode (August 2025) bills only for throttled requests, so it can stay on. Fix hot keys with write sharding (<a href="d2-task-2-4.html#s1">Task 2.4</a>).</li>
+					<li><strong>Kinesis Data Streams</strong>: records with the same partition key go to the same shard, so a low-cardinality key creates a <strong>hot shard</strong> (write limits per shard: 1 MB or 1,000 records per second). Use high-cardinality keys or <code>ExplicitHashKey</code>, find hot shards with enhanced shard-level metrics, and split them. On-demand streams can now use an <strong><code>AUTO</code> record distribution</strong> that spreads records evenly but gives up per-key ordering.</li>
+					<li><strong>MSK</strong> partitions behave like shards: spread keys or add partitions.</li>
+				</ul>
+				<div class="code"><span class="file">Find the hottest keys in the loyalty table</span>
+<pre><code>aws dynamodb update-contributor-insights \
+  --table-name loyalty \
+  --contributor-insights-action ENABLE \
+  --contributor-insights-mode \
+    THROTTLED_KEYS</code></pre></div>
+				<div class="callout tip"><p>Recognize skew in a scenario by its signature: <strong>most workers finish, one runs on</strong> (Spark); <strong>one slice is full</strong> (Redshift); <strong>throttling while total capacity is unused</strong> (DynamoDB, Kinesis). Adding capacity rarely helps &mdash; changing how keys spread does.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Glue Data Quality runs in ETL jobs (row-level results, quarantine, no separate fee) or on Data Catalog tables (recommendations, schedules, minimum 2 DPUs). <code>EvaluateDataQuality</code> outputs <code>ruleOutcomes</code> and <code>rowLevelOutcomes</code> with a <code>DataQualityEvaluationResult</code> column for splitting good and bad rows.</li>
+				<li>On failure: none (default), fail after loading, or fail without loading anything. <strong>EventBridge results need the CloudWatch metrics option on</strong> &mdash; off by default in the PySpark API.</li>
+				<li><strong>Empty strings pass <code>IsComplete</code> and <code>Completeness</code></strong>; use <code>ColumnValues "c" != EMPTY</code>. Most <code>ColumnValues</code> rules fail NULLs, but <code>!=</code> and <code>not in</code> pass them.</li>
+				<li>DQDL: thresholds only on <code>ColumnValues</code>, <code>ColumnDataType</code> and <code>CustomSql</code>; <code>between</code> is exclusive; <code>where</code> filters rows; composite rules with <code>and</code>/<code>or</code>; labels, dynamic rules and analyzers are ETL-only.</li>
+				<li>DataBrew rulesets belong to one dataset and <strong>run only in profile jobs</strong> (20,000-row sample by default); aggregate and per-row checks cannot be mixed in one rule. DataBrew for analysts, Glue Data Quality for pipelines.</li>
+				<li>Consistency: <code>RowCountMatch</code>, <code>AggregateMatch</code> (sum and avg only), <code>DatasetMatch</code> (unique, non-null keys), <code>SchemaMatch</code> and <code>ReferentialIntegrity</code> against an aliased reference. DMS validation needs primary keys and supports validation-only tasks; <code>EXCEPT</code> queries reconcile by hand.</li>
+				<li>Sampling: random, stratified, systematic, cluster, reservoir; first-N is biased. <strong>Athena <code>TABLESAMPLE BERNOULLI</code> scans everything</strong>; <code>SYSTEM</code> samples segments. Redshift has no <code>TABLESAMPLE</code> (use <code>ORDER BY RANDOM()</code>). Spark <code>sample</code> and <code>sampleBy</code> for stratified samples.</li>
+				<li>Skew: in Spark, broadcast, better keys, isolate hot keys or salt; watch <code>glue.driver.skewness.stage</code>. In Redshift, check <code>skew_rows</code> and use <code>DISTSTYLE AUTO</code> or a better key. In DynamoDB, Contributor Insights finds hot keys; in Kinesis, high-cardinality keys, shard splits or <code>AUTO</code> distribution on on-demand streams.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-3.html"><small>Previous</small>Task 3.3: Maintain and monitor data pipelines</a>
+				<a class="next" href="d4-task-4-1.html"><small>Next</small>Task 4.1: Apply authentication mechanisms</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Data Engineer &ndash; Associate (DEA-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
