@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.1: Networking | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 2.1, Kubernetes networking: the network model, CNI plugins, Services (ClusterIP, NodePort, LoadBalancer, ExternalName, headless), EndpointSlices, kube-proxy modes, CoreDNS and Service DNS names, Ingress and the Ingress NGINX retirement, Gateway API, NetworkPolicy and service mesh, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Container Orchestration &middot; 28%</span>
+		<h1>2.1: Networking</h1>
+		<p>How Pods reach each other and the outside world in Kubernetes&reg;: the network model, CNI plugins, Services and DNS, getting traffic in with Ingress and the Gateway API, restricting traffic with NetworkPolicy, and where a service mesh fits.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">Services</span><span class="tag">CNI</span><span class="tag">DNS</span><span class="tag">Gateway API</span><span class="tag">NetworkPolicy</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The network model</a></li>
+				<li><a href="#s2">CNI plugins</a></li>
+				<li><a href="#s3">Services</a></li>
+				<li><a href="#s4">kube-proxy</a></li>
+				<li><a href="#s5">DNS</a></li>
+				<li><a href="#s6">Ingress and the Gateway API</a></li>
+				<li><a href="#s7">NetworkPolicy</a></li>
+				<li><a href="#s8">Service mesh</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.1</span>
+				<p><strong>Networking.</strong></p>
+			</div>
+			<p>This page takes the topic to cover the <strong>Kubernetes network model</strong> and the plugins that implement it, <strong>Services</strong>, <strong>kube-proxy</strong> and <strong>DNS</strong> for finding Pods, <strong>Ingress</strong> and the <strong>Gateway API</strong> for traffic from outside, <strong>NetworkPolicy</strong> for restricting traffic, and <strong>service meshes</strong>, which the old curriculum named separately. Using NetworkPolicy as part of a security design is revisited in topic 2.2; diagnosing network problems is topic 2.3.</p>
+			<p>Quotes are from the <a href="https://kubernetes.io/docs/concepts/services-networking/">Kubernetes documentation</a> (&copy; The Kubernetes Authors) and the <a href="https://glossary.cncf.io/">CNCF Glossary</a>, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>, and from the <a href="https://gateway-api.sigs.k8s.io/">Gateway API project</a>, for Kubernetes v1.37.</p>
+			<div class="callout note"><p><strong>Running example.</strong> In the web shop, customers reach <code>shop-web</code> at <code>shop.example.com</code>; <code>shop-web</code> calls <code>shop-api</code>, which talks to <code>shop-db</code>. Only <code>shop-web</code> should be reachable from outside, and only <code>shop-api</code> should reach the database.</p></div>
+
+			<!-- ===== Model ===== -->
+			<h2 id="s1">The network model</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Stating the rules every Kubernetes network follows, and which parts Kubernetes itself does not implement.</span></p>
+				<ul>
+					<li>"Each pod in a cluster gets its own unique cluster-wide IP address."</li>
+					<li>Containers in the same Pod share one network namespace and "can communicate with each other over <code>localhost</code>."</li>
+					<li>"All pods can communicate with all other pods, whether they are on the same node or on different nodes. Pods can communicate with each other directly, without the use of proxies or address translation (NAT)."</li>
+					<li>"Agents on a node (such as system daemons, or kubelet) can communicate with all pods on that node."</li>
+				</ul>
+				<p>The documentation names four problems and their solutions: container-to-container (Pods and <code>localhost</code>), Pod-to-Pod (the pod network), Pod-to-Service and external-to-Service (Services, plus Ingress or Gateway).</p>
+				<div class="callout tip"><p><strong>Kubernetes defines the APIs; plugins do much of the work.</strong> "Only a few parts of this model are implemented by Kubernetes itself." The pod network comes from a CNI plugin, Service routing from kube-proxy or a replacement, and NetworkPolicy from the network plugin. Clusters can be IPv4, IPv6 or <strong>dual-stack</strong> (stable since v1.23).</p></div>
+			</div>
+
+			<!-- ===== CNI ===== -->
+			<h2 id="s2">CNI plugins</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Knowing what a CNI plugin does and recognizing the common ones.</span></p>
+				<p>"CNI (<em>Container Network Interface</em>), a Cloud Native Computing Foundation project, consists of a specification and libraries for writing plugins to configure network interfaces in Linux containers". It "concerns itself only with network connectivity of containers". CNI is a CNCF <strong>incubating</strong> project; the specification is at version 1.1.0. "A CNI plugin is required to implement the Kubernetes network model": it gives each Pod an IP address and connects Pods across nodes.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Plugin</th><th>Notes</th></tr></thead>
+						<tbody>
+							<tr><td>Cilium</td><td data-label="Notes">eBPF-based networking, observability and security; enforces policy at layers 3 to 7; "can act as a replacement for kube-proxy". CNCF graduated (2023)</td></tr>
+							<tr><td>Calico</td><td data-label="Notes">"A networking and network policy provider", with or without overlays and BGP</td></tr>
+							<tr><td>Flannel</td><td data-label="Notes">"An overlay network provider"; simple</td></tr>
+							<tr><td>Antrea</td><td data-label="Notes">Built on Open vSwitch; CNCF Sandbox</td></tr>
+							<tr><td>Multus</td><td data-label="Notes">Attaches several networks to one Pod</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>"You can install only one Pod network per cluster." The plugin is loaded by the container runtime, not the kubelet: kubelet's CNI flags "were removed in Kubernetes 1.24".</p>
+			</div>
+
+			<!-- ===== Services ===== -->
+			<h2 id="s3">Services</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Giving a changing set of Pods one stable address, and choosing how widely that address is exposed.</span></p>
+				<p>Pods come and go, so their IPs change. A <strong>Service</strong> is "a method for exposing a network application that is running as one or more Pods in your cluster", with "a stable (long lived) IP address or hostname". It usually finds its Pods with a label selector, and the control plane keeps a list of matching Pods in <strong>EndpointSlices</strong>.</p>
+				<div class="code"><span class="file">shop-api Service (ClusterIP)</span>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: shop-api
+spec:
+  type: ClusterIP   <span class="c"># default; may omit</span>
+  selector:
+    app: shop-api   <span class="c"># matches Pod labels</span>
+  ports:
+  - name: http
+    protocol: TCP   <span class="c"># default</span>
+    port: 80        <span class="c"># the Service's port</span>
+    targetPort: 8080 <span class="c"># container port</span></code></pre></div>
+				<p>A Service maps its <code>port</code> to the Pods' <code>targetPort</code> (by default the same number). Clients call <code>http://shop-api</code> on port 80 and reach a container listening on 8080.</p>
+
+				<h3>Service types</h3>
+				<p>"The <code>type</code> field in the Service API is designed as nested functionality - each level adds to the previous":</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Type</th><th>Reachable from</th><th>Web shop use</th></tr></thead>
+						<tbody>
+							<tr><td>ClusterIP (default)</td><td data-label="Reachable from">"Only reachable from within the cluster", through a virtual IP</td><td data-label="Web shop use"><code>shop-api</code>, <code>shop-db</code></td></tr>
+							<tr><td>NodePort</td><td data-label="Reachable from">Every node's IP at a fixed port from 30000&ndash;32767 by default, plus a cluster IP</td><td data-label="Web shop use">Quick testing without a load balancer</td></tr>
+							<tr><td>LoadBalancer</td><td data-label="Reachable from">An external load balancer; "you must provide one, or you can integrate your Kubernetes cluster with a cloud provider"</td><td data-label="Web shop use">A simple way to expose <code>shop-web</code></td></tr>
+							<tr><td>ExternalName</td><td data-label="Reachable from">A DNS <code>CNAME</code> to an outside name; "No proxying of any kind is set up"</td><td data-label="Web shop use">Point <code>payments</code> at an external provider's hostname</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Headless Services.</strong> Setting <code>clusterIP: None</code> creates a headless Service: "a cluster IP is not allocated, kube-proxy does not handle these Services, and there is no load balancing or proxying". DNS instead returns the individual Pod IPs, which is what a StatefulSet such as <code>shop-db</code> needs to give each Pod a stable name. <code>None</code> "is not the same as leaving the <code>.spec.clusterIP</code> field unset".</p></div>
+
+				<h3>Other Service settings</h3>
+				<ul>
+					<li><strong>Without a selector</strong>, no EndpointSlices are created automatically; you add them yourself, for example to point at a database outside the cluster.</li>
+					<li><code>sessionAffinity: ClientIP</code> sends each client to the same Pod (default <code>None</code>; timeout three hours).</li>
+					<li><code>externalTrafficPolicy</code> and <code>internalTrafficPolicy</code> are <code>Cluster</code> (default: any ready Pod) or <code>Local</code> (only Pods on the receiving node; traffic is dropped if there are none).</li>
+					<li><code>trafficDistribution: PreferSameZone</code> or <code>PreferSameNode</code> (stable since v1.35) prefers nearby Pods; the older value <code>PreferClose</code> is a deprecated alias.</li>
+				</ul>
+				<div class="callout retired"><p><strong>Two Service features are deprecated.</strong> The <code>Endpoints</code> API is deprecated since v1.33 in favour of EndpointSlices, and the Service field <code>.spec.externalIPs</code> since v1.36 because of a security problem: "All users should begin migrating away from <code>externalIPs</code>." The external IPs of LoadBalancer Services are not affected.</p></div>
+				<div class="code"><span class="file">Expose and inspect</span>
+<pre><code><span class="c"># create a Service for a Deployment</span>
+kubectl expose deployment shop-api \
+  --port=80 --target-port=8080
+
+kubectl get svc,endpointslices
+kubectl describe svc shop-api
+
+<span class="c"># reach it from your laptop (one Pod)</span>
+kubectl port-forward svc/shop-web 8080:80</code></pre></div>
+				<p>Note that <code>port-forward</code> picks a single Pod, so it does not load-balance.</p>
+			</div>
+
+			<!-- ===== kube-proxy ===== -->
+			<h2 id="s4">kube-proxy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Explaining how a Service's virtual IP actually reaches a Pod, and the modes kube-proxy can use.</span></p>
+				<p>"kube-proxy is a network proxy that runs on each node in your cluster, implementing part of the Kubernetes Service concept." It watches Services and EndpointSlices and programs the node's packet filtering so that traffic to a Service's virtual IP is rewritten to one of its Pods. The cluster IP is not assigned to any machine: "the Service IP is completely virtual, it never hits the wire."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Mode</th><th>State in v1.37</th></tr></thead>
+						<tbody>
+							<tr><td><code>iptables</code></td><td data-label="State in v1.37">The default on Linux; "a future version of Kubernetes will change the default to <code>nftables</code>"</td></tr>
+							<tr><td><code>nftables</code></td><td data-label="State in v1.37">Stable since v1.33; "the successor to the iptables API"; needs Linux kernel 5.13 or later</td></tr>
+							<tr><td><code>ipvs</code></td><td data-label="State in v1.37">Deprecated since v1.35; to be disabled by default in v1.40 and removed in v1.43</td></tr>
+							<tr><td><code>kernelspace</code></td><td data-label="State in v1.37">The only mode on Windows nodes</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Some network plugins, such as Cilium, replace kube-proxy entirely with their own eBPF-based Service routing.</p>
+			</div>
+
+			<!-- ===== DNS ===== -->
+			<h2 id="s5">DNS</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Finding Services by name, across namespaces, and knowing what DNS returns for each kind of Service.</span></p>
+				<p>"Kubernetes creates DNS records for Services and Pods. You can contact Services with consistent DNS names instead of IP addresses." The cluster DNS server is <strong>CoreDNS</strong>, "the default implementation of Kubernetes cluster DNS" (a CNCF graduated project); for compatibility its Service is still called <code>kube-dns</code>.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Name used from a shop Pod</th><th>Resolves to</th></tr></thead>
+						<tbody>
+							<tr><td><code>shop-api</code></td><td data-label="Resolves to">The <code>shop-api</code> Service in the Pod's own namespace</td></tr>
+							<tr><td><code>shop-api.staging</code></td><td data-label="Resolves to">The <code>shop-api</code> Service in <code>staging</code></td></tr>
+							<tr><td><code>shop-api.shop.svc.cluster.local</code></td><td data-label="Resolves to">The full name: service, namespace, <code>svc</code>, cluster domain</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>This works because the kubelet writes the Pod's <code>/etc/resolv.conf</code> with search domains for its namespace, and "DNS queries that don't specify a namespace are limited to the Pod's namespace."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Record</th><th>Returned for</th></tr></thead>
+						<tbody>
+							<tr><td>A / AAAA</td><td data-label="Returned for">A normal Service: its cluster IP. A headless Service: "the set of IPs of all of the Pods selected"</td></tr>
+							<tr><td>SRV</td><td data-label="Returned for">Named ports, as <code>_http._tcp.shop-api.shop.svc.cluster.local</code></td></tr>
+							<tr><td>CNAME</td><td data-label="Returned for">An ExternalName Service</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>"Default" is not the default DNS policy.</strong> A Pod's <code>dnsPolicy</code> defaults to <code>ClusterFirst</code> (use cluster DNS). The value named <code>Default</code> makes the Pod inherit the <em>node's</em> DNS settings instead, and <code>None</code> means you supply everything in <code>dnsConfig</code>.</p></div>
+				<div class="callout retired"><p><strong>kube-dns is deprecated.</strong> CoreDNS has been the default since v1.13, and v1.37 deprecates the old kube-dns add-on; "no new packages will be built for kube-dns after v1.40."</p></div>
+			</div>
+
+			<!-- ===== Ingress / Gateway ===== -->
+			<h2 id="s6">Ingress and the Gateway API</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Routing outside HTTP traffic to the right Service, and knowing why new clusters use the Gateway API instead of Ingress.</span></p>
+
+				<h3>Ingress</h3>
+				<p>An Ingress is "an API object that manages external access to the services in a cluster, typically HTTP", with routing rules by host name and path, and optional TLS. Two things are needed: the Ingress resource and an <strong>Ingress controller</strong>: "Only creating an Ingress resource has no effect." It handles only HTTP and HTTPS; other protocols use NodePort or LoadBalancer Services.</p>
+				<div class="callout retired"><p><strong>The Ingress API is frozen, and Ingress NGINX is retired.</strong> "The Kubernetes project recommends using Gateway instead of Ingress. The Ingress API has been frozen." It stays generally available with "no plans to remove" it, but "is no longer being developed". Separately, the popular Ingress NGINX controller was retired on March 24, 2026, after an announcement in November 2025: no more releases or security fixes, though "existing deployments of Ingress NGINX will continue to function". The Ingress2Gateway 1.0 tool (March 2026) helps convert Ingress resources to Gateway API.</p></div>
+
+				<h3>Gateway API</h3>
+				<p>"Gateway API is an add-on containing API kinds that provide dynamic infrastructure provisioning and advanced traffic routing", described by its project as "the next generation of Kubernetes Ingress, Load Balancing, and Service Mesh APIs". Its design is:</p>
+				<ul>
+					<li><strong>Role-oriented</strong>: separate objects for the infrastructure provider, the cluster operator and the application developer.</li>
+					<li><strong>Portable</strong>: "defined as custom resources and ... supported by many implementations".</li>
+					<li><strong>Expressive</strong>: header matching, traffic weighting and more, "that were only possible in Ingress by using custom annotations".</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Resource</th><th>Owned by</th><th>Defines</th></tr></thead>
+						<tbody>
+							<tr><td>GatewayClass</td><td data-label="Owned by">Infrastructure provider</td><td data-label="Defines">A kind of gateway and the controller that implements it</td></tr>
+							<tr><td>Gateway</td><td data-label="Owned by">Cluster operator</td><td data-label="Defines">"An instance of traffic handling infrastructure, such as cloud load balancer", with listeners (ports, protocols)</td></tr>
+							<tr><td>HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute</td><td data-label="Owned by">Application developer</td><td data-label="Defines">Rules that map traffic from a Gateway listener to backend Services</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Gateway and HTTPRoute for the shop</span>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shop-gw
+spec:
+  gatewayClassName: example-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+spec:
+  parentRefs:        <span class="c"># attach to Gateway</span>
+  - name: shop-gw
+  hostnames:
+  - "shop.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    backendRefs:     <span class="c"># target Service</span>
+    - name: shop-api
+      port: 80</code></pre></div>
+				<div class="callout trap"><p><strong>Gateway API is not built in.</strong> Its resources are custom resources you install (or a Gateway controller installs for you), and a controller must implement them, just as with Ingress. Gateway, GatewayClass and HTTPRoute reached GA in v1.0 (October 2023); the latest release is v1.7 (October 2026), and since v1.6 TCPRoute and UDPRoute are also standard.</p></div>
+			</div>
+
+			<!-- ===== NetworkPolicy ===== -->
+			<h2 id="s7">NetworkPolicy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Restricting which Pods may talk to which, starting from "everything is allowed".</span></p>
+				<p>A NetworkPolicy is "a specification of how groups of Pods are allowed to communicate with each other and with other network endpoints", at IP address and port level (OSI layer 3 or 4). It selects Pods by label and allows traffic from other Pods (<code>podSelector</code>), from namespaces (<code>namespaceSelector</code>) or from IP ranges (<code>ipBlock</code>).</p>
+				<ul>
+					<li><strong>Default open</strong>: "By default, a pod is non-isolated for ingress; all inbound connections are allowed." The same is true for egress.</li>
+					<li><strong>Isolation</strong>: a Pod becomes isolated for ingress as soon as any policy selects it with <code>Ingress</code> in its <code>policyTypes</code>. Then only traffic from its node and traffic the policies allow can reach it.</li>
+					<li><strong>Additive</strong>: "Network policies do not conflict; they are additive." The allowed traffic is the union of all policies, so order does not matter.</li>
+					<li><strong>Both ends</strong>: a connection needs both the source's egress rules and the destination's ingress rules to allow it.</li>
+				</ul>
+				<div class="code"><span class="file">Deny all incoming traffic in the namespace</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}   <span class="c"># all Pods here</span>
+  policyTypes:
+  - Ingress</code></pre></div>
+				<div class="code"><span class="file">Then allow only shop-web to reach shop-api</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-allow-web
+spec:
+  podSelector:       <span class="c"># pods protected</span>
+    matchLabels:
+      app: shop-api
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:   <span class="c"># same namespace</span>
+        matchLabels:
+          app: shop-web
+    ports:
+    - protocol: TCP
+      port: 8080</code></pre></div>
+				<div class="callout trap"><p><strong>No plugin support, no effect.</strong> "Network policies are implemented by the network plugin ... Creating a NetworkPolicy resource without a controller that implements it will have no effect." Choose a CNI plugin that enforces policy. NetworkPolicy also cannot express explicit deny rules, cluster-wide defaults or anything TLS-related.</p></div>
+				<p>Cluster-wide rules that administrators set for every namespace come from a separate SIG Network project: <strong>ClusterNetworkPolicy</strong>, which replaced the earlier AdminNetworkPolicy design in 2026 and reached beta (<code>v1beta1</code>) in November 2026. Like Gateway API, it is installed as custom resources.</p>
+			</div>
+
+			<!-- ===== Mesh ===== -->
+			<h2 id="s8">Service mesh</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Knowing what a service mesh adds between services, and the sidecar and sidecarless ways it is built.</span></p>
+				<p>The CNCF Glossary: "Service meshes add reliability, observability, and security features uniformly across all services across a cluster without requiring code changes." A mesh manages service-to-service traffic: retries and timeouts, traffic splitting, metrics and tracing, and <strong>mutual TLS</strong> (mTLS), in which "instead of validating the identity of just one connection, both sides are validated."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Design</th><th>How it works</th><th>Trade-off</th></tr></thead>
+						<tbody>
+							<tr><td>Sidecar</td><td data-label="How it works">"Pairs each pod with a proxy" (often Envoy) that intercepts its traffic</td><td data-label="Trade-off">Fine control, but "uses more computing resources and becomes more complex to manage as your system grows"</td></tr>
+							<tr><td>Sidecarless</td><td data-label="How it works">Moves mesh functions to shared node-level proxies or the kernel, for example with eBPF</td><td data-label="Trade-off">"Drastically reduces resource usage and removes unnecessary network hops"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Istio</strong> (CNCF graduated 2023) supports both; its sidecarless <em>ambient mode</em> reached general availability in Istio 1.24 (November 2024).</li>
+					<li><strong>Linkerd</strong> (CNCF graduated 2021) uses lightweight sidecar proxies.</li>
+					<li>Gateway API also configures meshes through the <strong>GAMMA</strong> initiative, standard since Gateway API v1.1: routes attach directly to Services.</li>
+				</ul>
+				<div class="callout retired"><p><strong>Service Mesh Interface is archived.</strong> SMI, an earlier attempt at a common mesh API, was archived by CNCF in September 2023; Gateway API's GAMMA work is its successor in practice.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Every Pod gets its own cluster-wide IP; all Pods can reach all Pods without NAT; containers in a Pod share <code>localhost</code>. A <strong>CNI plugin</strong> (Cilium, Calico, Flannel...) implements this; only one per cluster; CNI is a CNCF incubating project.</li>
+				<li>A <strong>Service</strong> gives Pods a stable virtual IP and name, found via a selector and EndpointSlices. Types nest: <strong>ClusterIP</strong> (default, internal) &rarr; <strong>NodePort</strong> (30000&ndash;32767) &rarr; <strong>LoadBalancer</strong>; <strong>ExternalName</strong> is a DNS CNAME. Headless (<code>clusterIP: None</code>) returns Pod IPs.</li>
+				<li>kube-proxy programs nodes to route Service traffic: iptables by default, nftables stable since v1.33, ipvs deprecated since v1.35. eBPF plugins can replace it. Endpoints (v1.33) and <code>externalIPs</code> (v1.36) are deprecated.</li>
+				<li>CoreDNS resolves <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>; short names work within a namespace. Default <code>dnsPolicy</code> is <code>ClusterFirst</code>. kube-dns is deprecated.</li>
+				<li><strong>Ingress</strong> needs a controller and handles HTTP(S) only; the API is frozen, and Ingress NGINX was retired in March 2026. The <strong>Gateway API</strong> (installed as CRDs; GatewayClass, Gateway, routes) is the role-oriented successor.</li>
+				<li><strong>NetworkPolicy</strong>: open by default; selecting a Pod isolates it; policies are additive allow rules; enforcement requires a CNI plugin that supports it.</li>
+				<li>A <strong>service mesh</strong> adds mTLS, retries and observability without code changes, with sidecar or sidecarless proxies (Istio ambient, Linkerd). SMI is archived.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d1-topic-1-4.html"><small>Previous</small>1.4: Containerization</a>
+				<a class="next" href="index.html"><small>Next</small>KCNA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Quotes from kubernetes.io &copy; The Kubernetes Authors and from glossary.cncf.io, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
