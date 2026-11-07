@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 4.2: Apply Authorization Mechanisms | AWS DEA-C01 Notes</title>
+	<meta name="description" content="DEA-C01 Task 4.2 study guide: writing custom IAM policies, policy evaluation with permissions boundaries, SCPs and RCPs, Secrets Manager versus Parameter Store for credentials, Redshift roles, grants and row-level security, Lake Formation permissions, data filters and LF-Tags, role-based, tag-based and attribute-based access control, and least privilege with IAM Access Analyzer.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="dea.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">DEA-C01</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">Task 4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Data Security and Governance &middot; 18%</span>
+		<h1>Task 4.2: Apply authorization mechanisms</h1>
+		<p>Once an identity is known, every request asks one question: is it allowed? This task covers writing IAM policies that answer it precisely, keeping credentials safe, granting access inside Redshift, governing the data lake with Lake Formation, choosing between role-, tag- and attribute-based models, and proving that nothing has more access than it needs.</p>
+		<div class="tags"><span class="tag code">DEA-C01</span><span class="tag">IAM policies</span><span class="tag">Parameter Store</span><span class="tag">Redshift RBAC</span><span class="tag">Lake Formation</span><span class="tag">LF-Tags</span><span class="tag">ABAC</span><span class="tag">Access Analyzer</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Custom IAM policies</a></li>
+				<li><a href="#s2">Storing credentials</a></li>
+				<li><a href="#s3">Access inside Redshift</a></li>
+				<li><a href="#s4">Lake Formation permissions</a></li>
+				<li><a href="#s5">RBAC, TBAC and ABAC</a></li>
+				<li><a href="#s6">Least privilege</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.2</span>
+				<p><strong>Apply authorization mechanisms.</strong></p>
+			</div>
+			<p>Six skills about deciding <em>what</em> an identity may do. Identities, roles, endpoint and access point policies are on <a href="d4-task-4-1.html">Task 4.1</a>; masking is on <a href="d4-task-4-3.html">Task 4.3</a>; Redshift data-sharing grants are on <a href="d4-task-4-5.html">Task 4.5</a>.</p>
+			<p>The examples continue the <strong>retail analytics platform</strong> in account 111111111111: the <code>retail-lake</code> bucket, the <code>retail</code> Glue database with its <code>orders</code> table, the <code>etl</code> Athena workgroup, the <code>retail-dw</code> Redshift cluster, and an <code>analyst</code> role used by regional analysts.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>4.2.1</td><td data-label="What you need to be able to do">Write custom IAM policies where managed policies fall short</td></tr>
+						<tr><td>4.2.2</td><td data-label="What you need to be able to do">Store application and database credentials</td></tr>
+						<tr><td>4.2.3</td><td data-label="What you need to be able to do">Give database users, groups and roles access in Redshift</td></tr>
+						<tr><td>4.2.4</td><td data-label="What you need to be able to do">Manage permissions through Lake Formation</td></tr>
+						<tr><td>4.2.5</td><td data-label="What you need to be able to do">Apply role-, tag- and attribute-based authorization</td></tr>
+						<tr><td>4.2.6</td><td data-label="What you need to be able to do">Construct least-privilege policies</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- ===== 4.2.1 ===== -->
+			<h2 id="s1">Custom IAM policies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.1</span><span class="skill-text">Create custom IAM policies when a managed policy does not meet the needs.</span></p>
+				<p>AWS says plainly that its managed policies "don't grant least privilege permissions". They are a starting point: broad, maintained by AWS (they can change), and not editable. When a job needs one bucket prefix, one database or one workgroup, you write a <strong>customer managed policy</strong> (reusable, up to 5 versions kept) or, for a one-off, an <strong>inline policy</strong> that lives and dies with one identity.</p>
+
+				<h3>How a request is evaluated</h3>
+				<ol class="steps">
+					<li>An <strong>explicit deny</strong> in any applicable policy wins, always.</li>
+					<li>Otherwise the request needs an <strong>allow</strong>. In one account, an allow in either the identity policy or the resource policy is enough.</li>
+					<li>Guardrails must also allow it: a <strong>permissions boundary</strong> (on the identity), <strong>SCPs</strong> (on the account's principals) and <strong>RCPs</strong> (on the account's resources). These <em>never grant</em> anything; the result is the intersection.</li>
+					<li>Anything not allowed is <strong>implicitly denied</strong>.</li>
+				</ol>
+				<div class="callout note"><p><strong>Resource control policies</strong> (November 2024) are the newest guardrail: an SCP limits what <em>your principals</em> can do; an RCP limits who can reach <em>your resources</em>, including principals outside your organization. RCPs cover services such as S3, KMS, Secrets Manager, DynamoDB, SQS and STS &mdash; but not Glue, Athena, Redshift or Lake Formation &mdash; and do not apply to the management account.</p></div>
+
+				<h3>Writing policies for data services</h3>
+				<ul>
+					<li><strong>S3 listing</strong> is a bucket-level action: limit it with the <code>s3:prefix</code> condition, and grant object actions on the prefix ARN.</li>
+					<li><strong>Glue Data Catalog</strong>: "All operations performed on a Data Catalog resource require permission on the resource and all the ancestors" &mdash; so reading a table needs the <strong>catalog, database and table</strong> ARNs. Access is per table; individual partitions cannot be scoped.</li>
+					<li><strong>Athena</strong>: scope query actions to a workgroup ARN, and grant the S3 query-results location.</li>
+					<li><strong>Policy variables</strong> such as <code>${aws:PrincipalTag/team}</code> make one policy serve many identities. <code>${aws:username}</code> works only for IAM users, <strong>not roles</strong>.</li>
+				</ul>
+				<div class="code"><span class="file">Analyst queries the retail database in the etl workgroup</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "QueryInWorkgroup",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:StopQueryExecution",
+        "athena:GetWorkGroup"
+      ],
+      "Resource":
+        "arn:aws:athena:us-east-1:111111111111:workgroup/etl"
+    },
+    {
+      "Sid": "ReadCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:GetPartitions"
+      ],
+      "Resource": [
+        "arn:aws:glue:us-east-1:111111111111:catalog",
+        "arn:aws:glue:us-east-1:111111111111:database/retail",
+        "arn:aws:glue:us-east-1:111111111111:table/retail/*"
+      ]
+    },
+    {
+      "Sid": "ReadData",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource":
+        "arn:aws:s3:::retail-lake/cur/*"
+    },
+    {
+      "Sid": "QueryResults",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::retail-results",
+        "arn:aws:s3:::retail-results/etl/*"
+      ]
+    }
+  ]
+}</code></pre></div>
+				<div class="callout trap"><p>Allowing one workgroup "does not limit users to only this workgroup" if another policy allows others. To <em>confine</em> someone, add an explicit deny for other workgroups. And if the table is governed by Lake Formation, these IAM permissions are necessary but not sufficient &mdash; Lake Formation must grant it too (<a href="#s4">below</a>).</p></div>
+
+				<h3>Limits</h3>
+				<ul>
+					<li>A managed policy holds up to <strong>6,144 characters</strong> (white space not counted); inline policies total up to 10,240 characters per role.</li>
+					<li>A role can have <strong>20 managed policies attached by default</strong> (raisable to 25); a user 10 (up to 20); a group 10.</li>
+				</ul>
+			</div>
+
+			<!-- ===== 4.2.2 ===== -->
+			<h2 id="s2">Storing credentials</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.2</span><span class="skill-text">Store application and database credentials (for example, Secrets Manager, AWS Systems Manager Parameter Store).</span></p>
+				<p>Rotation mechanics are on <a href="d4-task-4-1.html#s3">Task 4.1</a>. Here the question is <em>where</em> to keep a credential and how pipelines read it.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Feature</th><th>Secrets Manager</th><th>Parameter Store</th></tr></thead>
+						<tbody>
+							<tr><td>Built for</td><td data-label="Secrets Manager">Secrets: passwords, keys, tokens</td><td data-label="Parameter Store">Configuration, with <code>SecureString</code> for secrets</td></tr>
+							<tr><td>Automatic rotation</td><td data-label="Secrets Manager"><strong>Yes</strong></td><td data-label="Parameter Store"><strong>No</strong></td></tr>
+							<tr><td>Size</td><td data-label="Secrets Manager">64 KB</td><td data-label="Parameter Store">4 KB standard, 8 KB advanced</td></tr>
+							<tr><td>Cost</td><td data-label="Secrets Manager">$0.40 per secret-month plus API calls</td><td data-label="Parameter Store">Standard free; advanced $0.05 per parameter-month</td></tr>
+							<tr><td>Cross-account</td><td data-label="Secrets Manager">Resource policy (plus a customer managed KMS key)</td><td data-label="Parameter Store">Advanced parameters can be shared</td></tr>
+							<tr><td>Cross-Region</td><td data-label="Secrets Manager">Replicas, kept in sync on rotation</td><td data-label="Parameter Store">No built-in replication</td></tr>
+							<tr><td>Throughput</td><td data-label="Secrets Manager">10,000 <code>GetSecretValue</code> per second</td><td data-label="Parameter Store"><strong>40 per second shared</strong> across the Get APIs by default; higher throughput is billed</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>Database credentials that should rotate &rarr; <strong>Secrets Manager</strong>. Endpoints, flags and non-rotating settings &rarr; <strong>Parameter Store</strong> (free standard tier). Parameter Store can also <em>reference</em> a secret through <code>/aws/reference/secretsmanager/&lt;name&gt;</code>, so code that reads parameters can read secrets the same way.</p></div>
+				<div class="code"><span class="file">An encrypted parameter, and reading it back</span>
+<pre><code>aws ssm put-parameter \
+  --name /retail/etl/api-key \
+  --value "$API_KEY" \
+  --type SecureString \
+  --key-id alias/retail-etl
+
+aws ssm get-parameter \
+  --name /retail/etl/api-key \
+  --with-decryption</code></pre></div>
+				<p><code>SecureString</code> encrypts only the value (not the name) with a symmetric KMS key, and reading it needs <code>kms:Decrypt</code>. An advanced parameter cannot be downgraded to standard.</p>
+
+				<h3>How pipelines read credentials</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Consumer</th><th>How</th></tr></thead>
+						<tbody>
+							<tr><td>Glue connections</td><td data-label="How">Reference a secret holding <code>username</code> and <code>password</code>; the job role needs <code>secretsmanager:GetSecretValue</code> (not in <code>AWSGlueServiceRole</code>)</td></tr>
+							<tr><td>Redshift Data API</td><td data-label="How"><code>--secret-arn</code>, temporary credentials (<code>--db-user</code>), or the caller's IAM identity</td></tr>
+							<tr><td>Lambda</td><td data-label="How">The AWS Parameters and Secrets Lambda Extension: a local HTTP cache on port 2773, 300-second default TTL</td></tr>
+							<tr><td>ECS tasks</td><td data-label="How"><code>secrets</code> in the container definition, injected at start &mdash; a rotated value needs a new task</td></tr>
+							<tr><td>MWAA</td><td data-label="How">The Secrets Manager secrets backend, reading Airflow connections and variables from prefixed secrets</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Run SQL with credentials from a secret</span>
+<pre><code>aws redshift-data execute-statement \
+  --cluster-identifier retail-dw \
+  --database retail \
+  --secret-arn "$RS_SECRET_ARN" \
+  --sql "SELECT COUNT(*) FROM orders"</code></pre></div>
+				<div class="callout trap"><p>The managed policy <code>AmazonRedshiftDataFullAccess</code> allows <code>GetSecretValue</code> only on secrets <strong>tagged with the key <code>RedshiftDataFullAccess</code></strong>. An untagged secret fails with access denied even though the policy looks broad.</p></div>
+				<div class="code"><span class="file">MWAA configuration: Airflow connections from Secrets Manager</span>
+<pre><code>secrets.backend =
+  airflow.providers.amazon.aws.secrets.secrets_manager.SecretsManagerBackend
+secrets.backend_kwargs =
+  {"connections_prefix":
+     "airflow/connections",
+   "variables_prefix":
+     "airflow/variables"}</code></pre></div>
+				<p>Sharing a secret with another account needs three things: a <strong>resource policy</strong> on the secret, a <strong>customer managed KMS key</strong> whose key policy allows that account (the default <code>aws/secretsmanager</code> key cannot be shared), and an identity policy in the caller's account.</p>
+			</div>
+
+			<!-- ===== 4.2.3 ===== -->
+			<h2 id="s3">Access inside Redshift</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.3</span><span class="skill-text">Provide database users, groups, and roles access and authority in a database (for example, for Amazon Redshift).</span></p>
+				<p>IAM decides who may <em>connect</em> to Redshift; inside the database, SQL privileges decide what each user may touch. Redshift supports <strong>users</strong>, legacy <strong>groups</strong>, and <strong>roles</strong> (role-based access control), which can be nested by granting one role to another.</p>
+
+				<h3>System-defined roles</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Role</th><th>Can</th></tr></thead>
+						<tbody>
+							<tr><td><code>sys:monitor</code></td><td data-label="Can">Read catalog and system tables</td></tr>
+							<tr><td><code>sys:operator</code></td><td data-label="Can">Monitor, plus <code>ANALYZE</code>, <code>VACUUM</code> and cancelling queries</td></tr>
+							<tr><td><code>sys:dba</code></td><td data-label="Can">Create and drop schemas, tables, views, procedures and functions</td></tr>
+							<tr><td><code>sys:secadmin</code></td><td data-label="Can">Manage users and roles and row-level security and masking policies &mdash; but <strong>cannot read user tables unless granted</strong></td></tr>
+							<tr><td><code>sys:superuser</code></td><td data-label="Can">Everything</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Separating <code>sys:secadmin</code> from data access lets a security team manage permissions without seeing the data.</p>
+
+				<h3>Granting privileges</h3>
+				<div class="code"><span class="file">An analyst role over the sales schema</span>
+<pre><code>CREATE ROLE analyst;
+GRANT ROLE analyst TO alice;
+
+GRANT USAGE ON SCHEMA sales
+  TO ROLE analyst;
+GRANT SELECT ON ALL TABLES IN SCHEMA sales
+  TO ROLE analyst;
+
+<span class="c">-- tables created later, by anyone</span>
+GRANT SELECT FOR TABLES IN SCHEMA sales
+  TO ROLE analyst;
+
+<span class="c">-- only some columns of a sensitive table</span>
+GRANT SELECT (order_id, region, amount)
+  ON sales.customers TO ROLE analyst;</code></pre></div>
+				<ul>
+					<li>A table grant is useless without <strong><code>USAGE</code> on its schema</strong>.</li>
+					<li><code>ON ALL TABLES IN SCHEMA</code> covers <em>existing</em> tables only. For future tables, <strong>scoped permissions</strong> (<code>GRANT ... FOR TABLES IN SCHEMA</code>) cover objects created by any user, while <code>ALTER DEFAULT PRIVILEGES</code> covers only objects created by one named user.</li>
+					<li>Stored procedures take only <code>EXECUTE</code>. System permissions such as <code>CREATE USER</code> or <code>IGNORE RLS</code> can be granted only to roles.</li>
+					<li><strong>External schemas</strong> (Spectrum): <code>USAGE</code> on the schema; when the tables are governed by Lake Formation, access is granted in Lake Formation to the cluster's IAM role.</li>
+				</ul>
+
+				<h3>Row-level security</h3>
+				<p>Redshift <strong>RLS policies</strong> filter rows per role. The policy below lets each analyst see only regions listed for them in a mapping table.</p>
+				<div class="code"><span class="file">Analysts see only their own regions</span>
+<pre><code>CREATE RLS POLICY by_region
+WITH (region VARCHAR(20))
+USING (region IN (
+  SELECT region FROM sec.user_region
+  WHERE user_name = current_user));
+
+GRANT SELECT ON sec.user_region
+  TO RLS POLICY by_region;
+
+ATTACH RLS POLICY by_region
+  ON sales.orders TO ROLE analyst;
+
+ALTER TABLE sales.orders
+  ROW LEVEL SECURITY ON;</code></pre></div>
+				<div class="callout trap"><p>Once <code>ROW LEVEL SECURITY ON</code> is set, <strong>a user with no attached policy sees no rows</strong>. Policies attached to superusers and <code>sys:secadmin</code> are ignored, and roles granted <code>IGNORE RLS</code> bypass filtering. Creating and attaching policies needs a superuser or <code>sys:secadmin</code>. Masking columns instead of hiding rows is dynamic data masking (<a href="d4-task-4-3.html">Task 4.3</a>).</p></div>
+
+				<h3>Federated identities</h3>
+				<ul>
+					<li>Users from IAM appear as <code>IAM:name</code> (users) or <code>IAMR:name</code> (roles).</li>
+					<li>With <strong>IAM Identity Center</strong>, you choose a namespace when setting up the integration, and Identity Center groups map to Redshift roles named <code>"&lt;namespace&gt;:&lt;group&gt;"</code>. Users removed from Identity Center are <strong>not</strong> dropped from Redshift automatically.</li>
+					<li>The newer <strong>Redshift federated permissions</strong> let permissions, RLS and masking be defined once and enforced in every registered warehouse.</li>
+				</ul>
+				<p>RDS and Aurora PostgreSQL use the same ideas &mdash; PostgreSQL roles, <code>GRANT</code> and default privileges.</p>
+			</div>
+
+			<!-- ===== 4.2.4 ===== -->
+			<h2 id="s4">Lake Formation permissions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.4</span><span class="skill-text">Manage permissions through AWS Lake Formation (for Amazon Redshift, Amazon EMR, Amazon Athena, and Amazon S3).</span></p>
+				<p>IAM can grant a whole table and a whole S3 prefix, but not "these columns" or "rows where region is EMEA". <strong>Lake Formation</strong> adds database-style grants over Glue Data Catalog objects and the S3 data under them, enforced by every integrated engine. It costs nothing extra.</p>
+
+				<h3>How it works</h3>
+				<ol class="steps">
+					<li><strong>Register</strong> the S3 location with Lake Formation, using a role it can assume to read the data.</li>
+					<li>Appoint <strong>data lake administrators</strong> and <strong>grant</strong> permissions on databases, tables, columns and filters.</li>
+					<li>When Athena, Redshift Spectrum, EMR or Glue queries a table, it calls <code>GetDataAccess</code>; Lake Formation checks the grants and <strong>vends temporary credentials</strong> scoped to the data. The engine applies column and row filtering and must fail closed.</li>
+				</ol>
+				<div class="callout trap"><p>For compatibility, Lake Formation starts with <code>Super</code> granted to <strong><code>IAMAllowedPrincipals</code></strong> and "Use only IAM access control" on for new databases and tables &mdash; meaning <strong>IAM alone decides and Lake Formation grants have no effect</strong>. Remove those defaults (empty <code>CreateDatabaseDefaultPermissions</code> and <code>CreateTableDefaultPermissions</code>; upgrade existing resources), or use <strong>hybrid access mode</strong> to opt in principals one at a time.</p></div>
+				<ul>
+					<li>Register with the service-linked role in simple cases, but a <strong>custom role</strong> is required for access from <strong>EMR</strong>, for buckets encrypted with the AWS managed <code>aws/s3</code> key, and for locations in another account.</li>
+					<li>Callers still need IAM permissions for the API calls (<code>glue:GetTable</code>, <code>lakeformation:GetDataAccess</code>); Lake Formation decides the data access.</li>
+				</ul>
+				<div class="code"><span class="file">Register the lake and switch off IAM-only defaults</span>
+<pre><code>aws lakeformation register-resource \
+  --resource-arn \
+    arn:aws:s3:::retail-lake \
+  --role-arn "$LF_REGISTER_ROLE_ARN"
+
+aws lakeformation put-data-lake-settings \
+  --data-lake-settings \
+    file://settings.json</code></pre></div>
+				<div class="code"><span class="file">settings.json</span>
+<pre><code>{
+  "DataLakeAdmins": [{
+    "DataLakePrincipalIdentifier":
+      "arn:aws:iam::111111111111:role/LFAdmin"
+  }],
+  "CreateDatabaseDefaultPermissions": [],
+  "CreateTableDefaultPermissions": []
+}</code></pre></div>
+
+				<h3>Permissions</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Resource</th><th>Permissions</th></tr></thead>
+						<tbody>
+							<tr><td>Database</td><td data-label="Permissions"><code>CREATE_TABLE</code>, <code>ALTER</code>, <code>DROP</code>, <code>DESCRIBE</code>, <code>ALL</code> (Super)</td></tr>
+							<tr><td>Table</td><td data-label="Permissions"><code>SELECT</code>, <code>INSERT</code>, <code>DELETE</code>, <code>ALTER</code>, <code>DROP</code>, <code>DESCRIBE</code>, <code>ALL</code></td></tr>
+							<tr><td>Data location</td><td data-label="Permissions"><code>DATA_LOCATION_ACCESS</code> &mdash; needed only to <em>create</em> tables pointing at the location, not to query them</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Any permission can be granted <strong>with grant option</strong>. Grantees can be IAM users and roles, SAML and Identity Center users and groups, Quick Sight users, and other accounts, organizations or OUs.</p>
+				<div class="code"><span class="file">SELECT on two columns of orders</span>
+<pre><code>aws lakeformation grant-permissions \
+  --principal \
+    DataLakePrincipalIdentifier="$ROLE" \
+  --permissions SELECT \
+  --resource file://orders-cols.json</code></pre></div>
+				<p><code>ROLE</code> holds the analyst role's ARN.</p>
+				<div class="code"><span class="file">orders-cols.json</span>
+<pre><code>{
+  "TableWithColumns": {
+    "DatabaseName": "retail",
+    "Name": "orders",
+    "ColumnNames": ["order_id", "region"]
+  }
+}</code></pre></div>
+
+				<h3>Data filters: row, column and cell security</h3>
+				<p>A <strong>data filter</strong> combines a <strong>row filter</strong> expression with included or excluded columns; together they give <strong>cell-level</strong> security. Filters work with <code>SELECT</code> only.</p>
+				<div class="code"><span class="file">EMEA rows, without the email column</span>
+<pre><code>aws lakeformation create-data-cells-filter \
+  --table-data file://emea-filter.json</code></pre></div>
+				<div class="code"><span class="file">emea-filter.json</span>
+<pre><code>{
+  "TableCatalogId": "111111111111",
+  "DatabaseName": "retail",
+  "TableName": "orders",
+  "Name": "emea_no_email",
+  "RowFilter": {
+    "FilterExpression": "region = 'EMEA'"
+  },
+  "ColumnWildcard": {
+    "ExcludedColumnNames": ["email"]
+  }
+}</code></pre></div>
+				<ul>
+					<li>Row filter expressions are a PartiQL subset under 2,048 characters: <strong>no functions</strong>, and a column can be compared with a constant but not with another column. String comparisons are case sensitive.</li>
+					<li>At most <strong>100 filters per principal per table</strong>. Cell-level security does not work on nested columns, views or resource links.</li>
+				</ul>
+
+				<h3>LF-Tags: tag-based access control</h3>
+				<p>Granting on named tables does not scale: n principals times m tables. <strong>LF-Tags</strong> attach key-value labels to databases, tables and columns, and grants target <strong>tag expressions</strong>, so a new table tagged <code>domain=sales</code> is covered automatically.</p>
+				<div class="code"><span class="file">Tag the orders table and grant by tag</span>
+<pre><code>aws lakeformation create-lf-tag \
+  --tag-key domain \
+  --tag-values sales finance
+
+aws lakeformation add-lf-tags-to-resource \
+  --resource file://orders-table.json \
+  --lf-tags TagKey=domain,TagValues=sales
+
+aws lakeformation grant-permissions \
+  --principal \
+    DataLakePrincipalIdentifier="$ROLE" \
+  --permissions SELECT DESCRIBE \
+  --resource file://sales-tag-policy.json</code></pre></div>
+				<div class="code"><span class="file">orders-table.json</span>
+<pre><code>{
+  "Table": {
+    "DatabaseName": "retail",
+    "Name": "orders"
+  }
+}</code></pre></div>
+				<div class="code"><span class="file">sales-tag-policy.json</span>
+<pre><code>{
+  "LFTagPolicy": {
+    "CatalogId": "111111111111",
+    "ResourceType": "TABLE",
+    "Expression": [{
+      "TagKey": "domain",
+      "TagValues": ["sales"]
+    }]
+  }
+}</code></pre></div>
+				<ul>
+					<li>Tags inherit from database to table to column and can be overridden. A resource has <strong>one value per key</strong>, up to 50 LF-Tags; keys and values are stored in lower case.</li>
+					<li>In an expression, <strong>values of one key are OR'd; different keys are AND'd</strong>.</li>
+					<li>LF-Tags are <strong>not IAM tags</strong>; they exist only in Lake Formation. Since April 2025, Lake Formation can also grant to principals by their IAM tags (Lake Formation ABAC).</li>
+				</ul>
+
+				<h3>Engines and accounts</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Engine</th><th>Fine-grained support</th></tr></thead>
+						<tbody>
+							<tr><td>Athena (SQL)</td><td data-label="Fine-grained support">Table, column, row and cell</td></tr>
+							<tr><td>Redshift Spectrum</td><td data-label="Fine-grained support">Same as Athena</td></tr>
+							<tr><td>EMR on EC2</td><td data-label="Fine-grained support">Spark with runtime roles (EMR 6.7.0+; open table formats 6.15.0+); Hive without row or cell security</td></tr>
+							<tr><td>EMR Serverless</td><td data-label="Fine-grained support">Spark, release 7.2.0 and later</td></tr>
+							<tr><td>Glue ETL</td><td data-label="Fine-grained support">Glue 5.0+ with Spark DataFrames (<code>--enable-lakeformation-fine-grained-access</code>); the older DynamicFrame-based access does not carry over</td></tr>
+							<tr><td>Athena for Apache Spark</td><td data-label="Fine-grained support"><strong>Not supported</strong></td></tr>
+							<tr><td>Quick Sight</td><td data-label="Fine-grained support">Through Athena</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Lake Formation shares across accounts through <strong>AWS RAM</strong>, by named resource or by LF-Tag; recipients create <strong>resource links</strong> to query shared tables from Athena or Redshift Spectrum. The cross-account version setting (now up to version 5) decides which sharing features are available.</p>
+			</div>
+
+			<!-- ===== 4.2.5 ===== -->
+			<h2 id="s5">RBAC, TBAC and ABAC</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.5</span><span class="skill-text">Apply authorization methods that address business needs (role-based, tag-based, and attribute-based).</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Model</th><th>How it decides</th><th>Strength and weakness</th></tr></thead>
+						<tbody>
+							<tr><td>Role-based (RBAC)</td><td data-label="How it decides">Permissions per job function, attached to roles or groups</td><td data-label="Strength and weakness">Simple to understand; but "when you or your users add new resources... you have to update the policies"</td></tr>
+							<tr><td>Tag-based (Lake Formation TBAC)</td><td data-label="How it decides">LF-Tags on catalog objects, grants on tag expressions</td><td data-label="Strength and weakness">Scales to thousands of tables; applies only to Lake Formation-governed data</td></tr>
+							<tr><td>Attribute-based (IAM ABAC)</td><td data-label="How it decides">IAM tags on principals compared with tags on resources</td><td data-label="Strength and weakness">Fewer policies, new tagged resources covered automatically; depends on disciplined tagging</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>ABAC with IAM</h3>
+				<p>An ABAC policy matches a tag on the caller with the same tag on the resource. One policy then serves every project: a principal tagged <code>project=orders</code> reaches only resources tagged <code>project=orders</code>. Attributes can arrive as <strong>session tags</strong> from a SAML or OIDC identity provider, or as IAM Identity Center attributes for access control, so the corporate directory drives access.</p>
+				<div class="code"><span class="file">Secrets for your own project only</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action":
+      "secretsmanager:GetSecretValue",
+    "Resource": "*",
+    "Condition": {
+      "StringEquals": {
+        "aws:ResourceTag/project":
+          "${aws:PrincipalTag/project}"
+      }
+    }
+  }]
+}</code></pre></div>
+				<div class="code"><span class="file">S3 objects tagged for your project</span>
+<pre><code>{
+  "Effect": "Allow",
+  "Action": "s3:GetObject",
+  "Resource":
+    "arn:aws:s3:::retail-lake/*",
+  "Condition": {
+    "StringEquals": {
+      "s3:ExistingObjectTag/project":
+        "${aws:PrincipalTag/project}"
+    }
+  }
+}</code></pre></div>
+				<p>Tag-based authorization keeps spreading: DynamoDB tables (November 2024), S3 access points, directory buckets and S3 Tables (2025), and S3 general purpose buckets once ABAC is turned on for the bucket. Protect the tags themselves &mdash; whoever can change a resource's tag can change who may access it, so restrict tagging actions with <code>aws:RequestTag</code> and <code>aws:TagKeys</code>.</p>
+
+				<h3>Matching the mechanism to the need</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Business need</th><th>Mechanism</th></tr></thead>
+						<tbody>
+							<tr><td>Teams split by department or project</td><td data-label="Mechanism">IAM ABAC on a <code>project</code> tag, or LF-Tags on catalog objects</td></tr>
+							<tr><td>Regional analysts see only their region</td><td data-label="Mechanism">Lake Formation row filter; Redshift RLS; Quick Sight row-level security for dashboards</td></tr>
+							<tr><td>PII columns hidden from most users</td><td data-label="Mechanism">Lake Formation column or cell filter, an LF-Tag on the column, or Redshift column grants (masking is <a href="d4-task-4-3.html">Task 4.3</a>)</td></tr>
+							<tr><td>Thousands of tables and many teams</td><td data-label="Mechanism">LF-Tag-based grants rather than named-resource grants</td></tr>
+							<tr><td>A partner account reads a dataset</td><td data-label="Mechanism">Lake Formation cross-account sharing, or a resource policy plus a customer managed KMS key</td></tr>
+							<tr><td>Database job functions (loader, analyst, auditor)</td><td data-label="Mechanism">Redshift roles, including <code>sys:secadmin</code> for the security team</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== 4.2.6 ===== -->
+			<h2 id="s6">Least privilege</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.6</span><span class="skill-text">Construct custom policies that meet the principle of least privilege.</span></p>
+				<p>Least privilege means granting only the actions, on only the resources, under only the conditions a task needs. In practice: start narrow, add what is proven necessary, and keep checking for access nobody uses.</p>
+
+				<h3>A least-privilege policy for the ETL job</h3>
+				<div class="code"><span class="file">Glue job: read raw, write curated, nothing else</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOnlyItsPrefixes",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource":
+        "arn:aws:s3:::retail-lake",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["raw/pos/*",
+                        "cur/orders/*"]
+        }
+      }
+    },
+    {
+      "Sid": "ReadRaw",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource":
+        "arn:aws:s3:::retail-lake/raw/pos/*"
+    },
+    {
+      "Sid": "WriteCurated",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource":
+        "arn:aws:s3:::retail-lake/cur/orders/*"
+    }
+  ]
+}</code></pre></div>
+				<p>Pair it with guardrails on the bucket itself, such as denying any request not made over TLS:</p>
+				<div class="code"><span class="file">Bucket policy statement: TLS only</span>
+<pre><code>{
+  "Sid": "RestrictToTLSRequestsOnly",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:*",
+  "Resource": [
+    "arn:aws:s3:::retail-lake",
+    "arn:aws:s3:::retail-lake/*"
+  ],
+  "Condition": {
+    "Bool": {
+      "aws:SecureTransport": "false"
+    }
+  }
+}</code></pre></div>
+
+				<h3>Tools that find the right size</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool</th><th>What it does</th><th>Cost</th></tr></thead>
+						<tbody>
+							<tr><td>Access Analyzer <strong>policy generation</strong></td><td data-label="What it does">Builds a policy from up to 90 days of CloudTrail activity. It does not see S3 data events or <code>iam:PassRole</code>, so review and add those</td><td data-label="Cost">Free</td></tr>
+							<tr><td><strong>Policy validation</strong></td><td data-label="What it does">Flags errors, security warnings and suggestions in a policy before you attach it</td><td data-label="Cost">Free</td></tr>
+							<tr><td><strong>Custom policy checks</strong></td><td data-label="What it does"><code>check-no-new-access</code> (does a change add access?), <code>check-access-not-granted</code> (does it allow a sensitive action?), <code>check-no-public-access</code> &mdash; ideal in CI/CD</td><td data-label="Cost">$2 per 1,000 calls</td></tr>
+							<tr><td><strong>Unused access</strong> analyzer</td><td data-label="What it does">Finds unused roles, keys, passwords and permissions</td><td data-label="Cost">$0.20 per role or user per month</td></tr>
+							<tr><td><strong>External access</strong> analyzer</td><td data-label="What it does">Finds resources shared outside the account or organization</td><td data-label="Cost">Free</td></tr>
+							<tr><td><strong>Last accessed</strong> information</td><td data-label="What it does">When each service (and many actions) was last used by an identity</td><td data-label="Cost">Free</td></tr>
+							<tr><td>Policy simulator</td><td data-label="What it does">Tests whether given policies allow a given request</td><td data-label="Cost">Free</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Validate a policy, then block access increases</span>
+<pre><code>aws accessanalyzer validate-policy \
+  --policy-document file://etl.json \
+  --policy-type IDENTITY_POLICY
+
+aws accessanalyzer check-no-new-access \
+  --existing-policy-document \
+    file://etl-old.json \
+  --new-policy-document file://etl.json \
+  --policy-type IDENTITY_POLICY</code></pre></div>
+				<div class="callout tip"><p>Least-privilege habits the exam rewards: specific actions instead of <code>s3:*</code>; resource ARNs down to the prefix or table; conditions (<code>s3:prefix</code>, tags, <code>aws:SecureTransport</code>, <code>aws:SourceVpce</code>); separate roles per job rather than one shared role; permissions boundaries for roles that developers create; and generated policies refined over time.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>AWS managed policies do not grant least privilege; write customer managed policies (versioned, reusable) or inline policies (one identity). Explicit deny wins; otherwise an allow is needed; boundaries, SCPs and <strong>RCPs grant nothing</strong> and intersect. RCPs do not cover Glue, Athena, Redshift or Lake Formation.</li>
+				<li>Glue catalog access needs the <strong>catalog, database and table</strong> ARNs; Athena is scoped by workgroup ARN plus the results bucket; <code>s3:prefix</code> limits listing. <code>${aws:username}</code> does not work for roles. Roles take 20 managed policies by default; managed policies hold 6,144 characters.</li>
+				<li>Secrets Manager for rotating secrets (64 KB, replicas, resource policies); Parameter Store for configuration (<strong>no rotation</strong>, standard tier free, 40 TPS shared by default). Cross-account secrets need a customer managed KMS key. <code>AmazonRedshiftDataFullAccess</code> reads only secrets tagged <code>RedshiftDataFullAccess</code>.</li>
+				<li>Redshift: roles (nestable) and system roles; <code>sys:secadmin</code> manages security without reading data. Grant schema <code>USAGE</code> plus table privileges; scoped permissions for future tables; column-level grants. <strong>With RLS on, users without a policy see no rows.</strong> Identity Center groups map to roles named <code>"namespace:group"</code>.</li>
+				<li>Lake Formation: register locations (custom role for EMR, <code>aws/s3</code>-encrypted buckets or other accounts); remove the <code>IAMAllowedPrincipals</code> defaults or use hybrid mode, or grants do nothing. Engines get vended credentials through <code>GetDataAccess</code>.</li>
+				<li>Data filters give row, column and cell security (row expressions with no functions, 100 filters per principal per table). LF-Tags: one value per key per resource, OR within a key and AND across keys, inherited down to columns, not IAM tags. Athena SQL and Spectrum support all levels; EMR needs runtime roles; Glue 5.0+ with DataFrames; <strong>Athena Spark is not supported</strong>.</li>
+				<li>RBAC per job function; Lake Formation TBAC for many tables; IAM ABAC comparing <code>aws:PrincipalTag</code> with <code>aws:ResourceTag</code> for many teams. Protect tagging permissions, since tags become access.</li>
+				<li>Least privilege: specific actions and resources plus conditions, then Access Analyzer &mdash; policy generation (no data events or PassRole), validation, custom checks such as <code>check-no-new-access</code> in pipelines, and unused access findings.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-1.html"><small>Previous</small>Task 4.1: Apply authentication mechanisms</a>
+				<a class="next" href="d4-task-4-3.html"><small>Next</small>Task 4.3: Ensure data encryption and masking</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Data Engineer &ndash; Associate (DEA-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
