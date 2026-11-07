@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.4: Containerization | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 1.4, containerization: containers versus virtual machines, namespaces and cgroups, container images, tags and digests, the OCI image, runtime and distribution specs, building images with Dockerfiles and multi-stage builds, container runtimes and the CRI, containerd, CRI-O, dockershim removal, RuntimeClass, crictl, image pull policies, command and args, and container security basics, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Kubernetes Fundamentals &middot; 44%</span>
+		<h1>1.4: Containerization</h1>
+		<p>What a container really is, how images are named, built and shared, the open standards that let any tool run any image, the runtimes Kubernetes&reg; talks to, and how a Pod pulls and starts an image.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">Containers</span><span class="tag">Images</span><span class="tag">OCI</span><span class="tag">CRI</span><span class="tag">containerd</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What a container is</a></li>
+				<li><a href="#s2">Container images</a></li>
+				<li><a href="#s3">Open standards: OCI</a></li>
+				<li><a href="#s4">Building images</a></li>
+				<li><a href="#s5">Container runtimes and the CRI</a></li>
+				<li><a href="#s6">Running images in Pods</a></li>
+				<li><a href="#s7">Container security basics</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 1.4</span>
+				<p><strong>Containerization.</strong></p>
+			</div>
+			<p>The CNCF Glossary defines containerization as "the process of packaging of application code including libraries and dependencies required to run the code into a single lightweight executable—called container image." This page takes the topic to cover what containers are, <strong>images</strong> and how they are built, the <strong>OCI</strong> standards, <strong>container runtimes</strong> and the CRI, and how Kubernetes pulls and runs images. Security policy for containers is topic 2.2; build pipelines are topic 3.1.</p>
+			<p>Quotes are from the <a href="https://kubernetes.io/docs/concepts/containers/">Kubernetes documentation</a> (&copy; The Kubernetes Authors) and the <a href="https://glossary.cncf.io/">CNCF Glossary</a>, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>, and from the Open Container Initiative and Docker documentation.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's <code>shop-api</code> is a small Go program. This page builds it into an image, pushes it to a private registry as <code>ghcr.io/acme/shop-api:1.4.2</code> (an example name), and runs it in a Pod.</p></div>
+
+			<!-- ===== What a container is ===== -->
+			<h2 id="s1">What a container is</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Explaining what makes a container different from a virtual machine, and the Linux features that make containers possible.</span></p>
+				<p>The CNCF Glossary: "A container is a running process with resource and capability constraints managed by a computer's operating system. The files available to the container process are packaged as a container image." Kubernetes adds: "Each container that you run is repeatable; the standardization from having dependencies included means that you get the same behavior wherever you run it."</p>
+				<p>The Kubernetes documentation tells the history in three eras:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Era</th><th>How apps ran</th><th>Problem or benefit</th></tr></thead>
+						<tbody>
+							<tr><td>Traditional</td><td data-label="How apps ran">Directly on physical servers</td><td data-label="Problem or benefit">"No way to define resource boundaries"; one app could starve the others, and one server per app was expensive</td></tr>
+							<tr><td>Virtualized</td><td data-label="How apps ran">Many virtual machines on one server</td><td data-label="Problem or benefit">Isolation and better use of hardware, but "each VM is a full machine running all the components, including its own operating system"</td></tr>
+							<tr><td>Container</td><td data-label="How apps ran">Many containers on one operating system</td><td data-label="Problem or benefit">"Relaxed isolation properties to share the Operating System (OS) among the applications. Therefore, containers are considered lightweight."</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A container still has "its own filesystem, share of CPU, memory, process space, and more". This comes from features of the Linux kernel: <strong>namespaces</strong> give each container its own view of processes, network and files, and <strong>cgroups</strong> (control groups), a kernel feature that "limits, accounts for, and isolates the resource usage (CPU, memory, disk I/O, network) for a collection of processes". A layered (union) filesystem lets many containers share the same image files.</p>
+				<div class="callout trap"><p><strong>Containers share the host's kernel.</strong> That is what makes them light, and also their main weakness: the CNCF Glossary notes that "since containers share the same operating system, processes can be considered less secure than alternatives." A virtual machine has its own kernel. Sandboxed runtimes such as gVisor and Kata Containers (see <a href="#s5">below</a>) sit between the two.</p></div>
+				<div class="callout retired"><p><strong>cgroup v1 is deprecated.</strong> Since v1.35 the kubelet will not start on a cgroup v1 node by default (<code>failCgroupV1</code> defaults to true); cgroup v2, stable since v1.25, is now the norm. cgroup v1 is deprecated rather than removed: an override still exists in v1.37, but removal is planned.</p></div>
+				<p>Containers are also <strong>immutable</strong>: "you should not change the code of a container that is already running." To change an app, "build a new image that includes the change, then recreate the container". The CNCF Glossary calls containers "a good example of immutable infrastructure".</p>
+			</div>
+
+			<!-- ===== Images ===== -->
+			<h2 id="s2">Container images</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Naming images precisely, and knowing why a digest is safer than a tag.</span></p>
+				<p>"A container image is a ready-to-run software package containing everything needed to run an application: the code and any runtime it requires, application and system libraries, and default values for any essential settings." Images are built from read-only <strong>layers</strong>, each a set of filesystem changes, and are stored in and pulled from a <strong>registry</strong>.</p>
+				<p>A full image reference is <code>registry/repository:tag@digest</code>. The parts you leave out get defaults:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>You write</th><th>Kubernetes uses</th></tr></thead>
+						<tbody>
+							<tr><td><code>busybox</code></td><td data-label="Kubernetes uses"><code>docker.io/library/busybox:latest</code>: the Docker public registry and the <code>latest</code> tag</td></tr>
+							<tr><td><code>busybox:1.32.0</code></td><td data-label="Kubernetes uses"><code>docker.io/library/busybox:1.32.0</code></td></tr>
+							<tr><td><code>registry.k8s.io/pause:3.5</code></td><td data-label="Kubernetes uses">A specific registry and tag</td></tr>
+							<tr><td><code>registry.k8s.io/pause@sha256:...</code></td><td data-label="Kubernetes uses">An exact image, identified by its content hash</td></tr>
+							<tr><td>A tag and a digest together</td><td data-label="Kubernetes uses">"Only the digest will be used for pulling"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Tags move; digests do not.</strong> "Digests are hashes of the image's content, and are immutable. Tags can be moved to point to different images, but digests are fixed." If someone re-pushes a tag, you could end up with "a mix of Pods running the old and new code". The documentation advises avoiding <code>:latest</code> in production, since "it is harder to track which version of the image is running and more difficult to roll back".</p></div>
+				<p>One name can serve several CPU architectures: a registry can return an <strong>image index</strong> that points to an amd64, an arm64 and other versions, and each node pulls the one it needs.</p>
+			</div>
+
+			<!-- ===== OCI ===== -->
+			<h2 id="s3">Open standards: OCI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Knowing which open specifications let images built by one tool run under another.</span></p>
+				<p>The <strong>Open Container Initiative</strong> (OCI) is "a lightweight, open governance structure (project), formed under the auspices of the Linux Foundation, for the express purpose of creating open industry standards around container formats and runtimes", launched in June 2015. It maintains three specifications:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Specification</th><th>Defines</th><th>Latest version</th></tr></thead>
+						<tbody>
+							<tr><td>Image spec</td><td data-label="Defines">What an image is: "an image manifest, an image index (optional), a set of filesystem layers, and a configuration"</td><td data-label="Latest version">v1.1.1 (March 2025)</td></tr>
+							<tr><td>Runtime spec</td><td data-label="Defines">"The configuration, execution environment, and lifecycle of a container", from an unpacked "filesystem bundle"</td><td data-label="Latest version">v1.3.0 (November 2025)</td></tr>
+							<tr><td>Distribution spec</td><td data-label="Defines">"An API protocol to facilitate and standardize the distribution of content": how registries push and pull</td><td data-label="Latest version">v1.1.1 (January 2025)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Docker donated its runtime, <strong>runc</strong>, to the OCI as the reference implementation of the runtime spec; it is "the underlying default runtime for both containerd and CRI-O." The image format can also carry non-image content, called <strong>OCI artifacts</strong>, such as signatures or configuration bundles.</p>
+				<div class="callout tip"><p><strong>Why it matters.</strong> "The image that Docker produces isn't really a Docker-specific image—it's an OCI (Open Container Initiative) image. Any OCI-compliant image, regardless of the tool you use to build it, will look the same to Kubernetes."</p></div>
+			</div>
+
+			<!-- ===== Building ===== -->
+			<h2 id="s4">Building images</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Writing a small, cache-friendly Dockerfile and knowing the other tools that build OCI images.</span></p>
+				<p>"A Dockerfile is a text document that contains all the commands a user could call on the command line to assemble an image." This one uses a <strong>multi-stage build</strong>: the first stage has the full Go toolchain; the final image contains only the compiled program.</p>
+				<div class="code"><span class="file">Dockerfile (shop-api)</span>
+<pre><code><span class="c"># build stage: full Go toolchain</span>
+FROM golang:1.25 AS build
+WORKDIR /src
+<span class="c"># dependencies first: cached until</span>
+<span class="c"># go.mod changes</span>
+COPY go.mod go.sum ./
+RUN go mod download
+<span class="c"># then the source, which changes often</span>
+COPY . .
+RUN CGO_ENABLED=0 go build \
+    -o /out/shop-api ./cmd/api
+
+<span class="c"># runtime stage: tiny, no shell</span>
+FROM gcr.io/distroless/static-debian13
+COPY --from=build /out/shop-api /shop-api
+<span class="c"># run as a non-root user ID</span>
+USER 65532:65532
+<span class="c"># documentation only: publishes nothing</span>
+EXPOSE 8080
+ENTRYPOINT ["/shop-api"]
+CMD ["--port=8080"]</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Instruction</th><th>Purpose (Docker reference)</th></tr></thead>
+						<tbody>
+							<tr><td><code>FROM</code></td><td data-label="Purpose (Docker reference)">"Create a new build stage from a base image"; a Dockerfile must start with it</td></tr>
+							<tr><td><code>RUN</code></td><td data-label="Purpose (Docker reference)">"Execute build commands", creating a new layer</td></tr>
+							<tr><td><code>COPY</code></td><td data-label="Purpose (Docker reference)">"Copy files and directories"; <code>--from</code> copies from another stage</td></tr>
+							<tr><td><code>WORKDIR</code>, <code>ENV</code>, <code>USER</code></td><td data-label="Purpose (Docker reference)">Set the working directory, environment variables, and the user that runs the process</td></tr>
+							<tr><td><code>EXPOSE</code></td><td data-label="Purpose (Docker reference)">"Doesn't actually publish the port": documents which port the app listens on</td></tr>
+							<tr><td><code>ENTRYPOINT</code></td><td data-label="Purpose (Docker reference)">"Specify default executable"</td></tr>
+							<tr><td><code>CMD</code></td><td data-label="Purpose (Docker reference)">"Specify default commands": default arguments, easy to override</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Layer caching</strong>: "Once a layer changes, then all downstream layers need to be rebuilt as well." Copying <code>go.mod</code> and downloading dependencies before copying the source means a code change does not re-download everything.</li>
+					<li><strong>Small base images</strong> such as distroless or Alpine download faster and contain fewer vulnerabilities. Distroless images "do not contain package managers, shells or any other programs".</li>
+					<li>A <code>.dockerignore</code> file keeps files such as <code>.git</code> or <code>.env</code> out of the build.</li>
+					<li><strong>Never pass secrets as build arguments or <code>ENV</code></strong>: "they persist in the final image".</li>
+				</ul>
+				<div class="code"><span class="file">Build and push (Podman uses the same syntax)</span>
+<pre><code>docker build -t \
+  ghcr.io/acme/shop-api:1.4.2 .
+docker push \
+  ghcr.io/acme/shop-api:1.4.2</code></pre></div>
+
+				<h3>Other build tools</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool</th><th>Notes</th></tr></thead>
+						<tbody>
+							<tr><td>BuildKit</td><td data-label="Notes">"The builder backend used by Docker", with parallel stages and better caching</td></tr>
+							<tr><td>Podman and Buildah</td><td data-label="Notes">Build and run images "without requiring a daemon or root privileges"; CNCF Sandbox (as Podman Container Tools) since January 2025</td></tr>
+							<tr><td>Cloud Native Buildpacks</td><td data-label="Notes">Turn source code into images with no Dockerfile; <strong>graduated</strong> in CNCF in July 2026</td></tr>
+							<tr><td>kaniko</td><td data-label="Notes">Builds inside a container without Docker; Google archived the original project in June 2025 (a community fork continues)</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== Runtimes ===== -->
+			<h2 id="s5">Container runtimes and the CRI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Knowing how the kubelet talks to container runtimes, which runtimes exist, and why Kubernetes no longer needs Docker.</span></p>
+				<p>"You need a working container runtime on each Node in your cluster, so that the kubelet can launch Pods and their containers." The kubelet talks to it through the <strong>Container Runtime Interface</strong>: "The CRI is a plugin interface which enables the kubelet to use a wide variety of container runtimes, without having a need to recompile the cluster components." It is a gRPC API, stable since v1.23; since v1.26 runtimes must support CRI <code>v1</code>.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Layer</th><th>Examples</th><th>Role</th></tr></thead>
+						<tbody>
+							<tr><td>High-level (CRI) runtime</td><td data-label="Examples"><strong>containerd</strong> (CNCF graduated 2019), <strong>CRI-O</strong> (CNCF graduated 2023)</td><td data-label="Role">Pull and store images, manage containers, answer the kubelet over CRI</td></tr>
+							<tr><td>Low-level (OCI) runtime</td><td data-label="Examples"><strong>runc</strong> (the default), crun</td><td data-label="Role">Actually create the container from an OCI bundle</td></tr>
+							<tr><td>Sandboxed runtime</td><td data-label="Examples">gVisor (<code>runsc</code>), Kata Containers</td><td data-label="Role">Extra isolation: a user-space kernel, or lightweight VMs that "feel and perform like containers"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout retired"><p><strong>dockershim was removed in v1.24.</strong> Kubernetes once talked to Docker Engine through a built-in adapter called dockershim. It was deprecated in v1.20 and removed in v1.24, so clusters now use a CRI runtime such as containerd or CRI-O (Docker Engine needs the separate <code>cri-dockerd</code> adapter). This did not break images: "the images produced from <code>docker build</code> will work with all CRI implementations."</p></div>
+				<div class="callout retired"><p><strong>containerd 1.x is finished.</strong> Kubernetes v1.35 was "the last release to support the containerd v1.X series"; v1.36 and v1.37 need containerd 2.x, and containerd 1.7 reached end of life on September 30, 2026.</p></div>
+
+				<h3>RuntimeClass</h3>
+				<p>"RuntimeClass is a feature for selecting the container runtime configuration", stable since v1.20. It is useful when, for example, untrusted code should run in a sandboxed runtime while everything else uses runc. It is cluster-wide and has two main fields, a name and a <code>handler</code> that matches the runtime's configuration:</p>
+				<div class="code"><span class="file">sandboxed.yaml (RuntimeClass)</span>
+<pre><code>apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: sandboxed
+handler: runsc   <span class="c"># runtime config name</span></code></pre></div>
+				<p>A Pod opts in with <code>spec.runtimeClassName: sandboxed</code>. If the class does not exist or the runtime cannot run its handler, "the pod will enter the <code>Failed</code> terminal phase".</p>
+				<div class="callout tip"><p><strong>Cgroup drivers must match.</strong> "It's critical that the kubelet and the container runtime use the same cgroup driver". "The <code>systemd</code> cgroup driver is recommended if you use cgroup v2", and since v1.34 the kubelet detects the driver from the runtime automatically.</p></div>
+
+				<h3>crictl: looking at the runtime directly</h3>
+				<p>"<code>crictl</code> is a command-line interface for CRI-compatible container runtimes. You can use it to inspect and debug container runtimes and applications on a Kubernetes node." It only sees the node you run it on.</p>
+				<div class="code"><span class="file">On a node</span>
+<pre><code>crictl pods            <span class="c"># Pod sandboxes</span>
+crictl ps -a           <span class="c"># all containers</span>
+crictl images          <span class="c"># images on node</span>
+crictl logs &lt;container-id&gt;</code></pre></div>
+			</div>
+
+			<!-- ===== Running in Pods ===== -->
+			<h2 id="s6">Running images in Pods</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Controlling when images are pulled, pulling from private registries, and overriding an image's entrypoint and arguments.</span></p>
+				<div class="code"><span class="file">shop-api Pod</span>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: shop-api
+spec:
+  imagePullSecrets:
+  - name: regcred      <span class="c"># same namespace</span>
+  containers:
+  - name: api
+    image: ghcr.io/acme/shop-api:1.4.2
+    imagePullPolicy: IfNotPresent
+    args: ["--port=8080", "--log=json"]
+    ports:
+    - containerPort: 8080
+    env:
+    - name: SHOP_ENV
+      value: prod</code></pre></div>
+
+				<h3>Pull policy</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Policy</th><th>Behaviour</th></tr></thead>
+						<tbody>
+							<tr><td><code>IfNotPresent</code></td><td data-label="Behaviour">"The image is pulled only if it is not already present locally"</td></tr>
+							<tr><td><code>Always</code></td><td data-label="Behaviour">The runtime checks the registry every time a container starts, downloading only layers it does not already have</td></tr>
+							<tr><td><code>Never</code></td><td data-label="Behaviour">Never pulls; startup fails if the image is not already on the node</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>If you omit the field, it is set when the object is created: <strong><code>Always</code></strong> if the tag is <code>:latest</code> or there is no tag, otherwise <code>IfNotPresent</code> (including when you give a digest). It is "not updated if the image's tag or digest later changes".</p>
+				<div class="callout trap"><p><strong>Pull failures.</strong> A wrong image name or a missing credential first shows <code>ErrImagePull</code>, then <code>ImagePullBackOff</code>: "Kubernetes will keep trying to pull the image, with an increasing back-off delay", up to 300 seconds. "The most common cause of <code>Waiting</code> pods is a failure to pull the image." Diagnosing it is topic 3.2.</p></div>
+
+				<h3>Private registries</h3>
+				<p><code>imagePullSecrets</code> is "the recommended approach to run containers based on images in private registries". The Secret must be "in the same namespace as the Pod" and of type <code>kubernetes.io/dockerconfigjson</code>:</p>
+				<div class="code"><span class="file">Create the pull secret</span>
+<pre><code>kubectl create secret docker-registry \
+  regcred \
+  --docker-server=ghcr.io \
+  --docker-username=ci-bot \
+  --docker-password='&lt;token&gt;'</code></pre></div>
+				<p>Since v1.35 the kubelet also checks credentials for images already cached on a node (beta, on by default), so a Pod without the right secret cannot simply reuse a private image another Pod pulled.</p>
+
+				<h3>command and args</h3>
+				<p>"The <code>command</code> field corresponds to <code>ENTRYPOINT</code>, and the <code>args</code> field corresponds to <code>CMD</code>". What runs:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>In the Pod</th><th>What runs</th></tr></thead>
+						<tbody>
+							<tr><td>Neither</td><td data-label="What runs">The image's ENTRYPOINT plus its CMD</td></tr>
+							<tr><td><code>args</code> only</td><td data-label="What runs">The image's ENTRYPOINT with your args (the shop-api Pod above)</td></tr>
+							<tr><td><code>command</code> only</td><td data-label="What runs">Your command alone; the image's CMD is dropped too</td></tr>
+							<tr><td>Both</td><td data-label="What runs">Your command with your args</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Other container settings: <code>env</code> sets variables one by one and <code>envFrom</code> loads all keys of a ConfigMap or Secret; both "override any environment variables specified in the container image". Listing <code>ports</code> is informational: "Not specifying a port here DOES NOT prevent that port from being exposed." <strong>Lifecycle hooks</strong> run a command or HTTP call just after start (<code>PostStart</code>) or before stop (<code>PreStop</code>), and <strong>probes</strong> check health (topic 3.2).</p>
+				<div class="callout note"><p><strong>Images as volumes.</strong> Since v1.36 (stable), an <code>image</code> volume can mount an OCI image or artifact read-only into a Pod, for example to ship data or a model separately from the application image.</p></div>
+			</div>
+
+			<!-- ===== Security ===== -->
+			<h2 id="s7">Container security basics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.4</span><span class="skill-text">Building and running containers so that a compromised app does as little damage as possible.</span></p>
+				<p>Kubernetes' application security checklist starts with the container itself (policies to enforce these are topic 2.2):</p>
+				<ul>
+					<li>"Set <code>runAsNonRoot: true</code>" and build images with a non-root <code>USER</code>.</li>
+					<li>"Configure the root filesystem to be read-only with <code>readOnlyRootFilesystem: true</code>."</li>
+					<li>"Disable privilege escalations using <code>allowPrivilegeEscalation: false</code>", avoid privileged containers, and drop Linux capabilities you do not need.</li>
+					<li>Scan images for known vulnerabilities, and "use container signing to validate the container image signature before deploying".</li>
+				</ul>
+				<p><strong>User namespaces</strong> became stable in v1.36: with <code>spec.hostUsers: false</code>, root inside the container maps to an unprivileged user on the host, so "even if a process escapes the container, it possesses no administrative power over the underlying node."</p>
+				<div class="callout tip"><p><strong>Who owns the signing tools.</strong> Sigstore and its <code>cosign</code> client are an OpenSSF project, not CNCF; Kubernetes itself signs its release artifacts with cosign. CNCF projects in this space include Notary Project (incubating), in-toto and Harbor (both graduated).</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>A container is an isolated process sharing the host's kernel, built on Linux <strong>namespaces</strong> and <strong>cgroups</strong>; a VM runs its own operating system. cgroup v2 is required by default since v1.35. Containers are immutable: rebuild, don't patch.</li>
+				<li>An image is layers plus configuration, named <code>registry/repository:tag@digest</code>. No registry means Docker Hub; no tag means <code>latest</code>. Tags move, digests don't.</li>
+				<li>OCI specs: <strong>image</strong>, <strong>runtime</strong> and <strong>distribution</strong>; runc is the reference runtime. Any OCI image runs under any compliant runtime.</li>
+				<li>Dockerfiles: <code>FROM</code>, <code>RUN</code>, <code>COPY</code>, <code>USER</code>, <code>ENTRYPOINT</code> (executable), <code>CMD</code> (default arguments); <code>EXPOSE</code> only documents. Use multi-stage builds, small bases, cache-friendly order, no secrets in build args.</li>
+				<li>The kubelet uses the <strong>CRI</strong> to talk to containerd or CRI-O, which use runc. <strong>dockershim was removed in v1.24</strong>, yet Docker-built images still work. containerd 2.x is required from v1.36.</li>
+				<li>RuntimeClass (stable v1.20) selects a runtime handler, such as a sandbox. The kubelet and runtime must use the same cgroup driver. <code>crictl</code> inspects one node's runtime.</li>
+				<li>Pull policy defaults: <code>Always</code> for <code>:latest</code> or no tag, otherwise <code>IfNotPresent</code>. <code>ErrImagePull</code> then <code>ImagePullBackOff</code>. Private images need an <code>imagePullSecrets</code> Secret in the Pod's namespace.</li>
+				<li><code>command</code> replaces ENTRYPOINT (and drops CMD); <code>args</code> replaces CMD. Run as non-root with a read-only filesystem; user namespaces are stable since v1.36.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d1-topic-1-3.html"><small>Previous</small>1.3: Scheduling</a>
+				<a class="next" href="index.html"><small>Next</small>KCNA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Docker is a trademark of Docker, Inc. Quotes from kubernetes.io &copy; The Kubernetes Authors and from glossary.cncf.io, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
