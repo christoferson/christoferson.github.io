@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.1: API Server, Controller Manager, Scheduler and Etcd | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 2.1: securing the Kubernetes control plane. API server request flow, security flags and defaults, anonymous authentication endpoints, system:masters and super-admin.conf, health and metrics endpoints, API Priority and Fairness; controller manager keys and per-controller credentials; scheduler permissions and bind address; etcd TLS, auto-tls, backups and etcd 3.7 changes; control plane files, kubeadm certificates and CVE lessons.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Kubernetes Cluster Component Security &middot; 22%</span>
+		<h1>2.1: API Server, Controller Manager, Scheduler and Etcd</h1>
+		<p>The four control plane components of Kubernetes&reg;: what each one does, what an attacker gains by taking it over, and the flags, credentials and files that keep it safe.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">kube-apiserver</span><span class="tag">system:masters</span><span class="tag">Controller manager</span><span class="tag">Scheduler</span><span class="tag">etcd</span><span class="tag">kubeadm</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The control plane at a glance</a></li>
+				<li><a href="#s2">API server</a></li>
+				<li><a href="#s3">Controller manager</a></li>
+				<li><a href="#s4">Scheduler</a></li>
+				<li><a href="#s5">etcd</a></li>
+				<li><a href="#s6">Control plane files and hosts</a></li>
+				<li><a href="#s7">Lessons from CVEs</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.1</span>
+				<p><strong>API Server. Controller Manager. Scheduler. Etcd.</strong></p>
+			</div>
+			<p>The curriculum gives only the component names. This page asks three questions about each one: what it does, what an attacker gains by compromising it, and how it is secured (configuration, network exposure, credentials and file permissions). Flag examples follow kubeadm, the reference installer. On a managed service the provider sets these flags for you.</p>
+			<p>Page <a href="d1-topic-1-1.html">1.1</a> already covered the ports, keeping the control plane off the internet, etcd mutual TLS and encryption at rest. Authentication and authorization in depth are in <a href="index.html#d3">topic 3.2</a>, audit logging in <a href="index.html#d3">topic 3.5</a>, certificates in <a href="index.html#d5">topic 5.3</a> and admission control in <a href="index.html#d5">topic 5.4</a>. Quotes are from kubernetes.io (CC BY 4.0) and etcd.io.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop runs on a self-managed cluster built with kubeadm: three control plane nodes, each running all four components as static Pods. The platform team is reviewing how each one is configured.</p></div>
+
+			<!-- ===== At a glance ===== -->
+			<h2 id="s1">The control plane at a glance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">What each component holds, and what its compromise means.</span></p>
+				<p>Kubernetes uses a "hub-and-spoke" pattern: "All API usage from nodes (or the pods they run) terminates at the API server. None of the other control plane components are designed to expose remote services." The scheduler, the controller manager and every kubelet read and write cluster state through the API server. Only the API server, plus backup tooling, holds credentials for etcd.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Component</th><th>What it holds</th><th>If an attacker controls it</th></tr></thead>
+						<tbody>
+							<tr><td>kube-apiserver</td><td data-label="What it holds">etcd client certificate, kubelet client certificate, ServiceAccount signing key</td><td data-label="If an attacker controls it">Every request to the cluster passes through it: full control</td></tr>
+							<tr><td>kube-controller-manager</td><td data-label="What it holds">The cluster CA private key and the ServiceAccount signing key (kubeadm), broad write permissions</td><td data-label="If an attacker controls it">Mint certificates for any identity, forge tokens, create Pods anywhere</td></tr>
+							<tr><td>kube-scheduler</td><td data-label="What it holds">Permission to bind and delete Pods; can't read Secrets</td><td data-label="If an attacker controls it">Place Pods on chosen nodes, evict workloads, leave Pods unscheduled</td></tr>
+							<tr><td>etcd</td><td data-label="What it holds">All cluster data, including Secrets</td><td data-label="If an attacker controls it">"Equivalent to root permission in the cluster", with no admission control or audit logging</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== API server ===== -->
+			<h2 id="s2">API server</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">The front door: how requests are checked, and the flags that decide how strict it is.</span></p>
+				<p>"The API server is the front end for the Kubernetes control plane." By default it listens on port 6443, "protected by TLS". Every request then passes these stages (<a href="https://kubernetes.io/docs/concepts/security/controlling-access/">Controlling Access to the Kubernetes API</a>):</p>
+				<ol class="steps">
+					<li><b>Authentication</b>Each configured authenticator is "tried in sequence, until one of them succeeds". If none succeeds, the response is HTTP 401. Kubernetes "does not have a <code>User</code> object nor does it store usernames".</li>
+					<li><b>Authorization</b>"If any module authorizes the request, then the request can proceed. If all of the modules deny the request, then the request is denied (HTTP status code 403)."</li>
+					<li><b>Admission control</b>Mutating controllers first, then validating ones. "If any admission controller module rejects, then the request is immediately rejected." Admission doesn't act on reads.</li>
+					<li><b>Validation and storage</b>The object is validated against its schema and written to etcd.</li>
+				</ol>
+				<div class="callout trap"><p><strong>The "password" authenticator is gone.</strong> The Controlling Access page still lists "client certificates, password, and plain tokens", but password (basic) authentication with <code>--basic-auth-file</code> was removed in v1.19.</p></div>
+				<h3>Security flags and their defaults</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Flag</th><th>Upstream default</th><th>Hardened setting</th></tr></thead>
+						<tbody>
+							<tr><td><code>--anonymous-auth</code></td><td data-label="Upstream default">true: unauthenticated requests become <code>system:anonymous</code> in group <code>system:unauthenticated</code></td><td data-label="Hardened setting">Limit anonymous access to health endpoints (below)</td></tr>
+							<tr><td><code>--authorization-mode</code></td><td data-label="Upstream default">AlwaysAllow if neither it nor <code>--authorization-config</code> is set</td><td data-label="Hardened setting"><code>Node,RBAC</code> (what kubeadm sets)</td></tr>
+							<tr><td><code>--enable-admission-plugins</code></td><td data-label="Upstream default">A built-in default list; NodeRestriction isn't in it</td><td data-label="Hardened setting">Add <code>NodeRestriction</code> (kubeadm does)</td></tr>
+							<tr><td><code>--profiling</code></td><td data-label="Upstream default">true: serves <code>/debug/pprof</code></td><td data-label="Hardened setting">false (kubeadm leaves it on)</td></tr>
+							<tr><td><code>--bind-address</code></td><td data-label="Upstream default">0.0.0.0 (all interfaces)</td><td data-label="Hardened setting">A private interface; firewall the rest</td></tr>
+							<tr><td><code>--tls-min-version</code></td><td data-label="Upstream default">TLS 1.2 (built into the serving code)</td><td data-label="Hardened setting">1.2 or 1.3; with <code>--tls-cipher-suites</code> limited to strong suites</td></tr>
+							<tr><td><code>--kubelet-certificate-authority</code></td><td data-label="Upstream default">Not set: the kubelet's serving certificate isn't verified</td><td data-label="Hardened setting">Set it once kubelet serving certificates are CA-signed</td></tr>
+							<tr><td><code>--enable-priority-and-fairness</code></td><td data-label="Upstream default">true</td><td data-label="Hardened setting">Keep on</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The kubeadm manifest for the shop's API server, trimmed to the security flags (<code>P</code> stands for <code>/etc/kubernetes/pki</code>):</p>
+				<div class="code"><span class="file">kube-apiserver flags (static Pod excerpt)</span>
+<pre><code>kube-apiserver
+--secure-port=6443
+--authorization-mode=Node,RBAC
+--enable-admission-plugins=NodeRestriction
+--client-ca-file=P/ca.crt
+--tls-cert-file=P/apiserver.crt
+--tls-private-key-file=P/apiserver.key
+--service-account-key-file=P/sa.pub
+--etcd-servers=https://127.0.0.1:2379
+--etcd-cafile=P/etcd/ca.crt
+<span class="c"># hardening kubeadm doesn't add</span>
+--profiling=false
+--tls-min-version=VersionTLS12</code></pre></div>
+				<p>kubeadm also sets <code>--kubelet-client-certificate</code> and <code>--kubelet-client-key</code> (the API server's client certificate for talking to kubelets), and the ServiceAccount token issuer and signing key (<code>--service-account-issuer</code>, <code>--service-account-signing-key-file=P/sa.key</code>).</p>
+				<div class="callout trap"><p><strong>The API server trusts any kubelet by default.</strong> "By default, the API server does not verify the kubelet's serving certificate, which makes the connection subject to man-in-the-middle attacks and <strong>unsafe</strong> to run over untrusted and/or public networks." kubeadm doesn't set <code>--kubelet-certificate-authority</code>. Kubelet certificates are covered in <a href="index.html#d2">topic 2.2</a>.</p></div>
+				<h3>Limiting anonymous access</h3>
+				<p>Turning anonymous authentication off entirely with <code>--anonymous-auth=false</code> breaks health probes that call <code>/livez</code> and <code>/readyz</code> without credentials, including kubeadm's own. The structured authentication configuration (GA in v1.34) can allow anonymous requests on named paths only:</p>
+				<div class="code"><span class="file">Anonymous only for health checks (AuthenticationConfiguration)</span>
+<pre><code>apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+anonymous:
+  enabled: true
+  <span class="c"># the only paths open to anonymous</span>
+  conditions:
+  - path: /livez
+  - path: /readyz
+  - path: /healthz</code></pre></div>
+				<p>Load it with <code>--authentication-config</code>. "Any other endpoints will not be reachable anonymously, even if your authorization configuration would allow it." That protects against a mistaken RBAC binding to <code>system:anonymous</code>. If the file has an <code>anonymous</code> block, you can't also set <code>--anonymous-auth</code>. The equivalent for authorizers, <code>--authorization-config</code>, has been GA since v1.32 (<a href="index.html#d3">topic 3.2</a>).</p>
+				<h3>Who can reach which endpoint</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Endpoint</th><th>Who can read it by default</th></tr></thead>
+						<tbody>
+							<tr><td><code>/livez</code>, <code>/readyz</code>, <code>/healthz</code>, <code>/version</code></td><td data-label="Who can read it by default">Everyone, including unauthenticated users, through the <code>system:public-info-viewer</code> ClusterRole (<code>/healthz</code> is deprecated since v1.16)</td></tr>
+							<tr><td><code>/metrics</code>, <code>/flagz</code>, <code>/statusz</code></td><td data-label="Who can read it by default">The <code>system:monitoring</code> group and admins; "the metric endpoint may expose sensitive information." <code>/flagz</code> and <code>/statusz</code> are beta since v1.36</td></tr>
+							<tr><td><code>/debug/pprof</code></td><td data-label="Who can read it by default">Only admins, and only while <code>--profiling</code> is on</td></tr>
+							<tr><td>Discovery APIs</td><td data-label="Who can read it by default">Authenticated users. Before v1.14 unauthenticated users could call them too</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>The system:masters group</h3>
+				<p>RBAC good practices: "Any user who is a member of this group bypasses all RBAC rights checks and will always have unrestricted superuser access, which cannot be revoked by removing RoleBindings or ClusterRoleBindings." The API server checks this group before any other authorizer, so it also bypasses authorization webhooks, and it's exempt from API Priority and Fairness. The Security Checklist says it "should only be used as a break-glass mechanism".</p>
+				<div class="callout trap"><p><strong><code>admin.conf</code> is no longer system:masters.</strong> Since kubeadm v1.29, <code>admin.conf</code> belongs to the group <code>kubeadm:cluster-admins</code>, which an RBAC binding gives cluster-admin rights, so the access can be revoked. A separate <code>super-admin.conf</code>, created only on the node where <code>kubeadm init</code> ran, carries <code>system:masters</code>. Keep it offline. Membership comes from the certificate's organization field, and Kubernetes can't revoke a client certificate: it stays valid until it expires.</p></div>
+				<h3>API Priority and Fairness</h3>
+				<p>API Priority and Fairness (APF, GA in v1.29) protects the API server from being overwhelmed. It "classifies and isolates requests in a more fine-grained way", so "a poorly-behaved controller need not starve others". FlowSchemas sort requests into PriorityLevelConfigurations, each with its own share of concurrency. Requests over the limit get HTTP 429. Inspect them with <code>kubectl get flowschemas</code> and <code>kubectl get prioritylevelconfigurations</code>.</p>
+				<div class="callout retired"><p><strong>No more insecure port.</strong> The API server could once serve plain HTTP with no authentication or authorization on a local port. That ability was removed in v1.20, and the <code>--insecure-port</code> and <code>--insecure-bind-address</code> flags in v1.24. The kubeadm "Implementation details" page on kubernetes.io still lists <code>--insecure-port=0</code>; ignore it.</p></div>
+			</div>
+
+			<!-- ===== Controller manager ===== -->
+			<h2 id="s3">Controller manager</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">The component with the most powerful keys, and how to limit what each controller may do.</span></p>
+				<p>kube-controller-manager "runs controller processes", compiled "into a single binary and run in a single process". In a kubeadm cluster it holds two keys worth more than anything else on the node:</p>
+				<ul>
+					<li><strong>The cluster CA private key</strong> (<code>--cluster-signing-key-file=P/ca.key</code>), used to sign approved certificate requests. Whoever has it can mint a client certificate for any identity, including <code>system:masters</code>.</li>
+					<li><strong>The ServiceAccount private key</strong> (<code>--service-account-private-key-file=P/sa.key</code>). The flag now only "Enables legacy secret-based tokens"; current tokens are signed by the API server. But kubeadm points both at the same <code>sa.key</code>, so either host's compromise lets an attacker forge tokens.</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Flag</th><th>Upstream default</th><th>kubeadm</th></tr></thead>
+						<tbody>
+							<tr><td><code>--use-service-account-credentials</code></td><td data-label="Upstream default">false: all controllers share the manager's own credential</td><td data-label="kubeadm">true</td></tr>
+							<tr><td><code>--bind-address</code></td><td data-label="Upstream default">0.0.0.0</td><td data-label="kubeadm">127.0.0.1</td></tr>
+							<tr><td><code>--secure-port</code></td><td data-label="Upstream default">10257 (HTTPS only)</td><td data-label="kubeadm">Default</td></tr>
+							<tr><td><code>--profiling</code></td><td data-label="Upstream default">true</td><td data-label="kubeadm">Not changed (set false to harden)</td></tr>
+							<tr><td><code>--authentication-kubeconfig</code>, <code>--authorization-kubeconfig</code></td><td data-label="Upstream default">Empty: requests are anonymous, and anything not on the always-allowed paths is forbidden</td><td data-label="kubeadm"><code>controller-manager.conf</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>With <code>--use-service-account-credentials</code>, "kube-controller-manager starts each controller using a separate service account", each bound to a narrow role such as <code>system:controller:deployment-controller</code>. That's least privilege inside the control plane, and the Security Checklist asks for it.</p>
+				<p>The <strong>cloud-controller-manager</strong> "embeds cloud-specific control logic": it creates cloud load balancers and routes and watches cloud VMs. It holds cloud credentials, so its compromise reaches the cloud account. Give it least-privilege cloud permissions (<a href="d1-topic-1-1.html#s5">topic 1.1</a>). The in-tree cloud providers were switched off by default in v1.29, and the last one was removed in v1.31, so every cluster now uses an external cloud controller manager.</p>
+				<div class="callout tip"><p><strong>Controllers act on your behalf.</strong> A controller does things users ask for indirectly, so bugs can turn it into a "confused deputy". In CVE-2026-2270 (September 2026, fixed in v1.37.1), write access to StatefulSets and ControllerRevisions let a user make the StatefulSet controller create Pods in other namespaces. Patch releases matter even on the newest minor version.</p></div>
+			</div>
+
+			<!-- ===== Scheduler ===== -->
+			<h2 id="s4">Scheduler</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Who decides where Pods run, and the ways around that decision.</span></p>
+				<p>kube-scheduler "watches for newly created Pods with no assigned node, and selects a node for them to run on." Its ClusterRole, <code>system:kube-scheduler</code>, lets it read nodes and workloads, bind Pods to nodes, and delete Pods (for preemption). It can't read Secrets.</p>
+				<p>A compromised scheduler could put an attacker's Pod on the same node as a victim, steer sensitive Pods to a node the attacker controls, evict workloads, or leave Pods pending. The kubernetes.io <a href="https://kubernetes.io/docs/concepts/security/hardening-guide/scheduler/">scheduler hardening guide</a> warns that a misconfigured scheduler "can target specific nodes and evict the workloads or applications that are sharing the node".</p>
+				<ul>
+					<li><strong><code>--bind-address</code></strong>: "the kube-scheduler does not need to be externally accessible. Setting the bind address to <code>localhost</code> is a secure practice." kubeadm sets 127.0.0.1; it serves HTTPS on 10259.</li>
+					<li><strong>Profiling</strong>: turn it off to avoid the "risk of denial of service or information leakage". The <code>--profiling</code> flag is deprecated in favour of the configuration file.</li>
+					<li><strong>Its kubeconfig</strong> (<code>scheduler.conf</code>) "should be protected with strict file permissions."</li>
+				</ul>
+				<div class="code"><span class="file">Scheduler profiling off (KubeSchedulerConfiguration)</span>
+<pre><code>apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+enableProfiling: false</code></pre></div>
+				<div class="callout trap"><p><strong>The scheduler isn't the only way onto a node.</strong> "If the <code>nodeName</code> field is not empty, the scheduler ignores the Pod and the kubelet on the named node tries to place the Pod on that node", skipping taints and affinity rules. Anyone with <code>create</code> on <code>pods/binding</code> can also place Pods, and any Pod creator can pick a custom <code>schedulerName</code>. Use admission policy if those need restricting (<a href="index.html#d5">topic 5.4</a>).</p></div>
+				<div class="callout retired"><p><strong>Ports 10251 and 10252 are gone.</strong> The scheduler (10251) and controller manager (10252) used to serve plain HTTP with no authentication. Insecure serving stopped around v1.22 and v1.23, and the flags were removed in v1.24 (May 2022). Today they serve only HTTPS, on 10259 and 10257.</p></div>
+			</div>
+
+			<!-- ===== etcd ===== -->
+			<h2 id="s5">etcd</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Protecting the datastore that holds every object and Secret.</span></p>
+				<p>etcd is the "consistent and highly-available key value store used as Kubernetes' backing store for all cluster data." kubernetes.io's <a href="https://kubernetes.io/docs/concepts/security/api-server-bypass-risks/">API server bypass risks</a> page explains why direct access is so dangerous: it "is not subject to Kubernetes admission control and is not logged by Kubernetes audit logging." And etcd itself "doesn't encrypt key/value data stored on disk drives", so Secrets are only protected if encryption at rest is on (<a href="d1-topic-1-1.html#s6">topic 1.1</a>).</p>
+				<p>Kubernetes authenticates to etcd with TLS client certificates only. etcd has its own users and roles, but "etcd authentication is not planned for Kubernetes", so Kubernetes doesn't use them.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>etcd flag</th><th>Default</th><th>Purpose</th></tr></thead>
+						<tbody>
+							<tr><td><code>--client-cert-auth</code></td><td data-label="Default">false</td><td data-label="Purpose">Require a client certificate signed by the trusted CA (setting <code>--trusted-ca-file</code> turns this on too)</td></tr>
+							<tr><td><code>--peer-client-cert-auth</code></td><td data-label="Default">false</td><td data-label="Purpose">Same check for other etcd members (with <code>--peer-trusted-ca-file</code>)</td></tr>
+							<tr><td><code>--listen-client-urls</code></td><td data-label="Default"><code>http://localhost:2379</code></td><td data-label="Purpose">Use https, on localhost or a private address</td></tr>
+							<tr><td><code>--auto-tls</code>, <code>--peer-auto-tls</code></td><td data-label="Default">false</td><td data-label="Purpose">Self-signed certificates: encryption without authentication. Keep them off</td></tr>
+							<tr><td><code>--tls-min-version</code></td><td data-label="Default">TLS1.2</td><td data-label="Purpose">Minimum TLS version</td></tr>
+							<tr><td><code>--data-dir</code></td><td data-label="Default"><code>${name}.etcd</code> (kubeadm: <code>/var/lib/etcd</code>)</td><td data-label="Purpose">etcd expects mode 700 and warns otherwise</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Any certificate etcd trusts is a master key.</strong> "Any certificate issued by a certificate authority that etcd trusts allows full access to the data stored inside etcd", and "etcd client certificates that are only used for health checking can also grant full read and write access." That's why the etcd CA should be used for nothing else; kubeadm gives etcd its own CA. Note also that kubeadm's etcd listens on the node's IP as well as localhost, because the members of a highly available cluster need to reach each other. Firewall ports 2379 and 2380.</p></div>
+				<div class="callout trap"><p><strong><code>--auto-tls</code> isn't real TLS security.</strong> etcd's docs describe it as being for when "communication encryption, but not authentication, is needed": "Self-signed certificates do not authenticate identity." Anyone could connect, or join as a peer.</p></div>
+				<h3>Backups</h3>
+				<p>"The snapshot file contains all the Kubernetes state and critical information. In order to keep the sensitive Kubernetes data safe, encrypt the snapshot files." Restrict who can read the backup location as tightly as etcd itself.</p>
+				<div class="code"><span class="file">Back up and check a snapshot (shell)</span>
+<pre><code>E=/etc/kubernetes/pki/etcd
+etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=$E/ca.crt \
+  --cert=$E/server.crt \
+  --key=$E/server.key \
+  snapshot save /backup/etcd.db
+
+<span class="c"># status and restore use etcdutl</span>
+etcdutl --write-out=table \
+  snapshot status /backup/etcd.db</code></pre></div>
+				<div class="callout retired"><p><strong>etcd 3.6 and 3.7 changed the tools and flags.</strong> From etcd 3.6, snapshots are restored only with <code>etcdutl</code>, not <code>etcdctl</code>. etcd 3.6.0 (May 2025) replaced the <code>--experimental-*</code> flags with normal flags or <code>--feature-gates</code> entries. etcd 3.7.0 (July 2026), the default in Kubernetes 1.37, removed them along with the old v2 store, so manifests copied from older guides fail to start. etcd 3.4 is out of support. etcd is a CNCF graduated project (since November 2020) and, since 2023, also a Kubernetes SIG.</p></div>
+			</div>
+
+			<!-- ===== Files and hosts ===== -->
+			<h2 id="s6">Control plane files and hosts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">The files on a control plane node that are as sensitive as the components themselves.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Path (kubeadm)</th><th>Contents</th><th>Why it matters</th></tr></thead>
+						<tbody>
+							<tr><td><code>/etc/kubernetes/manifests/</code></td><td data-label="Contents">Static Pod manifests for the four components (written 0600, directory 0700)</td><td data-label="Why it matters">Write access lets an attacker change any flag or add a Pod. A static Pod that fails admission "still runs on the node"</td></tr>
+							<tr><td><code>/etc/kubernetes/pki/</code></td><td data-label="Contents">CA key (<code>ca.key</code>), <code>sa.key</code>, API server, front-proxy and etcd certificates and keys (keys 0600)</td><td data-label="Why it matters">The CA key mints any identity; <code>sa.key</code> forges tokens</td></tr>
+							<tr><td><code>admin.conf</code>, <code>super-admin.conf</code></td><td data-label="Contents">Administrator kubeconfigs</td><td data-label="Why it matters">Cluster-admin, and system:masters for super-admin</td></tr>
+							<tr><td><code>controller-manager.conf</code>, <code>scheduler.conf</code></td><td data-label="Contents">The components' own kubeconfigs (0600)</td><td data-label="Why it matters">Their identities and permissions</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The CIS Kubernetes Benchmark has checks for the permissions and ownership of these files; tools such as kube-bench run them (<a href="d1-topic-1-1.html#s7">topic 1.1</a>). kubernetes.io advises: "Avoid sharing the <code>super-admin.conf</code> or <code>admin.conf</code> files. Instead, create least privileged access even for people who work as administrators".</p>
+				<h3>Certificates</h3>
+				<p>kubeadm client certificates "expire after 1 year"; its CA lasts 10 years. In kubeadm config v1beta4 these are the <code>certificateValidityPeriod</code> and <code>caCertificateValidityPeriod</code> fields. v1beta3 was removed in v1.37. kubeadm renews certificates during every control plane upgrade.</p>
+				<div class="code"><span class="file">Check and renew certificates (shell)</span>
+<pre><code><span class="c"># expiry of certs and kubeconfigs</span>
+sudo kubeadm certs check-expiration
+
+<span class="c"># renew all, on every control plane node</span>
+sudo kubeadm certs renew all</code></pre></div>
+				<p>After renewing, restart the control plane Pods so they load the new certificates.</p>
+				<h3>Checking how components are configured</h3>
+				<div class="code"><span class="file">Inspect control plane flags (shell)</span>
+<pre><code><span class="c"># the control plane static Pods</span>
+kubectl -n kube-system get pods \
+  -l tier=control-plane
+
+<span class="c"># full command line of one component</span>
+kubectl -n kube-system get pod \
+  kube-apiserver-cp1 -o yaml
+
+<span class="c"># the API server's own flags (beta)</span>
+kubectl get --raw /flagz</code></pre></div>
+				<p>Control plane nodes carry the taint <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, which keeps ordinary workloads off them. Older material uses <code>master</code>: that label stopped being added in v1.24 and the taint in v1.25.</p>
+				<div class="callout tip"><p><strong>On a managed service</strong> you can't edit manifests, read <code>/etc/kubernetes/pki</code> or take raw etcd snapshots. You usually can control API endpoint exposure, export control plane audit logs, turn on Secret encryption with the provider's key service, and manage RBAC and admission policies. Flag questions about <code>--profiling</code> or etcd TLS are about self-managed clusters.</p></div>
+			</div>
+
+			<!-- ===== CVEs ===== -->
+			<h2 id="s7">Lessons from CVEs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.1</span><span class="skill-text">Past control plane vulnerabilities, and the pattern they share.</span></p>
+				<p>From the <a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">official Kubernetes CVE feed</a>:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CVE</th><th>Component</th><th>What happened</th></tr></thead>
+						<tbody>
+							<tr><td>CVE-2018-1002105 (critical, 9.8)</td><td data-label="Component">API server</td><td data-label="What happened">Proxied connections could be reused to send arbitrary requests to a backend "authenticated with the Kubernetes API server's TLS credentials", reaching aggregated APIs or the full kubelet API</td></tr>
+							<tr><td>CVE-2020-8559</td><td data-label="Component">API server</td><td data-label="What happened">From a compromised node, a redirect could make the API server's client follow it using the original request's credentials</td></tr>
+							<tr><td>CVE-2020-8555, CVE-2025-13281</td><td data-label="Component">Controller manager</td><td data-label="What happened">Half-blind SSRF: certain volume types or StorageClasses made it send requests into the control plane's network</td></tr>
+							<tr><td>CVE-2026-2270</td><td data-label="Component">Controller manager</td><td data-label="What happened">The StatefulSet controller could be made to create Pods across namespaces (fixed in 1.37.1)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>The common thread.</strong> Control plane components act with strong credentials on behalf of less privileged users. Most serious bugs make them do so for the wrong request: proxying, redirects, SSRF and confused deputies. Defenses: patch promptly, limit network reach from the control plane, give each component least privilege, and turn off what you don't use.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>All traffic goes through the API server; only it (and backups) should reach etcd. Request flow: authentication (401) &rarr; authorization (403) &rarr; mutating, then validating admission &rarr; validation &rarr; etcd.</li>
+				<li>Permissive upstream defaults: anonymous auth on, authorization falls back to AlwaysAllow, profiling on, bind address 0.0.0.0, kubelet certificate not verified. kubeadm sets <code>Node,RBAC</code> and NodeRestriction, but leaves profiling on.</li>
+				<li>Limit anonymous access to <code>/livez</code>, <code>/readyz</code> and <code>/healthz</code> with AuthenticationConfiguration <code>anonymous.conditions</code> (GA 1.34). Unauthenticated users can read health and version only; <code>/metrics</code> needs <code>system:monitoring</code>.</li>
+				<li><code>system:masters</code> bypasses RBAC, webhooks and APF and can't be revoked. Since kubeadm 1.29 only <code>super-admin.conf</code> has it. APF (GA 1.29) is the API server's DoS protection.</li>
+				<li>Controller manager: holds the CA key and <code>sa.key</code>; use <code>--use-service-account-credentials</code>, bind to 127.0.0.1, profiling off. Scheduler: bind to localhost, <code>enableProfiling: false</code>; <code>nodeName</code> and <code>pods/binding</code> bypass it. Ports 10251 and 10252 removed in 1.24.</li>
+				<li>etcd: access = root, with no admission or audit; client and peer certificate auth with a dedicated CA; no <code>--auto-tls</code>; data dir 700; encrypted, restricted backups. etcd 3.7 (default in 1.37) removed <code>--experimental-*</code> flags; restore with <code>etcdutl</code>.</li>
+				<li>Protect <code>/etc/kubernetes/manifests</code>, <code>/etc/kubernetes/pki</code> and the kubeconfigs. kubeadm certificates last 1 year, the CA 10 years: <code>kubeadm certs check-expiration</code> and <code>renew</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d1-topic-1-3.html"><small>Previous</small>1.3: Artifact Repository and Image Security, Workload and Application Code Security</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the etcd documentation (etcd Authors); CIS Benchmark mentioned, not reproduced; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
