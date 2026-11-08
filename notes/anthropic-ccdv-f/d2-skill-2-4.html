@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.4: Software Engineering Foundations | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 2.4: the Claude API as a REST API (endpoint, headers, versions), HTTP status codes and which to retry, SDK retries, backoff and timeouts, rate-limit headers, asynchronous calls with AsyncAnthropic and a semaphore, JSON handling, version control and CI with Claude Code, code review, and small and large refactoring.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Applications and Integration &middot; 33.1%</span>
+		<h1>2.4: Software Engineering Foundations</h1>
+		<p>The everyday engineering behind a Claude application: calling a REST API correctly, handling its errors and limits, running many requests at once, working with JSON, and fitting Claude into version control, code review and refactoring.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">REST</span><span class="tag">HTTP errors</span><span class="tag">Retries</span><span class="tag">asyncio</span><span class="tag">Code review</span><span class="tag">Refactoring</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The Claude API over HTTP</a></li>
+				<li><a href="#s2">Errors and what to retry</a></li>
+				<li><a href="#s3">Retries, timeouts and rate limits</a></li>
+				<li><a href="#s4">Asynchronous calls</a></li>
+				<li><a href="#s5">JSON</a></li>
+				<li><a href="#s6">Version control and CI</a></li>
+				<li><a href="#s7">Code review</a></li>
+				<li><a href="#s8">Refactoring, small and large</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.4</span>
+				<p><strong>Software Engineering Foundations</strong> (7.4% of the exam): "Core software engineering principles and practices, including REST APIs, JSON, asynchronous programming, version control, SDLC integration, code review, and small- and large-scale refactoring."</p>
+			</div>
+			<p>This is general engineering, applied to Claude: how the API behaves as an HTTP service, how the SDKs handle failures for you, how to make many calls efficiently, and how Claude Code helps with Git, reviews and refactors. The Messages API's own features (streaming, vision, caching, batches) are <span>skill 2.3</span>; diagnosing failures in depth is Domain 4.</p>
+			<p>Sources: Anthropic's API overview, versioning, errors, rate-limit and Python SDK documentation, the Claude Code documentation (common workflows, worktrees, code review, best practices) and Anthropic's post on large code migrations (July 2026), checked on 8 November 2026 and paraphrased; generic facts from RFC 9110, RFC 8259, the Python <code>asyncio</code> documentation and SemVer. The Python example was run against the real anthropic 2.6.0 client with a mocked network layer, not the live API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop is adding Claude-written descriptions to its product catalogue: a script calls the API for hundreds of products, and the team works on the code in Git with pull requests and reviews.</p></div>
+
+			<!-- ===== HTTP ===== -->
+			<h2 id="s1">The Claude API over HTTP</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">What a raw request looks like, and what the SDKs add.</span></p>
+				<p>The Claude API is a REST API at <code>https://api.anthropic.com</code>; a message is a <code>POST</code> to <code>/v1/messages</code> with a JSON body. Other endpoints include <code>/v1/messages/batches</code>, <code>/v1/messages/count_tokens</code>, <code>/v1/models</code> and <code>/v1/files</code>.</p>
+				<div class="code"><span class="file">One request with curl (shell)</span>
+<pre><code><span class="c"># -i prints the response headers (request-id, anthropic-ratelimit-*) before the body</span>
+curl -sS -i https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2026-10-21" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-haiku-5-5",
+    "max_tokens": 300,
+    "messages": [
+      {"role": "user", "content": "Write a two-sentence shop description for the Ridgeline 2-person tent (1.9 kg)."}
+    ]
+  }'</code></pre></div>
+				<ul>
+					<li><strong>Headers.</strong> Authentication (an API key, or a short-lived token from workload identity federation), <code>anthropic-version</code> and <code>content-type: application/json</code> are required. The API overview now lists <code>Authorization: Bearer</code> as the primary way to send the key and calls <code>x-api-key</code> a legacy fallback, though both work and the docs' own curl samples still use <code>x-api-key</code>.</li>
+					<li><strong>Response.</strong> Every response carries a <code>request-id</code> header (also in error bodies as <code>request_id</code>): log it, because support asks for it.</li>
+					<li><strong>Size.</strong> A Messages request may be up to 128 MB; larger requests get 413. Batches allow 256 MB and file uploads 500 MB; some cloud platforms set lower limits.</li>
+					<li><strong>The SDKs</strong> add the headers, typed requests and responses, retries, timeouts, streaming helpers, pagination and connection management, which is why the docs recommend them over raw HTTP.</li>
+				</ul>
+				<div class="callout retired"><p><strong>New API version, new SDK majors.</strong> API version <code>2026-10-21</code> (October 2026) removed <code>temperature</code>, <code>top_p</code> and <code>top_k</code> for every model, and the new major SDK versions (Python 2.0.0, TypeScript 1.0.0) send it by default and send the key as <code>Authorization: Bearer</code>. Code or gateways that set those sampling parameters, or that look for an <code>x-api-key</code> header, break on upgrade. The SDKs' licence also changed from MIT to Apache 2.0.</p></div>
+			</div>
+
+			<!-- ===== Errors ===== -->
+			<h2 id="s2">Errors and what to retry</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Reading HTTP status codes and error types.</span></p>
+				<p>Errors come back as JSON with a type, a message and the request ID. Roughly, client errors mean fix the request, and server errors and rate limits mean try again later:</p>
+				<ul>
+					<li><strong>Don't retry, fix:</strong> 400 <code>invalid_request_error</code> (bad request, or a spend limit you set yourself), 401 <code>authentication_error</code>, 402 <code>billing_error</code>, 403 <code>permission_error</code>, 404 <code>not_found_error</code>, 413 <code>request_too_large</code> (make the request smaller, for example by uploading files separately).</li>
+					<li><strong>Retry, with backoff:</strong> 429 <code>rate_limit_error</code> (respect <code>retry-after</code>), 500 <code>api_error</code>, 504 <code>timeout_error</code>, and 529 <code>overloaded_error</code>, which means the API as a whole is busy. 529 isn't a standard HTTP code; it's Anthropic's own.</li>
+					<li><strong>Retry after fixing the state:</strong> 409 <code>conflict_error</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Not every 429 is worth retrying.</strong> When an organization reaches its tier's monthly spend cap, the API returns 429 with no <code>retry-after</code> and an error code of <code>enforced_spend_limit_reached</code>; retries fail until the next month. And errors can also arrive <em>after</em> a 200 response when streaming, as an <code>error</code> event in the stream, so status-code handling alone won't catch them.</p></div>
+			</div>
+
+			<!-- ===== Retries ===== -->
+			<h2 id="s3">Retries, timeouts and rate limits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">What the SDK already does, so you don't do it twice.</span></p>
+				<ul>
+					<li><strong>Retries.</strong> The SDKs retry connection errors, 408, 409, 429 and all 5xx (including 529) <strong>twice by default</strong>, with exponential backoff and jitter (in the Python SDK, starting around half a second and capped at 8 seconds), and they honour <code>retry-after</code>. Change it with <code>max_retries</code> on the client or <code>client.with_options(max_retries=5)</code> per call; 400, 401, 403, 404, 413 and 422 are never retried.</li>
+					<li><strong>Timeouts.</strong> The default timeout is 10 minutes, and timeouts are retried too. The SDK refuses non-streaming requests it expects to take longer than about 10 minutes: stream those or use batches.</li>
+					<li><strong>Rate limits</strong> are per organization and model class (requests, input tokens and output tokens per minute) and work like a token bucket that refills continuously, so a burst can trip a per-minute limit. Response headers report the state: <code>anthropic-ratelimit-requests-remaining</code>, <code>anthropic-ratelimit-tokens-remaining</code> and their <code>-limit</code> and <code>-reset</code> partners.</li>
+					<li><strong>Idempotency.</strong> By HTTP's definition (RFC 9110), <code>POST</code> isn't idempotent, and the Messages API documents no idempotency key. Retrying a generation is harmless apart from cost, but if your code performs a side effect based on Claude's answer (creating a refund, say), make <em>that</em> step idempotent yourself.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Don't stack retry loops.</strong> Wrapping an SDK call in your own retry loop multiplies attempts: three of yours times three of the SDK's is nine calls. Raise <code>max_retries</code> instead, or set it to 0 if you want to own the retry policy entirely.</p></div>
+			</div>
+
+			<!-- ===== Async ===== -->
+			<h2 id="s4">Asynchronous calls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Running many requests at once without tripping limits.</span></p>
+				<p><code>AsyncAnthropic</code> has the same methods as the regular client, awaited. With <code>asyncio</code>, one process can wait on many requests at the same time; a semaphore caps how many are open at once.</p>
+				<div class="code"><span class="file">describe_catalogue.py (Python, anthropic SDK)</span>
+<pre><code><span class="c"># Generate short catalogue descriptions for many products at once.</span>
+import asyncio
+
+import anthropic
+from anthropic import AsyncAnthropic
+
+<span class="c"># Reads ANTHROPIC_API_KEY from the environment. The SDK retries 408, 409, 429,</span>
+<span class="c"># 5xx and connection errors with backoff, and waits for retry-after when sent.</span>
+client = AsyncAnthropic(max_retries=4, timeout=60.0)
+
+MAX_IN_FLIGHT = 5  <span class="c"># cap on requests open at the same time</span>
+
+PRODUCTS = [
+    {"sku": "TENT-2P", "name": "Ridgeline 2-person tent", "weight_kg": 1.9},
+    {"sku": "BAG-0C", "name": "Glacier 0 C sleeping bag", "weight_kg": 1.1},
+    {"sku": "PACK-45", "name": "Summit 45 L backpack", "weight_kg": 1.4},
+    {"sku": "STOVE-1", "name": "Canister camp stove", "weight_kg": 0.3},
+    {"sku": "LAMP-H", "name": "Trail headlamp", "weight_kg": 0.1},
+    {"sku": "POLE-C", "name": "Carbon trekking poles", "weight_kg": 0.5},
+]
+
+
+async def describe(product: dict, sem: asyncio.Semaphore) -&gt; str:
+    async with sem:  <span class="c"># waits here while MAX_IN_FLIGHT calls are open</span>
+        message = await client.messages.create(
+            model="claude-haiku-5-5",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": f"Write a two-sentence shop description for {product['name']} ({product['weight_kg']} kg).",
+            }],
+        )
+    return "".join(b.text for b in message.content if b.type == "text")
+
+
+async def describe_safely(product: dict, sem: asyncio.Semaphore) -&gt; dict:
+    sku = product["sku"]
+    try:
+        return {"sku": sku, "ok": True, "text": await describe(product, sem)}
+    except anthropic.RateLimitError as e:
+        <span class="c"># Still 429 after the SDK's own retries. A monthly spend cap is also a 429,</span>
+        <span class="c"># with error_code "enforced_spend_limit_reached": retrying won't help.</span>
+        return {"sku": sku, "ok": False, "error": f"429 {e.error_code or 'rate_limit'}", "request_id": e.request_id}
+    except anthropic.APIStatusError as e:
+        <span class="c"># Any other 4xx/5xx, for example 400 bad request or 529 overloaded.</span>
+        return {"sku": sku, "ok": False, "error": f"{e.status_code} {e.type}", "request_id": e.request_id}
+    except anthropic.APIConnectionError as e:
+        <span class="c"># Network failure or timeout (APITimeoutError is a subclass).</span>
+        return {"sku": sku, "ok": False, "error": type(e).__name__}
+
+
+async def main() -&gt; list[dict]:
+    sem = asyncio.Semaphore(MAX_IN_FLIGHT)
+    results = await asyncio.gather(*(describe_safely(p, sem) for p in PRODUCTS))
+    for r in results:  <span class="c"># gather keeps the input order</span>
+        print(r["sku"], "OK" if r["ok"] else r["error"])
+    return results
+
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre></div>
+				<ul>
+					<li><strong>Exception order matters:</strong> <code>RateLimitError</code> is a subclass of <code>APIStatusError</code>, so catch it first; catch typed classes rather than matching message text.</li>
+					<li><strong>One failure shouldn't sink the batch.</strong> <code>asyncio.gather</code> raises the first exception by default (without cancelling the others); catching inside each task, as here, or passing <code>return_exceptions=True</code> keeps the other results. <code>asyncio.TaskGroup</code> instead cancels the rest on the first failure.</li>
+					<li><strong>A semaphore limits concurrency, not rate.</strong> Five open requests can still exceed a requests-per-minute limit if each is fast; ramp up traffic gradually.</li>
+					<li><strong>Async isn't streaming, and isn't batching.</strong> Async waits on many requests at once; streaming returns one response bit by bit; for large jobs that aren't urgent, the Message Batches API is half the price (<span>skill 2.3</span>).</li>
+				</ul>
+				<p>The <code>error_code</code>, <code>type</code> and <code>request_id</code> attributes exist on <code>APIStatusError</code> in the current Python SDK (2.6.0) but aren't yet in its documentation's table; on older SDKs, read <code>e.status_code</code>, <code>e.body</code> and the <code>request-id</code> response header.</p>
+			</div>
+
+			<!-- ===== JSON ===== -->
+			<h2 id="s5">JSON</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Exchanging and validating JSON safely.</span></p>
+				<p>The API speaks JSON in both directions, and its errors are always JSON. JSON exchanged between systems must be UTF-8 (RFC 8259), object keys should be unique, and very large integers can lose precision, since many parsers use double-precision numbers. In Python, <code>json.loads</code> raises <code>json.JSONDecodeError</code> on bad input. When you need Claude's own output as JSON, use structured outputs (<code>output_config.format</code> with a JSON schema) rather than asking nicely in the prompt, and still check <code>stop_reason</code>: a refusal or hitting <code>max_tokens</code> can leave output that doesn't match the schema. Prefilling the reply with <code>{</code> no longer works on Claude 4.6 and later models, which reject a prefilled assistant message.</p>
+			</div>
+
+			<!-- ===== VCS ===== -->
+			<h2 id="s6">Version control and CI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Fitting Claude Code into Git and the delivery pipeline.</span></p>
+				<ul>
+					<li><strong>Branches and pull requests.</strong> Ask Claude Code to commit or "create a pr"; it uses <code>git</code> and <code>gh</code>. <code>claude --from-pr 1234</code> reopens the sessions linked to a pull request.</li>
+					<li><strong>Parallel work.</strong> <code>claude --worktree &lt;name&gt;</code> starts a session in its own Git worktree on a new branch, so two tasks never edit the same checkout. A fresh worktree has no installed dependencies and no ignored files; <code>.worktreeinclude</code> copies files such as <code>.env</code>.</li>
+					<li><strong>CI.</strong> <code>claude -p</code> runs non-interactively in pipelines and hooks, and the <code>anthropics/claude-code-action@v1</code> GitHub Action reviews or works on pull requests; GitLab has its own integration.</li>
+					<li><strong>Versioning.</strong> Semantic versioning (MAJOR.MINOR.PATCH, a major bump for breaking changes) applies to your own packages. Anthropic's Python SDK "generally follows" it, and its major version also decides the API version it sends, so pin it in your dependencies.</li>
+					<li><strong>Checks.</strong> Put the exact test, lint and type-check commands in CLAUDE.md, give Claude a pass-or-fail check, ask for the commands it ran as evidence, and protect the main branch before leaving anything unattended.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Review ===== -->
+			<h2 id="s7">Code review</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Reviewing code with people and with Claude.</span></p>
+				<p>Good review practice is the same with or without AI: small changes, attention to design, correctness, tests, complexity and naming, and approval once a change improves the code's overall health even if it isn't perfect (Google's engineering practices). Claude Code adds several tools:</p>
+				<ul>
+					<li><strong><code>/code-review</code></strong> reviews the current changes, a branch or a pull request for correctness bugs in a fresh subagent that hasn't seen the conversation, so it isn't swayed by the reasoning that produced the code. Options include an effort level, <code>--fix</code> to apply findings and <code>--comment</code> to post them on the pull request; <code>/review</code> is now an alias.</li>
+					<li><strong><code>/simplify</code></strong> is a cleanup pass (reuse, simpler code, efficiency); it doesn't hunt for bugs. <strong><code>/security-review</code></strong> checks the branch's changes for issues such as injection and data exposure.</li>
+					<li><strong>Code Review</strong> (for Team and Enterprise plans, on GitHub) runs several agents on Anthropic's infrastructure, verifies findings to drop false positives, and posts ranked inline comments. It never approves or blocks a pull request and doesn't run your code, and it reads its <code>REVIEW.md</code> rules from the base branch, so a pull request can't rewrite its own review rules.</li>
+				</ul>
+				<div class="callout tip"><p><strong>Narrow the reviewer's brief.</strong> The best-practices page warns that a reviewer asked to find problems will always find something, and fixing every finding adds needless abstraction. Say what matters ("correctness and security; skip style"), and give a read-only reviewer only <code>Read</code>, <code>Grep</code> and <code>Glob</code> so the limit is enforced, not just requested.</p></div>
+			</div>
+
+			<!-- ===== Refactoring ===== -->
+			<h2 id="s8">Refactoring, small and large</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Changing structure without changing behaviour.</span></p>
+				<h3>Small refactors</h3>
+				<p>The docs' advice: find the code to change, ask for suggestions, refactor while keeping the same behaviour, and run the tests, working "in small, testable increments". For a bug, have Claude write a failing test that reproduces it first, then fix it.</p>
+				<h3>Large refactors and migrations</h3>
+				<ul>
+					<li><strong><code>/batch &lt;instruction&gt;</code></strong> researches the codebase, splits a large mechanical change into 5 to 30 independent units and shows a plan; after approval it runs one background subagent per unit in its own worktree, and each runs the tests and opens a pull request. Example from the docs: <code>/batch migrate src/ from JavaScript to TypeScript</code>.</li>
+					<li><strong>Scripted fan-out:</strong> loop over files with <code>claude -p</code> and a tight set of allowed tools, try it on a few files first, fix the prompt, then run the rest.</li>
+					<li><strong>Anthropic's migration practice</strong> (its July 2026 post on large code migrations): first build a test harness that passes on the old code and fails on deliberately broken code; write down the rules; run a throwaway trial migration; process units from a resumable queue with implementing and reviewing agents; verify by compiling, smoke-testing and checking behaviour; and when the same error recurs, fix the rule and regenerate rather than hand-patching ("fix the loop, not the code").</li>
+				</ul>
+				<p><code>/rewind</code> can undo Claude's recent edits within a session, but it doesn't replace Git: commit before a large change.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The Messages API is <code>POST https://api.anthropic.com/v1/messages</code> with auth, <code>anthropic-version</code> (now <code>2026-10-21</code>) and JSON; log the <code>request-id</code>. New SDK majors send <code>Authorization: Bearer</code> and drop sampling parameters.</li>
+				<li>Don't retry 400, 401, 402, 403, 404 or 413; retry 429, 500, 504 and 529 with backoff; a spend-cap 429 has no <code>retry-after</code> and won't succeed. Streams can fail after a 200.</li>
+				<li>The SDK retries twice by default with backoff and a 10-minute timeout; tune <code>max_retries</code> instead of adding your own loop. <code>POST</code> isn't idempotent, so guard side effects.</li>
+				<li><code>AsyncAnthropic</code> plus a semaphore for concurrency (not rate); catch typed errors per task; batches for non-urgent bulk work.</li>
+				<li>Claude Code: commits and pull requests, worktrees for parallel work, <code>claude -p</code> and the GitHub Action in CI; <code>/code-review</code> in a fresh context; <code>/batch</code> for large mechanical refactors.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-3.html"><small>Previous</small>2.3: Claude API Mechanics</a>
+				<a class="next" href="d2-skill-2-5.html"><small>Next</small>2.5: Claude Application Design</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer – Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.0. Anthropic's documentation summarized in the author's own words; generic facts from IETF RFCs, the Python documentation, semver.org and Google's engineering practices (CC BY 3.0); examples are original.</div>
+</footer>
+
+</body>
+</html>

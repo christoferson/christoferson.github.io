@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.3: Claude API Mechanics | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 2.3: Messages API requests and responses, stop reasons and usage, tools at a glance, streaming events and SDK helpers, vision and PDFs, adaptive thinking and effort, prompt caching, Claude on AWS, Google Cloud and Microsoft Foundry, ways to get data into requests (Files API, retrieval, message threads), and the Message Batches API versus real-time calls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Applications and Integration &middot; 33.1%</span>
+		<h1>2.3: Claude API Mechanics</h1>
+		<p>How the Messages API actually behaves: what goes into a request and comes back, and how streaming, images, thinking, caching, cloud platforms and the Batch API change cost, speed and what you can build.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Messages API</span><span class="tag">Streaming</span><span class="tag">Vision</span><span class="tag">Thinking</span><span class="tag">Prompt caching</span><span class="tag">Batches</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Requests and responses</a></li>
+				<li><a href="#s2">Tools at a glance</a></li>
+				<li><a href="#s3">Streaming</a></li>
+				<li><a href="#s4">Images and PDFs</a></li>
+				<li><a href="#s5">Thinking and effort</a></li>
+				<li><a href="#s6">Prompt caching</a></li>
+				<li><a href="#s7">Claude on cloud platforms</a></li>
+				<li><a href="#s8">Getting data in and out</a></li>
+				<li><a href="#s9">Batch or real time</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.3</span>
+				<p><strong>Claude API Mechanics</strong> (6.8% of the exam): "Claude API behavior and mechanics, including messages, tools, streaming, vision, thinking, caching, invoking Claude through third-party vendors, Messages API data access patterns, batch API use, and tradeoffs between realtime and batch API selection."</p>
+			</div>
+			<p>This is the skill that most separates the developer exam from the architect one: the Architect – Foundations guide lists streaming, vision, caching details and cloud-provider setup as out of scope, and here they are the core (<a href="architect-vs-developer.html">Architect or Developer?</a>). Plain HTTP, errors and retries are <a href="d2-skill-2-4.html">skill 2.4</a>; tool design in depth belongs to Domain 8.</p>
+			<p>Sources: Anthropic's documentation on messages, stop reasons, streaming, vision, PDFs, thinking, effort, prompt caching, pricing, the cloud platform pages, the Files API, message threads, data retention and batch processing, plus the release notes and the anthropic Python SDK 2.6.0, checked on 8 November 2026 and paraphrased. The four examples were run against the real SDK with a mocked API, not the live service.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's applications call Claude in four ways: a gear advisor that streams long answers, a catalogue tool that reads product photos, a returns assistant with a long, fixed policy prompt, and a nightly job that writes product descriptions.</p></div>
+
+			<!-- ===== Requests ===== -->
+			<h2 id="s1">Requests and responses</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">The shape of a Messages API call.</span></p>
+				<p>A request to <code>POST /v1/messages</code> needs <code>model</code>, <code>max_tokens</code> and <code>messages</code> (a list of <code>user</code> and <code>assistant</code> turns). Common optional fields are <code>system</code>, <code>tools</code>, <code>tool_choice</code>, <code>thinking</code>, <code>output_config</code> (effort and structured output format), <code>stop_sequences</code> and <code>stream</code>. The API is <strong>stateless</strong>: each request carries the whole conversation, so your application keeps the history.</p>
+				<p>The response is a message with a list of <code>content</code> blocks (text, thinking, tool calls), the <code>model</code>, a <code>stop_reason</code> and <code>usage</code>. There are exactly seven stop reasons: <code>end_turn</code>, <code>max_tokens</code>, <code>stop_sequence</code>, <code>tool_use</code>, <code>pause_turn</code> (a server tool hit its step limit; send the content back to continue), <code>refusal</code> (returned with HTTP 200, not as an error) and <code>model_context_window_exceeded</code>. <code>usage</code> reports input and output tokens, cache reads and writes, and thinking tokens.</p>
+				<p>The current models are Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 (<code>claude-opus-5-5</code> and so on), all with a 1M-token context window and up to 128,000 output tokens.</p>
+				<div class="callout retired"><p><strong>Things that stopped working.</strong> A prefilled final assistant turn (the old trick for forcing a format) returns an error on Claude 4.6 and later models; use structured outputs instead. Under API version <code>2026-10-21</code>, sent by the current SDKs, <code>temperature</code>, <code>top_p</code> and <code>top_k</code> are rejected for every model. And the Messages API request limit rose from 32 MB to 128 MB in October 2026.</p></div>
+			</div>
+
+			<!-- ===== Tools ===== -->
+			<h2 id="s2">Tools at a glance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Where tool code runs.</span></p>
+				<ul>
+					<li><strong>Client tools</strong> (your own, defined with a JSON schema, plus Anthropic-defined ones such as bash and the text editor): Claude stops with <code>tool_use</code>, your code runs the tool, and you send a <code>tool_result</code> back in the next user message.</li>
+					<li><strong>Server tools</strong> (web search, web fetch, code execution, tool search, the MCP connector): Anthropic runs them during the same request and returns the results in the response; some carry their own usage charges.</li>
+				</ul>
+				<p>Tool definitions count as input tokens. On Opus 5.5, Sonnet 5.5 and Fable 5.1, forcing a tool with <code>tool_choice</code> <code>any</code> or a named tool returns an error; use <code>auto</code> with strict tool schemas, or structured outputs.</p>
+			</div>
+
+			<!-- ===== Streaming ===== -->
+			<h2 id="s3">Streaming</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Receiving a response as it's generated.</span></p>
+				<p>With <code>"stream": true</code>, the API sends server-sent events in a fixed order: <code>message_start</code>; then, for each content block, <code>content_block_start</code>, one or more <code>content_block_delta</code> events and <code>content_block_stop</code>; then <code>message_delta</code> (carrying the <code>stop_reason</code> and cumulative usage); and finally <code>message_stop</code>. <code>ping</code> events can appear anywhere, and an <code>error</code> event (for example <code>overloaded_error</code>) can arrive mid-stream after the HTTP 200. Deltas come in types such as <code>text_delta</code>, <code>input_json_delta</code> (tool input as partial JSON) and <code>thinking_delta</code>; new event types may be added, so ignore ones you don't recognize.</p>
+				<div class="code"><span class="file">gear_advisor.py (Python, anthropic SDK)</span>
+<pre><code>import anthropic
+
+client = anthropic.Anthropic()  <span class="c"># reads ANTHROPIC_API_KEY from the environment</span>
+
+<span class="c"># A long answer, so stream it: words reach the customer as they are generated.</span>
+<span class="c"># With max_tokens above about 21,333 the Python SDK also refuses a non-streaming call.</span>
+with client.messages.stream(
+    model="claude-opus-5-5",
+    max_tokens=64000,
+    system="You are the gear advisor for an outdoor-gear shop. Be practical and brief.",
+    messages=[{"role": "user", "content": "I'm hiking three days in late autumn hills. What should I pack?"}],
+) as stream:
+    for text in stream.text_stream:  <span class="c"># only the text deltas, in order</span>
+        print(text, end="", flush=True)
+    final = stream.get_final_message()  <span class="c"># the complete Message, same shape as messages.create()</span>
+
+print()
+print("stop_reason:", final.stop_reason)  <span class="c"># end_turn, max_tokens, refusal, ...</span>
+if final.stop_reason == "max_tokens":
+    print("Answer was cut off: raise max_tokens or ask Claude to continue.")</code></pre></div>
+				<div class="callout trap"><p><strong>"Streaming is required" is an SDK rule.</strong> The API itself accepts large non-streaming requests. The SDKs refuse non-streaming calls they estimate could run past 10 minutes; in the Python SDK that means <code>max_tokens</code> above 21,333. Streaming also improves perceived latency, since the first words arrive sooner.</p></div>
+			</div>
+
+			<!-- ===== Vision ===== -->
+			<h2 id="s4">Images and PDFs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Sending images and documents.</span></p>
+				<p>An image block has a <code>source</code> that is base64 data with a media type, a URL, or a <code>file_id</code> from the Files API. Supported formats are JPEG, PNG, GIF (first frame only) and WebP. Put the image before the question about it. Images can be up to 8,000 by 8,000 pixels and 10 MB each (base64, on the Claude API); with more than 20 images in a request, a stricter size applies. Tokens are counted in 28-by-28-pixel patches, so a 1,000 by 1,000 image costs about 1,296 tokens; Claude 4.7 and later models also have a high-resolution tier of up to 4,784 tokens per image.</p>
+				<div class="code"><span class="file">describe_photo.py (Python, anthropic SDK)</span>
+<pre><code>import base64
+from pathlib import Path
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+<span class="c"># Product photo from the shop's catalogue (JPEG, PNG, GIF or WebP).</span>
+photo_b64 = base64.standard_b64encode(Path("tent-photo.jpg").read_bytes()).decode("utf-8")
+
+message = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=2048,
+    messages=[{
+        "role": "user",
+        "content": [
+            <span class="c"># Image first, then the question about it.</span>
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": photo_b64}},
+            {"type": "text", "text": "List the visible features of this tent (doors, vents, guy-out points) and flag anything a customer would ask about."},
+        ],
+    }],
+)
+
+<span class="c"># With thinking on, thinking blocks can come before the text, so filter by type.</span>
+print("".join(block.text for block in message.content if block.type == "text"))
+print("input tokens (image + text):", message.usage.input_tokens)</code></pre></div>
+				<p>PDFs go in a <code>document</code> block (base64, URL or file ID), up to 600 pages: each page is read as both an image and extracted text, roughly 1,500 to 3,000 text tokens per page plus the image. Plain text can be a document too; Word and Excel files must be converted first. Claude won't identify people in images, and is weaker on very small, rotated or low-quality images and on precise counting. On Bedrock and Google-managed Google Cloud, images must be sent as base64 (no URLs or file IDs).</p>
+			</div>
+
+			<!-- ===== Thinking ===== -->
+			<h2 id="s5">Thinking and effort</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Controlling how much Claude reasons before answering.</span></p>
+				<ul>
+					<li><strong>Adaptive thinking</strong> (<code>thinking: {"type": "adaptive"}</code>) lets Claude decide whether and how much to think. On the Claude 5 models it's the default: thinking can't be switched off on Opus 5.5 or Fable 5.1; Sonnet 5.5 allows <code>between_tools</code> (no up-front thinking) but rejects <code>disabled</code>, and Haiku 5.5 allows <code>disabled</code> at effort <code>high</code> or below.</li>
+					<li><strong>Effort</strong> (<code>output_config.effort</code>: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>) guides how much work Claude puts into the whole answer, thinking, text and tool calls alike. The default is <code>high</code> on most models and <code>medium</code> on Opus 5.5 and Haiku 5.5. <code>max_tokens</code> stays the hard cap.</li>
+					<li><strong>What comes back:</strong> thinking blocks hold a summary (or nothing, with <code>display: "omitted"</code>, the default on the Claude 5 models) and an encrypted <code>signature</code>; the raw reasoning is never returned. You pay for the full thinking as output tokens even when it isn't displayed.</li>
+					<li><strong>With tools,</strong> pass thinking blocks back complete and unchanged alongside the tool call they came with; modified blocks cause an error.</li>
+				</ul>
+				<div class="callout retired"><p><strong>Manual thinking budgets are legacy.</strong> <code>thinking: {"type": "enabled", "budget_tokens": N}</code> is deprecated on Claude 4.6 models and rejected from Claude 4.7 on, including all Claude 5 models. Material that teaches <code>budget_tokens</code> as the main control is out of date; use adaptive thinking and effort.</p></div>
+			</div>
+
+			<!-- ===== Caching ===== -->
+			<h2 id="s6">Prompt caching</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Reusing a long, unchanged prefix to cut cost and latency.</span></p>
+				<div class="code"><span class="file">returns_assistant.py (Python, anthropic SDK)</span>
+<pre><code>from pathlib import Path
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+<span class="c"># The full returns policy: long, and identical on every request.</span>
+RETURNS_POLICY = Path("returns-policy.md").read_text(encoding="utf-8")
+
+SYSTEM = [
+    {"type": "text", "text": "You answer customer questions for an outdoor-gear shop."},
+    {
+        "type": "text",
+        "text": RETURNS_POLICY,
+        <span class="c"># Breakpoint: cache everything up to and including this block (tools, then system).</span>
+        <span class="c"># Default lifetime is 5 minutes; {"type": "ephemeral", "ttl": "1h"} keeps it an hour.</span>
+        "cache_control": {"type": "ephemeral"},
+    },
+]
+
+
+def ask(question: str) -&gt; None:
+    response = client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=1024,
+        system=SYSTEM,  <span class="c"># same bytes every time, or the cache misses</span>
+        messages=[{"role": "user", "content": question}],  <span class="c"># the part that changes goes last</span>
+    )
+    u = response.usage
+    print(f"cache write: {u.cache_creation_input_tokens}, cache read: {u.cache_read_input_tokens}, uncached: {u.input_tokens}")
+
+
+ask("Can I return boots I've worn on one hike?")      <span class="c"># first call writes the cache</span>
+ask("How long do refunds take for a sleeping bag?")   <span class="c"># within 5 minutes: read from the cache</span></code></pre></div>
+				<ul>
+					<li><strong>How matching works.</strong> The cache key is the exact prefix in the order tools, system, messages, up to a <code>cache_control</code> breakpoint (up to four per request). Any change before the breakpoint (a timestamp, reordered tools) misses. Changing tool definitions invalidates everything; changing <code>tool_choice</code>, images, or thinking and effort settings invalidates the message part.</li>
+					<li><strong>Automatic caching</strong> (since February 2026): one top-level <code>cache_control</code> on the request, and the API places and moves the breakpoint as the conversation grows.</li>
+					<li><strong>Minimum size.</strong> Prompts shorter than the minimum are silently not cached: 512 tokens on the Claude 5 models, more on older ones (4,096 on Opus 4.5 and 4.6, for example).</li>
+					<li><strong>Prices.</strong> A 5-minute cache write costs 1.25 times the normal input price and a 1-hour write 2 times; reads cost 0.1 times on most models, 0.05 times on Opus 5.5 and Sonnet 5.5, and 0.025 times on Fable 5.1. The 5-minute lifetime is refreshed free on every hit. Cache reads also don't count toward input-tokens-per-minute rate limits.</li>
+					<li><strong>Parallel requests:</strong> an entry exists only once the first response starts, so send one request before firing many in parallel.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Cloud ===== -->
+			<h2 id="s7">Claude on cloud platforms</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Calling Claude through Amazon, Google and Microsoft.</span></p>
+				<p>The same models are reachable through several vendors, each with its own client class in the SDK:</p>
+				<ul>
+					<li><strong>Claude Platform on AWS</strong> (Anthropic-operated, AWS billing): <code>AnthropicAWS</code>, the same model IDs and nearly the same features as the Claude API.</li>
+					<li><strong>Claude in Amazon Bedrock</strong> (AWS-operated): <code>AnthropicBedrockMantle</code> for the Messages API endpoint (legacy <code>AnthropicBedrock</code> for older models); model IDs prefixed <code>anthropic.</code>, such as <code>anthropic.claude-opus-5-5</code>; regional endpoints cost 10% more than the global one.</li>
+					<li><strong>Claude models on Google Cloud, Google-managed</strong> (the former Vertex AI): <code>AnthropicVertex</code>, with the model in the URL and its own retirement dates.</li>
+					<li><strong>Claude models on Google Cloud, Anthropic-managed</strong> (since October 2026): the Claude API's request format and features, billed through Google Cloud.</li>
+					<li><strong>Claude in Microsoft Foundry</strong>: <code>AnthropicFoundry</code>, where the <code>model</code> value is your deployment name.</li>
+				</ul>
+				<p>The Anthropic-operated options get features first. Bedrock and Google-managed Google Cloud lack, among other things, the Files API and URL image sources, several server tools, Agent Skills, the MCP connector and Message Batches; Foundry also has no batches. The docs recommend each platform's own client class rather than pointing the plain client at another base URL.</p>
+			</div>
+
+			<!-- ===== Data ===== -->
+			<h2 id="s8">Getting data in and out</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">One reading of "Messages API data access patterns".</span></p>
+				<p>No Anthropic page uses the guide's phrase "data access patterns", so this section covers the ways data reaches a request and where it's held, which is the best-supported reading:</p>
+				<ul>
+					<li><strong>Inline:</strong> text and base64 images and PDFs in each request; nothing is stored between calls.</li>
+					<li><strong>By URL:</strong> images and PDFs fetched from a URL (Claude API only).</li>
+					<li><strong>Files API</strong> (out of beta since August 2026): upload once, then reference the <code>file_id</code>; up to 500 MB per file. Files belong to the <strong>workspace</strong>, so any key in it can read them: never accept file IDs from end users, and use separate workspaces per tenant. Uploaded files can't be downloaded again.</li>
+					<li><strong>Retrieval through tools:</strong> your tool returns data as a tool result; <code>search_result</code> blocks enable citations for retrieval (RAG); web search and fetch bring in outside content.</li>
+					<li><strong>Server-held state:</strong> message threads (a beta since November 2026) let the API keep a conversation for a short time so you send only new messages; Managed Agents sessions keep transcripts until deleted.</li>
+					<li><strong>Retention:</strong> the Messages API and prompt caching are eligible for zero data retention; the Files API, Message Batches (results stored 29 days), message threads, code execution and Managed Agents are not.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Batches ===== -->
+			<h2 id="s9">Batch or real time</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">The Message Batches API, and when to use it instead of normal calls.</span></p>
+				<div class="code"><span class="file">nightly_descriptions.py (Python, anthropic SDK)</span>
+<pre><code>import time
+
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+client = anthropic.Anthropic()
+
+products = {
+    "sku-tent-2p": "Two-person tent, 1.9 kg, two doors, aluminium poles",
+    "sku-stove-ti": "Titanium canister stove, 73 g, piezo igniter",
+    "sku-pack-45l": "45-litre pack, adjustable back length, rain cover included",
+}
+
+<span class="c"># One request per product; custom_id ties each result back to its SKU.</span>
+batch = client.messages.batches.create(
+    requests=[
+        Request(
+            custom_id=sku,  <span class="c"># 1-64 characters: letters, digits, - and _</span>
+            params=MessageCreateParamsNonStreaming(
+                model="claude-opus-5-5",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": f"Write a 60-word shop description for: {spec}"}],
+            ),
+        )
+        for sku, spec in products.items()
+    ]
+)
+print("batch:", batch.id, batch.processing_status)  <span class="c"># in_progress</span>
+
+<span class="c"># Poll. Most batches end within an hour; requests still waiting after 24 hours expire.</span>
+while True:
+    batch = client.messages.batches.retrieve(batch.id)
+    if batch.processing_status == "ended":
+        break
+    time.sleep(60)
+
+<span class="c"># Results can arrive in any order: match them by custom_id, never by position.</span>
+descriptions = {}
+for item in client.messages.batches.results(batch.id):
+    match item.result.type:
+        case "succeeded":
+            msg = item.result.message
+            descriptions[item.custom_id] = "".join(b.text for b in msg.content if b.type == "text")
+        case "errored":
+            print(item.custom_id, "error:", item.result.error.error.type)  <span class="c"># e.g. invalid_request_error</span>
+        case "expired" | "canceled":
+            print(item.custom_id, item.result.type, "- not billed, submit again")</code></pre></div>
+				<p>Batches cost <strong>half</strong> the normal price, accept up to 100,000 requests or 256 MB per batch, and have their own rate limits. Most finish within an hour; anything not done in 24 hours expires. Results stay downloadable for 29 days, come back in any order, and errored, canceled or expired requests aren't billed. Request errors only show up once the batch has ended, so try one request normally first. Streaming, fast mode and a few other options aren't allowed in batches.</p>
+				<p><strong>Choosing:</strong> use real-time calls when a person is waiting (chat, the gear advisor) or you need streaming or the lowest latency (fast mode on Opus 5.5 is a real-time-only option). Use batches for large, non-urgent jobs (the nightly descriptions, evaluations, bulk classification), and for very long reasoning that risks timeouts. Remember that batches aren't available on Bedrock, Google-managed Google Cloud or Foundry, and aren't covered by zero data retention.</p>
+				<div class="callout retired"><p><strong>Priority Tier is gone.</strong> Service tiers are now marked legacy and Priority Tier capacity is no longer sold (and isn't offered on the Claude 5 models). The real choice is now between standard real-time calls, fast mode for latency, and batches for cost.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The Messages API is stateless: send <code>model</code>, <code>max_tokens</code> and the full <code>messages</code> history. Seven stop reasons; <code>refusal</code> comes with HTTP 200. No prefill on 4.6+; no sampling parameters under API version 2026-10-21.</li>
+				<li>Streaming events: <code>message_start</code>, content block start/delta/stop, <code>message_delta</code>, <code>message_stop</code>, plus <code>ping</code> and mid-stream <code>error</code>. Streaming large <code>max_tokens</code> is an SDK requirement, not an API one.</li>
+				<li>Images: base64, URL or file ID; image before text; tokens counted in 28-pixel patches. PDFs up to 600 pages as document blocks.</li>
+				<li>Adaptive thinking plus effort replace <code>budget_tokens</code>; pass thinking blocks back unchanged with tool calls; hidden thinking is still billed.</li>
+				<li>Caching: exact prefix (tools, system, messages) up to a breakpoint; 5-minute or 1-hour lifetime; 512-token minimum on Claude 5; reads from 0.025 to 0.1 times the input price.</li>
+				<li>Cloud platforms use their own clients and model IDs; Anthropic-operated ones get features first. Files are workspace-scoped. Batches: 50% off, up to 24 hours, any order, match by <code>custom_id</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-2.html"><small>Previous</small>2.2: Systems Life Cycle</a>
+				<a class="next" href="d2-skill-2-4.html"><small>Next</small>2.4: Software Engineering Foundations</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer – Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.0. Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
