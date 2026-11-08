@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.2: Debugging | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 3.2, debugging applications on Kubernetes: triaging Pending, Waiting and crashing Pods, container states and reasons, CrashLoopBackOff and exit codes, termination messages, kubectl logs --previous, exec and cp, kubectl debug with ephemeral containers and Pod copies, liveness, readiness and startup probes, init containers, stalled rollouts and Jobs, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Cloud Native Application Delivery &middot; 16%</span>
+		<h1>3.2: Debugging</h1>
+		<p>Finding out why an application on Kubernetes&reg; is not working: reading Pod and container states, getting logs from crashed containers, inspecting running Pods with debug containers, getting health probes right, and spotting stalled rollouts and failing Jobs.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">kubectl logs</span><span class="tag">kubectl debug</span><span class="tag">Probes</span><span class="tag">CrashLoopBackOff</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Triage</a></li>
+				<li><a href="#s2">Container states and reasons</a></li>
+				<li><a href="#s3">Logs</a></li>
+				<li><a href="#s4">Getting inside a Pod</a></li>
+				<li><a href="#s5">Health probes</a></li>
+				<li><a href="#s6">Init containers, rollouts and Jobs</a></li>
+				<li><a href="#s7">Tools and observability</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 3.2</span>
+				<p><strong>Debugging.</strong></p>
+			</div>
+			<p>This page takes the topic to mean debugging <strong>applications</strong>: the Kubernetes guide for it "is <em>not</em> a guide for people who want to debug their cluster." Cluster, node and network problems are topic 2.3. Here: triaging a failing Pod, reading container <strong>states</strong>, <strong>logs</strong>, inspecting Pods with <strong>exec</strong> and <strong>kubectl debug</strong>, <strong>probes</strong>, and debugging init containers, rollouts and Jobs.</p>
+			<p>Quotes are from the <a href="https://kubernetes.io/docs/tasks/debug/debug-application/">Kubernetes documentation</a> (&copy; The Kubernetes Authors, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>) for Kubernetes v1.37.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A new version of <code>shop-api</code> was just deployed. Some Pods restart over and over, others run but receive no traffic, and the rollout never finishes. Each section is one tool for finding out why.</p></div>
+
+			<!-- ===== Triage ===== -->
+			<h2 id="s1">Triage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Working out what kind of problem a Pod has from its status, before reaching for deeper tools.</span></p>
+				<p>"The first step in troubleshooting is triage. What is the problem? Is it your Pods, your Replication Controller or your Service?" For a Pod, "the first step ... is taking a look at it": <code>kubectl describe pod &lt;name&gt;</code> shows the state of each container, restarts and recent events.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Symptom</th><th>Meaning</th><th>Look at</th></tr></thead>
+						<tbody>
+							<tr><td>Stays <code>Pending</code></td><td data-label="Meaning">"It can not be scheduled onto a node", usually not enough resources, or a <code>hostPort</code> that limits where it can run</td><td data-label="Look at">Scheduler events in <code>describe</code> (topic 1.3)</td></tr>
+							<tr><td>Stays <code>Waiting</code></td><td data-label="Meaning">Scheduled, "but it can't run on that machine"; "the most common cause ... is a failure to pull the image"</td><td data-label="Look at">Image name, registry, pull secret (topic 1.4)</td></tr>
+							<tr><td>Crashing or unhealthy</td><td data-label="Meaning">Started but keeps failing</td><td data-label="Look at">Logs, exit code, probes (below)</td></tr>
+							<tr><td>Running, but not doing what you asked</td><td data-label="Meaning">Often a typo or mis-nested key in the manifest</td><td data-label="Look at">Compare your file with <code>kubectl get pod -o yaml</code></td></tr>
+							<tr><td>Running, but no traffic</td><td data-label="Meaning">Not ready, or the Service does not select it</td><td data-label="Look at">Readiness probe; EndpointSlices (topic 2.3)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>Typos are now caught.</strong> The Debug Pods guide still warns that a misspelled field such as <code>commnd</code> may be "silently ignored". Today kubectl's default is strict server-side field validation (stable since v1.27): the API server "rejects the request with a 400 Bad Request error when it detects any unknown or duplicate fields". Unknown fields are only dropped silently with <code>--validate=false</code>.</p></div>
+			</div>
+
+			<!-- ===== States ===== -->
+			<h2 id="s2">Container states and reasons</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Reading a container's state, reason and exit code to narrow down why it is not running.</span></p>
+				<p>"There are three possible container states: <code>Waiting</code>, <code>Running</code>, and <code>Terminated</code>." A <code>Waiting</code> container shows a <strong>reason</strong>; a <code>Terminated</code> one shows "a reason, an exit code, and the start and finish time". Common reasons, set by the kubelet and container runtime:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Reason</th><th>State</th><th>Usually means</th></tr></thead>
+						<tbody>
+							<tr><td><code>ContainerCreating</code></td><td data-label="State">Waiting</td><td data-label="Usually means">Still starting: pulling the image, mounting volumes</td></tr>
+							<tr><td><code>ErrImagePull</code>, <code>ImagePullBackOff</code></td><td data-label="State">Waiting</td><td data-label="Usually means">Cannot pull the image</td></tr>
+							<tr><td><code>CreateContainerConfigError</code></td><td data-label="State">Waiting</td><td data-label="Usually means">The container's configuration cannot be built, typically a missing ConfigMap or Secret, or a missing key in one</td></tr>
+							<tr><td><code>RunContainerError</code></td><td data-label="State">Waiting</td><td data-label="Usually means">The runtime could not start it, for example a wrong command</td></tr>
+							<tr><td><code>CrashLoopBackOff</code></td><td data-label="State">Waiting</td><td data-label="Usually means">It keeps crashing, and the kubelet is waiting before the next restart</td></tr>
+							<tr><td><code>Completed</code></td><td data-label="State">Terminated</td><td data-label="Usually means">Exited with code 0</td></tr>
+							<tr><td><code>Error</code></td><td data-label="State">Terminated</td><td data-label="Usually means">Exited with a non-zero code</td></tr>
+							<tr><td><code>OOMKilled</code></td><td data-label="State">Terminated</td><td data-label="Usually means">Killed for exceeding its memory limit (exit code 137)</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>CrashLoopBackOff</h3>
+				<p><code>CrashLoopBackOff</code> "indicates that the backoff delay mechanism is currently in effect for a given container that is in a crash loop, failing and restarting repeatedly". The kubelet waits "10s, 20s, 40s, …", "capped at 300 seconds (5 minutes)", and resets the timer once a container has run for 10 minutes without problems. Typical causes listed by the documentation: application errors, "configuration errors, such as incorrect environment variables or missing configuration files", too little memory or CPU, and failing liveness or startup probes.</p>
+				<div class="callout trap"><p><strong>Not a phase, and not the cause.</strong> <code>CrashLoopBackOff</code> is "a condition or event that might be seen as output from the <code>kubectl</code> command", not a Pod phase (topic 1.1). It tells you the container keeps failing, not why: check its logs and last exit code.</p></div>
+
+				<h3>Exit codes</h3>
+				<p>Kubernetes does not define exit codes; they follow the Linux shell convention that a process killed by signal <em>N</em> exits with 128 + <em>N</em>:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Exit code</th><th>Meaning</th></tr></thead>
+						<tbody>
+							<tr><td>0</td><td data-label="Meaning">Success</td></tr>
+							<tr><td>1 (or other small numbers)</td><td data-label="Meaning">The application reported an error</td></tr>
+							<tr><td>137 (128 + 9, SIGKILL)</td><td data-label="Meaning">Killed: by the out-of-memory killer, or after not stopping within the grace period</td></tr>
+							<tr><td>143 (128 + 15, SIGTERM)</td><td data-label="Meaning">Stopped by the termination signal Kubernetes sends first</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Last state and restart count</span>
+<pre><code>kubectl get pod shop-api-0 -o jsonpath=\
+'{.status.containerStatuses[0].lastState}'</code></pre></div>
+
+				<h3>Termination messages</h3>
+				<p>An app can write why it failed to <code>/dev/termination-log</code> (the default <code>terminationMessagePath</code>); Kubernetes shows it under <code>lastState.terminated.message</code>, truncated at 4096 bytes. With <code>terminationMessagePolicy: FallbackToLogsOnError</code>, Kubernetes uses "the last chunk of container log output if the termination message file is empty and the container exited with an error", up to 2048 bytes or 80 lines.</p>
+			</div>
+
+			<!-- ===== Logs ===== -->
+			<h2 id="s3">Logs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Reading what an application printed, including from a container that has already crashed.</span></p>
+				<div class="code"><span class="file">kubectl logs</span>
+<pre><code><span class="c"># the current container</span>
+kubectl logs shop-api-0
+
+<span class="c"># the crashed one before it</span>
+kubectl logs shop-api-0 --previous
+
+<span class="c"># a named container, live, recent only</span>
+kubectl logs shop-api-0 -c api -f \
+  --since=1h --tail=50
+
+<span class="c"># every Pod with a label</span>
+kubectl logs -l app=shop-api \
+  --all-containers
+
+<span class="c"># a Job's first container</span>
+kubectl logs job/reindex</code></pre></div>
+				<div class="callout trap"><p><strong>Use <code>--previous</code> after a crash.</strong> Without it you see the new, freshly restarted container, which may have printed nothing useful yet. "If your container has previously crashed, you can access the previous container's crash log with" <code>--previous</code>. The kubelet keeps only one terminated container's logs, and nothing survives eviction.</p></div>
+				<p><code>kubectl logs</code> shows only what the container writes to <strong>stdout and stderr</strong>. An app that logs to a file inside the container needs a sidecar that streams the file, or a change to log to stdout.</p>
+			</div>
+
+			<!-- ===== Inside ===== -->
+			<h2 id="s4">Getting inside a Pod</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Running commands next to a misbehaving application, even when its image has no shell.</span></p>
+				<p>If the image has a shell and tools, <code>kubectl exec</code> runs commands in a container; "the double dash (<code>--</code>) separates the arguments you want to pass to the command from the kubectl arguments". <code>kubectl cp</code> copies files in and out, but needs <code>tar</code> in the image.</p>
+				<div class="code"><span class="file">exec and cp</span>
+<pre><code>kubectl exec -it shop-api-0 -c api \
+  -- sh
+kubectl cp shop-api-0:/tmp/dump.txt \
+  ./dump.txt</code></pre></div>
+				<p>Minimal images such as distroless have no shell, so exec fails with "executable file not found". That is what <strong>ephemeral containers</strong> are for: "a special type of container that runs temporarily in an existing Pod to accomplish user-initiated actions such as troubleshooting" (stable since v1.25). <code>kubectl debug</code> adds one:</p>
+				<div class="code"><span class="file">Debug a running Pod in place</span>
+<pre><code><span class="c"># tools container sharing api's</span>
+<span class="c"># process namespace</span>
+kubectl debug -it shop-api-0 \
+  --image=busybox:1.36 --target=api</code></pre></div>
+				<div class="callout trap"><p><strong>Ephemeral containers are one-way.</strong> They "will never be automatically restarted", may not have ports, probes or resources, and "you may not change or remove an ephemeral container after you have added it to a Pod". They also need permission on the <code>pods/ephemeralcontainers</code> subresource, which the default <code>admin</code> and <code>edit</code> roles do not include.</p></div>
+
+				<h3>Debugging a copy</h3>
+				<p>When the app crashes at startup, attaching to it is not enough. <code>kubectl debug</code> can instead "create a copy of the Pod with configuration values changed to aid debugging", leaving the original untouched:</p>
+				<div class="code"><span class="file">Copy the Pod and start a shell instead</span>
+<pre><code>kubectl debug shop-api-0 -it \
+  --copy-to=api-debug \
+  --container=api -- sh
+
+<span class="c"># or swap every image for ubuntu</span>
+kubectl debug shop-api-0 \
+  --copy-to=api-debug --set-image=*=ubuntu
+
+<span class="c"># clean up afterwards</span>
+kubectl delete pod api-debug</code></pre></div>
+				<p>By default the copy drops the original's labels and probes, so it does not receive Service traffic or get restarted by a failing probe.</p>
+				<div class="callout retired"><p><strong>The default debug profile changed.</strong> Profiles set the debug container's privileges: <code>general</code>, <code>baseline</code>, <code>restricted</code>, <code>netadmin</code> and <code>sysadmin</code>. Since kubectl v1.36 the default is <code>general</code>; the old <code>legacy</code> profile "is deprecated and planned to be removed in v1.39". (The Debug Running Pods page still says legacy is the default.) Custom profiles with <code>--custom</code> are stable since v1.32.</p></div>
+			</div>
+
+			<!-- ===== Probes ===== -->
+			<h2 id="s5">Health probes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Telling Kubernetes how to check an application's health, and avoiding probes that cause the failures they should detect.</span></p>
+				<p>"A probe is a diagnostic performed periodically by the kubelet on a container." "Based on the probe results, Kubernetes can restart unhealthy containers or stop sending traffic to containers that are not ready."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Probe</th><th>Answers</th><th>On failure</th></tr></thead>
+						<tbody>
+							<tr><td>Startup</td><td data-label="Answers">Has the app finished starting? Liveness and readiness probes wait until it succeeds</td><td data-label="On failure">"The kubelet kills the container", and the restart policy applies</td></tr>
+							<tr><td>Liveness</td><td data-label="Answers">Is the app still working, or is it stuck, "for example ... a deadlock"?</td><td data-label="On failure">"The kubelet restarts that container"</td></tr>
+							<tr><td>Readiness</td><td data-label="Answers">Can it take traffic right now?</td><td data-label="On failure">No restart: the Pod's IP is removed "from the EndpointSlices of all Services that match the Pod", and <code>Ready</code> becomes false</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Each probe uses exactly one mechanism: <code>httpGet</code> (success is a status from 200 to 399), <code>tcpSocket</code> (the port is open), <code>exec</code> (the command exits with 0) or <code>grpc</code> (stable since v1.27; the service reports <code>SERVING</code>). A container without a given probe always counts as passing it.</p>
+				<div class="code"><span class="file">Probes for shop-api</span>
+<pre><code>    <span class="c"># slow start: up to 30 x 10s</span>
+    startupProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      failureThreshold: 30
+      periodSeconds: 10
+    <span class="c"># stuck process: restart it</span>
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      failureThreshold: 3
+    <span class="c"># not ready: stop sending traffic</span>
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      periodSeconds: 5</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Field</th><th>Default</th></tr></thead>
+						<tbody>
+							<tr><td><code>initialDelaySeconds</code></td><td data-label="Default">0</td></tr>
+							<tr><td><code>periodSeconds</code></td><td data-label="Default">10</td></tr>
+							<tr><td><code>timeoutSeconds</code></td><td data-label="Default">1</td></tr>
+							<tr><td><code>successThreshold</code></td><td data-label="Default">1 (must be 1 for liveness and startup)</td></tr>
+							<tr><td><code>failureThreshold</code></td><td data-label="Default">3</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Liveness probes can cause outages.</strong> They "must be configured carefully to ensure that they truly indicate unrecoverable application failure". A liveness probe that fails under heavy load restarts busy containers, putting more load on the rest: "cascading failures". For apps that start slowly, use a startup probe rather than a long initial delay; the documentation's example allows "a maximum of 5 minutes (30 * 10 = 300s)". And "the readiness and liveness probes do not depend on each other to succeed."</p></div>
+				<p>Failing probes show up as <code>Unhealthy</code> warning events in <code>kubectl describe pod</code>, and liveness failures increase the RESTARTS count.</p>
+			</div>
+
+			<!-- ===== Init / rollouts / Jobs ===== -->
+			<h2 id="s6">Init containers, rollouts and Jobs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Recognizing the statuses that init containers, stalled Deployments and failing Jobs report.</span></p>
+
+				<h3>Init containers</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Pod status</th><th>Meaning (kubernetes.io)</th></tr></thead>
+						<tbody>
+							<tr><td><code>Init:N/M</code></td><td data-label="Meaning (kubernetes.io)">"The Pod has <code>M</code> Init Containers, and <code>N</code> have completed so far."</td></tr>
+							<tr><td><code>Init:Error</code></td><td data-label="Meaning (kubernetes.io)">"An Init Container has failed to execute."</td></tr>
+							<tr><td><code>Init:CrashLoopBackOff</code></td><td data-label="Meaning (kubernetes.io)">"An Init Container has failed repeatedly."</td></tr>
+							<tr><td><code>PodInitializing</code> or <code>Running</code></td><td data-label="Meaning (kubernetes.io)">Init containers have finished</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Read an init container's logs by name: <code>kubectl logs shop-api-0 -c wait-for-db</code>.</p>
+
+				<h3>A rollout that never finishes</h3>
+				<p>The documentation lists why a Deployment can fail: "Insufficient quota", "Readiness probe failures", "Image pull errors", "Insufficient permissions", "Limit ranges", "Application runtime misconfiguration". After <code>progressDeadlineSeconds</code> (default 600), its <code>Progressing</code> condition becomes <code>False</code> with reason <code>ProgressDeadlineExceeded</code>, and <code>kubectl rollout status</code> exits with an error.</p>
+				<div class="code"><span class="file">Investigate, then roll back</span>
+<pre><code>kubectl rollout status deploy/shop-api
+kubectl describe deploy shop-api
+kubectl get rs -l app=shop-api
+kubectl rollout undo deploy/shop-api</code></pre></div>
+				<div class="callout trap"><p><strong>Kubernetes does not roll back by itself.</strong> "Kubernetes takes no action on a stalled Deployment other than to report a status condition". You or a higher-level tool (such as Argo Rollouts, topic 3.1) must roll back. A quota problem shows as a <code>ReplicaFailure</code> condition with reason <code>FailedCreate</code>.</p></div>
+
+				<h3>Jobs</h3>
+				<p>A Job retries failed Pods up to <code>backoffLimit</code> (default 6) and then fails with reason <code>BackoffLimitExceeded</code>; <code>activeDeadlineSeconds</code> takes precedence and fails it with <code>DeadlineExceeded</code>. The documentation suggests "setting <code>restartPolicy = "Never"</code> when debugging the Job", because with <code>OnFailure</code> the Pod is terminated at the backoff limit, taking its logs with it.</p>
+			</div>
+
+			<!-- ===== Tools ===== -->
+			<h2 id="s7">Tools and observability</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Using local-development tools and observability data to debug beyond a single Pod.</span></p>
+				<ul>
+					<li><code>kubectl port-forward pod/shop-api-0 8080:8080</code> reaches one Pod from your machine; "the forwarding session ends when the selected pod terminates".</li>
+					<li><strong>Telepresence</strong> (CNCF Sandbox) supports "local development against a remote Kubernetes ... cluster"; DevSpace is also a CNCF Sandbox project, while Tilt, Skaffold and Okteto are independent tools for inner-loop development.</li>
+					<li>For problems across many services, logs alone are not enough. "Observability is a system property that defines the degree to which the system can generate actionable insights" (CNCF Glossary): logs, metrics and traces, collected with tools such as <strong>OpenTelemetry</strong>, which graduated in CNCF on May 11, 2026. Topic 4.1 covers this.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Triage with <code>kubectl describe pod</code>: <code>Pending</code> = not scheduled; <code>Waiting</code> = cannot start (usually image); crashing = check logs and exit code; running but wrong = compare the manifest with <code>get -o yaml</code>. Strict field validation now rejects typos.</li>
+				<li>Container states: Waiting, Running, Terminated. Reasons: <code>CreateContainerConfigError</code> (missing ConfigMap or Secret), <code>RunContainerError</code>, <code>CrashLoopBackOff</code> (repeated crashes; 10 s to 300 s backoff), <code>Completed</code>, <code>Error</code>, <code>OOMKilled</code> (137).</li>
+				<li>Exit codes follow 128 + signal: 137 = SIGKILL, 143 = SIGTERM. Termination messages come from <code>/dev/termination-log</code> or, with <code>FallbackToLogsOnError</code>, the log tail.</li>
+				<li><code>kubectl logs --previous</code> for a crashed container; <code>-c</code>, <code>-f</code>, <code>-l</code>, <code>--since</code>, <code>--tail</code>. Only stdout and stderr are captured.</li>
+				<li><code>kubectl exec</code> needs a shell in the image; otherwise <code>kubectl debug --target</code> adds an ephemeral container (stable v1.25; cannot be removed). <code>--copy-to</code> debugs a copy. Default profile <code>general</code> since v1.36.</li>
+				<li>Probes: <strong>startup</strong> (gates the others), <strong>liveness</strong> (failure restarts), <strong>readiness</strong> (failure removes from Service endpoints, no restart). httpGet, tcpSocket, exec, grpc. Defaults: period 10 s, timeout 1 s, failure threshold 3. Careless liveness probes cause cascading failures.</li>
+				<li><code>Init:N/M</code>, <code>Init:Error</code>, <code>Init:CrashLoopBackOff</code>. A stalled Deployment reports <code>ProgressDeadlineExceeded</code> after 600 s but is not rolled back automatically. Jobs fail at <code>backoffLimit</code> 6; debug with <code>restartPolicy: Never</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d3-topic-3-1.html"><small>Previous</small>3.1: Application Delivery</a>
+				<a class="next" href="d4-topic-4-1.html"><small>Next</small>4.1: Observability</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg;, CNCF&reg; and OpenTelemetry&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Quotes from kubernetes.io &copy; The Kubernetes Authors and from glossary.cncf.io, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
