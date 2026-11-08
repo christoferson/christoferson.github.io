@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.2: Persistence, Denial of Service, Malicious Code | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 4.2: how attackers keep a foothold in a Kubernetes cluster (workload objects, admission webhooks, credentials, static Pods) and how to find it, denial of service against nodes, the control plane and applications with the limits that prevent it, compromised containers and malicious code with blast-radius controls and runtime detection, and responding to a compromised Pod.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Kubernetes Threat Model &middot; 16%</span>
+		<h1>4.2: Persistence, Denial of Service, Malicious Code Execution and Compromised Applications</h1>
+		<p>Three things attackers do in a Kubernetes&reg; cluster: stay in, knock things over, and run their own code. For each, the main techniques as public threat matrices describe them, and the controls that detect and prevent them.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Persistence</span><span class="tag">DoS</span><span class="tag">Resource hijacking</span><span class="tag">Compromised container</span><span class="tag">Falco</span><span class="tag">Incident response</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The threat matrices</a></li>
+				<li><a href="#s2">Persistence</a></li>
+				<li><a href="#s3">Denial of service</a></li>
+				<li><a href="#s4">Malicious code and compromised apps</a></li>
+				<li><a href="#s5">Responding to a compromised Pod</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 4.2</span>
+				<p><strong>Persistence. Denial of Service. Malicious Code Execution and Compromised Applications in Containers.</strong></p>
+			</div>
+			<p>The curriculum gives only these names. This page treats each as an attacker goal on the map from <a href="d4-topic-4-1.html">topic 4.1</a>, describes the techniques at the level of public threat matrices, and focuses on detection and prevention. The other goals (attacker on the network, access to sensitive data, privilege escalation) are in <a href="index.html#d4">topic 4.3</a>, and the frameworks themselves in <a href="index.html#d6">topic 6.2</a>.</p>
+			<p>Sources: kubernetes.io (CC BY 4.0), the Microsoft Threat Matrix for Kubernetes (CC BY 4.0), MITRE ATT&amp;CK&reg; (used under MITRE's terms), the CNCF&reg; Financial User Group attack trees (Apache-2.0) and the Falco rules (Apache-2.0). Incidents reported by security vendors are summarized in a line each.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A vulnerable library in the shop's <code>api</code> image lets an attacker run commands inside one <code>api</code> Pod. What could they do next, how would the team notice, and what limits the damage?</p></div>
+
+			<!-- ===== Matrices ===== -->
+			<h2 id="s1">The threat matrices</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.2</span><span class="skill-text">Where these three goals sit in the public catalogues of attacker techniques.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Goal</th><th>Microsoft Threat Matrix for Kubernetes</th><th>MITRE ATT&amp;CK Containers examples</th></tr></thead>
+						<tbody>
+							<tr><td>Persistence</td><td data-label="Microsoft Threat Matrix for Kubernetes">Backdoor container, writable hostPath mount, Kubernetes CronJob, malicious admission controller, container service account, static Pods</td><td data-label="MITRE ATT&amp;CK Containers examples">T1053.007 Container Orchestration Job, T1525 Implant Internal Image, T1078 Valid Accounts</td></tr>
+							<tr><td>Execution</td><td data-label="Microsoft Threat Matrix for Kubernetes">Exec into container, bash/cmd inside container, new container, application exploit (RCE), SSH server running inside container, sidecar injection</td><td data-label="MITRE ATT&amp;CK Containers examples">T1609 Container Administration Command, T1610 Deploy Container</td></tr>
+							<tr><td>Impact</td><td data-label="Microsoft Threat Matrix for Kubernetes">Data destruction, resource hijacking, denial of service</td><td data-label="MITRE ATT&amp;CK Containers examples">T1496 Resource Hijacking, T1499 Endpoint Denial of Service</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Escaping from a container to the node (MITRE T1611 Escape to Host) is privilege escalation, covered in <a href="index.html#d4">topic 4.3</a>. The CNCF Financial User Group's attack trees cover the same ground, with trees named Establish Persistence, Denial of Service, Malicious Code Execution and Compromised Container. They were modeled on Kubernetes 1.14, so some leaves mention ports and Docker integrations that no longer exist. The project's own summary of the main mitigations still holds: "Strict RBAC policies or disabling the automatic service token mounting are key mitigations".</p>
+				<div class="callout retired"><p><strong>ATT&amp;CK renamed a tactic in 2026.</strong> Version 19 (April 2026) split "Defense Evasion" into Stealth and Defense Impairment. Older material, and the Microsoft matrix, still use the old name.</p></div>
+			</div>
+
+			<!-- ===== Persistence ===== -->
+			<h2 id="s2">Persistence</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.2</span><span class="skill-text">How attackers make a foothold survive restarts, and where to look for it.</span></p>
+				<p>A shell in a container is fragile: Kubernetes replaces containers and Pods all the time. The attack trees order footholds by how much they survive. Defenders can use the same ladder to decide where to look:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Foothold</th><th>Survives</th><th>Where it shows up</th></tr></thead>
+						<tbody>
+							<tr><td>A process in a running container</td><td data-label="Survives">Nothing: gone when the container restarts</td><td data-label="Where it shows up">Runtime detection; audit events for <code>pods/exec</code></td></tr>
+							<tr><td>A backdoored image in the registry (implant internal image)</td><td data-label="Survives">Pod restarts and redeployments that pull it</td><td data-label="Where it shows up">Registry pushes, image digests changing for the same tag (<a href="d1-topic-1-3.html#s1">topic 1.3</a>)</td></tr>
+							<tr><td>Workload objects: a CronJob, DaemonSet or Deployment</td><td data-label="Survives">Pod deletion; the controller recreates it. A DaemonSet runs on every node</td><td data-label="Where it shows up">Audit events creating workloads, unfamiliar objects in any namespace</td></tr>
+							<tr><td>A mutating admission webhook</td><td data-label="Survives">Everything: it can inject a sidecar into every new Pod (sidecar injection)</td><td data-label="Where it shows up">Changes to MutatingWebhookConfigurations</td></tr>
+							<tr><td>Credentials: a token Secret, a client certificate, a new RBAC binding</td><td data-label="Survives">Workload deletion; client certificates can't be revoked (<a href="d3-topic-3-2.html#s4">topic 3.2</a>)</td><td data-label="Where it shows up">Audit events for CSRs, <code>serviceaccounts/token</code>, (Cluster)RoleBindings</td></tr>
+							<tr><td>Node level: a static Pod manifest, files written through a writable hostPath</td><td data-label="Survives">Cluster-level cleanup; static Pods bypass the API server</td><td data-label="Where it shows up">File integrity monitoring on nodes, mirror Pods that no one created</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Hunt for persistence (shell)</span>
+<pre><code><span class="c"># scheduled and per-node workloads</span>
+kubectl get cronjobs,daemonsets -A
+
+<span class="c"># webhooks that see every new object</span>
+kubectl get \
+  mutatingwebhookconfigurations
+
+<span class="c"># who holds cluster-admin</span>
+kubectl get clusterrolebindings \
+  -o wide | grep cluster-admin
+
+<span class="c"># certificate requests, recent first</span>
+kubectl get csr \
+  --sort-by=.metadata.creationTimestamp</code></pre></div>
+				<p>Static Pods show up in the API as mirror Pods, named after their node and carrying the <code>kubernetes.io/config.mirror</code> annotation. One that nobody put in <code>/etc/kubernetes/manifests</code> on purpose is a red flag (<a href="d2-topic-2-2.html#s6">topic 2.2</a>).</p>
+				<div class="callout tip"><p><strong>Prevention, in short.</strong> Restrict who can create workloads, webhook configurations, bindings, CSRs and tokens (<a href="d3-topic-3-2.html#s7">topic 3.2</a>); forbid hostPath and privileged Pods (<a href="d3-topic-3-1.html">topic 3.1</a>); pin images by digest and allow only trusted registries; audit those object types at the RequestResponse level (<a href="d3-topic-3-5.html#s2">topic 3.5</a>); and protect node manifest directories.</p></div>
+			</div>
+
+			<!-- ===== DoS ===== -->
+			<h2 id="s3">Denial of service</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.2</span><span class="skill-text">Exhausting nodes, the control plane or an application, and the limits that stop it.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Target</th><th>How it's exhausted</th><th>Controls</th></tr></thead>
+						<tbody>
+							<tr><td>Node CPU and memory</td><td data-label="How it's exhausted">A Pod with no limits starves its neighbours</td><td data-label="Controls">Requests and limits, LimitRange defaults, ResourceQuota (<a href="d3-topic-3-4.html#s3">topic 3.4</a>); node-pressure eviction</td></tr>
+							<tr><td>Node process IDs</td><td data-label="How it's exhausted">A fork bomb uses up every PID on the node</td><td data-label="Controls">The kubelet's <code>podPidsLimit</code> (default -1, unlimited)</td></tr>
+							<tr><td>Node disk</td><td data-label="How it's exhausted">Logs, <code>emptyDir</code> or image layers fill the disk</td><td data-label="Controls"><code>ephemeral-storage</code> requests and limits, <code>emptyDir.sizeLimit</code>, log rotation</td></tr>
+							<tr><td>API server</td><td data-label="How it's exhausted">Floods of requests, especially expensive lists and watches</td><td data-label="Controls">API Priority and Fairness (<a href="d2-topic-2-1.html#s2">topic 2.1</a>), authentication, network limits on the endpoint</td></tr>
+							<tr><td>etcd and controllers</td><td data-label="How it's exhausted">Huge numbers of objects, or large ones</td><td data-label="Controls">Object-count quotas (<code>count/secrets</code>, <code>count/jobs.batch</code>); size limits; etcd's storage quota (2 GiB by default)</td></tr>
+							<tr><td>Scheduling</td><td data-label="How it's exhausted">High-priority Pods preempt everything else</td><td data-label="Controls">PriorityClass-scoped quotas</td></tr>
+							<tr><td>The application</td><td data-label="How it's exhausted">Request floods, slow clients</td><td data-label="Controls">Rate limiting at the Ingress, Gateway or mesh; autoscaling with sane maximums</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Cap processes per Pod on each node (KubeletConfiguration)</span>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+<span class="c"># max processes per Pod (-1 = none)</span>
+podPidsLimit: 1024</code></pre></div>
+				<p>Kubernetes has no per-Pod PID field; the limit is set per node. The API also caps object sizes: a Secret or ConfigMap at 1 MiB, an etcd request at 1.5 MiB and an API request body at 3 MiB.</p>
+				<ul>
+					<li><strong>Parser bugs:</strong> CVE-2019-11253 let a small YAML or JSON document with deeply nested references ("billion laughs") consume the API server's memory.</li>
+					<li><strong>Protocol attacks:</strong> since v1.29 the API server limits HTTP/2 from unauthenticated clients (the <code>UnauthenticatedHTTP2DOSMitigation</code> gate, beta and on by default), a response to HTTP/2 attacks such as "Rapid Reset".</li>
+				</ul>
+				<h3>Resource hijacking</h3>
+				<p>The most common "impact" in real incidents isn't an outage: it's cryptocurrency mining on someone else's CPUs, which Microsoft's matrix calls resource hijacking. Public cases include a 2018 report of a car maker's cloud account mined through an unprotected Kubernetes dashboard, Unit 42's 2021 "Hildegard" campaign, which entered through a misconfigured kubelet, and Microsoft's 2023 report on the Kinsing malware targeting vulnerable containers. The defences are the same as above (CPU limits, quotas) plus restricted access and detection of unexpected processes and outbound connections.</p>
+				<div class="callout trap"><p><strong>Limits are a security control.</strong> A Pod without resource limits, or a namespace without quotas, is a denial-of-service risk to everything sharing the node or the control plane. kubernetes.io's Application Security Checklist asks for memory limits on every workload (<a href="d1-topic-1-3.html#s8">topic 1.3</a>).</p></div>
+			</div>
+
+			<!-- ===== Code execution ===== -->
+			<h2 id="s4">Malicious code and compromised apps</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.2</span><span class="skill-text">How attacker code gets into a container, what it reaches, and what contains it.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Way in</th><th>Example</th><th>Main defence</th></tr></thead>
+						<tbody>
+							<tr><td>Exploit in the application</td><td data-label="Example">Remote code execution in a library, such as Log4Shell (CVE-2021-44228) in 2021</td><td data-label="Main defence">Dependency scanning and patching (<a href="d1-topic-1-3.html#s6">topic 1.3</a>)</td></tr>
+							<tr><td>Malicious or vulnerable image</td><td data-label="Example">A public image with a miner, or a stale base image</td><td data-label="Main defence">Trusted registries, scanning, signatures (<a href="index.html#d5">topic 5.1</a>)</td></tr>
+							<tr><td>Legitimate access, misused</td><td data-label="Example"><code>kubectl exec</code>, or creating a new Pod, with stolen or overbroad credentials</td><td data-label="Main defence">RBAC on <code>pods/exec</code> and Pod creation; short-lived credentials</td></tr>
+							<tr><td>Pipeline compromise</td><td data-label="Example">Code injected into CI, or a poisoned build dependency</td><td data-label="Main defence">Supply chain controls (<a href="index.html#d5">topic 5.1</a>)</td></tr>
+							<tr><td>Exposed management services</td><td data-label="Example">An anonymous kubelet, or an open dashboard</td><td data-label="Main defence">The hardening in <a href="d2-topic-2-2.html#s1">topic 2.2</a></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Once inside, an attacker's first moves are predictable: read the mounted ServiceAccount token and try the API, query the cloud metadata service, scan the flat Pod network, and look for a way onto the node through privileged settings, hostPath or a runtime bug. Those steps are the subject of <a href="index.html#d4">topic 4.3</a>. The attack trees call "default network exposure of the control plane to all running containers" a main vector.</p>
+				<h3>Limiting the blast radius</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Control</th><th>What it denies the attacker</th></tr></thead>
+						<tbody>
+							<tr><td>No token mount (<code>automountServiceAccountToken: false</code>)</td><td data-label="What it denies the attacker">An API credential</td></tr>
+							<tr><td>Restricted Pod Security, non-root, drop ALL capabilities, seccomp</td><td data-label="What it denies the attacker">Easy routes to the node</td></tr>
+							<tr><td>Read-only root filesystem, no shell in the image</td><td data-label="What it denies the attacker">A place to drop tools, and tools to run</td></tr>
+							<tr><td>Egress NetworkPolicy, metadata blocked</td><td data-label="What it denies the attacker">Lateral movement, downloads and data exfiltration</td></tr>
+							<tr><td>User namespaces or a sandboxed runtime</td><td data-label="What it denies the attacker">Root on the host, even after an escape bug</td></tr>
+							<tr><td>Resource limits</td><td data-label="What it denies the attacker">The node's capacity, for mining or DoS</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Runtime detection</h3>
+				<p>Audit logs show API calls, not what happens inside a container (<a href="d3-topic-3-5.html#s6">topic 3.5</a>). Runtime tools watch system calls and process activity instead:</p>
+				<ul>
+					<li><strong>Falco</strong> (CNCF graduated): its default rules include "Terminal shell in container" and "Contact K8S API Server From Container". Many more rules exist in its sandbox and incubating sets, which aren't loaded by default.</li>
+					<li><strong>Tetragon</strong> (part of the Cilium project) and <strong>KubeArmor</strong> (CNCF sandbox) can also enforce policy, blocking an action rather than only alerting.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Response ===== -->
+			<h2 id="s5">Responding to a compromised Pod</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.2</span><span class="skill-text">Containing a compromised workload without destroying the evidence.</span></p>
+				<ol class="steps">
+					<li><b>Isolate, don't delete</b>Deleting the Pod destroys evidence, and the ReplicaSet just starts a fresh copy. Cut its network access and take it out of service first.</li>
+					<li><b>Take it out of service</b>Removing the label that the Service and ReplicaSet select on (here <code>app</code>) stops traffic to it, and the ReplicaSet replaces it with a clean Pod.</li>
+					<li><b>Contain the node</b><code>kubectl cordon</code> stops new Pods landing on that node while you investigate.</li>
+					<li><b>Collect evidence</b>Logs, audit events, runtime alerts. A container checkpoint (beta since v1.30, through the kubelet API only) captures its memory, but treat that file as highly sensitive.</li>
+					<li><b>Rotate and rebuild</b>Rotate every credential the Pod could reach (its token, mounted Secrets, cloud credentials), fix the cause, and redeploy from a clean image.</li>
+				</ol>
+				<div class="code"><span class="file">Quarantine policy for the shop (NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: quarantine
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      quarantine: "true"
+  <span class="c"># no rules: deny both directions</span>
+  policyTypes:
+  - Ingress
+  - Egress</code></pre></div>
+				<div class="code"><span class="file">Quarantine one Pod and its node (shell)</span>
+<pre><code><span class="c"># apply the policy above to it</span>
+kubectl label pod api-7d9f -n shop \
+  quarantine=true
+<span class="c"># out of the Service and ReplicaSet</span>
+kubectl label pod api-7d9f -n shop \
+  app-
+<span class="c"># no new Pods on its node</span>
+kubectl cordon node2</code></pre></div>
+				<div class="callout trap"><p><strong>A quarantine policy doesn't override others.</strong> NetworkPolicies only add allows, so any other policy that still selects the Pod, such as an allow-DNS policy with <code>podSelector: {}</code>, keeps working. Removing the Pod's app labels drops the policies that select on them. For a true block regardless of other policies, use an Admin-tier ClusterNetworkPolicy with a Deny rule (<a href="d3-topic-3-4.html#s7">topic 3.4</a>), or the network plugin's own deny policies.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Public catalogues: the Microsoft Threat Matrix (persistence, execution, impact techniques), MITRE ATT&amp;CK Containers (T1609, T1610, T1053.007, T1525, T1496, T1499; Defense Evasion split in 2026), and the CNCF Financial User Group attack trees.</li>
+				<li>Persistence, by what survives: processes (nothing), backdoored images, workload objects (CronJobs, DaemonSets), mutating webhooks (sidecar injection), credentials (token Secrets, unrevocable client certificates, RBAC bindings), node-level (static Pods, hostPath writes). Hunt with kubectl and audit; prevent with RBAC, Pod Security, digests and audit.</li>
+				<li>DoS: node CPU, memory, PIDs (<code>podPidsLimit</code>, per node) and disk; API server (APF); etcd (object quotas, size limits); priority abuse. Limits and quotas are security controls. Resource hijacking (crypto-mining) is the most common real impact.</li>
+				<li>Code gets in through app exploits, bad images, misused exec or Pod creation, pipelines, or exposed management services. Then: token, metadata, network, escape (topic 4.3).</li>
+				<li>Shrink the blast radius: no token mount, Restricted Pod Security, read-only root, no shell, egress policy, metadata blocked, user namespaces or sandboxes, limits. Detect at runtime with Falco, Tetragon or KubeArmor.</li>
+				<li>Respond: isolate (quarantine label and policy), take it out of service (remove the app label), cordon the node, collect evidence (checkpoints are sensitive), rotate credentials, rebuild. Quarantine policies don't override other allows.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d4-topic-4-1.html"><small>Previous</small>4.1: Kubernetes Trust Boundaries and Data Flow</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA and Falco are marks of The Linux Foundation. MITRE ATT&amp;CK and ATT&amp;CK are registered trademarks of The MITRE Corporation; technique names and IDs &copy; 2026 The MITRE Corporation, reproduced with permission under its terms of use. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors) and the Microsoft Threat Matrix for Kubernetes, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the CNCF Financial User Group attack trees (Apache-2.0); vendor incident reports summarized, not quoted; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>

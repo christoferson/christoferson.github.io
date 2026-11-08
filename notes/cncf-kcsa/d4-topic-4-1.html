@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.1: Kubernetes Trust Boundaries and Data Flow | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 4.1: what trust boundaries and data flow diagrams are, the six trust zones of the 2019 Kubernetes threat model, the life of a Deployment across those zones, every major Kubernetes data flow with its authentication and encryption, the weak control-plane-to-node direction, flows that bypass the API server, and where the cluster's boundaries sit.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Kubernetes Threat Model &middot; 16%</span>
+		<h1>4.1: Kubernetes Trust Boundaries and Data Flow</h1>
+		<p>Where trust changes inside a Kubernetes&reg; cluster, what data crosses each line, and how well each crossing is protected by default: the map every threat model of a cluster starts from.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Trust zones</span><span class="tag">Data flows</span><span class="tag">Threat modeling</span><span class="tag">Control plane to node</span><span class="tag">API bypass</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Trust boundaries and data flows</a></li>
+				<li><a href="#s2">The Kubernetes trust zones</a></li>
+				<li><a href="#s3">The life of a Deployment</a></li>
+				<li><a href="#s4">Every flow and its protection</a></li>
+				<li><a href="#s5">The weak crossings</a></li>
+				<li><a href="#s6">Where the boundaries sit</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 4.1</span>
+				<p><strong>Kubernetes Trust Boundaries and Data Flow.</strong></p>
+			</div>
+			<p>The curriculum gives only the name. This page takes it to mean the map behind every Kubernetes threat model: what a trust boundary is, which zones a cluster divides into, which data flows cross between them, and how each crossing is authenticated and encrypted by default. The other Domain 4 pages walk through what attackers do on that map (<a href="d4-topic-4-2.html">topics 4.2</a> and <a href="index.html#d4">4.3</a>), and the formal methods such as STRIDE and MITRE ATT&amp;CK&reg; are in <a href="index.html#d6">topic 6.2</a>.</p>
+			<p>Sources: kubernetes.io (CC BY 4.0); the 2019 Kubernetes security audit by Trail of Bits and Atredis Partners and the CNCF&reg; Financial User Group attack trees (both in Apache-2.0 repositories); the CNCF Cloud Native Security Whitepaper (CC BY 4.0); OWASP (CC BY-SA 4.0, quoted briefly). The 2022 NCC Group audit report forbids copying, so it's paraphrased.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's security review starts by drawing its threat model: who and what talks to whom, through which component, and with what proof of identity. This page builds that map.</p></div>
+
+			<!-- ===== Vocabulary ===== -->
+			<h2 id="s1">Trust boundaries and data flows</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">The vocabulary of threat modeling, and why boundaries are where to look.</span></p>
+				<p>A <strong>trust boundary</strong> is a line where the level of trust changes. OWASP: trust boundaries "represent the change of trust levels as the data flows through the application", and "Boundaries show any location where the level of trust changes." Microsoft's Threat Modeling Tool gives examples: "Corporate networks, internet, machine, sandbox, user/kernel mode". Data crossing a boundary is where checks belong, and where attacks happen.</p>
+				<p>Threat models are usually drawn as <strong>data flow diagrams</strong> with five kinds of element:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Element</th><th>Meaning</th><th>Kubernetes example</th></tr></thead>
+						<tbody>
+							<tr><td>External entity</td><td data-label="Meaning">Something outside the system that interacts with it</td><td data-label="Kubernetes example">An administrator with kubectl, a CI pipeline, a shop customer</td></tr>
+							<tr><td>Process</td><td data-label="Meaning">Code that handles data</td><td data-label="Kubernetes example">kube-apiserver, kubelet, a Pod</td></tr>
+							<tr><td>Data store</td><td data-label="Meaning">Somewhere data is kept; "Data stores do not modify the data, they only store data"</td><td data-label="Kubernetes example">etcd, a PersistentVolume, an image registry</td></tr>
+							<tr><td>Data flow</td><td data-label="Meaning">Data moving between elements</td><td data-label="Kubernetes example">An API request, an image pull, a database query</td></tr>
+							<tr><td>Trust boundary</td><td data-label="Meaning">Where the trust level changes</td><td data-label="Kubernetes example">Internet to cluster, control plane to node, host to container</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The CNCF whitepaper describes the method: start with "identifying all important processes, data stores, and security boundaries", then "model how these elements interact, with special attention paid to any interactions that cross security boundaries". Its "end-to-end architecture" view includes the source code and build pipeline too, not just the running cluster. kubernetes.io's Cloud Native Security page puts it as one step: "Build a <em>threat model</em> of your system or application that identifies trust boundaries."</p>
+			</div>
+
+			<!-- ===== Zones ===== -->
+			<h2 id="s2">The Kubernetes trust zones</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">The zones Kubernetes' own audit divided a cluster into, and the attackers it considered.</span></p>
+				<p>The 2019 CNCF-funded security audit (Trail of Bits and Atredis Partners, on Kubernetes 1.13.4) produced a threat model that groups components "based on shared criticality, rather than physical placement". Zones "capture logical boundaries where controls should or could be enforced by the system".</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Zone</th><th>Description (2019 threat model)</th><th>Components</th></tr></thead>
+						<tbody>
+							<tr><td>Internet</td><td data-label="Description (2019 threat model)">"The externally facing, wider internet zone."</td><td data-label="Components">kubectl users, application clients</td></tr>
+							<tr><td>API Server</td><td data-label="Description (2019 threat model)">"The central coordinator for the system, exposed only as much as needed for access from administrators"</td><td data-label="Components">kube-apiserver</td></tr>
+							<tr><td>Master Components</td><td data-label="Description (2019 threat model)">Internal control plane parts that "work via callbacks and subscriptions to the API server"</td><td data-label="Components">Controller managers, scheduler</td></tr>
+							<tr><td>Master Data</td><td data-label="Description (2019 threat model)">The data layer, "tantamount to 'root' or administrative access to the cluster when accessed in an uncontrolled fashion"</td><td data-label="Components">etcd</td></tr>
+							<tr><td>Worker</td><td data-label="Description (2019 threat model)">"All the components required to run and network containers"</td><td data-label="Components">kubelet, kube-proxy</td></tr>
+							<tr><td>Container</td><td data-label="Description (2019 threat model)">"The actual Linux containers"</td><td data-label="Components">The container runtime and workloads</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Today the "master" zones would be called the control plane. The model also named three attackers: a <strong>malicious internal user</strong> (an administrator or developer abusing their access, or someone with stolen credentials); an <strong>internal attacker</strong> "who had transited one or more trust boundaries, such as an attacker with container access"; and an <strong>external attacker</strong>, unauthenticated, who "will seek to transit network edges in order to become Internal Attackers".</p>
+				<ul>
+					<li>The audit's broad findings: policies can be silently ineffective when the component that enforces them is missing; many channels carried credentials without the strongest TLS settings; and hosts "should be treated as a separate security domain from the cluster itself".</li>
+					<li>The 2022 audit, by NCC Group on Kubernetes 1.24, framed the cluster by actors (platform, node, cluster and namespace administrators, workloads, external users) and found that several 2019 issues were still open.</li>
+					<li>The CNCF Financial User Group ran STRIDE workshops "to identify potential security issues at the trust boundaries within the platform". Its attack trees are named for what attackers want: access sensitive data, attacker on the network, compromised container, denial of service, establish persistence, malicious code execution. Those are the threats on <a href="index.html#d4">the next two pages</a>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Life of a Deployment ===== -->
+			<h2 id="s3">The life of a Deployment</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">Following one change through the cluster, boundary by boundary.</span></p>
+				<p>The attack-tree project mapped what happens when a user applies a Deployment. Condensed, with the shop's API as the example:</p>
+				<ol class="steps">
+					<li><b>Developer to API server (crosses: outside to control plane)</b>kubectl sends the Deployment over TLS; the API server authenticates, authorizes and runs admission (<a href="d2-topic-2-1.html#s2">topic 2.1</a>).</li>
+					<li><b>API server to etcd (crosses: into cluster data)</b>The object is stored over mutual TLS.</li>
+					<li><b>Controllers and scheduler (within the control plane)</b>The Deployment controller creates a ReplicaSet and Pods; the scheduler binds each Pod to a node. Both talk to the API server, never to etcd.</li>
+					<li><b>Kubelet to API server (crosses: node to control plane)</b>The node's kubelet watches for Pods bound to it, using its node certificate; the Node authorizer limits what it sees.</li>
+					<li><b>Runtime to registry (crosses: node to supply chain)</b>The runtime pulls <code>shop/api</code> if it isn't cached (<a href="d1-topic-1-3.html#s2">topic 1.3</a>).</li>
+					<li><b>Kubelet to runtime (crosses: host to container)</b>Over the local CRI socket; the runtime creates the containers inside namespaces and cgroups (<a href="d2-topic-2-2.html#s4">topic 2.2</a>).</li>
+					<li><b>kube-proxy (within the node)</b>Watches Services and EndpointSlices and programs the rules that send <code>api</code> traffic to the new Pod.</li>
+				</ol>
+				<p>Each step is a place to ask: who could pretend to be the sender, change the data, or read it on the way?</p>
+			</div>
+
+			<!-- ===== Flows ===== -->
+			<h2 id="s4">Every flow and its protection</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">The main data flows in a cluster, with their authentication, encryption and default weak spot.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Flow</th><th>Protection</th><th>Default weak spot</th></tr></thead>
+						<tbody>
+							<tr><td>User or CI to API server</td><td data-label="Protection">TLS (6443, often 443); authentication, authorization, admission</td><td data-label="Default weak spot">Anonymous requests allowed; endpoint often public on managed services</td></tr>
+							<tr><td>API server to etcd</td><td data-label="Protection">Mutual TLS with a dedicated etcd CA</td><td data-label="Default weak spot">Any certificate from that CA has full access</td></tr>
+							<tr><td>Control plane components to API server</td><td data-label="Protection">TLS with client certificates</td><td data-label="Default weak spot">Their credentials sit in files on the control plane hosts</td></tr>
+							<tr><td>Kubelet to API server</td><td data-label="Protection">TLS with the node's client certificate; Node authorizer and NodeRestriction</td><td data-label="Default weak spot">NodeRestriction must be enabled</td></tr>
+							<tr><td>API server to kubelet (logs, exec, port-forward)</td><td data-label="Protection">TLS; the API server presents a client certificate</td><td data-label="Default weak spot">The kubelet's certificate isn't verified, so man-in-the-middle is possible</td></tr>
+							<tr><td>API server proxy to nodes, Pods, Services</td><td data-label="Protection">None by default</td><td data-label="Default weak spot">"Plain HTTP connections ... neither authenticated nor encrypted"</td></tr>
+							<tr><td>Kubelet to container runtime</td><td data-label="Protection">Local CRI socket, protected only by file permissions</td><td data-label="Default weak spot">Anyone with the socket controls the node's containers</td></tr>
+							<tr><td>Pod to API server</td><td data-label="Protection">The <code>kubernetes</code> Service; bound ServiceAccount token and cluster CA mounted into the Pod</td><td data-label="Default weak spot">A token is mounted unless turned off</td></tr>
+							<tr><td>Pod to Pod</td><td data-label="Protection">NetworkPolicy, if the CNI enforces it; mesh mTLS if installed</td><td data-label="Default weak spot">Allow-all and unencrypted</td></tr>
+							<tr><td>Internet to Ingress or Gateway</td><td data-label="Protection">TLS from a <code>kubernetes.io/tls</code> Secret</td><td data-label="Default weak spot">TLS ends at the ingress: "traffic to the Service and its Pods is in plaintext"</td></tr>
+							<tr><td>Pod to cloud metadata</td><td data-label="Protection">Egress NetworkPolicy, provider controls</td><td data-label="Default weak spot">Reachable by default, may hold node credentials (<a href="d1-topic-1-1.html#s5">topic 1.1</a>)</td></tr>
+							<tr><td>API server to webhooks</td><td data-label="Protection">HTTPS required, server verified with <code>caBundle</code></td><td data-label="Default weak spot">Webhooks see, and can change, every object they match</td></tr>
+							<tr><td>API server to aggregated APIs</td><td data-label="Protection">Front-proxy client certificate, identity in <code>X-Remote-*</code> headers</td><td data-label="Default weak spot">An empty allowed-names list accepts any certificate from that CA</td></tr>
+							<tr><td>Node to image registry</td><td data-label="Protection">TLS, pull credentials, digests</td><td data-label="Default weak spot">Mutable tags; cached images reused</td></tr>
+							<tr><td>CI/CD or GitOps to cluster</td><td data-label="Protection">Push: the pipeline holds credentials. Pull: an in-cluster agent pulls from Git</td><td data-label="Default weak spot">Pipeline credentials are often over-privileged</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">See how Pods reach the API server (shell)</span>
+<pre><code><span class="c"># the Service every Pod can use</span>
+kubectl get svc kubernetes -n default
+
+<span class="c"># the API server addresses behind it</span>
+kubectl get endpointslices -n default \
+  -l kubernetes.io/service-name=kubernetes</code></pre></div>
+			</div>
+
+			<!-- ===== Weak crossings ===== -->
+			<h2 id="s5">The weak crossings</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">Directions and paths where default protection is thin or missing.</span></p>
+				<p>kubernetes.io's <a href="https://kubernetes.io/docs/concepts/architecture/control-plane-node-communication/">control plane and node communication</a> page uses a "hub-and-spoke" pattern: "All API usage from nodes (or the pods they run) terminates at the API server." That direction "is secured by default and can run over untrusted and/or public networks." The reverse direction is not:</p>
+				<div class="callout trap"><p><strong>Control plane to node is the weak direction.</strong> "By default, the API server does not verify the kubelet's serving certificate, which makes the connection subject to man-in-the-middle attacks and <strong>unsafe</strong> to run over untrusted and/or public networks." The API server's proxy to nodes, Pods and Services uses plain HTTP by default, and even with <code>https:</code> it "will not validate the certificate". Fixes: <code>--kubelet-certificate-authority</code> with CA-signed kubelet certificates, kubelet authentication and authorization, and a private control plane network or the Konnectivity proxy (beta since v1.18), which replaces the deprecated SSH tunnels.</p></div>
+				<h3>Flows that skip the API server</h3>
+				<p>Some paths never cross the API server, so they skip authentication, admission and audit logging (<a href="d3-topic-3-5.html#s6">topic 3.5</a>):</p>
+				<ul>
+					<li><strong>The kubelet API</strong>: "Direct access to the kubelet API is not subject to admission control and is not logged by Kubernetes audit logging."</li>
+					<li><strong>etcd</strong>: "Any certificate issued by a certificate authority that etcd trusts allows full access to the data stored inside etcd."</li>
+					<li><strong>The runtime socket</strong>: "An attacker with access to this socket can launch new containers or interact with running containers."</li>
+					<li><strong>Static Pods</strong>: "The API server doesn't manage these static Pods"; one that fails admission "still runs on the node".</li>
+				</ul>
+				<p>In a threat model, mark each of these as a boundary crossing with weak or no checks, and decide how to compensate.</p>
+			</div>
+
+			<!-- ===== Boundaries ===== -->
+			<h2 id="s6">Where the boundaries sit</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.1</span><span class="skill-text">The cluster's main trust boundaries, what crosses them and what guards them.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Boundary</th><th>What crosses it</th><th>Main controls</th></tr></thead>
+						<tbody>
+							<tr><td>Internet and cluster</td><td data-label="What crosses it">Admin API calls, customer traffic</td><td data-label="Main controls">Private or allow-listed API endpoint, TLS, authentication; Ingress or Gateway TLS; limits on LoadBalancer and NodePort</td></tr>
+							<tr><td>API server and etcd</td><td data-label="What crosses it">All cluster state, including Secrets</td><td data-label="Main controls">mTLS, a dedicated CA, firewalling, encryption at rest (<a href="d2-topic-2-1.html#s5">topic 2.1</a>)</td></tr>
+							<tr><td>Control plane and nodes</td><td data-label="What crosses it">Kubelet updates, logs, exec, port-forward</td><td data-label="Main controls">Client certificates, Node authorizer, NodeRestriction, kubelet authn and authz, verified kubelet certificates</td></tr>
+							<tr><td>Host and container (the kernel)</td><td data-label="What crosses it">System calls, mounts, devices</td><td data-label="Main controls">Pod Security, seccomp, AppArmor or SELinux, user namespaces, sandboxes (<a href="d1-topic-1-2.html#s5">topic 1.2</a>)</td></tr>
+							<tr><td>Containers in one Pod</td><td data-label="What crosses it">Shared network namespace and volumes</td><td data-label="Main controls">Barely a boundary: treat the Pod as one unit</td></tr>
+							<tr><td>Namespace and namespace (tenants)</td><td data-label="What crosses it">API access, network traffic</td><td data-label="Main controls">RBAC, NetworkPolicy, quotas, Pod Security; separate nodes or clusters for hard isolation (<a href="d3-topic-3-4.html#s1">topic 3.4</a>)</td></tr>
+							<tr><td>Cluster and cloud account</td><td data-label="What crosses it">Metadata, node and controller cloud credentials</td><td data-label="Main controls">Block metadata, least-privilege roles, workload identity</td></tr>
+							<tr><td>Cluster and supply chain</td><td data-label="What crosses it">Images, manifests, pipeline credentials</td><td data-label="Main controls">Digests, signatures, admission policy, pull-based GitOps (<a href="index.html#d5">topic 5.1</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Within this map, the control plane and kubelets are <strong>trusted</strong> infrastructure, and workloads are <strong>untrusted</strong>. kubernetes.io's multi-tenancy page describes sandboxing for cases "where workloads are assumed to be malicious". So the most important boundary for a workload is the one between its container and the node, and the most important crossing for an attacker is the step from a compromised container into the Worker or control plane zones.</p>
+				<div class="callout tip"><p><strong>The shop's threat model, in one sentence per boundary.</strong> Customers reach only <code>web</code> through the Gateway. Developers reach the API server only through the company's identity provider. The <code>api</code> Pod reaches the database and nothing else, and has no token mount. Nodes block the metadata service. Images come only from the private registry, by digest. Each sentence names a crossing and the control that guards it.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>A trust boundary is where the level of trust changes; data flow diagrams show external entities, processes, data stores, data flows and boundaries. Focus on flows that cross boundaries, end to end (code and pipeline included).</li>
+				<li>The 2019 Kubernetes threat model had six zones: Internet, API Server, Master Components, Master Data (etcd: tantamount to root), Worker, Container. Attackers: malicious insider, internal attacker (already crossed a boundary, e.g. from a container), external attacker.</li>
+				<li>Node to control plane is secure by default. Control plane to node is weak: kubelet certificates aren't verified, and the API server proxy is plain HTTP. Use <code>--kubelet-certificate-authority</code>, kubelet authn and authz, and private networks or Konnectivity.</li>
+				<li>Flows that bypass the API server, and so admission and audit: the kubelet API, etcd (any trusted certificate = full access), the runtime socket, static Pods.</li>
+				<li>Default weak spots: Pod-to-Pod is allow-all and plaintext; Ingress TLS ends at the ingress; Pods reach cloud metadata; ServiceAccount tokens are mounted; webhooks see every object they match.</li>
+				<li>Boundaries: internet and cluster, API server and etcd, control plane and nodes, host and container (the kernel, the key one for workloads), Pod (weak), namespaces, cloud account, supply chain. Control plane and kubelets are trusted; workloads aren't.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d3-topic-3-5.html"><small>Previous</small>3.5: Audit Logging</a>
+				<a class="next" href="d4-topic-4-2.html"><small>Next</small>4.2: Persistence, Denial of Service, Malicious Code</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. MITRE ATT&amp;CK and ATT&amp;CK are registered trademarks of The MITRE Corporation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors) and the CNCF TAG Security Cloud Native Security Whitepaper, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the 2019 Kubernetes threat model (Trail of Bits, kubernetes/sig-security) and the CNCF Financial User Group attack trees (Apache-2.0); the NCC Group 2022 audit is paraphrased; short quotes from OWASP (CC BY-SA 4.0) and the Microsoft Threat Modeling Tool documentation (CC BY 4.0); topic name from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
