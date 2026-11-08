@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.2: Kubelet, Container Runtime, KubeProxy and Pod | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 2.2: securing the node. Kubelet API endpoints, authentication and authorization defaults with and without a config file, nodes/proxy risk, fine-grained kubelet authorization, the read-only port, certificate bootstrap and rotation, Node authorizer and NodeRestriction; container runtime sockets, runc CVEs and containerd status; kube-proxy modes, privileges and CVEs; and the Pod as a security boundary: host namespaces, hostPath, static Pods, ephemeral containers.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Kubernetes Cluster Component Security &middot; 22%</span>
+		<h1>2.2: Kubelet, Container Runtime, KubeProxy and Pod</h1>
+		<p>The components on every Kubernetes&reg; node, and the Pod they run: what each can do, what an attacker gains from it, and the settings that keep a compromised workload from becoming a compromised node.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Kubelet API</span><span class="tag">nodes/proxy</span><span class="tag">NodeRestriction</span><span class="tag">Runtime socket</span><span class="tag">runc</span><span class="tag">kube-proxy</span><span class="tag">hostPath</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Kubelet API and its defaults</a></li>
+				<li><a href="#s2">Kubelet authorization</a></li>
+				<li><a href="#s3">Kubelet certificates and identity</a></li>
+				<li><a href="#s4">Container runtime</a></li>
+				<li><a href="#s5">kube-proxy</a></li>
+				<li><a href="#s6">The Pod as a security boundary</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.2</span>
+				<p><strong>Kubelet. Container Runtime. KubeProxy. Pod.</strong></p>
+			</div>
+			<p>The curriculum gives only the names. As with <a href="d2-topic-2-1.html">topic 2.1</a>, this page asks of each: what it does, what an attacker gains by compromising it, and how it is secured. Kernel-level hardening (securityContext, seccomp, user namespaces, sandboxes) is in <a href="d1-topic-1-2.html">topic 1.2</a>; Pod Security Standards are in <a href="index.html#d3">topic 3.1</a>; the Node authorizer in depth is in <a href="index.html#d3">topic 3.2</a>.</p>
+			<p>Quotes are from kubernetes.io and the CNCF&reg; Glossary (CC BY 4.0) and from project security advisories.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's worker nodes run the kubelet, containerd and kube-proxy, set up with kubeadm. A security review asks: if one shop Pod were compromised, how far could the attacker get?</p></div>
+
+			<!-- ===== Kubelet API ===== -->
+			<h2 id="s1">Kubelet API and its defaults</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">What the kubelet exposes, and why its defaults depend on how it's started.</span></p>
+				<p>The kubelet is "an agent that runs on each node in the cluster. It makes sure that containers are running in a Pod." Its HTTPS API, on port 10250 on all interfaces by default, allows "disclosure of information about the pods running on a node, the logs from those pods, and execution of commands in every container running on the node." And: "Direct access to the kubelet API is not subject to admission control and is not logged by Kubernetes audit logging."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Endpoint</th><th>What it gives</th></tr></thead>
+						<tbody>
+							<tr><td><code>/pods</code>, <code>/runningpods/</code></td><td data-label="What it gives">Full specs of every Pod on the node</td></tr>
+							<tr><td><code>/exec</code>, <code>/run</code>, <code>/attach</code>, <code>/portForward</code></td><td data-label="What it gives">Commands and shells in any container on the node</td></tr>
+							<tr><td><code>/containerLogs</code>, <code>/logs/</code></td><td data-label="What it gives">Container logs and node log files</td></tr>
+							<tr><td><code>/configz</code></td><td data-label="What it gives">The kubelet's running configuration</td></tr>
+							<tr><td><code>/stats/</code>, <code>/metrics</code></td><td data-label="What it gives">Resource statistics and Prometheus metrics</td></tr>
+							<tr><td><code>/checkpoint</code></td><td data-label="What it gives">A container's full memory written to disk, which "includes all private data and possibly keys used for encryption" (beta, on since v1.30)</td></tr>
+							<tr><td><code>/debug/pprof</code></td><td data-label="What it gives">Go profiling</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Three different sets of defaults</h3>
+				<p>kubernetes.io warns that "some default values differ between command-line flags and the kubelet config file":</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>How the kubelet starts</th><th>Anonymous requests</th><th>Authorization</th><th>Read-only port</th></tr></thead>
+						<tbody>
+							<tr><td>Flags only, no <code>--config</code></td><td data-label="Anonymous requests">Allowed</td><td data-label="Authorization">AlwaysAllow</td><td data-label="Read-only port">10255 open</td></tr>
+							<tr><td>Config file, field left out</td><td data-label="Anonymous requests">Refused (401)</td><td data-label="Authorization">Webhook</td><td data-label="Read-only port">0 (off)</td></tr>
+							<tr><td>kubeadm (writes a config file)</td><td data-label="Anonymous requests">Refused</td><td data-label="Authorization">Webhook</td><td data-label="Read-only port">0, and kubeadm warns if you change it</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The kubelet's security flags are all deprecated in favour of the config file. Writing the settings out explicitly documents intent, and protects against a stray flag overriding them:</p>
+				<div class="code"><span class="file">Hardened kubelet settings (KubeletConfiguration)</span>
+<pre><code>apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  <span class="c"># no credentials = 401</span>
+  anonymous:
+    enabled: false
+  <span class="c"># bearer tokens via TokenReview</span>
+  webhook:
+    enabled: true
+  <span class="c"># client certs from the cluster CA</span>
+  x509:
+    clientCAFile: >-
+      /etc/kubernetes/pki/ca.crt
+authorization:
+  <span class="c"># ask the API server (SAR)</span>
+  mode: Webhook
+<span class="c"># no unauthenticated port 10255</span>
+readOnlyPort: 0
+protectKernelDefaults: true
+rotateCertificates: true
+serverTLSBootstrap: true</code></pre></div>
+				<div class="callout trap"><p><strong>Two kubelet traps.</strong> The kubernetes.io example of viewing a kubelet's configuration shows <code>anonymous: enabled: true</code>, AlwaysAllow and port 10255. That's output from a development cluster, not the defaults. Also, <code>protectKernelDefaults: true</code> doesn't set kernel parameters: the kubelet refuses to start unless the expected sysctls are already set on the host.</p></div>
+				<div class="callout trap"><p><strong>The read-only port has no authentication at all.</strong> It serves "with no authentication/authorization". CVE-2025-0426 (February 2025) let anyone fill a node's disk with checkpoint requests through it. Keep <code>readOnlyPort: 0</code>.</p></div>
+				<div class="code"><span class="file">Check a node's kubelet settings (shell)</span>
+<pre><code><span class="c"># running config via the API server</span>
+<span class="c"># (needs get on nodes/proxy)</span>
+kubectl get --raw \
+  "/api/v1/nodes/node1/proxy/configz" \
+  | jq .kubeletconfig.authentication
+
+<span class="c"># read-only port should refuse</span>
+curl -s http://&lt;node-ip&gt;:10255/pods</code></pre></div>
+				<p>A direct call to <code>https://&lt;node-ip&gt;:10250/pods</code> without credentials should return 401. A 403 means anonymous access is on, with Webhook authorization. Pod JSON means anonymous access with AlwaysAllow, which is the worst case.</p>
+			</div>
+
+			<!-- ===== Kubelet authz ===== -->
+			<h2 id="s2">Kubelet authorization</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">How kubelet API calls map to RBAC, and why nodes/proxy is so powerful.</span></p>
+				<p>In Webhook mode, the kubelet sends a SubjectAccessReview to the API server for each request. HTTP verbs become RBAC verbs (GET becomes <code>get</code>, POST becomes <code>create</code>), the resource is always <code>nodes</code>, and the path chooses the subresource:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Kubelet path</th><th>RBAC subresource</th></tr></thead>
+						<tbody>
+							<tr><td><code>/stats/*</code></td><td data-label="RBAC subresource"><code>nodes/stats</code></td></tr>
+							<tr><td><code>/metrics/*</code></td><td data-label="RBAC subresource"><code>nodes/metrics</code></td></tr>
+							<tr><td><code>/logs/*</code></td><td data-label="RBAC subresource"><code>nodes/log</code></td></tr>
+							<tr><td><code>/spec/*</code></td><td data-label="RBAC subresource"><code>nodes/spec</code></td></tr>
+							<tr><td><code>/checkpoint/*</code></td><td data-label="RBAC subresource"><code>nodes/checkpoint</code></td></tr>
+							<tr><td><code>/pods</code>, <code>/configz</code>, <code>/healthz</code></td><td data-label="RBAC subresource"><code>nodes/pods</code>, <code>nodes/configz</code>, <code>nodes/healthz</code> first, then <code>nodes/proxy</code></td></tr>
+							<tr><td>Everything else, including exec</td><td data-label="RBAC subresource"><code>nodes/proxy</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The finer-grained subresources come from <strong>fine-grained kubelet authorization</strong> (alpha v1.32, beta v1.33, GA v1.36). A monitoring tool can now read <code>/pods</code> or <code>/configz</code> without the catch-all <code>nodes/proxy</code>.</p>
+				<div class="callout trap"><p><strong><code>get</code> on <code>nodes/proxy</code> is not read-only.</strong> kubernetes.io, January 2026: some endpoints "support Websocket protocols via HTTP <code>GET</code> requests, which are authorized with the <strong>get</strong> verb. This means that <strong>get</strong> permission on <code>nodes/proxy</code> is not a read-only permission, and authorizes executing commands in any container running on the node." That access "bypasses audit logging and admission control". "Avoid granting the <code>nodes/proxy</code> catch-all permission, even with just the <strong>get</strong> verb."</p></div>
+				<div class="code"><span class="file">Who may use the kubelet API? (shell)</span>
+<pre><code>kubectl auth can-i get nodes/proxy
+kubectl auth can-i get nodes/proxy \
+  --as=system:serviceaccount:shop:web</code></pre></div>
+				<p>Other mitigations from the bypass-risks page: allow port 10250 only from trusted address ranges, use webhook or certificate authentication, and make sure the read-only port is off.</p>
+			</div>
+
+			<!-- ===== Certificates and identity ===== -->
+			<h2 id="s3">Kubelet certificates and identity</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">How a kubelet gets its credentials, and what a stolen kubelet credential allows.</span></p>
+				<ol class="steps">
+					<li><b>TLS bootstrap</b>A new kubelet starts with a low-privilege bootstrap token (format <code>abcdef.0123456789abcdef</code>, valid 24 hours by default under kubeadm) and uses it to create a certificate signing request (CSR).</li>
+					<li><b>Client certificate</b>The controller manager can auto-approve client CSRs. The kubelet gets a certificate with CN <code>system:node:&lt;node&gt;</code> and group <code>system:nodes</code>, valid one year.</li>
+					<li><b>Rotation</b>With <code>rotateCertificates: true</code> (default false; kubeadm forces it on), the kubelet renews its client certificate before expiry.</li>
+					<li><b>Serving certificate</b>By default self-signed. With <code>serverTLSBootstrap: true</code> the kubelet requests one through the CSR API instead. Then the API server can verify it (<a href="d2-topic-2-1.html#s2">topic 2.1</a>).</li>
+				</ol>
+				<div class="callout trap"><p><strong>Serving CSRs are never approved automatically.</strong> The <code>kubernetes.io/kubelet-serving</code> signer is "Never auto-approved by kube-controller-manager", "for security reasons": a serving certificate claims hostnames and IPs. A person or a custom approver must check each one: the requester is <code>system:node:&lt;name&gt;</code> in <code>system:nodes</code>, the usages are server auth only, and the IP and DNS names belong to that node.</p></div>
+				<div class="code"><span class="file">Approve kubelet serving CSRs (shell)</span>
+<pre><code>S=kubernetes.io/kubelet-serving
+kubectl get csr \
+  --field-selector spec.signerName=$S
+
+<span class="c"># check requester, usages and SANs</span>
+kubectl describe csr csr-9wvgt
+kubectl certificate approve csr-9wvgt</code></pre></div>
+				<h3>What a stolen kubelet credential can do</h3>
+				<p>Two controls limit each kubelet to its own node. The <strong>Node authorizer</strong> lets a kubelet read only the Secrets, ConfigMaps and volumes of Pods bound to its node, and, since v1.34, only its own Node and Pods. The <strong>NodeRestriction</strong> admission plugin limits writes: kubelets "will only be allowed to modify their own <code>Node</code> API object, and only modify <code>Pod</code> API objects that are bound to their node", may not change their own taints, and may not set <code>node-restriction.kubernetes.io/</code> labels.</p>
+				<div class="callout trap"><p><strong>NodeRestriction isn't on by default.</strong> It isn't in the API server's default admission plugin list; kubeadm adds it. Without it, a compromised node could relabel itself to attract sensitive Pods or edit other nodes. Even with it, patch promptly: CVE-2025-5187 (August 2025) let a node delete and recreate its own Node object with different taints.</p></div>
+			</div>
+
+			<!-- ===== Runtime ===== -->
+			<h2 id="s4">Container runtime</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">The software that actually starts containers, and its socket.</span></p>
+				<p>The kubelet talks to the runtime through the Container Runtime Interface (CRI), "the main protocol for the communication between the kubelet and Container Runtime", over a local socket. Kubernetes 1.37 requires CRI v1.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Layer</th><th>Examples</th><th>Project</th></tr></thead>
+						<tbody>
+							<tr><td>High-level runtime (CRI)</td><td data-label="Examples">containerd (socket <code>/run/containerd/containerd.sock</code>), CRI-O (<code>/var/run/crio/crio.sock</code>)</td><td data-label="Project">Both CNCF graduated: containerd 2019, CRI-O 2023</td></tr>
+							<tr><td>Low-level OCI runtime</td><td data-label="Examples">runc (containerd's default), crun (CRI-O's default)</td><td data-label="Project">runc is an Open Container Initiative project, not CNCF</td></tr>
+							<tr><td>Sandboxed runtimes</td><td data-label="Examples">gVisor, Kata Containers (<a href="d1-topic-1-2.html#s6">topic 1.2</a>)</td><td data-label="Project">Not CNCF</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>The runtime socket is root on the node</h3>
+				<p>kubernetes.io: "An attacker with access to this socket can launch new containers or interact with running containers." The runtime doesn't apply RBAC, admission or Pod Security, and the Kubernetes audit log doesn't see the calls. So a client on the socket can start a privileged container with the host filesystem mounted, or open a shell in any container on the node and take its Secrets. The Docker socket (<code>/var/run/docker.sock</code>), where Docker Engine is still installed, is just as dangerous.</p>
+				<div class="code"><span class="file">DANGER: what not to allow (Pod, teaching only)</span>
+<pre><code><span class="c"># Do not apply. Hands the Pod the</span>
+<span class="c"># node's containerd API.</span>
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sock-demo
+spec:
+  containers:
+  - name: shell
+    image: busybox:1.36
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: cri
+      mountPath: /cri.sock
+  volumes:
+  - name: cri
+    hostPath:
+      path: >-
+        /run/containerd/containerd.sock
+      type: Socket</code></pre></div>
+				<p>The Baseline Pod Security Standard forbids <code>hostPath</code>, so enforcing it on the <code>shop</code> namespace blocks this Pod (<a href="index.html#d3">topic 3.1</a>). kubernetes.io's mitigations: restrict socket access to <code>root</code>; forbid <code>hostPath</code> mounts of the socket "either directly or by mounting a parent directory", and make allowed host mounts read-only; and restrict user access to nodes.</p>
+				<h3>Runtime escapes</h3>
+				<p>A runtime bug bypasses every Kubernetes control, so the runtime and runc need patching like the kernel:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CVE</th><th>What it allowed</th></tr></thead>
+						<tbody>
+							<tr><td>CVE-2019-5736</td><td data-label="What it allowed">A root process in a container could "overwrite the host runc binary (and consequently obtain host root access)"</td></tr>
+							<tr><td>CVE-2024-21626 ("Leaky Vessels", January 2024)</td><td data-label="What it allowed">A leaked file descriptor gave a new container process a working directory on the host filesystem, through a malicious image or <code>runc exec</code>. Fixed in runc 1.1.12</td></tr>
+							<tr><td>CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (November 2025)</td><td data-label="What it allowed">Container escapes by tricking runc into writing to host <code>/proc</code> files, including a way to bypass AppArmor and SELinux. Fixed in runc 1.2.8, 1.3.3 and 1.4.0-rc.3</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>The runc maintainers' own advice:</strong> "we <strong>strongly</strong> recommend all users use user namespaced containers", which blocks "most of the most serious aspects of these attacks". In Kubernetes that's <code>hostUsers: false</code>, GA since v1.36 (<a href="d1-topic-1-2.html#s5">topic 1.2</a>). Running node components themselves without root (the rootless kubelet) became beta in v1.37.</p></div>
+				<div class="callout retired"><p><strong>Runtime versions that are gone or going.</strong> dockershim, the kubelet's built-in Docker support, was removed in v1.24 (May 2022); Kubernetes has used only CRI v1 since v1.26. containerd 1.7 reached end of life on 30 September 2026, and kubernetes.io warns that from v1.38 "older versions of containerd will fail with newer kubelets". containerd 2.x also removed <code>io_uring</code> syscalls from its default seccomp profile.</p></div>
+			</div>
+
+			<!-- ===== kube-proxy ===== -->
+			<h2 id="s5">kube-proxy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">The node agent that programs Service traffic, and the networking risks around it.</span></p>
+				<p>kube-proxy "maintains network rules on nodes" so that traffic to a Service's virtual IP reaches a backend Pod. In iptables and nftables modes the kernel forwards the packets; kube-proxy just writes the rules.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Mode</th><th>Status in v1.37</th></tr></thead>
+						<tbody>
+							<tr><td><code>iptables</code></td><td data-label="Status in v1.37">Default on Linux; "a future version of Kubernetes will change the default to <code>nftables</code>"</td></tr>
+							<tr><td><code>nftables</code></td><td data-label="Status in v1.37">GA since v1.33; by default exposes NodePorts only on the node's primary IPs</td></tr>
+							<tr><td><code>ipvs</code></td><td data-label="Status in v1.37">Deprecated since v1.35; off by default from v1.40, removed in v1.43</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Privileges:</strong> under kubeadm, kube-proxy is a DaemonSet that runs <code>privileged</code> with <code>hostNetwork</code> on every node. Its RBAC role, <code>system:node-proxier</code>, is read-only (Services, EndpointSlices, nodes), so the danger is its host access, not its API rights.</li>
+					<li><strong>Credentials:</strong> its kubeconfig, in the <code>kube-proxy</code> ConfigMap, points at the Pod's own projected ServiceAccount token, so there's no long-lived secret in the ConfigMap.</li>
+					<li><strong>Ports:</strong> health checks on 10256 (all interfaces), metrics on 10249 (localhost only).</li>
+				</ul>
+				<div class="callout trap"><p><strong>CVE-2020-8554 has no patch.</strong> "An attacker that is able to create a ClusterIP service and set the spec.externalIPs field can intercept traffic to that IP." It's "a design flaw that cannot be mitigated without user-facing changes", and all versions are affected. The fix is policy: the <code>DenyServiceExternalIPs</code> admission plugin (since v1.21, off by default) "rejects all net-new usage" of <code>externalIPs</code>, and nobody should be granted <code>patch</code> on <code>services/status</code>.</p></div>
+				<p>CVE-2020-8558 is a reminder that "localhost only" isn't a guarantee: a setting kube-proxy used for localhost NodePorts let neighbouring hosts and containers reach services bound to <code>127.0.0.1</code> on the node. Some network plugins replace kube-proxy entirely with eBPF; their agent is then just as privileged.</p>
+			</div>
+
+			<!-- ===== Pod ===== -->
+			<h2 id="s6">The Pod as a security boundary</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.2</span><span class="skill-text">What containers in a Pod share, and the fields that break the wall between Pod and node.</span></p>
+				<p>The Pod is "the smallest and simplest Kubernetes object". Its containers share a network namespace (one IP, one <code>localhost</code>), can share volumes, and run on one node. So the boundary between workloads is the Pod, not the container: containers in one Pod trust each other. With <code>shareProcessNamespace: true</code> they also see each other's processes, "such as passwords that were passed as arguments or environment variables", and each other's filesystems through <code>/proc/$pid/root</code>.</p>
+				<h3>Fields that reach the host</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Field</th><th>What it exposes</th></tr></thead>
+						<tbody>
+							<tr><td><code>hostNetwork</code></td><td data-label="What it exposes">The node's interfaces and localhost-only services; skips most network policies</td></tr>
+							<tr><td><code>hostPID</code></td><td data-label="What it exposes">Every process on the node, including other workloads' environment variables</td></tr>
+							<tr><td><code>hostIPC</code></td><td data-label="What it exposes">Shared memory of host processes</td></tr>
+							<tr><td><code>hostPath</code> volumes</td><td data-label="What it exposes">The node's filesystem: kubelet credentials, the runtime socket</td></tr>
+							<tr><td><code>hostPort</code></td><td data-label="What it exposes">A port on the node itself</td></tr>
+							<tr><td><code>privileged: true</code></td><td data-label="What it exposes">All capabilities and devices, no seccomp or AppArmor confinement</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The Baseline Pod Security Standard forbids all of these, plus unsafe capabilities, host probes and unsafe sysctls (<a href="index.html#d3">topic 3.1</a>). On hostPath, kubernetes.io is direct: "Using the <code>hostPath</code> volume type presents many security risks. If you can avoid using a <code>hostPath</code> volume, you should." It "can expose privileged system credentials (such as for the kubelet) or privileged APIs (such as the container runtime socket)".</p>
+				<div class="callout trap"><p><strong>Allow-listing host directories only works read-only.</strong> A restriction on hostPath directories "is only effective when you additionally require that any mounts of that <code>hostPath</code> volume are <strong>read only</strong>." A read-write mount can be subverted to reach other paths. And <code>type: Socket</code> or <code>Directory</code> are existence checks, not security controls.</p></div>
+				<h3>Static Pods</h3>
+				<p>A static Pod is "managed directly by the kubelet daemon on a specific node, without the API server observing it"; kubeadm runs the control plane this way (<a href="d2-topic-2-1.html#s6">topic 2.1</a>). The kubelet publishes a read-only "mirror Pod" to the API. Static Pods "cannot refer to other API objects, such as ServiceAccount, ConfigMap, or Secret", and don't support ephemeral containers.</p>
+				<div class="callout trap"><p><strong>Static Pods dodge admission.</strong> "If a static Pod fails admission control, the kubelet won't register the Pod with the API server. However, the Pod still runs on the node." Anyone who can write to the manifest directory (<code>staticPodPath</code>) can run anything there. The kubelet loads every file in that directory that doesn't start with a dot, whatever its extension, so backup copies run too.</p></div>
+				<h3>Ephemeral containers and kubectl debug</h3>
+				<p>Ephemeral containers (GA v1.25) are added to a running Pod for troubleshooting, through the <code>pods/ephemeralcontainers</code> subresource. That subresource is not in the default <code>edit</code> or <code>admin</code> roles, so it must be granted on purpose. Pod Security Standards apply to ephemeral containers too.</p>
+				<ul>
+					<li><code>kubectl debug -it web --image=busybox:1.36 --target=web</code> adds a debugging container that shares the target's process namespace.</li>
+					<li><code>kubectl debug node/node1 -it --image=busybox:1.36</code> creates a Pod with host namespaces and the host's root filesystem at <code>/host</code>. That's root-level access to the node, so it's blocked wherever Baseline is enforced.</li>
+				</ul>
+				<div class="callout retired"><p><strong>The kubectl debug default changed.</strong> Since kubectl v1.36 the default profile is <code>general</code>, not <code>legacy</code>; <code>legacy</code> is planned for removal in v1.39. The kubernetes.io "Debug Running Pods" page still says legacy is the default.</p></div>
+				<h3>The Pod's API credential</h3>
+				<p>Unless <code>automountServiceAccountToken</code> is false, each Pod gets a projected ServiceAccount token. It's bound to the Pod and has an audience and an expiry (an hour by default for explicitly projected tokens), and the kubelet refreshes it. A stolen token stops working when the Pod is deleted. Tokens and ServiceAccounts are covered in <a href="index.html#d3">topic 3.2</a>.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The kubelet API (10250) can exec into every container on the node, and bypasses admission and audit. Defaults: flags only = anonymous + AlwaysAllow + read-only port 10255; config file (and kubeadm) = anonymous off, Webhook, <code>readOnlyPort: 0</code>.</li>
+				<li>Kubelet paths map to <code>nodes/stats</code>, <code>/metrics</code>, <code>/log</code>, <code>/spec</code>, <code>/checkpoint</code>; everything else to <code>nodes/proxy</code>. <code>get nodes/proxy</code> allows exec. Fine-grained subresources (<code>nodes/pods</code>, <code>/configz</code>, <code>/healthz</code>) are GA in 1.36.</li>
+				<li>Certificates: bootstrap token &rarr; client CSR (auto-approvable) &rarr; <code>system:node:&lt;name&gt;</code>; <code>rotateCertificates</code> defaults to false (kubeadm sets true); serving CSRs are never auto-approved. Node authorizer plus NodeRestriction (not on by default) confine a kubelet to its own node.</li>
+				<li>The runtime socket (and its parent directory) is root on the node and bypasses all Kubernetes controls. containerd and CRI-O are CNCF graduated; runc is OCI. Patch runc (Leaky Vessels 2024, three escapes November 2025) and use user namespaces. containerd 1.7 is end of life.</li>
+				<li>kube-proxy: iptables default, nftables GA (1.33), ipvs deprecated (1.35). Privileged and host-network, with read-only RBAC. CVE-2020-8554 (externalIPs) has no patch: use <code>DenyServiceExternalIPs</code>.</li>
+				<li>Pods: containers in a Pod trust each other. hostNetwork, hostPID, hostIPC, hostPath, hostPort and privileged break out to the node; Baseline forbids them. Static Pods run even if they fail admission. <code>pods/ephemeralcontainers</code> isn't in edit or admin; kubectl debug's default profile is now <code>general</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d2-topic-2-1.html"><small>Previous</small>2.1: API Server, Controller Manager, Scheduler and Etcd</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors) and glossary.cncf.io, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from runc security advisories (opencontainers/runc) and NVD; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
