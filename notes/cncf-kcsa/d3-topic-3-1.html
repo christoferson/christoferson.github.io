@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.1: Pod Security Standards and Pod Security Admission | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 3.1: the Privileged, Baseline and Restricted Pod Security Standards control by control (as of v1.37), Windows and user namespace relaxations, the PodSecurity admission controller, enforce, audit and warn modes, namespace labels and versions, server dry runs, cluster defaults and exemptions, messages and audit annotations, what PSA does not do, PodSecurityPolicy history and policy engine alternatives.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Kubernetes Security Fundamentals &middot; 22%</span>
+		<h1>3.1: Pod Security Standards and Pod Security Admission</h1>
+		<p>The three standard security levels for Pods in Kubernetes&reg;, exactly what each one forbids, and the built-in admission controller that applies them namespace by namespace.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Privileged</span><span class="tag">Baseline</span><span class="tag">Restricted</span><span class="tag">enforce / audit / warn</span><span class="tag">Exemptions</span><span class="tag">PSP retired</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The three standards</a></li>
+				<li><a href="#s2">Baseline controls</a></li>
+				<li><a href="#s3">Restricted controls</a></li>
+				<li><a href="#s4">Pod Security Admission</a></li>
+				<li><a href="#s5">Namespace labels</a></li>
+				<li><a href="#s6">Cluster defaults and exemptions</a></li>
+				<li><a href="#s7">What PSA does and doesn't check</a></li>
+				<li><a href="#s8">PodSecurityPolicy and alternatives</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 3.1</span>
+				<p><strong>Pod Security Standards. Pod Security Admissions.</strong></p>
+			</div>
+			<p>The <strong>Pod Security Standards</strong> (PSS) are a definition: three named levels listing which Pod settings are allowed. <strong>Pod Security Admission</strong> (PSA) is the built-in admission controller that enforces them, configured with namespace labels. This page covers both, as of Kubernetes v1.37. The kernel features the standards refer to (capabilities, seccomp, AppArmor, SELinux, user namespaces) are explained in <a href="d1-topic-1-2.html#s5">topic 1.2</a>, and admission control in general in <a href="index.html#d5">topic 5.4</a>.</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0).</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's <code>shop</code> namespace should enforce Baseline now and move to Restricted. The platform team needs to test the change, roll it out, and exempt the one system workload that can't comply.</p></div>
+
+			<!-- ===== Three standards ===== -->
+			<h2 id="s1">The three standards</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">What each level is for, and who it's aimed at.</span></p>
+				<p>"The Pod Security Standards define three different <em>policies</em> to broadly cover the security spectrum. These policies are <em>cumulative</em> and range from highly-permissive to highly-restrictive."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Level</th><th>Definition</th><th>Aimed at</th></tr></thead>
+						<tbody>
+							<tr><td>Privileged</td><td data-label="Definition">"Unrestricted policy, providing the widest possible level of permissions. This policy allows for known privilege escalations."</td><td data-label="Aimed at">"System- and infrastructure-level workloads managed by privileged, trusted users", such as CNI agents and storage drivers</td></tr>
+							<tr><td>Baseline</td><td data-label="Definition">"Minimally restrictive policy which prevents known privilege escalations. Allows the default (minimally specified) Pod configuration."</td><td data-label="Aimed at">"Application operators and developers of non-critical applications"</td></tr>
+							<tr><td>Restricted</td><td data-label="Definition">"Heavily restricted policy, following current Pod hardening best practices."</td><td data-label="Aimed at">"Operators and developers of security-critical applications, as well as lower-trust users"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The standards only define the levels: "The methods of enforcement of individual policies are not defined here." PSA is one way to enforce them; policy engines are another. The checks cover every container in the Pod, including init and ephemeral containers: "If any of the listed containers fails to meet the requirements, the entire pod will fail validation."</p>
+				<div class="callout tip"><p><strong>Profile vs security context.</strong> A security context configures a Pod or container "at runtime". A security profile (a PSS level) is a "control plane mechanism to enforce specific settings in the Security Context". There's no level between Privileged and Baseline, because "privileges required above the Baseline policy are typically very application specific".</p></div>
+			</div>
+
+			<!-- ===== Baseline ===== -->
+			<h2 id="s2">Baseline controls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">Everything Baseline forbids: the known ways out of a Pod.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Control</th><th>Forbidden</th><th>Allowed</th></tr></thead>
+						<tbody>
+							<tr><td>HostProcess</td><td data-label="Forbidden">Windows <code>hostProcess: true</code></td><td data-label="Allowed">Unset or false</td></tr>
+							<tr><td>Host namespaces</td><td data-label="Forbidden"><code>hostNetwork</code>, <code>hostPID</code>, <code>hostIPC</code> set to true</td><td data-label="Allowed">Unset or false</td></tr>
+							<tr><td>Privileged containers</td><td data-label="Forbidden"><code>privileged: true</code>: "Privileged Pods disable most security mechanisms"</td><td data-label="Allowed">Unset or false</td></tr>
+							<tr><td>Capabilities</td><td data-label="Forbidden">Adding anything outside the default set</td><td data-label="Allowed">Adding only AUDIT_WRITE, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, MKNOD, NET_BIND_SERVICE, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT</td></tr>
+							<tr><td>HostPath volumes</td><td data-label="Forbidden">Any <code>hostPath</code> volume</td><td data-label="Allowed">None</td></tr>
+							<tr><td>Host ports</td><td data-label="Forbidden">Any <code>hostPort</code> (PSA doesn't support allow-lists)</td><td data-label="Allowed">Unset or 0</td></tr>
+							<tr><td>Host probes and lifecycle hooks (v1.34+)</td><td data-label="Forbidden">A <code>host</code> field in <code>httpGet</code> or <code>tcpSocket</code> probes and hooks</td><td data-label="Allowed">Unset or empty</td></tr>
+							<tr><td>AppArmor</td><td data-label="Forbidden"><code>Unconfined</code></td><td data-label="Allowed">Unset, <code>RuntimeDefault</code>, <code>Localhost</code></td></tr>
+							<tr><td>SELinux</td><td data-label="Forbidden">Custom <code>user</code> or <code>role</code>; other types</td><td data-label="Allowed">Type unset, <code>container_t</code>, <code>container_init_t</code>, <code>container_kvm_t</code>, <code>container_engine_t</code></td></tr>
+							<tr><td>/proc mount type</td><td data-label="Forbidden"><code>Unmasked</code></td><td data-label="Allowed">Unset or <code>Default</code></td></tr>
+							<tr><td>Seccomp</td><td data-label="Forbidden"><code>Unconfined</code></td><td data-label="Allowed">Unset, <code>RuntimeDefault</code>, <code>Localhost</code></td></tr>
+							<tr><td>Sysctls</td><td data-label="Forbidden">Any sysctl outside the safe set</td><td data-label="Allowed">14 namespaced "safe" sysctls (see below)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The safe sysctls are those "namespaced in the container or the Pod, and ... isolated from other Pods or processes on the same Node": <code>kernel.shm_rmid_forced</code> and twelve <code>net.ipv4.*</code> settings for ports, keepalives and TCP buffers. v1.37 added two, <code>net.ipv4.tcp_slow_start_after_idle</code> and <code>net.ipv4.tcp_notsent_lowat</code>, bringing the list to 14.</p>
+				<div class="callout trap"><p><strong>Baseline still allows a lot.</strong> A Baseline Pod may run as root, have no seccomp profile at all (only explicitly <code>Unconfined</code> is blocked) and keep the 13 default capabilities. <code>NET_RAW</code> isn't on that list, so it can't be <em>added</em>, but on containerd it's granted by default and Baseline doesn't drop it (<a href="d2-topic-2-3.html#s2">topic 2.3</a>).</p></div>
+			</div>
+
+			<!-- ===== Restricted ===== -->
+			<h2 id="s3">Restricted controls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">What Restricted adds to Baseline, and how to write a Pod that passes.</span></p>
+				<p>Restricted includes "everything from the Baseline policy", plus:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Control</th><th>Requirement</th></tr></thead>
+						<tbody>
+							<tr><td>Volume types</td><td data-label="Requirement">Only <code>configMap</code>, <code>csi</code>, <code>downwardAPI</code>, <code>emptyDir</code>, <code>ephemeral</code>, <code>persistentVolumeClaim</code>, <code>projected</code>, <code>secret</code></td></tr>
+							<tr><td>Privilege escalation</td><td data-label="Requirement"><code>allowPrivilegeEscalation: false</code>, set explicitly</td></tr>
+							<tr><td>Running as non-root</td><td data-label="Requirement"><code>runAsNonRoot: true</code> (Pod level, or on every container)</td></tr>
+							<tr><td>Non-root user</td><td data-label="Requirement"><code>runAsUser</code> must not be 0</td></tr>
+							<tr><td>Seccomp</td><td data-label="Requirement"><code>RuntimeDefault</code> or <code>Localhost</code>: "Both the <code>Unconfined</code> profile and the <em>absence</em> of a profile are prohibited."</td></tr>
+							<tr><td>Capabilities</td><td data-label="Requirement">"Containers must drop <code>ALL</code> capabilities, and are only permitted to add back the <code>NET_BIND_SERVICE</code> capability."</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">A shop Pod that passes Restricted (Pod)</span>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: shop
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: web
+    image: shop/web:1.4.2
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]</code></pre></div>
+				<div class="callout trap"><p><strong>Restricted needs explicit settings.</strong> Leaving <code>allowPrivilegeEscalation</code>, <code>runAsNonRoot</code>, <code>capabilities.drop</code> or the seccomp profile unset fails, because PSA checks the spec and never fills in defaults. Restricted does <em>not</em> require <code>readOnlyRootFilesystem</code>, <code>runAsGroup</code>, resource limits or <code>hostUsers: false</code>. And passing PSA with <code>runAsNonRoot: true</code> isn't the end: if the image's user is root and no <code>runAsUser</code> is set, the kubelet refuses to start the container.</p></div>
+				<h3>Two relaxations</h3>
+				<ul>
+					<li><strong>Windows Pods.</strong> Since v1.25, Restricted uses <code>spec.os.name</code>: the privilege escalation, seccomp and capabilities rules "are only required if <code>.spec.os.name</code> is not <code>windows</code>".</li>
+					<li><strong>User namespaces.</strong> For Pods with <code>hostUsers: false</code>, "Kubernetes relaxes the application of Pod Security Standards in a controlled way". <code>runAsNonRoot</code> and <code>runAsUser</code> aren't checked, because root in the Pod "is never mapped to a privileged user on the host". Baseline also relaxes <code>procMount</code>, but Restricted doesn't. This is built into policy version v1.35 and later; it used to need a feature gate, now removed.</li>
+				</ul>
+				<p>On sandboxed runtimes, the standards admit "there is no standard definition of what a sandboxed runtime is", so there's no special level. PSA's way to handle them is a RuntimeClass exemption (<a href="#s6">below</a>).</p>
+			</div>
+
+			<!-- ===== PSA ===== -->
+			<h2 id="s4">Pod Security Admission</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">The built-in controller: its modes, and what each mode acts on.</span></p>
+				<p>The <code>PodSecurity</code> admission plugin is a validating admission controller that "checks new Pods before they are admitted". It was alpha in v1.22, became beta and on by default in v1.23, and went GA in v1.25. Its feature gate was removed in v1.28, and it's in the API server's default plugin list. "Pod security restrictions are applied at the namespace level when pods are created."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Mode</th><th>On a violation</th><th>Applies to</th></tr></thead>
+						<tbody>
+							<tr><td><code>enforce</code></td><td data-label="On a violation">"The pod to be rejected."</td><td data-label="Applies to">Pods only</td></tr>
+							<tr><td><code>audit</code></td><td data-label="On a violation">"The addition of an audit annotation to the event recorded in the audit log", otherwise allowed</td><td data-label="Applies to">Pods and workload resources</td></tr>
+							<tr><td><code>warn</code></td><td data-label="On a violation">"A user-facing warning", otherwise allowed</td><td data-label="Applies to">Pods and workload resources</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>"A namespace can configure any or all modes, or even set a different level for different modes." Workload resources are those with a Pod template: Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs, CronJobs, ReplicationControllers and PodTemplates.</p>
+				<div class="callout trap"><p><strong>Enforce doesn't block Deployments.</strong> "Enforce mode is <strong>not</strong> applied to workload resources, only to the resulting pod objects." A Deployment that violates the enforced level is accepted. Its ReplicaSet then fails to create Pods, and the error shows in the ReplicaSet's events, not in the output of <code>kubectl apply</code>. That's why a <code>warn</code> label at the same level is useful: it warns at apply time.</p></div>
+			</div>
+
+			<!-- ===== Labels ===== -->
+			<h2 id="s5">Namespace labels</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">Setting the level and version for each mode, and testing a change safely.</span></p>
+				<div class="record">
+					<div class="record-title">PSA namespace labels</div>
+					<dl>
+						<dt>Level</dt><dd><code>pod-security.kubernetes.io/<wbr>&lt;MODE&gt;: &lt;LEVEL&gt;</code></dd>
+						<dt>Version</dt><dd><code>pod-security.kubernetes.io/<wbr>&lt;MODE&gt;-version: &lt;VERSION&gt;</code></dd>
+						<dt>MODE</dt><dd><code>enforce</code>, <code>audit</code>, <code>warn</code></dd>
+						<dt>LEVEL</dt><dd><code>privileged</code>, <code>baseline</code>, <code>restricted</code></dd>
+						<dt>VERSION</dt><dd><code>latest</code> (default) or <code>v&lt;major&gt;.&lt;minor&gt;</code>, such as <code>v1.37</code></dd>
+					</dl>
+				</div>
+				<p>Pinning a version keeps a namespace on that release's rules when the cluster is upgraded. <code>latest</code> picks up new rules automatically. A common pattern is to enforce a pinned version and warn and audit on <code>latest</code>, so you see new violations before they're enforced.</p>
+				<div class="code"><span class="file">Roll out Baseline on the shop namespace (shell)</span>
+<pre><code>P=pod-security.kubernetes.io
+
+<span class="c"># 1. test: nothing is saved</span>
+kubectl label --dry-run=server \
+  --overwrite ns shop \
+  $P/enforce=baseline
+
+<span class="c"># 2. enforce Baseline, pinned;</span>
+<span class="c">#    warn and audit on Restricted</span>
+kubectl label --overwrite ns shop \
+  $P/enforce=baseline \
+  $P/enforce-version=v1.37 \
+  $P/warn=restricted \
+  $P/audit=restricted
+
+<span class="c"># namespaces with no enforce label</span>
+kubectl get ns -l "!$P/enforce"</code></pre></div>
+				<p>The server dry run tests existing Pods and prints warnings without changing anything, in the form <code>Warning: existing pods in namespace "shop" violate the new PodSecurity enforce level "baseline:latest"</code>, followed by each Pod and its violations, such as <code>host namespaces, hostPath volumes</code>. Applying the label for real prints the same warnings: "Violations are returned to the user as warnings." Running Pods are never evicted.</p>
+				<div class="callout trap"><p><strong>Label details that trip people up.</strong> The version needs the <code>v</code>: <code>v1.37</code>, not <code>1.37</code>. An invalid enforce level is treated as <code>restricted</code>, so it fails closed. An unlabelled namespace gets the cluster default, which out of the box is <code>privileged</code>: no restrictions at all. kubernetes.io: "Namespaces that lack any configuration at all should be considered significant gaps in your cluster security model."</p></div>
+				<div class="callout trap"><p><strong>Namespace editors control the level.</strong> "Anyone who can update (or patch or create) a namespace can also modify the Pod Security level for that namespace." Restrict <code>update</code> and <code>patch</code> on Namespaces with RBAC (<a href="index.html#d3">topic 3.2</a>).</p></div>
+			</div>
+
+			<!-- ===== Defaults and exemptions ===== -->
+			<h2 id="s6">Cluster defaults and exemptions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">Configuring the controller itself: levels for unlabelled namespaces, and who skips the checks.</span></p>
+				<p>The API server reads the plugin's configuration from the file named by <code>--admission-control-config-file</code>: an <code>AdmissionConfiguration</code> (<code>apiserver.config.k8s.io/v1</code>) containing a <code>PodSecurityConfiguration</code>.</p>
+				<div class="record">
+					<div class="record-title">PodSecurityConfiguration for the shop cluster</div>
+					<dl>
+						<dt>apiVersion</dt><dd><code>pod-security.admission.<wbr>config.k8s.io/v1</code></dd>
+						<dt>defaults</dt><dd><code>enforce: baseline</code>, <code>audit: restricted</code>, <code>warn: restricted</code>, each with a <code>-version</code> (default <code>latest</code>); applied "when a mode label is not set"</dd>
+						<dt>exemptions.usernames</dt><dd>Requests from these authenticated (or impersonated) users</dd>
+						<dt>exemptions.runtimeClasses</dt><dd>Pods using these RuntimeClasses, for example a sandbox such as <code>gvisor</code></dd>
+						<dt>exemptions.namespaces</dt><dd>All Pods and workloads in these namespaces, for example the CNI agent's namespace</dd>
+					</dl>
+				</div>
+				<p>"Exemptions must be explicitly enumerated. Requests meeting exemption criteria are <em>ignored</em> by the Admission Controller (all <code>enforce</code>, <code>audit</code> and <code>warn</code> behaviors are skipped)." They exist only in this static file: there's no exemption label. Exempt requests get the audit annotation <code>pod-security.kubernetes.io/exempt</code> with the value <code>user</code>, <code>namespace</code> or <code>runtimeClass</code>.</p>
+				<div class="callout trap"><p><strong>Two exemption mistakes.</strong> First, exempting a person "will only exempt them from enforcement when creating pods directly, but not when creating a workload resource". Exempting a controller's ServiceAccount, such as <code>system:serviceaccount:kube-system:replicaset-controller</code>, "would implicitly exempt any user that can create the corresponding workload resource". Second, <code>kube-system</code> is <em>not</em> exempt by default; a server dry run of Baseline usually reports violations there (etcd, kube-proxy, CNI agents). Label it <code>privileged</code> deliberately, or exempt it.</p></div>
+			</div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s7">What PSA does and doesn't check</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">The edges of the built-in controller, and where its results show up.</span></p>
+				<ul>
+					<li><strong>It never changes Pods.</strong> "Pod Security Admission is a non-mutating admission controller, meaning it won't modify pods before validating them." Unlike the old PodSecurityPolicy, it won't add a seccomp profile or drop capabilities for you.</li>
+					<li><strong>It checks updates selectively.</strong> Changing only metadata, <code>activeDeadlineSeconds</code> or tolerations isn't re-checked. Adding an <strong>ephemeral container</strong> is checked, so <code>kubectl debug</code> with a privileged profile fails in a Baseline namespace.</li>
+					<li><strong>It doesn't cover <code>exec</code>, <code>attach</code> or <code>port-forward</code>.</strong> Those are RBAC's job (<a href="d2-topic-2-2.html#s6">topic 2.2</a>).</li>
+					<li><strong>It knows only three levels.</strong> It has no custom rules, nothing per user inside a namespace, and nothing about images, registries, labels, resource limits or <code>readOnlyRootFilesystem</code>.</li>
+					<li><strong>Static Pods</strong> are started by the kubelet from files and never pass through admission (<a href="d2-topic-2-2.html#s6">topic 2.2</a>).</li>
+				</ul>
+				<h3>Where results appear</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Output</th><th>Example</th></tr></thead>
+						<tbody>
+							<tr><td>Enforce rejection</td><td data-label="Example"><code>pods "bad" is forbidden: violates PodSecurity "baseline:latest": host namespaces (hostNetwork=true), privileged (container "app" must not set securityContext.privileged=true)</code></td></tr>
+							<tr><td>Warning</td><td data-label="Example"><code>Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (...)</code></td></tr>
+							<tr><td>Audit annotations</td><td data-label="Example"><code>pod-security.kubernetes.io/enforce-policy</code> (for example <code>restricted:latest</code>) and <code>pod-security.kubernetes.io/audit-violations</code>, on the audit event</td></tr>
+							<tr><td>Metrics</td><td data-label="Example"><code>pod_security_evaluations_total</code>, <code>pod_security_exemptions_total</code>, <code>pod_security_errors_total</code> on the API server</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>Audit mode needs auditing.</strong> The audit annotations are added to API server audit events, not to Pods (the labels reference page wrongly says "to the Pod"). If API auditing isn't configured, audit mode records nothing anyone can see (<a href="index.html#d3">topic 3.5</a>).</p></div>
+			</div>
+
+			<!-- ===== PSP and alternatives ===== -->
+			<h2 id="s8">PodSecurityPolicy and alternatives</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.1</span><span class="skill-text">What PSA replaced, and what to use when three levels aren't enough.</span></p>
+				<div class="callout retired"><p><strong>PodSecurityPolicy is gone.</strong> "PodSecurityPolicy was deprecated in Kubernetes v1.21, and removed from Kubernetes in v1.25" (April 2021 and August 2022). PSA went GA in the same release. PSP could mutate Pods and was granted through RBAC's <code>use</code> verb per ServiceAccount; the migration guide calls that model one with "many pitfalls". Migrating means mapping each PSP to the nearest level, testing with <code>--dry-run=server</code> and <code>audit</code>, then enforcing. Older material that mentions PSP, or says PSA mutates Pods, is out of date.</p></div>
+				<p>PSA "was designed to be <em>complementary</em> to other policy enforcement mechanisms". For custom rules, defaults or exceptions finer than a namespace, add one of these, often alongside PSA as a fallback:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>What it is</th><th>Status</th></tr></thead>
+						<tbody>
+							<tr><td>ValidatingAdmissionPolicy</td><td data-label="What it is">Built-in rules written in CEL</td><td data-label="Status">GA v1.30</td></tr>
+							<tr><td>MutatingAdmissionPolicy</td><td data-label="What it is">Built-in CEL mutations, for example adding a seccomp profile</td><td data-label="Status">GA v1.36</td></tr>
+							<tr><td>Kyverno</td><td data-label="What it is">Policy engine with YAML policies: validate, mutate, generate, verify images</td><td data-label="Status">CNCF graduated, March 2026</td></tr>
+							<tr><td>OPA Gatekeeper</td><td data-label="What it is">Admission webhook running Open Policy Agent policies written in Rego</td><td data-label="Status">Sub-project of OPA (CNCF graduated 2021)</td></tr>
+							<tr><td>Kubewarden</td><td data-label="What it is">Policies compiled to WebAssembly</td><td data-label="Status">CNCF sandbox</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>kubernetes.io's advice on choosing: "Ultimately, using <em>any</em> of the aforementioned approaches will be better than doing nothing." Admission policies are covered in <a href="index.html#d5">topic 5.4</a>.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Three cumulative levels: Privileged (no restrictions), Baseline (blocks known escalations; allows the default Pod), Restricted (hardening best practice). PSS is a definition; PSA is one enforcer.</li>
+				<li>Baseline forbids host namespaces, privileged, extra capabilities beyond the default 13, hostPath, hostPort, probe and hook <code>host</code> (1.34), Unconfined AppArmor or seccomp, custom SELinux, Unmasked procMount and unsafe sysctls (14 safe in 1.37).</li>
+				<li>Restricted adds: allowed volume types only, explicit <code>allowPrivilegeEscalation: false</code>, <code>runAsNonRoot: true</code>, <code>runAsUser</code> not 0, seccomp RuntimeDefault or Localhost, drop ALL (add back only NET_BIND_SERVICE). It doesn't require readOnlyRootFilesystem. Windows Pods skip three rules; <code>hostUsers: false</code> Pods skip the non-root checks (policy v1.35+).</li>
+				<li>PSA: built-in validating plugin, GA 1.25. <code>enforce</code> rejects Pods only; <code>audit</code> (annotation on the audit event) and <code>warn</code> also cover workloads.</li>
+				<li>Labels <code>pod-security.kubernetes.io/&lt;mode&gt;</code> and <code>&lt;mode&gt;-version</code> (<code>v1.37</code> or <code>latest</code>). Test with <code>kubectl label --dry-run=server</code>; label changes only warn about running Pods. Unlabelled = cluster default, privileged out of the box.</li>
+				<li>Defaults and exemptions (usernames, runtimeClasses, namespaces) live in the static <code>PodSecurityConfiguration</code>; exemptions skip all modes. Don't exempt controller ServiceAccounts; kube-system isn't exempt by default.</li>
+				<li>PSA never mutates, checks ephemeral containers, ignores exec and attach. PSP: deprecated 1.21, removed 1.25. For more: ValidatingAdmissionPolicy, MutatingAdmissionPolicy, Kyverno, Gatekeeper, Kubewarden.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d2-topic-2-3.html"><small>Previous</small>2.3: Container Networking, Client Security and Storage</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
