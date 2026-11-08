@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.3: Image Security, Workload and Application Code Security | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 1.3: tags vs digests, imagePullPolicy defaults, private registries and imagePullSecrets, credential providers, AlwaysPullImages and credential re-verification for cached images, registry security, building minimal non-root images without secrets, image scanning with Trivy and others, CVSS, EPSS and VEX, secure coding and testing (OWASP Top 10, SAST, DAST, SCA, fuzzing, secret scanning), and workload settings app teams control.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Overview of Cloud Native Security &middot; 14%</span>
+		<h1>1.3: Artifact Repository and Image Security, Workload and Application Code Security</h1>
+		<p>Keeping what runs in Kubernetes&reg; trustworthy: naming and pulling images safely, protecting registries, building small images without secrets, scanning them, and securing the code inside and the workload settings around it.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Digests</span><span class="tag">imagePullSecrets</span><span class="tag">Registries</span><span class="tag">Distroless</span><span class="tag">Trivy</span><span class="tag">OWASP</span><span class="tag">SAST/DAST</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Naming images: tags and digests</a></li>
+				<li><a href="#s2">Pulling from private registries</a></li>
+				<li><a href="#s3">Cached images and credentials</a></li>
+				<li><a href="#s4">Securing the registry</a></li>
+				<li><a href="#s5">Building secure images</a></li>
+				<li><a href="#s6">Scanning images</a></li>
+				<li><a href="#s7">Securing application code</a></li>
+				<li><a href="#s8">Workload settings</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 1.3</span>
+				<p><strong>Artifact Repository and Image Security. Workload and Application Code Security.</strong></p>
+			</div>
+			<p>The curriculum gives only these topic names. This page takes <strong>artifact repository and image security</strong> to mean how images are named, stored, pulled and kept trustworthy: digests and tags, pull policies and credentials, registry protection, image hygiene and vulnerability scanning. It takes <strong>workload and application code security</strong> to mean securing the code and dependencies inside the image (secure coding and security testing) and the workload settings an application team controls. Signing, SBOMs, provenance and SLSA belong to supply chain security and are covered in <a href="index.html#d5">topic 5.1</a>.</p>
+			<p>Quotes are from kubernetes.io and the CNCF&reg; Glossary (CC BY 4.0), NIST SP 800-190 (credited), and the docs of the tools named.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's images (<code>web</code>, <code>api</code>, <code>worker</code>) are built in CI and pushed to the team's private registry. The cluster pulls them into the <code>shop</code> namespace.</p></div>
+
+			<!-- ===== Tags and digests ===== -->
+			<h2 id="s1">Naming images: tags and digests</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Why a digest is safer than a tag, and how the image name decides the pull policy.</span></p>
+				<p>kubernetes.io: "Digests are hashes of the image's content, and are immutable. Tags can be moved to point to different images, but digests are fixed." The CNCF Glossary's <a href="https://glossary.cncf.io/image-digest/">image digest</a> entry calls a tag "a nickname" you can reassign and a digest "a fingerprint", and spells out the risk: "a compromised tag could silently deliver a malicious image."</p>
+				<ul>
+					<li>A name with no registry means Docker Hub, and no tag means <code>latest</code>. kubernetes.io advises avoiding <code>:latest</code> in production because "it is harder to track which version of the image is running and more difficult to roll back properly."</li>
+					<li>Pinning by digest means a change at the registry can't change what you run. A reference with both a tag and a digest (<code>web:1.4.2@sha256:...</code>) is allowed: "Only the digest will be used for pulling."</li>
+				</ul>
+				<div class="callout trap"><p><strong>A real case of mutable tags: Trivy, March 2026.</strong> On 19 March 2026, attackers with stolen credentials published a malicious Trivy release, v0.69.4, and repointed 76 of the 77 version tags of its GitHub Action to credential-stealing code. More malicious images followed on Docker Hub on 22 March (advisory <a href="https://github.com/aquasecurity/trivy/security/advisories/GHSA-69fq-xp46-6x23">GHSA-69fq-xp46-6x23</a>, CVE-2026-33634). The advisory lists images referenced by digest, and Actions pinned to a full commit SHA, as not affected. Even security tools are supply chain inputs.</p></div>
+				<h3>imagePullPolicy</h3>
+				<p>The pull policy decides when the kubelet asks the runtime to pull: <code>Always</code> (check the registry on every container start), <code>IfNotPresent</code> (pull only if the image isn't on the node) or <code>Never</code>. If you leave it out, it's defaulted from the image name:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Image reference</th><th>Default policy</th></tr></thead>
+						<tbody>
+							<tr><td>Has a digest</td><td data-label="Default policy"><code>IfNotPresent</code></td></tr>
+							<tr><td>Tag <code>:latest</code></td><td data-label="Default policy"><code>Always</code></td></tr>
+							<tr><td>No tag</td><td data-label="Default policy"><code>Always</code></td></tr>
+							<tr><td>Any other tag</td><td data-label="Default policy"><code>IfNotPresent</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>The default is set once.</strong> "The value of <code>imagePullPolicy</code> of the container is always set when the object is first <em>created</em>, and is not updated if the image's tag or digest later changes." Changing a Deployment's image to <code>:latest</code> later doesn't switch it to <code>Always</code>. And <code>Always</code> isn't a full download: the runtime checks the digest and fetches only missing layers.</p></div>
+			</div>
+
+			<!-- ===== Private registries ===== -->
+			<h2 id="s2">Pulling from private registries</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Giving Pods registry credentials without baking them into nodes or images.</span></p>
+				<p>kubernetes.io lists several ways to authenticate to a private registry. Pod-level <code>imagePullSecrets</code> are "the recommended approach to run containers based on images in private registries". With node-level configuration, by contrast, "All Pods can read any configured private registries." The shop's pull credential:</p>
+				<div class="code"><span class="file">Create the registry Secret (shell)</span>
+<pre><code>kubectl create secret docker-registry \
+  regcred -n shop \
+  --docker-server=registry.example.com \
+  --docker-username=ci-puller \
+  --docker-password="$REG_TOKEN"</code></pre></div>
+				<p>This creates a Secret of type <code>kubernetes.io/dockerconfigjson</code>. kubernetes.io warns that typing secrets on the command line "may store them in your shell history", hence the environment variable here. Attaching the Secret to the workload's ServiceAccount means every Pod created with that account gets it automatically:</p>
+				<div class="code"><span class="file">ServiceAccount for the web Pods (ServiceAccount)</span>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web
+  namespace: shop
+<span class="c"># web never calls the Kubernetes API</span>
+automountServiceAccountToken: false
+<span class="c"># added to every Pod using this account</span>
+imagePullSecrets:
+- name: regcred</code></pre></div>
+				<div class="code"><span class="file">The web Pod, pinned by digest (Pod)</span>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: shop
+spec:
+  serviceAccountName: web
+  containers:
+  - name: web
+    <span class="c"># only the digest is used to pull</span>
+    image: shop/web@sha256:&lt;digest&gt;</code></pre></div>
+				<p>A real reference includes the registry host and the 64-character hex digest. A Pod can also list <code>imagePullSecrets</code> directly under <code>spec</code>.</p>
+				<div class="callout trap"><p><strong>Pull secrets are namespaced.</strong> The Secret must be in the same namespace as the Pod. One <code>docker-registry</code> Secret covers one registry. Adding a pull secret to a ServiceAccount affects only Pods created afterwards. And the Secret only base64-encodes the password: anyone who can read it can decode it.</p></div>
+				<h3>Credential provider plugins</h3>
+				<p>Kubelet credential provider plugins (GA since v1.26) let the kubelet fetch short-lived registry credentials on demand from an external program, "as opposed to storing static credentials on disk". They replaced the old built-in cloud credential providers, which have been removed. Since v1.34 (beta, on by default), a plugin can receive a token for the Pod's ServiceAccount, so each workload pulls with its own identity. Plugins also cover static Pods, which can't reference Secrets or ServiceAccounts.</p>
+			</div>
+
+			<!-- ===== Cached images ===== -->
+			<h2 id="s3">Cached images and credentials</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Stopping Pods without credentials from using private images already on a node.</span></p>
+				<p>Once a private image is on a node, the old behaviour with <code>IfNotPresent</code> let any Pod on that node use it. kubernetes.io describes the problem on the AlwaysPullImages admission plugin: "once an image has been pulled to a node, any pod from any user can use it by knowing the image's name ... without any authorization check against the image."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Control</th><th>How it works</th><th>Default</th></tr></thead>
+						<tbody>
+							<tr><td>AlwaysPullImages admission plugin</td><td data-label="How it works">Rewrites every new Pod to <code>imagePullPolicy: Always</code>, so every start checks the Pod's credentials with the registry</td><td data-label="Default">Not enabled; add it with <code>--enable-admission-plugins</code></td></tr>
+							<tr><td>Credential re-verification (KubeletEnsureSecretPulledImages)</td><td data-label="How it works">The kubelet checks that a Pod's credentials have pulled an image before letting it use the cached copy; known-good credentials are checked locally, without calling the registry</td><td data-label="Default">Beta, on by default since v1.35 (December 2025)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>AlwaysPullImages' downside is that "the <code>pull</code> does put the registry in the critical path of starting a container": if the registry is down, Pods can't start. That's why kubernetes.io's multi-tenancy advice says to make sure it's active when tenants have their own registries, "Otherwise, all Pods of all tenants potentially have access to all images." The kubelet feature solves the same problem with less registry traffic. It's set in the kubelet configuration:</p>
+				<div class="record">
+					<div class="record-title">KubeletConfiguration: image credential checks</div>
+					<dl>
+						<dt>Field</dt><dd><code>imagePullCredentials<wbr>VerificationPolicy</code></dd>
+						<dt>NeverVerify</dt><dd>Old behaviour: anyone on the node can use any cached image</dd>
+						<dt>NeverVerify<wbr>PreloadedImages</dt><dd>Default. Images the kubelet didn't pull itself (pre-loaded) aren't re-checked</dd>
+						<dt>NeverVerify<wbr>AllowlistedImages</dt><dd>Only images listed in <code>preloadedImages<wbr>VerificationAllowlist</code> skip the check</dd>
+						<dt>AlwaysVerify</dt><dd>Every image needs its credentials re-verified</dd>
+					</dl>
+				</div>
+				<div class="callout trap"><p><strong>The first enablement trusts everything already on the node.</strong> When the feature is first turned on, every image already cached counts as pre-pulled, so under the default policy it's never checked. Clean the nodes first if that matters. (The kubernetes.io Images page spells one value <code>NeverVerifyAllowListedImages</code>; the API uses a lowercase "l".)</p></div>
+				<div class="callout tip"><p><strong>Admission can also restrict which images run at all.</strong> The ImagePolicyWebhook admission plugin (off by default) asks an external service to approve each image, and policy engines can require approved registries, digests or signatures. Admission control is covered in <a href="index.html#d5">topic 5.4</a>.</p></div>
+			</div>
+
+			<!-- ===== Registry ===== -->
+			<h2 id="s4">Securing the registry</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Protecting the artifact repository that every node trusts.</span></p>
+				<p>NIST SP 800-190 names three registry risks, each with countermeasures:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Risk</th><th>Countermeasure (paraphrased)</th></tr></thead>
+						<tbody>
+							<tr><td>Insecure connections</td><td data-label="Countermeasure (paraphrased)">Connect to registries only over encrypted channels; don't use "insecure registry" settings</td></tr>
+							<tr><td>Stale images</td><td data-label="Countermeasure (paraphrased)">Prune vulnerable images regularly; deploy by immutable, versioned names, since <code>latest</code> is "not a guarantee of freshness"</td></tr>
+							<tr><td>Weak authentication and authorization</td><td data-label="Countermeasure (paraphrased)">Authenticate all access to private registries and every write; grant push rights per repository; audit writes; allow pushes only after scans and checks pass</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Common practices built on that:</p>
+				<ul>
+					<li><strong>Use a private registry</strong> or curated internal mirror for production, rather than pulling straight from public registries. A pull-through cache also protects against upstream outages and rate limits (Docker Hub allows 100 unauthenticated pulls per 6 hours per IP address).</li>
+					<li><strong>Least-privilege accounts:</strong> only CI can push; nodes and Pods get pull-only credentials.</li>
+					<li><strong>Tag immutability</strong>, so a released tag can't be overwritten, plus retention rules for stale images and scanning on push.</li>
+				</ul>
+				<p>Harbor, a CNCF graduated registry, is one example: it can scan images on push, make tags immutable and block pulls of images above a chosen severity. It's covered with other supply chain tools in <a href="index.html#d5">topic 5.1</a>. Other CNCF projects in this space include Distribution and Zot (registries, sandbox) and Dragonfly (peer-to-peer image distribution, graduated 2025).</p>
+				<div class="callout retired"><p><strong><code>k8s.gcr.io</code> is frozen.</strong> The Kubernetes project's images moved to <code>registry.k8s.io</code>. The old registry was redirected from 20 March 2023 and frozen after 3 April 2023, with no new images or security updates. Manifests that still reference it run outdated images.</p></div>
+			</div>
+
+			<!-- ===== Building ===== -->
+			<h2 id="s5">Building secure images</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Small, non-root images that carry no secrets and are rebuilt often.</span></p>
+				<p>The kubernetes.io <a href="https://kubernetes.io/docs/concepts/security/security-checklist/">Security Checklist</a> has four image items:</p>
+				<ul>
+					<li>"Minimize unnecessary content in container images."</li>
+					<li>"Container images are configured to be run as unprivileged user."</li>
+					<li>"References to container images are made by sha256 digests (rather than tags) or the provenance of the image is validated by verifying the image's digital signature at deploy time via admission control."</li>
+					<li>"Container images are regularly scanned during creation and in deployment, and known vulnerable software is patched."</li>
+				</ul>
+				<p>It adds that a production image "should not contain shells or debugging utilities, as an ephemeral debug container can be used for troubleshooting." A multi-stage build onto a minimal base does all of that for the shop's Go services:</p>
+				<div class="code"><span class="file">Multi-stage build onto distroless (Dockerfile)</span>
+<pre><code># syntax=docker/dockerfile:1
+ARG BASE=gcr.io/distroless/static-debian13
+
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+<span class="c"># secret file exists for this RUN only</span>
+RUN --mount=type=secret,id=token \
+    ./scripts/fetch-deps.sh
+COPY . .
+RUN CGO_ENABLED=0 go build \
+    -o /out/web ./cmd/web
+
+<span class="c"># no shell, no package manager</span>
+FROM ${BASE}:nonroot
+COPY --from=build /out/web /web
+<span class="c"># the nonroot user, UID 65532</span>
+USER 65532:65532
+<span class="c"># exec form: there is no shell</span>
+ENTRYPOINT ["/web"]</code></pre></div>
+				<div class="code"><span class="file">Build with the secret (shell)</span>
+<pre><code>docker build \
+  --secret id=token,src=token.txt \
+  -t registry.example.com/shop/web:1.4.2 .</code></pre></div>
+				<ul>
+					<li><strong>Multi-stage:</strong> compilers and build tools stay in the first stage; the final image holds only the binary.</li>
+					<li><strong>Minimal base:</strong> "Distroless" images "contain only your application and its runtime dependencies. They do not contain package managers, shells or any other programs", which also "improves the signal to noise of scanners". Alternatives include <code>scratch</code> (empty) and other minimal distributions that are rebuilt often. Distroless is a Google project, not a CNCF one, and its current images are based on Debian 13.</li>
+					<li><strong>Non-root:</strong> set <code>USER</code> in the image. <code>runAsUser</code> can override it, but the checklist notes that file permissions in the image may then stop the process from starting.</li>
+					<li><strong>Rebuild often</strong> to pick up base image fixes, and keep <code>.env</code> files, keys and <code>.git</code> out of the build context with <code>.dockerignore</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Build arguments leak secrets.</strong> Docker's docs: build arguments and environment variables "are inappropriate for passing secrets to your build" because "they persist in the final image." Deleting a copied secret in a later step doesn't help either: it's still in the earlier layer. Use a secret mount (<code>RUN --mount=type=secret</code>), and give Pods their secrets at run time through Kubernetes Secrets (<a href="index.html#d3">topic 3.3</a>). NIST SP 800-190 makes the same point: keep secrets out of images and inject them at run time.</p></div>
+			</div>
+
+			<!-- ===== Scanning ===== -->
+			<h2 id="s6">Scanning images</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">What scanners find and miss, where to run them, and how to rank what they report.</span></p>
+				<p>An image scanner lists the OS packages and language dependencies in an image and matches them against vulnerability databases. Many also flag misconfigurations, secrets and licences. Their limits:</p>
+				<ul>
+					<li>They find only <strong>known, published</strong> vulnerabilities, and only in software they can identify. Binaries copied in without package metadata may be missed.</li>
+					<li>They say nothing about flaws in your own code logic. That's what code testing is for (<a href="#s7">below</a>).</li>
+					<li>A clean scan today isn't clean tomorrow: new CVEs appear for images already in the registry or running.</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Where</th><th>Why</th><th>Example</th></tr></thead>
+						<tbody>
+							<tr><td>CI pipeline</td><td data-label="Why">Earliest and cheapest fix; fail the build on policy. The checklist says scanning "is usually done as part of the deployment process in a CI/CD pipeline"</td><td data-label="Example"><code>trivy image --exit-code 1</code></td></tr>
+							<tr><td>Registry</td><td data-label="Why">Scan on push and re-scan on a schedule; block pulls above a severity</td><td data-label="Example">Harbor with its built-in Trivy scanner</td></tr>
+							<tr><td>Running cluster</td><td data-label="Why">Catches images that skipped CI and CVEs disclosed after deployment</td><td data-label="Example">Trivy Operator, Kubescape</td></tr>
+							<tr><td>Admission</td><td data-label="Why">Refuses images that are unscanned, unsigned or from unapproved registries</td><td data-label="Example">Policy engines (<a href="index.html#d5">topic 5.4</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Scan the web image in CI (shell)</span>
+<pre><code><span class="c"># default scanners: vuln and secret</span>
+trivy image shop/web:1.4.2
+
+<span class="c"># only HIGH and CRITICAL findings</span>
+trivy image --severity HIGH,CRITICAL \
+  shop/web:1.4.2
+
+<span class="c"># fail the build on a fixable CRITICAL</span>
+trivy image --exit-code 1 \
+  --severity CRITICAL --ignore-unfixed \
+  shop/web:1.4.2
+
+<span class="c"># misconfigurations in the manifests</span>
+trivy config ./k8s</code></pre></div>
+				<div class="callout trap"><p><strong>A scan doesn't fail a pipeline by default.</strong> "By default, Trivy exits with code 0 even when security issues are detected", so without <code>--exit-code</code> the build passes whatever it finds. <code>--ignore-unfixed</code> hides vulnerabilities that have no fix yet. That cuts noise, but those risks are still there.</p></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool</th><th>What it does</th><th>Owner</th></tr></thead>
+						<tbody>
+							<tr><td>Trivy</td><td data-label="What it does">Scans images, file systems, repositories and clusters for vulnerabilities, misconfigurations, secrets and licences</td><td data-label="Owner">Aqua Security; not CNCF</td></tr>
+							<tr><td>Grype and Syft</td><td data-label="What it does">Vulnerability scanner, and SBOM generator</td><td data-label="Owner">Anchore; not CNCF</td></tr>
+							<tr><td>Clair</td><td data-label="What it does">API-based static image analysis</td><td data-label="Owner">Red Hat (Quay); not CNCF</td></tr>
+							<tr><td>Harbor</td><td data-label="What it does">Registry with built-in scanning (Trivy by default)</td><td data-label="Owner">CNCF, graduated</td></tr>
+							<tr><td>Kubescape</td><td data-label="What it does">Cluster and manifest scanning against NSA/CISA, MITRE and CIS controls, plus image CVEs</td><td data-label="Owner">CNCF, incubating since January 2025</td></tr>
+							<tr><td>Copacetic</td><td data-label="What it does">Patches OS-package vulnerabilities in an existing image without a full rebuild</td><td data-label="Owner">CNCF, sandbox</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Ranking what a scan finds</h3>
+				<ul>
+					<li><strong>CVSS</strong> (now version 4.0, from FIRST) scores how <em>severe</em> a vulnerability is, from 0 to 10. FIRST stresses that base scores "are not risk".</li>
+					<li><strong>EPSS</strong> (FIRST, version 5 since June 2026) estimates "the probability that a published CVE will be exploited in the wild" in the next 30 days.</li>
+					<li><strong>VEX</strong> (Vulnerability Exploitability eXchange) is a machine-readable statement from a supplier that a product is, or isn't, affected by a CVE. Scanners can use it to drop findings for code that's present but not exploitable.</li>
+				</ul>
+				<div class="callout tip"><p><strong>Fix first:</strong> high severity, likely to be exploited (high EPSS or on a known-exploited list), a fix available, and actually reachable in your image.</p></div>
+			</div>
+
+			<!-- ===== App code ===== -->
+			<h2 id="s7">Securing application code</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">Finding flaws in the code and its dependencies before they ship.</span></p>
+				<p>The CNCF Glossary's <a href="https://glossary.cncf.io/shift-left/">shift left</a> entry describes "implementing tests, security, or other development practices early in the software development lifecycle rather than towards the end", because late fixes are "more difficult and expensive". Its <a href="https://glossary.cncf.io/devsecops/">DevSecOps</a> entry calls this "a cultural merger of the development, operational, and security responsibilities", where "the goal is not to be a blocker".</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Technique</th><th>What it does</th><th>Strengths and limits</th></tr></thead>
+						<tbody>
+							<tr><td>SAST (static analysis)</td><td data-label="What it does">Analyzes source or compiled code for security flaws without running it</td><td data-label="Strengths and limits">Scales, runs in CI, points to the line; many false positives, weak on access control and design flaws</td></tr>
+							<tr><td>DAST (dynamic testing)</td><td data-label="What it does">"Black-Box" testing of a running application by sending attack payloads such as SQL injection and XSS</td><td data-label="Strengths and limits">Finds what's really exploitable; needs a running app, can't see code paths it doesn't reach</td></tr>
+							<tr><td>SCA (dependency scanning)</td><td data-label="What it does">Lists third-party libraries and matches them to known vulnerabilities and licences</td><td data-label="Strengths and limits">Covers most of the code you didn't write; only known issues</td></tr>
+							<tr><td>Fuzzing</td><td data-label="What it does">Feeds automatically generated, malformed input to find crashes and unexpected behaviour</td><td data-label="Strengths and limits">Finds unknown bugs; needs setup and run time</td></tr>
+							<tr><td>Secret scanning</td><td data-label="What it does">Detects committed keys and tokens in repositories and images</td><td data-label="Strengths and limits">Cheap, best as a pre-commit hook; anything found must be rotated</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The <a href="https://top10.owasp.org/2025/">OWASP Top 10:2025</a> lists the most critical web application risks: A01 Broken Access Control, A02 Security Misconfiguration, A03 Software Supply Chain Failures, A04 Cryptographic Failures, A05 Injection, A06 Insecure Design, A07 Authentication Failures, A08 Software or Data Integrity Failures, A09 Security Logging and Alerting Failures, A10 Mishandling of Exceptional Conditions.</p>
+				<div class="callout trap"><p><strong>Two OWASP lists, both 2025.</strong> The OWASP Top 10 (web applications) replaced its 2021 edition, adding Software Supply Chain Failures and Mishandling of Exceptional Conditions. The separate OWASP <em>Kubernetes</em> Top 10 is in <a href="d1-topic-1-2.html#s3">topic 1.2</a>. And a secret removed from git history must still be rotated: it may already have been copied.</p></div>
+				<p>The <strong>Open Source Security Foundation</strong> (OpenSSF), a Linux Foundation foundation separate from the CNCF, offers the free course LFD121 "Developing Secure Software", the <a href="https://scorecard.dev/">OpenSSF Scorecard</a> (automated checks that score an open source project's security practices, such as pinned dependencies, fuzzing, SAST and signed releases) and the OpenSSF Best Practices Badge. Secret scanners such as gitleaks and TruffleHog aren't CNCF projects either.</p>
+			</div>
+
+			<!-- ===== Workload settings ===== -->
+			<h2 id="s8">Workload settings</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 1.3</span><span class="skill-text">The security settings an application team controls in its own manifests.</span></p>
+				<p>The kubernetes.io <a href="https://kubernetes.io/docs/concepts/security/application-security-checklist/">Application Security Checklist</a> (2024) is written for application developers; the older Security Checklist is for cluster administrators. Its main items:</p>
+				<ul>
+					<li><strong>ServiceAccounts:</strong> "Avoid using the <code>default</code> ServiceAccount. Instead, create ServiceAccounts for each workload". "<code>automountServiceAccountToken</code> should be set to <code>false</code> unless the pod specifically requires access to the Kubernetes API".</li>
+					<li><strong>Resources:</strong> set requests and limits for an appropriate QoS class; "Memory limit is set for the workloads with a limit equal to or greater than the request". Limits contain the damage of a runaway or abused process.</li>
+					<li><strong>securityContext:</strong> <code>runAsNonRoot: true</code>, <code>allowPrivilegeEscalation: false</code>, <code>readOnlyRootFilesystem: true</code>, no privileged containers, drop all capabilities (<a href="d1-topic-1-2.html#s5">topic 1.2</a>).</li>
+					<li><strong>Images:</strong> scan before deploying, and "use container signing to validate the container image signature before deploying".</li>
+					<li><strong>Network:</strong> "Configure NetworkPolicies to only allow expected ingress and egress traffic from the pods."</li>
+				</ul>
+				<p>The shop's <code>web</code> ServiceAccount <a href="#s2">above</a> already turns off token automounting. If both the ServiceAccount and the Pod set <code>automountServiceAccountToken</code>, the Pod spec wins.</p>
+				<h3>Consuming Secrets safely</h3>
+				<p>The Security Checklist prefers files: "Pods needing secrets should have these automatically mounted through volumes, preferably stored in memory". It explains that "the environment variable method might be more prone to leakage due to crash dumps in logs and the non-confidential nature of environment variable in Linux". The kubelet keeps Secret volumes in <code>tmpfs</code> "so that the confidential data is not written to durable storage". Mount Secrets only into the containers that need them, and make sure the app never logs them.</p>
+				<div class="callout tip"><p><strong>Immutable ConfigMaps and Secrets.</strong> Setting <code>immutable: true</code> (GA since v1.21) protects against accidental or unwanted changes and lowers API server load. It can't be undone: "You can only delete and recreate" the object.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Tags are mutable, digests immutable; pin production images by digest (with a tag and a digest, only the digest is used). The March 2026 Trivy compromise spared digest-pinned users.</li>
+				<li>Default pull policy: digest or ordinary tag = <code>IfNotPresent</code>; <code>:latest</code> or no tag = <code>Always</code>; fixed when the object is created.</li>
+				<li>Private registries: <code>docker-registry</code> Secrets in the Pod's namespace, referenced by <code>imagePullSecrets</code> on the Pod or its ServiceAccount; or kubelet credential provider plugins (GA 1.26) for short-lived credentials.</li>
+				<li>Cached private images: AlwaysPullImages (off by default, puts the registry on the critical path) or kubelet credential re-verification (beta, on since 1.35; default <code>NeverVerifyPreloadedImages</code>).</li>
+				<li>Registries: TLS only, authenticated pulls and pushes, push from CI only, immutable tags, pruning, scan on push. <code>k8s.gcr.io</code> is frozen; use <code>registry.k8s.io</code>.</li>
+				<li>Images: multi-stage, minimal or distroless, non-root <code>USER</code>, no shell, no secrets in layers (use <code>--mount=type=secret</code>), rebuilt often.</li>
+				<li>Scan in CI, the registry and the cluster. Trivy exits 0 without <code>--exit-code</code>. CVSS = severity, EPSS = likelihood of exploitation, VEX = "not affected" statements. Trivy, Grype and Clair aren't CNCF; Harbor and Kubescape are.</li>
+				<li>Code: SAST, DAST, SCA, fuzzing and secret scanning; OWASP Top 10:2025. Workloads: own ServiceAccount, token automount off, limits, hardened securityContext, Secrets as in-memory files rather than environment variables.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d1-topic-1-2.html"><small>Previous</small>1.2: Controls and Frameworks, Isolation Techniques</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors) and glossary.cncf.io, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; NIST SP 800-190 paraphrased courtesy of the National Institute of Standards and Technology; short quotes from the Trivy, distroless and Docker documentation, FIRST and OWASP; OWASP Top 10 titles from the OWASP Foundation; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
