@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.2: Authentication and Authorization | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 3.2: users vs ServiceAccounts, authentication methods and which to use (client certificates, tokens, OIDC with structured AuthenticationConfiguration, webhooks, authenticating proxy), ServiceAccount tokens and their lifetimes, user certificates through the CSR API, authorization modes and the authorizer chain, verbs and kubectl auth can-i, RBAC objects, default roles, escalation prevention and RBAC good practices.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Kubernetes Security Fundamentals &middot; 22%</span>
+		<h1>3.2: Authentication and Authorization</h1>
+		<p>How Kubernetes&reg; decides who is calling (users, ServiceAccounts, certificates, tokens, OIDC) and what they may do (the authorizer chain, RBAC roles and bindings, and the permissions that quietly lead to more).</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">ServiceAccounts</span><span class="tag">OIDC</span><span class="tag">Bound tokens</span><span class="tag">CSR</span><span class="tag">RBAC</span><span class="tag">can-i</span><span class="tag">Escalation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Identities</a></li>
+				<li><a href="#s2">Authentication methods</a></li>
+				<li><a href="#s3">ServiceAccount tokens</a></li>
+				<li><a href="#s4">User certificates</a></li>
+				<li><a href="#s5">Authorization</a></li>
+				<li><a href="#s6">RBAC objects</a></li>
+				<li><a href="#s7">Default roles and escalation</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 3.2</span>
+				<p><strong>Authentication. Authorization.</strong></p>
+			</div>
+			<p>The curriculum PDF lists Authentication; the LF exam page also lists Authorization, so this page covers both. <strong>Authentication</strong> answers "who is this?" and <strong>authorization</strong> answers "may they do this?". Both happen in the API server before admission (<a href="d2-topic-2-1.html#s2">topic 2.1</a>, which also covers anonymous access and <code>system:masters</code>). The kubelet's own checks and the Node authorizer are in <a href="d2-topic-2-2.html">topic 2.2</a>; kubeconfig files and client-side credentials in <a href="d2-topic-2-3.html#s4">topic 2.3</a>.</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0).</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's <code>web</code> ServiceAccount needs to read Pods and their logs, a developer called Ana needs read access in <code>shop</code>, and an external secret store needs to trust tokens from the cluster.</p></div>
+
+			<!-- ===== Identities ===== -->
+			<h2 id="s1">Identities</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">The two kinds of user, and the identity attributes an authenticator produces.</span></p>
+				<p>"All Kubernetes clusters have two categories of users: service accounts managed by Kubernetes, and normal users." And: "<em>Kubernetes does not have objects which represent normal user accounts.</em> Normal users cannot be added to a cluster through an API call." People come from outside (certificates, an identity provider); workloads use ServiceAccounts, which are namespaced API objects.</p>
+				<p>An authenticator produces a <strong>username</strong>, a <strong>UID</strong>, <strong>groups</strong> and <strong>extra</strong> fields. "All values are opaque to the authentication system and only hold significance when interpreted by an authorizer."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Identity</th><th>Who has it</th></tr></thead>
+						<tbody>
+							<tr><td><code>system:authenticated</code></td><td data-label="Who has it">Every authenticated request (group)</td></tr>
+							<tr><td><code>system:anonymous</code> in <code>system:unauthenticated</code></td><td data-label="Who has it">Requests with no credentials, if anonymous access is on</td></tr>
+							<tr><td><code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code></td><td data-label="Who has it">A ServiceAccount (username, singular)</td></tr>
+							<tr><td><code>system:serviceaccounts</code>, <code>system:serviceaccounts:&lt;ns&gt;</code></td><td data-label="Who has it">All ServiceAccounts, and all in one namespace (groups, plural)</td></tr>
+							<tr><td><code>system:node:&lt;name&gt;</code> in <code>system:nodes</code></td><td data-label="Who has it">Kubelets</td></tr>
+							<tr><td><code>system:masters</code></td><td data-label="Who has it">Superusers that bypass authorization (<a href="d2-topic-2-1.html#s2">topic 2.1</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>"The prefix <code>system:</code> is reserved for Kubernetes system use." Several authenticators can be on at once, and "the first module to successfully authenticate the request short-circuits evaluation." <code>kubectl auth whoami</code> (GA v1.28) shows what the API server concluded.</p>
+				<div class="callout trap"><p><strong>Authenticators have no fixed order.</strong> "The API server does not guarantee the order authenticators run in." Authorizers, by contrast, run in exactly the order configured (<a href="#s5">below</a>).</p></div>
+			</div>
+
+			<!-- ===== Authn methods ===== -->
+			<h2 id="s2">Authentication methods</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">The ways to prove an identity, and which ones suit people in production.</span></p>
+				<p>The kubernetes.io hardening guide <a href="https://kubernetes.io/docs/concepts/security/hardening-guide/authentication-mechanisms/">Authentication Mechanisms</a> advises: "enable as few authentication mechanisms as possible". "For production clusters with multiple users directly accessing the Kubernetes API, it is recommended to use external authentication sources such as OIDC."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Method</th><th>How it works</th><th>Verdict and why</th></tr></thead>
+						<tbody>
+							<tr><td>X.509 client certificates</td><td data-label="How it works">A certificate signed by <code>--client-ca-file</code>; CN = username, each O = a group</td><td data-label="Verdict and why">Fine for components; weak for people. Can't be revoked, keys can't be password-protected, groups are fixed for the certificate's life</td></tr>
+							<tr><td>Static token file</td><td data-label="How it works"><code>--token-auth-file</code> CSV: token, user, uid, groups</td><td data-label="Verdict and why">"Not recommended for production servers": clear text on disk, restart to change, no rotation, no lockout</td></tr>
+							<tr><td>Bootstrap tokens</td><td data-label="How it works">Short tokens for joining nodes (<a href="d2-topic-2-2.html#s3">topic 2.2</a>)</td><td data-label="Verdict and why">Node join only, "not recommended for user authentication"</td></tr>
+							<tr><td>ServiceAccount tokens</td><td data-label="How it works">Signed JWTs (<a href="#s3">below</a>)</td><td data-label="Verdict and why">For workloads, not people</td></tr>
+							<tr><td>OIDC / JWT</td><td data-label="How it works">The identity provider's <code>id_token</code> as a bearer token</td><td data-label="Verdict and why">Recommended for people; keep tokens short-lived, because an id_token "can't be revoked"</td></tr>
+							<tr><td>Webhook token</td><td data-label="How it works">The API server sends a TokenReview to an external service</td><td data-label="Verdict and why">Flexible; needs control plane access, so rarely available on managed services</td></tr>
+							<tr><td>Authenticating proxy</td><td data-label="How it works">A proxy authenticates the user and passes the identity in headers such as <code>X-Remote-User</code></td><td data-label="Verdict and why">Works if the proxy-to-API-server link is trusted (trap below)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>OIDC with structured configuration</h3>
+				<p>The <code>--oidc-*</code> flags support a single issuer. The structured <code>AuthenticationConfiguration</code> (GA v1.34, loaded with <code>--authentication-config</code>) supports several JWT issuers, CEL rules on claims and on the resulting user, and reloads when the file changes:</p>
+				<div class="code"><span class="file">Trust the company IdP for people (AuthenticationConfiguration)</span>
+<pre><code>apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+jwt:
+- issuer:
+    url: https://idp.example.com
+    audiences:
+    - kubernetes
+  <span class="c"># reject tokens living over 1 hour</span>
+  claimValidationRules:
+  - expression: >-
+      claims.exp - claims.nbf &lt;= 3600
+    message: token lives max 1 hour
+  claimMappings:
+    username:
+      claim: email
+      <span class="c"># required when claim is set</span>
+      prefix: "oidc:"
+    groups:
+      claim: groups
+      prefix: "oidc:"
+  <span class="c"># nobody may become a system: user</span>
+  userValidationRules:
+  - expression: >-
+      !user.username.startsWith('system:')
+    message: no system names</code></pre></div>
+				<p>The prefix keeps IdP users from colliding with other identities, and the user rule stops a crafted token from claiming a <code>system:</code> name. A failed rule returns 401. Mixing a <code>jwt</code> section with any <code>--oidc-*</code> flag makes the API server exit at startup.</p>
+				<div class="callout trap"><p><strong>Authenticating proxy headers can be spoofed.</strong> The API server trusts <code>X-Remote-User</code> only from a client presenting a certificate signed by <code>--requestheader-client-ca-file</code>. If that CA also signs other certificates, and <code>--requestheader-allowed-names</code> is empty ("If empty, any CN is allowed"), any holder of such a certificate can claim to be anyone. kubernetes.io warns not to reuse a CA "used in another context" for this.</p></div>
+			</div>
+
+			<!-- ===== SA tokens ===== -->
+			<h2 id="s3">ServiceAccount tokens</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">How workload identities get credentials, how long those last, and how to cut them off.</span></p>
+				<ul>
+					<li>Every namespace has a <code>default</code> ServiceAccount, used by any Pod that doesn't set <code>serviceAccountName</code>. It gets "no permissions by default other than the default API discovery permissions", but anything granted to it goes to all those Pods. Give each workload its own ServiceAccount.</li>
+					<li>Pods get a <strong>bound token</strong> through a projected volume (default since v1.22), mounted at <code>/var/run/secrets/kubernetes.io/serviceaccount</code>. It's bound to the Pod, has an audience and an expiry, and the kubelet refreshes it.</li>
+					<li>The token is a JWT whose <code>sub</code> is <code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>, plus private claims naming the Pod, node and ServiceAccount, and a unique <code>jti</code> (GA v1.32) that appears in audit logs.</li>
+				</ul>
+				<div class="code"><span class="file">Issue short-lived tokens by hand (shell)</span>
+<pre><code><span class="c"># 10 minutes, for one audience</span>
+kubectl create token web -n shop \
+  --duration=10m \
+  --audience=https://vault.example.com
+
+<span class="c"># a token that dies with a Pod</span>
+kubectl create token web -n shop \
+  --bound-object-kind=Pod \
+  --bound-object-name=web-0</code></pre></div>
+				<p>This needs <code>create</code> on <code>serviceaccounts/token</code>, a powerful permission in its own right. Nothing records issued tokens: "There is no central record of tokens issued".</p>
+				<div class="callout trap"><p><strong>The default token lasts a year, not an hour.</strong> The automatically mounted token shows <code>expirationSeconds: 3607</code>, but with <code>--service-account-extend-token-expiration</code> (default true) the API server extends it "up to 1 year" for older clients, adding a <code>warnafter</code> claim. A stolen default token can work for months unless its Pod is deleted. If an app doesn't call the API, set <code>automountServiceAccountToken: false</code>.</p></div>
+				<h3>Revoking tokens</h3>
+				<p>"There is no specific mechanism to invalidate a token issued via TokenRequest." A bound token stops working when its Pod, Secret or Node is deleted (within 60 seconds). To kill every token of an account, delete and recreate the ServiceAccount: its new UID invalidates them all. Services that accept ServiceAccount tokens should check them with a <strong>TokenReview</strong>, which notices deleted Pods at once, rather than validating the JWT offline until it expires.</p>
+				<div class="callout retired"><p><strong>Secret-based tokens are legacy.</strong> Before v1.24, each ServiceAccount automatically got a token Secret that never expired. Since v1.24 none are created, and since v1.30 auto-generated ones unused for a year are invalidated and later deleted. You can still create one by hand: a Secret of type <code>kubernetes.io/<wbr>service-account-token</code> with the annotation <code>kubernetes.io/<wbr>service-account.name</code>. kubernetes.io says "These tokens don't expire and don't rotate" and recommends avoiding them. Manually created ones are <em>not</em> cleaned up.</p></div>
+				<h3>Trusting cluster tokens outside the cluster</h3>
+				<p>ServiceAccount issuer discovery (GA v1.21) makes the API server publish <code>/.well-known/openid-configuration</code> and its signing keys at <code>/openid/v1/jwks</code>. Cloud IAM systems or a secret store can then verify the shop's tokens and exchange them for their own credentials, if the token's audience matches. That's workload identity federation, with no static keys. The design is "OIDC compatible, but not strictly OIDC compliant".</p>
+			</div>
+
+			<!-- ===== CSR ===== -->
+			<h2 id="s4">User certificates</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Issuing a client certificate through the API, and living with the fact it can't be revoked.</span></p>
+				<p>The CertificateSigningRequest API can issue a user certificate signed by the cluster CA. Ana creates a key and a CSR with <code>/CN=ana/O=devs</code> (username <code>ana</code>, group <code>devs</code>), and an admin submits it:</p>
+				<div class="code"><span class="file">Request a 1-day certificate for Ana (CertificateSigningRequest)</span>
+<pre><code>apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: ana
+spec:
+  <span class="c"># base64 of ana.csr</span>
+  request: LS0tLS1CRUdJTi...
+  signerName: >-
+    kubernetes.io/kube-apiserver-client
+  <span class="c"># 1 day; the minimum is 600</span>
+  expirationSeconds: 86400
+  usages:
+  - client auth</code></pre></div>
+				<div class="code"><span class="file">Approve and collect it (shell)</span>
+<pre><code>kubectl get csr
+kubectl certificate approve ana
+kubectl get csr ana \
+  -o jsonpath='{.status.certificate}' \
+  | base64 -d > ana.crt</code></pre></div>
+				<p>The <code>kube-apiserver-client</code> signer is "never auto-approved". The certificate's lifetime is the smaller of <code>expirationSeconds</code> and the controller manager's <code>--cluster-signing-duration</code> (one year by default). Approving needs the special verb <code>approve</code> on <code>signers</code>, and anyone who can both create and approve these CSRs can mint certificates for "arbitrary names including duplicates of Kubernetes system components".</p>
+				<div class="callout trap"><p><strong>Certificates can't be revoked.</strong> "Any certificate that is issued remains valid until it expires." Mitigations: issue short-lived certificates; grant access through RBAC bindings on the username or group, so removing the binding leaves the certificate authenticated but authorized for nothing; never put users in <code>system:masters</code>, where no binding can be removed; and keep a record yourself, since approved CSR objects are deleted after an hour. For people, prefer OIDC.</p></div>
+			</div>
+
+			<!-- ===== Authorization ===== -->
+			<h2 id="s5">Authorization</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">The authorizer chain, the attributes it sees, and how to test a permission.</span></p>
+				<p>"Access is denied by default." "When multiple authorization modules are configured, each is checked in sequence. If any authorizer <em>approves</em> or <em>denies</em> a request, that decision is immediately returned and no other authorizer is consulted. If all modules have <em>no opinion</em> on the request, then the request is denied" (HTTP 403).</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Mode</th><th>What it does</th></tr></thead>
+						<tbody>
+							<tr><td>Node</td><td data-label="What it does">Authorizes kubelets for their own node's objects (<a href="d2-topic-2-2.html#s3">topic 2.2</a>)</td></tr>
+							<tr><td>RBAC</td><td data-label="What it does">Roles and bindings stored as API objects (GA since v1.8); only allows or has no opinion, never denies</td></tr>
+							<tr><td>Webhook</td><td data-label="What it does">"Synchronous HTTP callout" sending a SubjectAccessReview; the only mode that can explicitly deny</td></tr>
+							<tr><td>ABAC</td><td data-label="What it does">Legacy JSON policy file; "The apiserver will need to be restarted to pick up the new policy lines"</td></tr>
+							<tr><td>AlwaysAllow, AlwaysDeny</td><td data-label="What it does">Testing only</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>The default is AlwaysAllow.</strong> <code>--authorization-mode</code> "Defaults to AlwaysAllow if --authorization-config is not used". kubeadm sets <code>Node,RBAC</code>. And <code>AlwaysAllow,RBAC</code> "has the same effect as" AlwaysAllow alone, "because Kubernetes RBAC does not provide negative (deny) access rules": RBAC can never stop a request.</p></div>
+				<h3>What an authorizer sees</h3>
+				<p>Each request carries the user, groups and extra fields, the namespace, the API group, the resource and subresource (for example <code>pods/log</code>), or a non-resource path such as <code>/healthz</code>, and a verb:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>HTTP</th><th>Verb</th></tr></thead>
+						<tbody>
+							<tr><td>GET, HEAD</td><td data-label="Verb"><code>get</code> (one object), <code>list</code> (collection), <code>watch</code></td></tr>
+							<tr><td>POST</td><td data-label="Verb"><code>create</code></td></tr>
+							<tr><td>PUT, PATCH</td><td data-label="Verb"><code>update</code>, <code>patch</code></td></tr>
+							<tr><td>DELETE</td><td data-label="Verb"><code>delete</code>, <code>deletecollection</code></td></tr>
+							<tr><td>Special verbs</td><td data-label="Verb"><code>impersonate</code>, <code>bind</code>, <code>escalate</code>, <code>approve</code>, <code>sign</code>, <code>attest</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong><code>list</code> on Secrets is reading Secrets.</strong> "The <strong>get</strong>, <strong>list</strong> and <strong>watch</strong> verbs can all return the full details of a resource", so <code>list</code> on <code>secrets</code> "will reveal the <strong>data</strong>". There's no "list names only" permission. (The <code>use</code> verb belonged to PodSecurityPolicy, removed in v1.25.)</p></div>
+				<div class="code"><span class="file">Test permissions (shell)</span>
+<pre><code><span class="c"># can I create Deployments in shop?</span>
+kubectl auth can-i create deployments \
+  -n shop
+
+<span class="c"># everything I may do in shop</span>
+kubectl auth can-i --list -n shop
+
+<span class="c"># as the web ServiceAccount (needs</span>
+<span class="c"># impersonate permission)</span>
+kubectl auth can-i get pods/log -n shop \
+  --as=system:serviceaccount:shop:web</code></pre></div>
+				<p><code>can-i</code> sends a SelfSubjectAccessReview; <code>--list</code> uses a SelfSubjectRulesReview and warns that the list may be incomplete when a webhook can't list its rules. Components and extension servers use SubjectAccessReview to ask about other users. Two newer refinements: the structured <code>AuthorizationConfiguration</code> (GA v1.32) chains several webhooks with CEL <code>matchConditions</code> and a <code>failurePolicy</code>, and authorization with label and field selectors (GA v1.34) lets a webhook allow, say, listing only Pods on one node.</p>
+			</div>
+
+			<!-- ===== RBAC objects ===== -->
+			<h2 id="s6">RBAC objects</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">Roles, bindings and their fields, with the shop's permissions as examples.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Object</th><th>Scope</th><th>Holds</th></tr></thead>
+						<tbody>
+							<tr><td>Role</td><td data-label="Scope">One namespace</td><td data-label="Holds">Rules: <code>apiGroups</code>, <code>resources</code>, <code>verbs</code>, optional <code>resourceNames</code></td></tr>
+							<tr><td>ClusterRole</td><td data-label="Scope">Cluster</td><td data-label="Holds">Rules, plus cluster-scoped resources (nodes) and <code>nonResourceURLs</code></td></tr>
+							<tr><td>RoleBinding</td><td data-label="Scope">One namespace</td><td data-label="Holds"><code>subjects</code> (User, Group, ServiceAccount) and a <code>roleRef</code> to a Role or ClusterRole</td></tr>
+							<tr><td>ClusterRoleBinding</td><td data-label="Scope">Cluster</td><td data-label="Holds">Subjects and a ClusterRole, granted in every namespace</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>"Permissions are purely additive (there are no 'deny' rules)." A RoleBinding can refer to a ClusterRole: the rights then apply only in the binding's namespace, which is how the built-in <code>view</code> or <code>edit</code> roles are reused per namespace.</p>
+				<div class="code"><span class="file">Let web read Pods and logs in shop (Role and RoleBinding)</span>
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-log-reader
+  namespace: shop
+rules:
+<span class="c"># "" is the core API group</span>
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: web-reads-pods
+  namespace: shop
+subjects:
+- kind: ServiceAccount
+  name: web
+  namespace: shop
+<span class="c"># immutable once created</span>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-log-reader</code></pre></div>
+				<div class="code"><span class="file">The same with kubectl, plus Ana's access (shell)</span>
+<pre><code>kubectl create role pod-log-reader \
+  --verb=get,list,watch \
+  --resource=pods,pods/log -n shop
+
+kubectl create rolebinding web-reads \
+  --role=pod-log-reader \
+  --serviceaccount=shop:web -n shop
+
+<span class="c"># built-in view, in shop only</span>
+kubectl create rolebinding ana-view \
+  --clusterrole=view \
+  --user=ana@example.com -n shop</code></pre></div>
+				<ul>
+					<li><strong><code>resourceNames</code></strong> limits a rule to named objects. "You cannot restrict <strong>deletecollection</strong> or top-level <strong>create</strong> requests by resource name." <code>list</code> and <code>watch</code> can be limited only if the client asks with a <code>metadata.name</code> field selector. An empty list means all names.</li>
+					<li><strong>Wildcards</strong> (<code>*</code>) also cover resource types and verbs added later, so avoid them.</li>
+					<li><strong>Aggregated ClusterRoles</strong> use <code>aggregationRule.clusterRoleSelectors</code> to combine other ClusterRoles by label. The built-in roles grow this way through labels such as <code>rbac.authorization.k8s.io/aggregate-to-edit</code>, so installing a CRD can widen <code>edit</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong><code>roleRef</code> can't be changed.</strong> Updating it gives a validation error: delete and recreate the binding, or use <code>kubectl auth reconcile</code>. Subjects can be changed, which is why <code>update</code> on a binding doesn't let anyone switch which role it grants.</p></div>
+			</div>
+
+			<!-- ===== Default roles and escalation ===== -->
+			<h2 id="s7">Default roles and escalation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.2</span><span class="skill-text">The built-in roles, the guard against self-promotion, and permissions that lead to more.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Role</th><th>Can</th><th>Can't</th></tr></thead>
+						<tbody>
+							<tr><td>cluster-admin</td><td data-label="Can">Anything, anywhere; bound by default to group <code>system:masters</code></td><td data-label="Can't">Nothing is off limits</td></tr>
+							<tr><td>admin</td><td data-label="Can">Read and write most namespace resources, including Roles and RoleBindings there</td><td data-label="Can't">Change ResourceQuotas or the Namespace itself</td></tr>
+							<tr><td>edit</td><td data-label="Can">Read and write most objects, including Secrets, and run Pods as any ServiceAccount</td><td data-label="Can't">View or change Roles and RoleBindings</td></tr>
+							<tr><td>view</td><td data-label="Can">Read most objects</td><td data-label="Can't">Read Secrets, or Roles and RoleBindings</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong><code>edit</code> means every ServiceAccount's rights.</strong> It "allows accessing Secrets and running Pods as any ServiceAccount in the namespace, so it can be used to gain the API access levels of any ServiceAccount in the namespace." <code>view</code> excludes Secrets because "reading the contents of Secrets enables access to ServiceAccount credentials".</p></div>
+				<h3>Escalation prevention</h3>
+				<p>"The RBAC API prevents users from escalating privileges by editing roles or role bindings", and this applies "even when the RBAC authorizer is not in use". You can create or update a role only if you already hold every permission in it, unless you have the <code>escalate</code> verb. You can create a binding only if you hold every permission in the referenced role, unless you have the <code>bind</code> verb on that role. So <code>escalate</code> and <code>bind</code> are themselves escalation permissions.</p>
+				<h3>Permissions that lead to more</h3>
+				<p>The <a href="https://kubernetes.io/docs/concepts/security/rbac-good-practices/">RBAC good practices</a> page lists the dangerous ones:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Permission</th><th>Why it's dangerous</th></tr></thead>
+						<tbody>
+							<tr><td><code>list</code> or <code>watch</code> on Secrets</td><td data-label="Why it's dangerous">Reveals every Secret's contents</td></tr>
+							<tr><td>Creating workloads</td><td data-label="Why it's dangerous">Mount any Secret, ConfigMap or volume in the namespace, run as any ServiceAccount; "boundaries within a namespace should be considered weak"</td></tr>
+							<tr><td>Creating PersistentVolumes</td><td data-label="Why it's dangerous">hostPath volumes give host filesystem access (<a href="d2-topic-2-3.html#s6">topic 2.3</a>)</td></tr>
+							<tr><td><code>nodes/proxy</code></td><td data-label="Why it's dangerous">Exec into any container through the kubelet, bypassing audit and admission</td></tr>
+							<tr><td><code>escalate</code>, <code>bind</code>, <code>impersonate</code></td><td data-label="Why it's dangerous">Grant yourself more, or act as someone with more</td></tr>
+							<tr><td>CSR create and approve</td><td data-label="Why it's dangerous">Mint certificates for any name</td></tr>
+							<tr><td><code>create</code> on <code>serviceaccounts/token</code></td><td data-label="Why it's dangerous">Issue tokens for any ServiceAccount in scope</td></tr>
+							<tr><td>Admission webhook configurations</td><td data-label="Why it's dangerous">Read, and change, every object admitted</td></tr>
+							<tr><td>Modifying Namespaces</td><td data-label="Why it's dangerous">Lower the Pod Security level through its labels (<a href="d3-topic-3-1.html#s5">topic 3.1</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Least privilege:</strong> namespace RoleBindings over ClusterRoleBindings, no wildcards, no day-to-day <code>cluster-admin</code> (use a low-privilege account plus impersonation when needed), and nobody in <code>system:masters</code>.</li>
+					<li><strong>ServiceAccounts:</strong> from best to worst, a Role for an app-specific ServiceAccount, then the <code>default</code> account, then all accounts in a namespace, then all accounts cluster-wide. Avoid anything granted to all ServiceAccounts cluster-wide.</li>
+					<li><strong>Review regularly:</strong> look for unused or overly broad bindings, and bindings to <code>system:unauthenticated</code>. "If an attacker is able to create a user account with the same name as a deleted user, they can automatically inherit all the rights of the deleted user."</li>
+				</ul>
+				<div class="callout tip"><p><strong>Reviewing RBAC.</strong> Built in: <code>kubectl auth can-i --list --as=...</code> and <code>kubectl get rolebindings,clusterrolebindings -A -o wide</code>. Third-party tools (none of them CNCF projects) include kubectl-who-can, rbac-lookup, rakkess, rbac-tool and audit2rbac, which builds roles from audit logs.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>No User objects: people come from certificates or an IdP; workloads use namespaced ServiceAccounts (<code>system:serviceaccount:&lt;ns&gt;:&lt;name&gt;</code>, groups <code>system:serviceaccounts[:&lt;ns&gt;]</code>). Authenticators have no guaranteed order.</li>
+				<li>For people use OIDC (structured <code>AuthenticationConfiguration</code>, GA 1.34: multiple issuers, CEL rules, username prefix). Static tokens: not for production. Client certificates can't be revoked. Protect the request-header CA of an authenticating proxy.</li>
+				<li>ServiceAccount tokens: bound, projected, audience-scoped; <code>kubectl create token --duration --audience</code>. The default mounted token is extended to about a year. No auto token Secrets since 1.24; manual ones never expire or get cleaned up. Revoke by deleting the Pod or recreating the ServiceAccount; validate with TokenReview.</li>
+				<li>CSR API: signer <code>kubernetes.io/kube-apiserver-client</code>, never auto-approved, <code>expirationSeconds</code> at least 600; keep certificates short and grant through removable bindings.</li>
+				<li>Authorizers run in order; first allow or deny wins; all no-opinion = 403. Default <code>--authorization-mode</code> is AlwaysAllow (kubeadm: <code>Node,RBAC</code>). RBAC never denies; webhooks can.</li>
+				<li>RBAC: Role, ClusterRole, RoleBinding (can reuse a ClusterRole in one namespace), ClusterRoleBinding. <code>roleRef</code> is immutable. <code>resourceNames</code> can't limit create or deletecollection. <code>list</code> on Secrets reveals them.</li>
+				<li><code>edit</code> = Secrets plus every ServiceAccount in the namespace; <code>view</code> = no Secrets; <code>admin</code> manages namespace RBAC. Escalation prevention is bypassed by <code>escalate</code> and <code>bind</code>; also watch <code>impersonate</code>, <code>nodes/proxy</code>, PV creation, CSR approval, token creation, webhook configs and namespace edits.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d3-topic-3-1.html"><small>Previous</small>3.1: Pod Security Standards and Pod Security Admission</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0, plus "Authorization" as listed on the Linux Foundation's KCSA exam page.</div>
+</footer>
+
+</body>
+</html>
