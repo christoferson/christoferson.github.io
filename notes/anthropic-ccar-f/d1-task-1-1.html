@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.1: Agentic Loops | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.1: the agentic loop with the Claude API, tool definitions and tool_use blocks, all seven stop_reason values and how a loop handles each, returning tool_result blocks (ordering and parallel calls), a complete Python loop, model-driven agents versus predefined workflows, anti-patterns and iteration caps as safety nets, and the tool runner and Claude Agent SDK loops.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.1: Agentic Loops</h1>
+		<p>How an application lets Claude work through a task on its own: send a request, run the tools Claude asks for, return the results, and repeat until Claude is finished, deciding when to stop from the API's stop reason rather than from the text.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Messages API</span><span class="tag">tool_use</span><span class="tag">stop_reason</span><span class="tag">tool_result</span><span class="tag">Agent SDK</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The loop</a></li>
+				<li><a href="#s2">Tools and tool_use blocks</a></li>
+				<li><a href="#s3">Stop reasons</a></li>
+				<li><a href="#s4">Returning results</a></li>
+				<li><a href="#s5">A complete loop</a></li>
+				<li><a href="#s6">Model-driven or predefined</a></li>
+				<li><a href="#s7">Anti-patterns and safety nets</a></li>
+				<li><a href="#s8">Letting an SDK run the loop</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.1</span>
+				<p><strong>Design and implement agentic loops for autonomous task execution.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the loop's lifecycle (request, inspect <code>stop_reason</code>, run tools, return results), how tool results build up the conversation history, and the difference between Claude choosing its next step and code following a fixed sequence. In practice it asks you to write a loop that continues on <code>"tool_use"</code> and ends on <code>"end_turn"</code>, and to avoid three anti-patterns: parsing Claude's wording to decide when to stop, relying on an iteration cap as the main stopping rule, and treating the presence of text as a sign the task is done. Coordinators and subagents are task 1.2, and tool design task 2.1.</p>
+			<p>Sources: the Claude API documentation on tool use and stop reasons, the Claude Agent SDK documentation, and Anthropic's "Building effective agents" (December 2024), all checked on 8 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The code is my own, following the docs' loop pattern, and was tested with anthropic 2.6.0 and claude-agent-sdk 0.2.179 against a mocked client, not the live API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An online outdoor-gear shop builds a customer support agent. In this task it has one tool, <code>get_order</code>, and answers questions such as "Where is order A123?" Later tasks add refunds, escalation and more agents.</p></div>
+
+			<!-- ===== The loop ===== -->
+			<h2 id="s1">The loop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">The agentic loop lifecycle, from request to final answer.</span></p>
+				<p>"Building effective agents" describes agents as "typically just LLMs using tools based on environmental feedback in a loop." With the Messages API, your code is that loop:</p>
+				<ol class="steps">
+					<li><b>Send a request</b>With the conversation so far and the tool definitions.</li>
+					<li><b>Check <code>stop_reason</code></b>If it's <code>"tool_use"</code>, Claude wants one or more tools run. Anything else ends the loop.</li>
+					<li><b>Run the requested tools</b>Your code executes each <code>tool_use</code> block; Claude never runs your tools itself.</li>
+					<li><b>Return the results</b>Append Claude's whole turn, then one user message holding a <code>tool_result</code> for every call.</li>
+					<li><b>Repeat</b>The next request carries the complete history, so Claude can reason about what it learned and choose the next step.</li>
+				</ol>
+				<p>The docs put the rule simply: while <code>stop_reason == "tool_use"</code>, run the tools and continue; the loop exits on any other stop reason, after which "your application should handle" whichever one it was. The API is stateless: the only memory between iterations is the <code>messages</code> list you send back.</p>
+			</div>
+
+			<!-- ===== Tools ===== -->
+			<h2 id="s2">Tools and tool_use blocks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">What goes into a request, and what a tool call looks like coming back.</span></p>
+				<p>Each tool has a <code>name</code> (letters, digits, <code>_</code> and <code>-</code>, up to 128 characters), a <code>description</code> and an <code>input_schema</code> (JSON Schema). The docs call the description "by far the most important factor in tool performance"; tool design is task 2.1.</p>
+				<p>When Claude decides to call a tool, the response contains a <code>tool_use</code> block with an <code>id</code> (like <code>toolu_01A0...</code>), the tool <code>name</code> and an <code>input</code> object matching the schema, and the response's <code>stop_reason</code> is <code>"tool_use"</code>. The same response often starts with a <code>text</code> block ("I'll look that order up."), and can contain several <code>tool_use</code> blocks, because by default Claude may call more than one tool at once. So scan the whole <code>content</code> array; don't assume the tool call is the first or only block.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool kind</th><th>Who runs it</th><th>What your loop does</th></tr></thead>
+						<tbody>
+							<tr><td>Client tools (your own, plus Anthropic-defined ones such as bash, text editor and memory)</td><td data-label="Who runs it">Your application</td><td data-label="What your loop does">Executes the call and sends back a <code>tool_result</code></td></tr>
+							<tr><td>Server tools (web search, web fetch, code execution, tool search)</td><td data-label="Who runs it">Anthropic, inside the API</td><td data-label="What your loop does">Nothing per call: results arrive in the response. Handle <code>pause_turn</code> (<a href="#s3">below</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== Stop reasons ===== -->
+			<h2 id="s3">Stop reasons</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">Every value of stop_reason, and what the loop does with each.</span></p>
+				<p>The docs distinguish errors (HTTP 4xx and 5xx, a failed request) from <code>stop_reason</code>, which "tells you why Claude completed its response generation". There are seven values:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>stop_reason</th><th>Meaning</th><th>In the loop</th></tr></thead>
+						<tbody>
+							<tr><td><code>tool_use</code></td><td data-label="Meaning">Claude is calling a tool you need to run</td><td data-label="In the loop">Run every call, return the results, continue</td></tr>
+							<tr><td><code>end_turn</code></td><td data-label="Meaning">Claude finished naturally</td><td data-label="In the loop">Exit and use the answer</td></tr>
+							<tr><td><code>max_tokens</code></td><td data-label="Meaning">Your <code>max_tokens</code> limit was reached</td><td data-label="In the loop">Exit or continue the output; if the last block is an unfinished <code>tool_use</code>, retry with a higher limit rather than run a partial call</td></tr>
+							<tr><td><code>stop_sequence</code></td><td data-label="Meaning">One of your stop sequences was generated</td><td data-label="In the loop">Exit; <code>stop_sequence</code> says which one</td></tr>
+							<tr><td><code>pause_turn</code></td><td data-label="Meaning">A server-tool loop hit its iteration limit (10 per request by default)</td><td data-label="In the loop">Send the response back as it is to let Claude carry on, keeping any container ID</td></tr>
+							<tr><td><code>refusal</code></td><td data-label="Meaning">Claude declined to respond (HTTP 200, not an error)</td><td data-label="In the loop">Exit; <code>stop_details</code> gives the category</td></tr>
+							<tr><td><code>model_<wbr>context_<wbr>window_<wbr>exceeded</code></td><td data-label="Meaning">The response filled the model's context window</td><td data-label="In the loop">Exit; treat the output as truncated but valid</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>"Stop on end_turn" isn't the whole rule.</strong> The exam guide frames the loop as continue on <code>tool_use</code>, stop on <code>end_turn</code>. That's the core, but a loop that only checks for <code>end_turn</code> can spin forever on a refusal or a token limit. Write it as: continue while the reason is <code>tool_use</code>; otherwise exit and branch on which reason it was. Only <code>end_turn</code> means the task finished normally.</p></div>
+				<div class="callout tip"><p><strong><code>pause_turn</code> isn't "done".</strong> It only happens with server tools, and never while a client <code>tool_use</code> is waiting for you. A loop that uses web search or code execution needs a branch that sends the paused response straight back.</p></div>
+			</div>
+
+			<!-- ===== Results ===== -->
+			<h2 id="s4">Returning results</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">How tool results are added to the conversation history.</span></p>
+				<p>The Claude API has no separate tool role: results go back in a <strong>user</strong> message as <code>tool_result</code> blocks, each pointing at its call with <code>tool_use_id</code>. <code>content</code> can be a string or a list of blocks, and <code>is_error: true</code> marks a failure so Claude can retry or work around it.</p>
+				<div class="code"><span class="file">A tool result message (JSON)</span>
+<pre><code>{
+  "role": "user",
+  "content": [
+    {
+      "type": "tool_result",
+      "tool_use_id": "toolu_01A09q90...",
+      "content": "A123: shipped, ETA 2d"
+    }
+  ]
+}</code></pre></div>
+				<p>The ordering rules are strict:</p>
+				<ul>
+					<li>First append Claude's full assistant turn (its whole <code>content</code>, text and tool calls), then the user message with the results. Nothing may come between them.</li>
+					<li>In that user message, the <code>tool_result</code> blocks come <strong>first</strong>. Text before them is a 400 error.</li>
+					<li>Every <code>tool_use</code> needs a result, all in <strong>one</strong> user message. If you skip a call (because an earlier one failed, say), still return a result for it with <code>is_error: true</code> and a reason.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Two quiet mistakes.</strong> Sending parallel results in separate user messages works, but the docs say it "teaches" Claude to stop making parallel calls. And adding your own text after the results is a common cause of empty <code>end_turn</code> responses; send only the results. To limit Claude to one call per turn, set <code>disable_parallel_tool_use: true</code>, which goes <em>inside</em> <code>tool_choice</code>, not at the top level.</p></div>
+			</div>
+
+			<!-- ===== Complete loop ===== -->
+			<h2 id="s5">A complete loop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">Loop control flow driven by stop_reason, with results fed back each iteration.</span></p>
+				<div class="code"><span class="file">support_agent.py (Python, anthropic SDK)</span>
+<pre><code>import anthropic
+
+client = anthropic.Anthropic()
+
+tools = [{
+    "name": "get_order",
+    "description": (
+        "Look up an order by ID. "
+        "Returns status and ETA."),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "order_id": {
+                "type": "string"},
+        },
+        "required": ["order_id"],
+    },
+}]
+
+
+def run_tool(name, args):
+    if name == "get_order":
+        oid = args["order_id"]
+        <span class="c"># Stand-in for a real lookup</span>
+        return f"{oid}: shipped, ETA 2d"
+    raise ValueError(f"Unknown: {name}")
+
+
+messages = [{
+    "role": "user",
+    "content": "Where is order A123?",
+}]
+
+while True:
+    resp = client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages,
+    )
+    <span class="c"># Keep the whole assistant turn</span>
+    messages.append({
+        "role": "assistant",
+        "content": resp.content,
+    })
+    if resp.stop_reason != "tool_use":
+        break  <span class="c"># handled below</span>
+
+    results = []
+    for b in resp.content:
+        if b.type != "tool_use":
+            continue
+        try:
+            out = run_tool(b.name,
+                           b.input)
+            err = False
+        except Exception as e:
+            out, err = str(e), True
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": b.id,
+            "content": out,
+            "is_error": err,
+        })
+    <span class="c"># All results in ONE user message</span>
+    messages.append({
+        "role": "user",
+        "content": results,
+    })
+
+if resp.stop_reason == "end_turn":
+    for b in resp.content:
+        if b.type == "text":
+            print(b.text)
+else:
+    print("Stopped:", resp.stop_reason)</code></pre></div>
+				<p>Things to notice: the loop never looks at Claude's wording; a tool failure goes back as an error result instead of crashing the loop; and the number of iterations isn't known in advance. As the docs' tutorial says, the loop "might run once or several times depending on how Claude breaks down the task." This loop has no server tools, so it needs no <code>pause_turn</code> branch.</p>
+			</div>
+
+			<!-- ===== Model-driven ===== -->
+			<h2 id="s6">Model-driven or predefined</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">When Claude should choose the next step, and when code should.</span></p>
+				<p>"Building effective agents" separates two designs. <strong>Workflows</strong> are "systems where LLMs and tools are orchestrated through predefined code paths"; <strong>agents</strong> are "systems where LLMs dynamically direct their own processes and tool usage".</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th></th><th>Predefined workflow</th><th>Model-driven agent loop</th></tr></thead>
+						<tbody>
+							<tr><td>Who picks the next step</td><td data-label="Predefined workflow">Your code: a fixed sequence or decision tree</td><td data-label="Model-driven agent loop">Claude, from the conversation and tool results so far</td></tr>
+							<tr><td>Number of steps</td><td data-label="Predefined workflow">Known in advance</td><td data-label="Model-driven agent loop">Varies with the task</td></tr>
+							<tr><td>Strength</td><td data-label="Predefined workflow">Predictability and consistency</td><td data-label="Model-driven agent loop">Flexibility for open-ended problems</td></tr>
+							<tr><td>Fits</td><td data-label="Predefined workflow">Well-defined tasks, such as "classify, then route to one of three handlers"</td><td data-label="Model-driven agent loop">Problems "where it's difficult or impossible to predict the required number of steps"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The article's advice is to start with the simplest design that works and add agency only when it pays off. The shop's order questions vary a lot (one lookup, or a lookup and then a returns check), so a loop where Claude decides fits better than a hard-coded sequence. Rules that must <em>always</em> hold, such as "verify the customer before a refund", belong in code rather than in Claude's choices; that's task 1.4.</p>
+			</div>
+
+			<!-- ===== Anti-patterns ===== -->
+			<h2 id="s7">Anti-patterns and safety nets</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">Three ways to decide "done" wrongly, and where an iteration cap fits.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Anti-pattern</th><th>Why it fails</th><th>Instead</th></tr></thead>
+						<tbody>
+							<tr><td>Parsing Claude's words ("I'm done", "FINAL ANSWER") to end the loop</td><td data-label="Why it fails">Phrasing varies; the docs say not to rely on formatting conventions in generated text</td><td data-label="Instead">Use <code>stop_reason</code>. The docs: if you're writing a regex to pull a decision out of the output, "that decision should have been a tool call"</td></tr>
+							<tr><td>Treating any text in the response as completion</td><td data-label="Why it fails">Tool-call responses often include text ("Let me check..."), and an <code>end_turn</code> can even be empty</td><td data-label="Instead">Only <code>stop_reason</code> says whether Claude is finished</td></tr>
+							<tr><td>An iteration cap as the main way to stop</td><td data-label="Why it fails">Cuts off tasks that legitimately need more steps, and hides why the loop didn't finish</td><td data-label="Instead">Let the task end on <code>end_turn</code>; keep a cap only as a safety net that reports an error</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Caps still have a place. "Building effective agents" notes it's "common to include stopping conditions (such as a maximum number of iterations) to maintain control." Anthropic's own tooling treats them that way: the caps are optional, unlimited by default, and hitting one is reported as an error, not a success.</p>
+				<div class="callout tip"><p><strong>Spotting the right answer.</strong> In a question about loop termination, the answer that checks <code>stop_reason</code> beats one that inspects the text, counts iterations or searches for keywords. A cap appears in a good answer only as an extra guard against runaway loops or cost.</p></div>
+			</div>
+
+			<!-- ===== SDKs ===== -->
+			<h2 id="s8">Letting an SDK run the loop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.1</span><span class="skill-text">The tool runner and the Claude Agent SDK, which implement the same loop for you.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>What it does</th><th>Stopping</th></tr></thead>
+						<tbody>
+							<tr><td>Your own loop (<a href="#s5">above</a>)</td><td data-label="What it does">Full control; the docs recommend it when you need human approval, custom logging or conditional execution</td><td data-label="Stopping">Whatever you write</td></tr>
+							<tr><td>Tool runner (beta), <code>client.beta.<wbr>messages.<wbr>tool_runner</code></td><td data-label="What it does">Runs your <code>@beta_tool</code> functions, manages the history and passes tool exceptions back as error results</td><td data-label="Stopping">Ends when a response has no tool call; <code>max_iterations</code> is optional</td></tr>
+							<tr><td>Claude Agent SDK, <code>query()</code> or <code>ClaudeSDKClient</code></td><td data-label="What it does">Runs "the same execution loop that powers Claude Code", with built-in tools (Read, Bash, Grep and more), hooks and sessions</td><td data-label="Stopping">Ends when Claude replies without tool calls; <code>max_turns</code> and <code>max_budget_usd</code> default to no limit</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Agent SDK with a safety net (Python)</span>
+<pre><code>import anyio
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage, query)
+
+opts = ClaudeAgentOptions(
+    max_turns=30,  <span class="c"># runaway guard</span>
+)
+
+
+async def main():
+    async for msg in query(
+            prompt="List open tickets",
+            options=opts):
+        if isinstance(msg, ResultMessage):
+            <span class="c"># success, error_max_turns..</span>
+            print(msg.subtype)
+
+anyio.run(main)</code></pre></div>
+				<p>When the Agent SDK stops, it emits a result message whose <code>subtype</code> says why: <code>success</code> (with the final <code>result</code>), or an error such as <code>error_max_turns</code> or <code>error_max_budget_usd</code>, which has no <code>result</code> field. Every result carries the cost, usage, turn count and session ID.</p>
+				<div class="callout retired"><p><strong>Renamed: Claude Code SDK.</strong> On 29 September 2025 the Claude Code SDK became the <strong>Claude Agent SDK</strong>: packages <code>claude-agent-sdk</code> (Python) and <code>@anthropic-ai/claude-agent-sdk</code> (TypeScript), and <code>ClaudeCodeOptions</code> became <code>ClaudeAgentOptions</code>. The API docs moved too: docs.anthropic.com and docs.claude.com now redirect to platform.claude.com, and the Agent SDK docs are on code.claude.com.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The loop: request, check <code>stop_reason</code>, run every <code>tool_use</code>, return the results, repeat with the full history. The API is stateless; the <code>messages</code> list is the memory.</li>
+				<li>Continue only while <code>stop_reason</code> is <code>tool_use</code>. Exit on anything else and branch: <code>end_turn</code> (done), <code>max_tokens</code>, <code>stop_sequence</code>, <code>pause_turn</code> (send it back: server tools), <code>refusal</code>, <code>model_context_window_exceeded</code>.</li>
+				<li>Results go in a user message as <code>tool_result</code> blocks with <code>tool_use_id</code>: right after the assistant turn, results first, one result per call, all in one message, <code>is_error: true</code> for failures.</li>
+				<li>Agents let Claude choose the next step; workflows follow predefined code paths. Use an agent when the number of steps can't be predicted, and put must-always rules in code.</li>
+				<li>Don't end the loop by parsing text, by the presence of text, or by an iteration cap. Caps are a safety net that reports an error (Agent SDK <code>error_max_turns</code>).</li>
+				<li>The tool runner (beta) and the Claude Agent SDK (renamed from the Claude Code SDK in September 2025) run the same loop for you; both stop when Claude replies without tool calls.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="index.html"><small>Previous</small>CCAR-F overview</a>
+				<a class="next" href="index.html"><small>Next</small>CCAR-F overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Short quotes from the Claude API and Claude Agent SDK documentation and from "Building effective agents" (Anthropic), with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
