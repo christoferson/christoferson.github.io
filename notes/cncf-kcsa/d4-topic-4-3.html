@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.3: Network Attacker, Sensitive Data, Privilege Escalation | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 4.3, from the defender's side: attackers on the cluster network (flat network, control plane ports, spoofing, externalIPs, metadata, unencrypted traffic), paths to sensitive data (Secrets via RBAC and Pod creation, etcd, nodes, tokens, logs, volumes, Helm), privilege escalation from container to node, within the API, from node to cluster and to the cloud, and how to detect and prevent each.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Kubernetes Threat Model &middot; 16%</span>
+		<h1>4.3: Attacker on the Network, Access to Sensitive Data, Privilege Escalation</h1>
+		<p>What an attacker inside a Kubernetes&reg; cluster tries next: move across the network, reach secrets and credentials, and turn a small foothold into control of a node, the cluster or the cloud account. Seen from the defender's side: what enables each step, and what detects and stops it.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Lateral movement</span><span class="tag">Credential access</span><span class="tag">Escape to host</span><span class="tag">RBAC escalation</span><span class="tag">Detection</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The threat matrices</a></li>
+				<li><a href="#s2">Attacker on the network</a></li>
+				<li><a href="#s3">Access to sensitive data</a></li>
+				<li><a href="#s4">Privilege escalation</a></li>
+				<li><a href="#s5">Detecting these steps</a></li>
+				<li><a href="#s6">Defender self-checks</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 4.3</span>
+				<p><strong>Attacker on the Network. Access to Sensitive Data. Privilege Escalation.</strong></p>
+			</div>
+			<p>The curriculum gives only these names. This page continues from <a href="d4-topic-4-2.html">topic 4.2</a>: once an attacker has code running in a container, these are the three things they try next. Each is described the way public threat matrices do, then mapped to the misconfigurations that enable it and the controls covered on earlier pages. As the Microsoft matrix says of itself, the purpose "is to educate readers on the potential of Kubernetes-based tactics, techniques, and procedures (TTPs). It is not to teach how to weaponize or specifically abuse them."</p>
+			<p>Sources: kubernetes.io (CC BY 4.0), the Microsoft Threat Matrix for Kubernetes (CC BY 4.0), MITRE ATT&amp;CK&reg; (under MITRE's terms) and the Falco rules (Apache-2.0). Public incident reports are summarized in a line each.</p>
+			<div class="callout note"><p><strong>Running example.</strong> Picking up from 4.2: an attacker is running code in one shop <code>api</code> Pod. For each step they might try, the review asks: would it work here, would we see it, and what stops it?</p></div>
+
+			<!-- ===== Matrices ===== -->
+			<h2 id="s1">The threat matrices</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">Where these three goals sit in the public catalogues.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Goal</th><th>Microsoft Threat Matrix techniques</th><th>MITRE ATT&amp;CK Containers</th></tr></thead>
+						<tbody>
+							<tr><td>Attacker on the network</td><td data-label="Microsoft Threat Matrix techniques">Network mapping, cluster internal networking, access Kubelet API, access Kubernetes API server, exposed sensitive interfaces, ARP poisoning and IP spoofing, CoreDNS poisoning</td><td data-label="MITRE ATT&amp;CK Containers">T1046 Network Service Discovery, T1613 Container and Resource Discovery</td></tr>
+							<tr><td>Access to sensitive data</td><td data-label="Microsoft Threat Matrix techniques">List K8S secrets, container service account, application credentials in configuration files, mount service principal, access managed identity credentials, instance metadata API, images from a private registry, collecting data from Pod</td><td data-label="MITRE ATT&amp;CK Containers">T1552.007 Container API, T1552.001 Credentials In Files, T1528 Steal Application Access Token</td></tr>
+							<tr><td>Privilege escalation</td><td data-label="Microsoft Threat Matrix techniques">Privileged container, cluster-admin binding, hostPath mount, access cloud resources</td><td data-label="MITRE ATT&amp;CK Containers">T1611 Escape to Host, T1068 Exploitation for Privilege Escalation, T1098.006 Additional Container Cluster Roles, T1078 Valid Accounts</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The Microsoft matrix pairs each technique with numbered mitigations, for example "Adhere to least-privilege principle", "Network Segmentation", "Restricting cloud metadata API access", "Disable Service Account Auto Mount" and "Use NodeRestriction Admission Controller". Those names are a good summary of this page's defences.</p>
+				<div class="callout trap"><p><strong>The two matrices don't line up exactly.</strong> Microsoft maps ARP and CoreDNS poisoning to MITRE T1557 (Adversary-in-the-Middle), and metadata theft to T1552.005, but neither technique is on ATT&amp;CK's <em>Containers</em> matrix: they sit on its Linux and cloud (IaaS) matrices. The Microsoft matrix also still uses the tactic name "Defense Evasion", which MITRE split in 2026 (<a href="d4-topic-4-2.html#s1">topic 4.2</a>).</p></div>
+			</div>
+
+			<!-- ===== Network ===== -->
+			<h2 id="s2">Attacker on the network</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">What a compromised Pod can reach and intercept, and the controls that narrow it.</span></p>
+				<p>The starting point is kubernetes.io's own warning: "By default, all pods in a Kubernetes cluster are allowed to communicate with each other, and all network traffic is unencrypted. This can lead to security vulnerabilities where traffic is accidentally or maliciously sent to an unintended destination, or is intercepted by a workload on a compromised node."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Risk</th><th>What enables it</th><th>Prevent</th></tr></thead>
+						<tbody>
+							<tr><td>Mapping and reaching every Pod and Service</td><td data-label="What enables it">No NetworkPolicy, or a CNI that ignores it; cluster DNS answers for every namespace</td><td data-label="Prevent">Default deny per namespace plus allow lists; ClusterNetworkPolicy guardrails (<a href="d3-topic-3-4.html#s5">topic 3.4</a>)</td></tr>
+							<tr><td>Reaching the API server, kubelet or etcd</td><td data-label="What enables it">Control plane and node ports reachable from the Pod network; anonymous kubelet; a public API endpoint</td><td data-label="Prevent">Egress policy to node and control plane addresses; kubelet Webhook authn and authz; etcd firewall and mTLS; private endpoint (<a href="d2-topic-2-1.html#s1">topic 2.1</a>, <a href="d2-topic-2-2.html#s1">2.2</a>)</td></tr>
+							<tr><td>Spoofing neighbours on the node</td><td data-label="What enables it">A bridge-based CNI plus a container with <code>NET_RAW</code> (granted by default on containerd); CVE-2020-10749</td><td data-label="Prevent">Drop <code>NET_RAW</code> (Restricted drops all capabilities); a CNI that filters spoofed traffic; TLS with certificate checks</td></tr>
+							<tr><td>Intercepting a Service's traffic</td><td data-label="What enables it">Users who can set <code>externalIPs</code> or patch <code>services/status</code> (CVE-2020-8554, which has no patch)</td><td data-label="Prevent">The <code>DenyServiceExternalIPs</code> admission plugin (off by default); never grant <code>patch</code> on <code>services/status</code> (<a href="d2-topic-2-2.html#s5">topic 2.2</a>)</td></tr>
+							<tr><td>Redirecting names</td><td data-label="What enables it">Write access to the CoreDNS ConfigMap in <code>kube-system</code></td><td data-label="Prevent">Restrict writes in <code>kube-system</code>; audit changes there</td></tr>
+							<tr><td>Cloud credentials from the metadata service</td><td data-label="What enables it">Pod egress to <code>169.254.169.254</code>; a broad node role</td><td data-label="Prevent">Block metadata egress; workload identity; least-privilege node role (<a href="d1-topic-1-1.html#s5">topic 1.1</a>)</td></tr>
+							<tr><td>Reading traffic in transit</td><td data-label="What enables it">Plaintext east-west traffic</td><td data-label="Prevent">Mesh mTLS or CNI encryption; TLS in the app (<a href="d2-topic-2-3.html#s1">topic 2.3</a>, <a href="index.html#d5">5.2</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>NetworkPolicy has two blind spots here.</strong> It doesn't cover Pods with <code>hostNetwork: true</code>, which can still reach the metadata service and node ports, and a CNI that doesn't implement it silently ignores it. Pair network policy with Pod Security, which forbids <code>hostNetwork</code> at Baseline.</p></div>
+			</div>
+
+			<!-- ===== Data ===== -->
+			<h2 id="s3">Access to sensitive data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">The paths to Secrets, tokens and data, and the control for each.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Path</th><th>What enables it</th><th>Control</th></tr></thead>
+						<tbody>
+							<tr><td>The mounted ServiceAccount token</td><td data-label="What enables it">Automount on by default; a ServiceAccount with broad RBAC</td><td data-label="Control"><code>automountServiceAccountToken: false</code>; least privilege for every ServiceAccount (<a href="d3-topic-3-2.html#s3">topic 3.2</a>)</td></tr>
+							<tr><td>Listing Secrets through the API</td><td data-label="What enables it">Roles with <code>list</code> or <code>watch</code> on Secrets: "<code>list</code> and <code>watch</code> access also effectively allow for users to reveal the Secret contents"</td><td data-label="Control"><code>get</code> on named Secrets only; <code>view</code> excludes Secrets</td></tr>
+							<tr><td>Creating Pods</td><td data-label="What enables it">Any right to create workloads in a namespace means mounting any Secret and running as any ServiceAccount there</td><td data-label="Control">Limit workload creation; separate namespaces by trust; admission policy</td></tr>
+							<tr><td>etcd and its backups</td><td data-label="What enables it">No encryption at rest; etcd reachable; unencrypted backups</td><td data-label="Control">KMS v2 encryption; etcd mTLS and firewall; "Always encrypt your backups" (<a href="d3-topic-3-3.html#s5">topic 3.3</a>)</td></tr>
+							<tr><td>The node</td><td data-label="What enables it">Root on a node reaches every Secret mounted there and the kubelet's credentials</td><td data-label="Control">Pod Security to prevent escapes; the Node authorizer limits a kubelet to its own Pods' Secrets</td></tr>
+							<tr><td>Env vars, logs, images, ConfigMaps</td><td data-label="What enables it">Secrets in environment variables, echoed in logs, baked into images, or stored in ConfigMaps</td><td data-label="Control">Files not env vars; secret scanning; "ConfigMaps are not used to hold confidential data" (<a href="d3-topic-3-3.html#s4">topic 3.3</a>)</td></tr>
+							<tr><td>Data in Pods and volumes</td><td data-label="What enables it"><code>pods/exec</code>, <code>kubectl cp</code>, checkpoints, snapshots, released PersistentVolumes</td><td data-label="Control">Restrict <code>pods/exec</code> and <code>nodes/proxy</code>; restrict snapshot and PV rights (<a href="d2-topic-2-3.html#s7">topic 2.3</a>)</td></tr>
+							<tr><td>Helm release data</td><td data-label="What enables it">Release values, including passwords, stored in Secrets in the release namespace</td><td data-label="Control">Restrict Secret reads there; use external secrets instead of values</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The Security Checklist adds a preference: injecting secrets from third-party storage "should be done preferentially as compared to providing the pods service account RBAC access to secrets." And "Securing a Cluster" warns that integrations which ask to "view all secrets on your cluster" are "effectively making that component a cluster admin".</p>
+				<div class="callout trap"><p><strong>Encryption at rest doesn't stop API readers.</strong> It protects etcd and its backups. Anyone the API authorizes to read a Secret still gets the plaintext value, so RBAC and token hygiene matter just as much.</p></div>
+			</div>
+
+			<!-- ===== Privesc ===== -->
+			<h2 id="s4">Privilege escalation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">The four ladders an attacker climbs, and what breaks each rung.</span></p>
+				<h3>Container to node</h3>
+				<p>The Microsoft matrix describes this tactic as "getting access to the node from a container, gaining higher privileges in the cluster, and even getting access to the cloud resources". What makes escaping to the node easy:</p>
+				<ul>
+					<li><code>privileged: true</code>, host namespaces (<code>hostPID</code>, <code>hostNetwork</code>, <code>hostIPC</code>), writable <code>hostPath</code> mounts, and powerful capabilities such as <code>SYS_ADMIN</code>;</li>
+					<li>running as root without user namespaces, with <code>allowPrivilegeEscalation</code> left at its default of true;</li>
+					<li>an unpatched runtime or kernel: for example runc's "Leaky Vessels" bug, CVE-2024-21626 (<a href="d2-topic-2-2.html#s4">topic 2.2</a>).</li>
+				</ul>
+				<p>Defences: Pod Security, user namespaces (<code>hostUsers: false</code>, GA v1.36), seccomp and AppArmor or SELinux, sandboxed runtimes, and patching (<a href="d1-topic-1-2.html#s5">topic 1.2</a>). "Securing a Cluster" sums it up: administrators "who wish to prevent client applications from escaping their containers should apply the <strong>Baseline</strong> or <strong>Restricted</strong> Pod Security Standard."</p>
+				<div class="callout trap"><p><strong>Baseline vs Restricted on escalation.</strong> Baseline "prevents known privilege escalations": no privileged mode, host namespaces, hostPath or extra capabilities. But <code>allowPrivilegeEscalation: false</code>, dropping all capabilities (including <code>NET_RAW</code>), running as non-root and requiring seccomp are <em>Restricted</em> rules (<a href="d3-topic-3-1.html#s3">topic 3.1</a>).</p></div>
+				<h3>Within the API</h3>
+				<p>RBAC good practices: "Within Kubernetes RBAC there are a number of privileges which, if granted, can allow a user or a service account to escalate their privileges in the cluster or affect systems outside the cluster."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Permission</th><th>Leads to</th></tr></thead>
+						<tbody>
+							<tr><td>Create (Cluster)RoleBindings plus <code>bind</code>, or <code>escalate</code> on roles</td><td data-label="Leads to">Granting yourself cluster-admin (Microsoft: "cluster-admin binding")</td></tr>
+							<tr><td><code>impersonate</code></td><td data-label="Leads to">Acting as any user, group or ServiceAccount allowed</td></tr>
+							<tr><td>Create workloads</td><td data-label="Leads to">"The API access levels of any service account in that namespace"; with privileged Pods allowed, node access</td></tr>
+							<tr><td><code>nodes/proxy</code>, even <code>get</code></td><td data-label="Leads to">Commands in any container on the node, without audit or admission</td></tr>
+							<tr><td>Create and approve CSRs</td><td data-label="Leads to">Certificates with "arbitrary names including duplicates of Kubernetes system components"</td></tr>
+							<tr><td>Create <code>serviceaccounts/token</code></td><td data-label="Leads to">Tokens for powerful ServiceAccounts</td></tr>
+							<tr><td>Write webhook configurations</td><td data-label="Leads to">Reading and changing every admitted object</td></tr>
+							<tr><td>Patch Namespaces</td><td data-label="Leads to">Lowering the Pod Security level</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>RBAC's built-in escalation check applies "even when the RBAC authorizer is not in use", and only <code>escalate</code> and <code>bind</code> get around it (<a href="d3-topic-3-2.html#s7">topic 3.2</a>).</p>
+				<h3>Node to cluster, and cluster to cloud</h3>
+				<ul>
+					<li><strong>Node to cluster:</strong> a stolen kubelet credential is limited by the Node authorizer (only its own Node and its Pods' objects) and by NodeRestriction (only its own Node and Pods; no protected labels). NodeRestriction isn't in the API server's default plugin list, but kubeadm enables it. CVE-2020-8559 was a "privilege escalation from compromised node to cluster" (<a href="d2-topic-2-2.html#s3">topic 2.2</a>).</li>
+					<li><strong>Cluster to cloud:</strong> node roles and managed identities reachable through the metadata service, or cloud credential files on the node. "These credentials can be used to escalate within the cluster or to other cloud services under the same account." Block metadata access from Pods, give each workload its own cloud identity, and keep node roles minimal.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Detection ===== -->
+			<h2 id="s5">Detecting these steps</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">Signals in the audit log and at runtime.</span></p>
+				<p><strong>Audit log</strong> (<a href="d3-topic-3-5.html#s5">topic 3.5</a>): events with <code>impersonatedUser</code>; writes in <code>rbac.authorization.k8s.io</code>; <code>list</code> or <code>watch</code> on Secrets; bursts of 403s from one identity; <code>externalIPs</code> being set or <code>services/status</code> patched by a user; <code>pods/exec</code>, CSR approvals, <code>serviceaccounts/token</code> creation and webhook configuration changes. Direct kubelet API access won't appear.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Falco rule</th><th>Ruleset</th><th>Loaded by default?</th></tr></thead>
+						<tbody>
+							<tr><td>Contact K8S API Server From Container</td><td data-label="Ruleset">Stable</td><td data-label="Loaded by default?">Yes</td></tr>
+							<tr><td>Read sensitive file untrusted</td><td data-label="Ruleset">Stable</td><td data-label="Loaded by default?">Yes</td></tr>
+							<tr><td>Packet socket created in container (can indicate ARP spoofing)</td><td data-label="Ruleset">Stable</td><td data-label="Loaded by default?">Yes</td></tr>
+							<tr><td>Launch Privileged Container</td><td data-label="Ruleset">Incubating</td><td data-label="Loaded by default?">No</td></tr>
+							<tr><td>Contact cloud metadata service from container</td><td data-label="Ruleset">Incubating</td><td data-label="Loaded by default?">No</td></tr>
+							<tr><td>Launch Sensitive Mount Container</td><td data-label="Ruleset">Sandbox</td><td data-label="Loaded by default?">No</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Falco's separate <code>k8saudit</code> plugin reads the audit log instead of system calls, with rules such as "Create Privileged Pod", "Attach to cluster-admin Role", "Anonymous Request Allowed" and "K8s Secret Get Successfully".</p>
+				<div class="callout tip"><p><strong>Check which rules are on.</strong> A default Falco install loads only the stable rules. Detection of privileged Pod launches or metadata access needs the incubating or sandbox rulesets, or the k8saudit plugin.</p></div>
+			</div>
+
+			<!-- ===== Self-checks ===== -->
+			<h2 id="s6">Defender self-checks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 4.3</span><span class="skill-text">Quick checks that show how far an attacker in the shop could get.</span></p>
+				<div class="code"><span class="file">What could the api ServiceAccount do? (shell)</span>
+<pre><code><span class="c"># needs impersonate rights yourself</span>
+kubectl auth can-i --list \
+  --as=system:serviceaccount:shop:api \
+  -n shop
+
+<span class="c"># can it climb? each should say "no"</span>
+S=system:serviceaccount:shop:api
+kubectl auth can-i escalate \
+  clusterroles --as="$S"
+kubectl auth can-i bind \
+  clusterroles --as="$S"
+kubectl auth can-i impersonate \
+  serviceaccounts --as="$S"</code></pre></div>
+				<div class="code"><span class="file">Find privileged or hostPath Pods (shell, using jq)</span>
+<pre><code>kubectl get pods -A -o json \
+  | jq -r '
+  .items[]
+  | select(
+      any((.spec.containers
+        + (.spec.initContainers
+           // []))[];
+        .securityContext.privileged
+          == true)
+      or any(.spec.volumes[]?;
+        .hostPath != null))
+  | .metadata.namespace + "/"
+    + .metadata.name'</code></pre></div>
+				<div class="code"><span class="file">Enforce Restricted on the shop namespace (shell)</span>
+<pre><code>L=pod-security.kubernetes.io
+kubectl label --overwrite ns shop \
+  "$L/enforce=restricted" \
+  "$L/warn=restricted" \
+  "$L/audit=restricted"</code></pre></div>
+				<p>Expect system namespaces such as <code>kube-system</code> to appear in the privileged and hostPath list: CNI agents and kube-proxy need host access. Anything else is a finding to review.</p>
+				<div class="callout tip"><p><strong>Two public incidents, one lesson.</strong> In 2018 researchers reported a car maker's Kubernetes console open without a password, with cloud credentials reachable from a Pod and the cluster used for crypto-mining. In a 2018 bug bounty report, a server-side request forgery flaw at an e-commerce company reached a cloud metadata service and, through the credentials it exposed, gave root on Kubernetes-hosted instances. In both, an exposed interface or the metadata service turned a small foothold into broad access: the boundaries in <a href="d4-topic-4-1.html#s6">topic 4.1</a>.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Matrices: Microsoft (network mapping, cluster internal networking, kubelet and API server access, ARP and CoreDNS poisoning; list secrets, container service account, metadata; privileged container, cluster-admin binding, hostPath, cloud resources) and MITRE Containers (T1046, T1613, T1552.007, T1528, T1611, T1068, T1098.006). T1557 and T1552.005 aren't on the Containers matrix.</li>
+				<li>Network: the default is open and unencrypted. Default-deny policies, blocked control plane ports and metadata from Pods, no <code>NET_RAW</code>, <code>DenyServiceExternalIPs</code> (CVE-2020-8554 has no patch), locked-down CoreDNS config, mTLS or CNI encryption. NetworkPolicy misses hostNetwork Pods.</li>
+				<li>Sensitive data: the mounted token, <code>list</code> or <code>watch</code> on Secrets, Pod creation, etcd and backups, nodes, env vars, logs, images, ConfigMaps, exec and snapshots, Helm releases. Encryption at rest doesn't stop authorized API readers.</li>
+				<li>Container to node: privileged, host namespaces, hostPath, <code>SYS_ADMIN</code>, root, runtime CVEs. Baseline blocks the known escapes; <code>allowPrivilegeEscalation: false</code>, drop ALL, non-root and seccomp are Restricted. Add user namespaces and sandboxes.</li>
+				<li>Within the API: <code>escalate</code>, <code>bind</code>, <code>impersonate</code>, workload creation, <code>nodes/proxy</code>, CSR approval, token creation, webhook configs, namespace edits. Node to cluster: Node authorizer plus NodeRestriction (not default; kubeadm enables it). Cluster to cloud: metadata and node roles; use workload identity.</li>
+				<li>Detect with audit signals (impersonation, RBAC writes, Secret lists, 403 bursts) and Falco (only stable rules load by default; privileged-launch and metadata rules are incubating). Self-check with <code>kubectl auth can-i --list --as=...</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d4-topic-4-2.html"><small>Previous</small>4.2: Persistence, Denial of Service, Malicious Code</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA and Falco are marks of The Linux Foundation. MITRE ATT&amp;CK and ATT&amp;CK are registered trademarks of The MITRE Corporation; technique names and IDs &copy; 2026 The MITRE Corporation, reproduced with permission under its terms of use. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors) and the Microsoft Threat Matrix for Kubernetes, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; Falco rule names from falcosecurity/rules (Apache-2.0); incident reports summarized, not quoted; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
