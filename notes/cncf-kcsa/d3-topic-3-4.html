@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.4: Isolation and Segmentation, Network Policy | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 3.4: namespaces as a security boundary and what they don't isolate, multi-tenancy patterns, ResourceQuota and LimitRange against noisy neighbours, NetworkPolicy semantics in depth (isolation per direction, additive rules, AND vs OR selectors, ipBlock, ports, DNS), a default-deny policy set, what NetworkPolicy can't do, Cilium and Calico extensions, ClusterNetworkPolicy tiers and actions, testing and CVE-2024-7598.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Kubernetes Security Fundamentals &middot; 22%</span>
+		<h1>3.4: Isolation and Segmentation, Network Policy</h1>
+		<p>Dividing a Kubernetes&reg; cluster into safer pieces: what namespaces separate and what they don't, quotas against noisy neighbours, and network policies that decide which Pods may talk to which.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Namespaces</span><span class="tag">Multi-tenancy</span><span class="tag">ResourceQuota</span><span class="tag">NetworkPolicy</span><span class="tag">Default deny</span><span class="tag">ClusterNetworkPolicy</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Namespaces as a boundary</a></li>
+				<li><a href="#s2">Sharing a cluster safely</a></li>
+				<li><a href="#s3">Quotas and limits</a></li>
+				<li><a href="#s4">How NetworkPolicy works</a></li>
+				<li><a href="#s5">Default deny for the shop</a></li>
+				<li><a href="#s6">What NetworkPolicy can't do</a></li>
+				<li><a href="#s7">ClusterNetworkPolicy</a></li>
+				<li><a href="#s8">Testing policies</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 3.4</span>
+				<p><strong>Isolation and Segmentation. Network Policy.</strong></p>
+			</div>
+			<p>The curriculum gives only these names. This page takes <strong>isolation and segmentation</strong> to mean the Kubernetes-level ways to separate workloads and tenants: namespaces, RBAC scoping, quotas and the multi-tenancy patterns built from them. <strong>Network policy</strong> means the NetworkPolicy API in depth, plus the cluster-wide ClusterNetworkPolicy. Kernel and node isolation (sandboxes, dedicated nodes) are in <a href="d1-topic-1-2.html#s4">topic 1.2</a>; the Pod network, CNI and DNS in <a href="d2-topic-2-3.html#s1">topic 2.3</a>.</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0) and the Kubernetes network-policy-api project (Apache-2.0).</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop runs in its own <code>shop</code> namespace: <code>web</code> calls <code>api</code> on port 8080, and <code>api</code> calls <code>db</code> on 5432. Nothing else should get in or out, apart from DNS.</p></div>
+
+			<!-- ===== Namespaces ===== -->
+			<h2 id="s1">Namespaces as a boundary</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">What a namespace separates, and what it leaves shared.</span></p>
+				<p>"In Kubernetes, <em>namespaces</em> provide a mechanism for isolating groups of resources within a single cluster." Their scoping "is applicable only for namespaced objects <em>(e.g. Deployments, Services, etc.)</em> and not for cluster-wide objects <em>(e.g. StorageClass, Nodes, PersistentVolumes, etc.)</em>." Many security policies are scoped to a namespace: Roles and RoleBindings, NetworkPolicies, ResourceQuotas, LimitRanges and Pod Security labels.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Namespaces separate</th><th>Namespaces don't separate</th></tr></thead>
+						<tbody>
+							<tr><td>Object names, RBAC Roles and RoleBindings, quotas, NetworkPolicies, Pod Security levels</td><td data-label="Namespaces don't separate">Nodes, PersistentVolumes, StorageClasses, CRDs, webhooks, ClusterRoles, PriorityClasses, Namespaces themselves</td></tr>
+							<tr><td>Which Secrets and ConfigMaps a Pod can mount</td><td data-label="Namespaces don't separate">The network: "all pods in a Kubernetes cluster are allowed to communicate with each other" by default</td></tr>
+							<tr><td>Service names (short names resolve within the namespace)</td><td data-label="Namespaces don't separate">DNS: "the Kubernetes DNS service allows lookups across all namespaces"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p><code>kubectl api-resources --namespaced=false</code> lists the cluster-scoped kinds.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Initial namespace</th><th>Security note</th></tr></thead>
+						<tbody>
+							<tr><td><code>default</code></td><td data-label="Security note">"For a production cluster, consider <em>not</em> using the <code>default</code> namespace."</td></tr>
+							<tr><td><code>kube-system</code></td><td data-label="Security note">Objects created by the Kubernetes system; tightly restrict who can write here</td></tr>
+							<tr><td><code>kube-public</code></td><td data-label="Security note">"Readable by <em>all</em> clients (including those not authenticated)"; "the public aspect ... is only a convention"</td></tr>
+							<tr><td><code>kube-node-lease</code></td><td data-label="Security note">Node heartbeat Leases</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Namespace names can hijack DNS.</strong> A namespace named like a public top-level domain (say <code>com</code>) gives its Services short names that overlap with public DNS, so lookups "without a trailing dot will be redirected to those services". The fix: "limit privileges for creating namespaces to trusted users". Also avoid the reserved <code>kube-</code> prefix.</p></div>
+			</div>
+
+			<!-- ===== Multi-tenancy ===== -->
+			<h2 id="s2">Sharing a cluster safely</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">The patterns for putting several teams or customers on shared infrastructure.</span></p>
+				<p>"While Kubernetes does not have first-class concepts of end users or tenants, it provides several features to help manage different tenancy requirements." The most important is authorization: "If teams or their workloads can access or modify each others' API resources, they can change or disable all other types of policies thereby negating any protection those policies may offer." A common practice is "to isolate every workload in its own namespace, even if multiple workloads are operated by the same tenant."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Pattern</th><th>Isolates</th><th>Cost and limits</th></tr></thead>
+						<tbody>
+							<tr><td>Namespace per tenant</td><td data-label="Isolates">Namespaced objects, with RBAC, quotas, NetworkPolicies and Pod Security</td><td data-label="Cost and limits">"Negligible resource cost", but "difficult to configure" and doesn't cover CRDs, StorageClasses or webhooks</td></tr>
+							<tr><td>Virtual control plane per tenant</td><td data-label="Isolates">Each tenant gets its own API server, controller manager and etcd on a shared host cluster</td><td data-label="Cost and limits">Isolates non-namespaced objects, but "do[es] not solve isolation problems in the data plane"</td></tr>
+							<tr><td>Dedicated nodes</td><td data-label="Isolates">The machines (<a href="d1-topic-1-2.html#s7">topic 1.2</a>)</td><td data-label="Cost and limits">The API server and network remain shared</td></tr>
+							<tr><td>Dedicated cluster</td><td data-label="Isolates">Everything</td><td data-label="Cost and limits">Strongest, but cost and operations scale with the number of clusters</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout retired"><p><strong>Tools come and go.</strong> The Hierarchical Namespace Controller (HNC) was archived in 2025, and in 2025 kubernetes.io removed its references to it and to other third-party multi-tenancy projects. Capsule, a namespace-based multi-tenancy operator, is a CNCF sandbox project; vCluster, a popular virtual-cluster tool, is not a CNCF project.</p></div>
+			</div>
+
+			<!-- ===== Quotas ===== -->
+			<h2 id="s3">Quotas and limits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">Stopping one namespace from exhausting the cluster or its control plane.</span></p>
+				<p>A ResourceQuota "provides constraints that limit aggregate resource consumption per namespace" and can "limit the quantity of objects that can be created in a namespace by API kind". Object counts protect the control plane too: "Too many Secrets in a cluster can actually prevent servers and controllers from starting", and a misconfigured CronJob creating Jobs "can lead to a denial of service."</p>
+				<div class="code"><span class="file">Cap the shop namespace (ResourceQuota)</span>
+<pre><code>apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: shop-quota
+  namespace: shop
+spec:
+  hard:
+    <span class="c"># sums across all Pods</span>
+    requests.cpu: "4"
+    limits.memory: 8Gi
+    <span class="c"># also protects the Pod IP pool</span>
+    pods: "20"
+    <span class="c"># object count limit</span>
+    count/secrets: "30"</code></pre></div>
+				<div class="code"><span class="file">Defaults for Pods that set nothing (LimitRange)</span>
+<pre><code>apiVersion: v1
+kind: LimitRange
+metadata:
+  name: shop-defaults
+  namespace: shop
+spec:
+  limits:
+  - type: Container
+    <span class="c"># request if none is set</span>
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    <span class="c"># limit if none is set</span>
+    default:
+      cpu: 500m
+      memory: 256Mi
+    max:
+      cpu: "1"
+      memory: 512Mi</code></pre></div>
+				<div class="callout trap"><p><strong>Quotas change what Pods must declare.</strong> With a CPU or memory quota, every new Pod "<strong>must</strong> specify either <code>requests</code> or <code>limits</code> for that resource", or it can be rejected with 403. A LimitRange supplies defaults so users don't have to remember. Quotas don't affect objects that already exist, and "cannot protect against all kinds of resource sharing, such as network traffic". Restrict who can edit or delete the quota itself.</p></div>
+				<ul>
+					<li><strong>Priority:</strong> "In a cluster where not all users are trusted, a malicious user could create Pods at the highest possible priorities, causing other Pods to be evicted". A ResourceQuota scoped to PriorityClass prevents this.</li>
+					<li><strong>API load:</strong> API Priority and Fairness can split requests into flows <code>ByUser</code> or <code>ByNamespace</code>, so one tenant "will not be able to starve requests for resources in other namespaces" (<a href="d2-topic-2-1.html#s2">topic 2.1</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== NetworkPolicy semantics ===== -->
+			<h2 id="s4">How NetworkPolicy works</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">The rules that decide whether a connection is allowed.</span></p>
+				<p>NetworkPolicy (<code>networking.k8s.io/v1</code>, GA since v1.7) controls traffic "at the IP address or port level (OSI layer 3 or 4)". "Creating a NetworkPolicy resource without a controller that implements it will have no effect": the network plugin must support it.</p>
+				<ol class="steps">
+					<li><b>Isolation is per Pod and per direction</b>"By default, a pod is non-isolated for egress; all outbound connections are allowed." A Pod becomes isolated for a direction once any policy that selects it lists that direction in <code>policyTypes</code>.</li>
+					<li><b>Rules only allow</b>"Network policies do not conflict; they are additive." What's allowed is the union of all applicable policies, so "order of evaluation does not affect the policy result". There's no deny rule.</li>
+					<li><b>Both ends must agree</b>"Both the egress policy on the source pod and the ingress policy on the destination pod need to allow the connection."</li>
+					<li><b>Replies are automatic</b>Policies apply to connections: "Reply traffic for those allowed connections will also be implicitly allowed."</li>
+				</ol>
+				<div class="callout trap"><p><strong>Leaving out <code>policyTypes</code>.</strong> "If no <code>policyTypes</code> are specified on a NetworkPolicy then by default <code>Ingress</code> will always be set and <code>Egress</code> will be set if the NetworkPolicy has any egress rules." A policy meant to block all egress must list <code>Egress</code> explicitly.</p></div>
+				<h3>Choosing peers</h3>
+				<ul>
+					<li><code>podSelector</code> in a rule picks Pods in the policy's own namespace. <code>namespaceSelector</code> picks every Pod in matching namespaces; an empty one (<code>{}</code>) means all namespaces. Namespaces can't be named directly, so select them by the automatic label <code>kubernetes.io/metadata.name</code> (GA v1.22).</li>
+					<li><code>ipBlock</code> (<code>cidr</code> with optional <code>except</code>) is meant for "cluster-external IPs, since Pod IPs are ephemeral and unpredictable". NAT and load balancers may hide the real source address.</li>
+					<li><code>ports</code> takes a protocol (TCP, the default, UDP or SCTP), a port number or name, and optionally <code>endPort</code> for a range (GA v1.25).</li>
+				</ul>
+				<p>Combining selectors is the classic trap. Compare:</p>
+				<div class="code"><span class="file">AND: Pods labelled role=client in namespaces labelled user=alice</span>
+<pre><code>ingress:
+- from:
+  <span class="c"># one element: both must match</span>
+  - namespaceSelector:
+      matchLabels:
+        user: alice
+    podSelector:
+      matchLabels:
+        role: client</code></pre></div>
+				<div class="code"><span class="file">OR: any Pod in user=alice namespaces, or role=client here</span>
+<pre><code>ingress:
+- from:
+  <span class="c"># two elements: either may match</span>
+  - namespaceSelector:
+      matchLabels:
+        user: alice
+  - podSelector:
+      matchLabels:
+        role: client</code></pre></div>
+				<div class="callout trap"><p><strong>One dash opens a whole namespace.</strong> The only difference is the <code>-</code> before <code>podSelector</code>. kubernetes.io: "Be careful to use correct YAML syntax", and "When in doubt, use <code>kubectl describe</code> to see how Kubernetes has interpreted the policy." The multi-tenancy page also advises against an empty <code>namespaceSelector</code> when allowing traffic between namespaces.</p></div>
+				<div class="callout tip"><p><strong>Some traffic is always allowed.</strong> Traffic to and from the Pod's own node is allowed "regardless of the IP address of the Pod or the node", and "a pod cannot block access to itself". Only TCP, UDP and SCTP are guaranteed to be filtered; for ICMP or ARP "the behaviour is undefined".</p></div>
+			</div>
+
+			<!-- ===== Default deny ===== -->
+			<h2 id="s5">Default deny for the shop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">Building an allow list: deny everything, then open only the flows the app needs.</span></p>
+				<p>The Security Checklist asks for "default network policies within each namespace, selecting all pods, denying everything", because "default network policies that block all egress and ingress ... can be useful to adopt an allow list approach to ensure that no workloads are missed."</p>
+				<div class="code"><span class="file">1. Deny all traffic in shop (NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: shop
+spec:
+  <span class="c"># every Pod in shop</span>
+  podSelector: {}
+  <span class="c"># isolated both ways, no rules</span>
+  policyTypes:
+  - Ingress
+  - Egress</code></pre></div>
+				<div class="code"><span class="file">2. Allow DNS to CoreDNS (NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: shop
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    <span class="c"># one element: namespace AND Pod</span>
+    - namespaceSelector:
+        matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [kube-system]
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53</code></pre></div>
+				<div class="callout trap"><p><strong>Default-deny egress breaks DNS.</strong> kubernetes.io added this caution in 2026: "A default deny-all egress policy also blocks DNS traffic." Allow UDP and TCP port 53 to the CoreDNS Pods (label <code>k8s-app=kube-dns</code> in <code>kube-system</code>).</p></div>
+				<div class="code"><span class="file">3. The API accepts only web, on 8080 (NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-web
+  namespace: shop
+spec:
+  <span class="c"># the Pods this protects</span>
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+  - Ingress
+  ingress:
+  <span class="c"># from web AND on this port</span>
+  - from:
+    - podSelector:
+        matchLabels:
+          app: web
+    ports:
+    - protocol: TCP
+      port: 8080</code></pre></div>
+				<p>Because egress is denied too, each flow needs both ends opened: an egress policy on <code>web</code> allowing <code>app=api</code> on 8080, then the same pair for <code>api</code> to <code>db</code> on 5432 (ingress on <code>db</code>, egress on <code>api</code>). The finished set:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Flow</th><th>Egress side</th><th>Ingress side</th></tr></thead>
+						<tbody>
+							<tr><td>Any Pod to DNS</td><td data-label="Egress side"><code>allow-dns-egress</code></td><td data-label="Ingress side">None needed, unless kube-system has its own policies</td></tr>
+							<tr><td>web to api :8080</td><td data-label="Egress side">On <code>app=web</code>, to <code>app=api</code></td><td data-label="Ingress side"><code>api-from-web</code></td></tr>
+							<tr><td>api to db :5432</td><td data-label="Egress side">On <code>app=api</code>, to <code>app=db</code></td><td data-label="Ingress side">On <code>app=db</code>, from <code>app=api</code></td></tr>
+							<tr><td>Internet to web</td><td data-label="Egress side">None</td><td data-label="Ingress side">From the ingress controller's namespace and Pods</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s6">What NetworkPolicy can't do</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">The documented gaps, and the extensions that fill some of them.</span></p>
+				<p>kubernetes.io lists what you can't do with network policies "(at least, not yet)":</p>
+				<ul>
+					<li>Force traffic through a common gateway, or "anything TLS related" (use a service mesh or ingress controller).</li>
+					<li>Target nodes by identity, or Services by name (select Pods or namespaces by label instead).</li>
+					<li>Apply default policies to all namespaces, or explicitly deny ("the model for NetworkPolicies are deny by default, with only the ability to add allow rules").</li>
+					<li>Log network security events, or query reachability.</li>
+					<li>Block loopback or traffic from the Pod's own node.</li>
+				</ul>
+				<p>There are also timing and scope gaps. A new Pod "may be started unprotected" if it's created before the network plugin has processed the policy. Whether a policy change affects existing connections is implementation-defined. And for <code>hostNetwork</code> Pods the behaviour "is undefined": most implementations treat their traffic as node traffic, so selectors don't see them.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Extension</th><th>Adds</th></tr></thead>
+						<tbody>
+							<tr><td>CiliumNetworkPolicy and CiliumClusterwideNetworkPolicy (<code>cilium.io/v2</code>)</td><td data-label="Adds">Layer 7 HTTP rules, DNS name (<code>toFQDNs</code>) rules, and deny rules that "take precedence over allow policies", cluster-wide</td></tr>
+							<tr><td>Calico GlobalNetworkPolicy (<code>projectcalico.org/v3</code>)</td><td data-label="Adds">Cluster-wide, ordered policies with Allow, Deny, Log and Pass actions, tiers, and host endpoints</td></tr>
+							<tr><td>Service mesh (<a href="index.html#d5">topic 5.2</a>)</td><td data-label="Adds">Layer 7 rules based on workload identity, plus mutual TLS</td></tr>
+							<tr><td>ClusterNetworkPolicy (<a href="#s7">below</a>)</td><td data-label="Adds">A vendor-neutral, cluster-wide API with deny rules and tiers</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== CNP ===== -->
+			<h2 id="s7">ClusterNetworkPolicy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">Cluster-wide rules that administrators set and namespace owners can't override.</span></p>
+				<p>ClusterNetworkPolicy comes from the Kubernetes network-policy-api project. It's a CRD in <code>policy.networking.k8s.io</code>, not a built-in API: you install it and need a supporting plugin (kube-network-policies, Calico v3.32+, Kube-OVN). It replaced AdminNetworkPolicy and BaselineAdminNetworkPolicy: "<code>AdminNetworkPolicy</code> becomes a <code>ClusterNetworkPolicy</code> with <code>tier=Admin</code> and <code>BaselineAdminNetworkPolicy</code> becomes a <code>ClusterNetworkPolicy</code> with <code>tier=Baseline</code>."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Order</th><th>Layer</th><th>Role</th></tr></thead>
+						<tbody>
+							<tr><td>1</td><td data-label="Layer">Admin tier</td><td data-label="Role">"Takes precedence over all other policies": guardrails namespace owners can't override</td></tr>
+							<tr><td>2</td><td data-label="Layer">NetworkPolicy</td><td data-label="Role">Ordinary policies; "always makes a final decision for selected pods"</td></tr>
+							<tr><td>3</td><td data-label="Layer">Baseline tier</td><td data-label="Role">Cluster-wide defaults that NetworkPolicy can override</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Each rule has an action: <strong>Accept</strong> (allow, and stop evaluating), <strong>Deny</strong> ("Drops the selected traffic") or <strong>Pass</strong> (skip the rest of this tier and let the next tier decide). Within a tier, <code>priority</code> runs from 0 to 1000 and the lower number wins.</p>
+				<div class="code"><span class="file">Keep sandbox namespaces out of prod (ClusterNetworkPolicy)</span>
+<pre><code>apiVersion:
+  policy.networking.k8s.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  <span class="c"># cluster-scoped, no namespace</span>
+  name: block-sandbox
+spec:
+  <span class="c"># namespace owners can't override</span>
+  tier: Admin
+  priority: 10
+  subject:
+    namespaces:
+      matchLabels:
+        env: prod
+  ingress:
+  - name: deny-sandbox
+    action: Deny
+    from:
+    - namespaces:
+        matchLabels:
+          env: sandbox</code></pre></div>
+				<div class="callout retired"><p><strong>The API is new and still moving.</strong> ClusterNetworkPolicy was announced in October 2025, released as <code>v1alpha2</code> in April 2026 (when the old <code>Allow</code> action was renamed <code>Accept</code>), and reached <code>v1beta1</code> in release v0.3.0 on 6 November 2026; both versions are served. Older material uses AdminNetworkPolicy and BaselineAdminNetworkPolicy. Unlike NetworkPolicy, it has no implicit isolation: Pods it selects aren't denied anything unless a rule says so.</p></div>
+			</div>
+
+			<!-- ===== Testing ===== -->
+			<h2 id="s8">Testing policies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.4</span><span class="skill-text">Checking that policies do what you meant, and one lifecycle bug to know.</span></p>
+				<div class="code"><span class="file">See and test the shop's policies (shell)</span>
+<pre><code>kubectl get networkpolicy -n shop
+kubectl describe networkpolicy \
+  api-from-web -n shop
+
+<span class="c"># from a Pod without app=web:</span>
+<span class="c"># this should time out</span>
+kubectl run t --rm -it -n shop \
+  --image=busybox:1.36 -- \
+  wget -T 2 -qO- http://api:8080
+
+<span class="c"># the same with the web label works</span>
+kubectl run t --rm -it -n shop \
+  --labels=app=web \
+  --image=busybox:1.36 -- \
+  wget -T 2 -qO- http://api:8080</code></pre></div>
+				<p>NetworkPolicy itself has no logs. Plugin tools fill the gap: Cilium's Hubble shows flows and verdicts, Calico has flow logs, and visual editors help draft policies.</p>
+				<div class="callout retired"><p><strong>CVE-2024-7598: policies could vanish first.</strong> "The order in which objects are deleted during namespace termination is not defined, and it is possible for network policies to be deleted before the pods that they protect." That left a brief window where Pods ran without their restrictions (rated Low, 3.1). Ordered namespace deletion, which deletes Pods before other resources, fixed it: on by default from v1.33 and GA in v1.34. The GitHub issue still says "Fixed Versions - None".</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Namespaces scope names, RBAC, quotas, NetworkPolicies and Pod Security, but not Nodes, PVs, StorageClasses, CRDs, webhooks or ClusterRoles, and not the network or DNS. Don't use <code>default</code> in production; <code>kube-public</code> is readable by everyone; restrict namespace creation (TLD names hijack DNS).</li>
+				<li>Multi-tenancy: RBAC matters most. Namespace per tenant (cheap, can't isolate cluster-scoped objects), virtual control plane (isolates the API, not the data plane), dedicated nodes, dedicated clusters. HNC archived; Capsule is sandbox; vCluster isn't CNCF.</li>
+				<li>ResourceQuota limits totals and object counts (<code>count/secrets</code>, <code>pods</code>); a CPU or memory quota forces requests or limits on every Pod, so pair it with a LimitRange. Use PriorityClass-scoped quotas against priority abuse.</li>
+				<li>NetworkPolicy: needs a supporting CNI; isolation per Pod per direction; allow-only and additive; both ends must allow; replies automatic. Omitting <code>policyTypes</code> = Ingress, plus Egress only if egress rules exist.</li>
+				<li>One <code>from</code> element with namespaceSelector and podSelector = AND; two elements = OR. Select namespaces by <code>kubernetes.io/metadata.name</code>. ipBlock is for external IPs. Node traffic and a Pod's traffic to itself are always allowed.</li>
+				<li>Default deny all, then allow DNS (UDP and TCP 53 to <code>k8s-app=kube-dns</code>), then each flow at both ends. NetworkPolicy has no L7, TLS, logging, deny rules, cluster-wide defaults or Service-name targets: use Cilium or Calico CRDs, a mesh, or ClusterNetworkPolicy.</li>
+				<li>ClusterNetworkPolicy (CRD, <code>v1beta1</code> since November 2026): tiers Admin, then NetworkPolicy, then Baseline; actions Accept, Deny, Pass; lower priority number wins. CVE-2024-7598 was fixed by ordered namespace deletion (GA 1.34).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d3-topic-3-3.html"><small>Previous</small>3.3: Secrets</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the Kubernetes network-policy-api project (Apache-2.0) and the Cilium documentation; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.3: Secrets | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 3.3, Kubernetes Secrets: what a Secret is, types and limits, why base64 isn't encryption, who can read Secrets directly and indirectly, safe use in Pods, leakage paths (env vars, kubectl, Git, Helm, audit logs), encryption at rest with KMS v2, external secret managers (External Secrets Operator, Secrets Store CSI Driver, Sealed Secrets, SOPS, Vault and OpenBao), TLS Secrets and Secret-related CVEs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Kubernetes Security Fundamentals &middot; 22%</span>
+		<h1>3.3: Secrets</h1>
+		<p>How Kubernetes&reg; stores passwords, keys and tokens, who can really read them, the many ways they leak, and how encryption at rest and external secret managers close the gaps.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Secret types</span><span class="tag">base64</span><span class="tag">RBAC</span><span class="tag">KMS v2</span><span class="tag">External Secrets</span><span class="tag">CSI driver</span><span class="tag">Sealed Secrets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What a Secret is</a></li>
+				<li><a href="#s2">Who can read a Secret</a></li>
+				<li><a href="#s3">Using Secrets in Pods</a></li>
+				<li><a href="#s4">How Secrets leak</a></li>
+				<li><a href="#s5">Encryption at rest with KMS</a></li>
+				<li><a href="#s6">External secret managers</a></li>
+				<li><a href="#s7">TLS Secrets and CVEs</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 3.3</span>
+				<p><strong>Secrets.</strong></p>
+			</div>
+			<p>This page covers the Secret object: its types and limits, who can read it, how Pods should consume it, how it leaks, encryption at rest with a key management service, and the external tools that keep secrets out of the cluster or out of Git. Related material elsewhere: the encryption providers table (<a href="d1-topic-1-1.html#s6">topic 1.1</a>), secrets in images (<a href="d1-topic-1-3.html#s5">topic 1.3</a>), Secret volumes on nodes (<a href="d2-topic-2-3.html#s7">topic 2.3</a>) and ServiceAccount token Secrets (<a href="d3-topic-3-2.html#s3">topic 3.2</a>).</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0) and the projects named.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's API needs the database password. Today it sits in a Secret called <code>db-creds</code>, created by hand. The team wants it encrypted in etcd, readable by the API alone, and eventually fetched from the company's secret store.</p></div>
+
+			<!-- ===== What ===== -->
+			<h2 id="s1">What a Secret is</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">The object, its limits and types, and the default risk.</span></p>
+				<p>"A Secret is an object that contains a small amount of sensitive data such as a password, a token, or a key." It's a namespaced core object, "similar to ConfigMaps but ... specifically intended to hold confidential data." The Secrets page opens with this caution:</p>
+				<div class="callout trap"><p><strong>The default is plaintext.</strong> "Kubernetes Secrets are, by default, stored unencrypted in the API server's underlying data store (etcd). Anyone with API access can retrieve or modify a Secret, and so can anyone with access to etcd. Additionally, anyone who is authorized to create a Pod in a namespace can use that access to read any Secret in that namespace; this includes indirect access such as the ability to create a Deployment." Its four steps: enable encryption at rest, least-privilege RBAC, restrict Secret access to specific containers, and consider external Secret store providers.</p></div>
+				<ul>
+					<li><strong><code>data</code> vs <code>stringData</code>:</strong> <code>data</code> values are base64; <code>stringData</code> takes plain strings, is merged into <code>data</code> and wins on a clash. Reading the Secret back always shows <code>data</code>.</li>
+					<li><strong>base64 isn't protection:</strong> "Base64 encoding is <em>not</em> an encryption method, it provides no additional confidentiality over plain text."</li>
+					<li><strong>Limits:</strong> "Individual Secrets are limited to 1MiB in size", to protect API server and kubelet memory. The <code>type</code> can't be changed after creation. Static Pods can't use Secrets.</li>
+					<li><strong>Immutable:</strong> <code>immutable: true</code> (GA v1.21) blocks changes and stops the kubelet watching the Secret; it can't be undone.</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Type</th><th>For</th><th>Required keys</th></tr></thead>
+						<tbody>
+							<tr><td><code>Opaque</code></td><td data-label="For">Anything (the default)</td><td data-label="Required keys">None</td></tr>
+							<tr><td><code>kubernetes.io/tls</code></td><td data-label="For">A TLS certificate and key</td><td data-label="Required keys"><code>tls.crt</code> and <code>tls.key</code> (values aren't validated)</td></tr>
+							<tr><td><code>kubernetes.io/dockerconfigjson</code></td><td data-label="For">Registry credentials (<a href="d1-topic-1-3.html#s2">topic 1.3</a>)</td><td data-label="Required keys"><code>.dockerconfigjson</code> (<code>kubernetes.io/dockercfg</code> is the older form)</td></tr>
+							<tr><td><code>kubernetes.io/basic-auth</code></td><td data-label="For">Username and password</td><td data-label="Required keys">At least one of <code>username</code>, <code>password</code></td></tr>
+							<tr><td><code>kubernetes.io/ssh-auth</code></td><td data-label="For">SSH private key</td><td data-label="Required keys"><code>ssh-privatekey</code></td></tr>
+							<tr><td><code>kubernetes.io/<wbr>service-account-token</code></td><td data-label="For">Legacy long-lived ServiceAccount token</td><td data-label="Required keys">Annotation naming the ServiceAccount (<a href="d3-topic-3-2.html#s3">topic 3.2</a>)</td></tr>
+							<tr><td><code>bootstrap.kubernetes.io/token</code></td><td data-label="For">Node bootstrap tokens</td><td data-label="Required keys"><code>token-id</code>, <code>token-secret</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The convenience types only help people and tools understand the contents; the API server doesn't treat their values more securely than <code>Opaque</code>.</p>
+			</div>
+
+			<!-- ===== Who can read ===== -->
+			<h2 id="s2">Who can read a Secret</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">The direct and indirect routes to a Secret's value, and how to narrow them.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Route</th><th>Why it works</th></tr></thead>
+						<tbody>
+							<tr><td><code>get</code>, <code>list</code> or <code>watch</code> on <code>secrets</code></td><td data-label="Why it works">"Granting <code>list</code> access to Secrets implicitly lets the subject fetch the contents of the Secrets"</td></tr>
+							<tr><td>Creating Pods or workloads</td><td data-label="Why it works">"A user who can create a Pod that uses a Secret can also see the value of that Secret", even without any Secret permission</td></tr>
+							<tr><td>A privileged container</td><td data-label="Why it works">"Any containers that run with <code>privileged: true</code> on a node can access all Secrets used on that node"</td></tr>
+							<tr><td>etcd or its backups</td><td data-label="Why it works">Everything is readable if encryption at rest is off</td></tr>
+							<tr><td>Cluster-wide controllers</td><td data-label="Why it works">Ingress controllers, secret syncers and CD tools often read Secrets everywhere (CVE-2025-1974 in <a href="d2-topic-2-3.html#s3">topic 2.3</a>)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A Pod that needs one Secret should get exactly that one:</p>
+				<div class="code"><span class="file">The API may read only db-creds (Role)</span>
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: read-db-creds
+  namespace: shop
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["db-creds"]
+  <span class="c"># no list or watch</span>
+  verbs: ["get"]</code></pre></div>
+				<p>Most apps don't need this at all: mounting a Secret into a Pod requires no RBAC on <code>secrets</code> for the Pod's ServiceAccount, because the kubelet fetches it under the Node authorizer. Grant API access only to apps that read Secrets themselves.</p>
+				<h3>Good practices</h3>
+				<p>The kubernetes.io <a href="https://kubernetes.io/docs/concepts/security/secrets-good-practices/">Good practices for Kubernetes Secrets</a> page, by role:</p>
+				<ul>
+					<li><strong>Cluster administrators:</strong> configure encryption at rest; for components, "Restrict <code>watch</code> or <code>list</code> access to only the most privileged, system-level components"; for humans, "Restrict <code>get</code>, <code>watch</code>, or <code>list</code> access to Secrets. Only allow cluster administrators to access <code>etcd</code>." It also recommends "Use short-lived Secrets", audit rules that alert on unusual reads (such as one user reading many Secrets at once), wiping old etcd storage, and "separate namespaces to isolate access to mounted secrets".</li>
+					<li><strong>Developers:</strong> restrict Secret access to the containers that need it; "your application must avoid logging the secret data in the clear or transmitting it to an untrusted party"; and avoid sharing Secret manifests, since a checked-in manifest "means the secret is available to everyone who can read the manifest."</li>
+				</ul>
+			</div>
+
+			<!-- ===== Using in Pods ===== -->
+			<h2 id="s3">Using Secrets in Pods</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">Creating Secrets without leaving traces, and mounting them safely.</span></p>
+				<div class="code"><span class="file">Create db-creds from files, not the command line (shell)</span>
+<pre><code><span class="c"># files keep values out of shell history</span>
+kubectl create secret generic db-creds \
+  --namespace shop \
+  --from-file=username=./user.txt \
+  --from-file=password=./pass.txt
+<span class="c"># then delete the files</span></code></pre></div>
+				<p><code>--from-literal=password=...</code> works too, but it puts the password in your shell history. kubernetes.io's own pull-secret page warns of this.</p>
+				<div class="code"><span class="file">Mount one key, owner-read only (Pod)</span>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  namespace: shop
+spec:
+  containers:
+  - name: api
+    image: shop/api:1.4.2
+    volumeMounts:
+    - name: db
+      mountPath: /etc/db
+      readOnly: true
+  volumes:
+  - name: db
+    secret:
+      secretName: db-creds
+      <span class="c"># default is 0644</span>
+      defaultMode: 0400
+      <span class="c"># only this key is projected</span>
+      items:
+      - key: password
+        path: password</code></pre></div>
+				<p>The kubelet keeps the files in <code>tmpfs</code> "so that the confidential data is not written to durable storage", and "a Secret is only sent to a node if a Pod on that node requires it". Only the <code>api</code> container mounts it, so a sidecar in the same Pod wouldn't see it.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Consumed as</th><th>Sees updates?</th><th>Leak risk</th></tr></thead>
+						<tbody>
+							<tr><td>Volume</td><td data-label="Sees updates?">Yes, eventually</td><td data-label="Leak risk">Lower: protected by file permissions</td></tr>
+							<tr><td>Volume with <code>subPath</code></td><td data-label="Sees updates?">Never</td><td data-label="Leak risk">Lower</td></tr>
+							<tr><td>Environment variable</td><td data-label="Sees updates?">Only after a restart</td><td data-label="Leak risk">Higher: "crash dumps in logs and the non-confidential nature of environment variable in Linux"; inherited by child processes</td></tr>
+							<tr><td>Immutable Secret</td><td data-label="Sees updates?">Never: delete and recreate</td><td data-label="Leak risk">Same as how it's mounted</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>A missing Secret can block a Pod.</strong> By default, "None of a Pod's containers will start until all non-optional Secrets are available", and a missing key in an existing Secret makes the Pod fail. With <code>optional: true</code>, a missing Secret is ignored, which is safer for availability but means the app must handle having no credentials.</p></div>
+			</div>
+
+			<!-- ===== Leakage ===== -->
+			<h2 id="s4">How Secrets leak</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">The everyday paths by which secret values escape the cluster's controls.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Path</th><th>What happens</th><th>Fix</th></tr></thead>
+						<tbody>
+							<tr><td>kubectl output</td><td data-label="What happens"><code>describe</code> shows only byte counts, but <code>get -o yaml</code> shows the base64 values</td><td data-label="Fix">Limit <code>get</code>; never paste the output</td></tr>
+							<tr><td>Git</td><td data-label="What happens">A Secret manifest in a repository is plaintext to every reader, forever in history</td><td data-label="Fix">Sealed Secrets, SOPS, or references to an external store</td></tr>
+							<tr><td>Helm</td><td data-label="What happens">"Release information is stored in Secrets in the namespace of the release", including values files that may hold passwords</td><td data-label="Fix">Treat Secret read access as access to all chart values</td></tr>
+							<tr><td>Audit logs</td><td data-label="What happens">Logging Secrets at <code>Request</code> or <code>RequestResponse</code> copies their contents into the log</td><td data-label="Fix">Log Secrets at <code>Metadata</code> only; protect the logs</td></tr>
+							<tr><td>Component logs</td><td data-label="What happens">Verbose logging has leaked tokens, for example CVE-2023-2878 and CVE-2025-7445</td><td data-label="Fix">Patch, and keep log levels low in production</td></tr>
+							<tr><td>ConfigMaps</td><td data-label="What happens">Readable by <code>view</code> and not treated as confidential</td><td data-label="Fix">The checklist: "ConfigMaps are not used to hold confidential data"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The kubernetes.io audit policy example logs Secrets and ConfigMaps at <code>Metadata</code> level, recording who touched what, but not the contents:</p>
+				<div class="code"><span class="file">Audit rule for Secrets (audit policy excerpt)</span>
+<pre><code><span class="c"># who and when, not the values</span>
+- level: Metadata
+  resources:
+  - group: ""
+    resources: ["secrets", "configmaps"]</code></pre></div>
+				<p>Audit logging is covered in <a href="index.html#d3">topic 3.5</a>.</p>
+			</div>
+
+			<!-- ===== KMS ===== -->
+			<h2 id="s5">Encryption at rest with KMS</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">Envelope encryption with an external key service, and checking that it works.</span></p>
+				<p>Page 1.1 introduced <code>EncryptionConfiguration</code> and its providers. Local-key providers keep the key in a file on the control plane host, which protects etcd and its backups but "fails to protect against a host compromise". The <strong>KMS</strong> provider keeps the master key outside:</p>
+				<ul>
+					<li>"The data is encrypted using a data encryption key (DEK). The DEKs are encrypted with a key encryption key (KEK) that is stored and managed in a remote KMS." An attacker "would need to compromise etcd <strong>and</strong> the third-party KMS provider".</li>
+					<li>The API server talks to a <strong>KMS plugin</strong> over gRPC on a local Unix socket; the plugin holds the credentials for the remote KMS.</li>
+					<li><strong>KMS v2</strong> (GA v1.29) derives single-use DEKs from a seed, so it doesn't call the KMS on every write. KEK rotation needs no API server restart, and kubernetes.io "recommends rotating the KEK at least every 90 days."</li>
+				</ul>
+				<div class="code"><span class="file">Encrypt Secrets with a KMS v2 plugin (EncryptionConfiguration)</span>
+<pre><code>apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  providers:
+  <span class="c"># first provider encrypts writes</span>
+  - kms:
+      apiVersion: v2
+      <span class="c"># can't be changed once set</span>
+      name: cloud-kms
+      endpoint: unix:///var/run/kms.sock
+      timeout: 3s
+  <span class="c"># reads old plaintext; remove later</span>
+  - identity: {}</code></pre></div>
+				<div class="code"><span class="file">Re-encrypt, then check etcd directly (shell)</span>
+<pre><code><span class="c"># rewrite every Secret with the new key</span>
+kubectl get secrets -A -o json \
+  | kubectl replace -f -
+
+P=/etc/kubernetes/pki/etcd
+etcdctl \
+  --cacert=$P/ca.crt \
+  --cert=$P/server.crt \
+  --key=$P/server.key \
+  get /registry/secrets/shop/db-creds \
+  | hexdump -C | head
+<span class="c"># encrypted values start with</span>
+<span class="c"># k8s:enc:kms:v2:cloud-kms:</span></code></pre></div>
+				<p>An encrypted value starts with <code>k8s:enc:&lt;provider&gt;:</code>; a readable value means encryption isn't working. With <code>--encryption-provider-config-automatic-reload</code> (since v1.26), the API server picks up config changes without a restart. On a managed service you can't edit this file; the provider offers envelope encryption with its cloud KMS instead, and you manage the key's access policy and rotation.</p>
+				<div class="callout retired"><p><strong>KMS v1 is off by default.</strong> KMS v1 was deprecated in v1.28 and disabled by default from v1.29; it can be re-enabled only with the <code>KMSv1</code> feature gate. Use <code>apiVersion: v2</code>, which also has no <code>cachesize</code> field. (The kubernetes.io KMS page checks etcd at <code>/kubernetes.io/secrets/...</code>; the default prefix is <code>/registry</code>.)</p></div>
+				<div class="callout trap"><p><strong>Order and leftovers.</strong> The first provider encrypts, so <code>identity</code> first means nothing is encrypted. Keep <code>identity</code> last only while migrating, then remove it so plaintext is no longer accepted. And existing Secrets stay plaintext until rewritten.</p></div>
+			</div>
+
+			<!-- ===== External ===== -->
+			<h2 id="s6">External secret managers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">Tools that fetch secrets from a dedicated store, or keep them safe in Git.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool</th><th>How it works</th><th>Status</th></tr></thead>
+						<tbody>
+							<tr><td>External Secrets Operator (ESO)</td><td data-label="How it works">Reads from AWS, Azure, Google, Vault and others, and "automatically injects the values into a Kubernetes Secret"</td><td data-label="Status">CNCF sandbox since 2022; API <code>external-secrets.io/v1</code></td></tr>
+							<tr><td>Secrets Store CSI Driver</td><td data-label="How it works">A privileged DaemonSet mounts secrets from an external store straight into Pods as a tmpfs volume; sync to a Secret is optional</td><td data-label="Status">Kubernetes SIG Auth subproject</td></tr>
+							<tr><td>Sealed Secrets</td><td data-label="How it works"><code>kubeseal</code> encrypts with the controller's public key; only the controller can decrypt, into a normal Secret</td><td data-label="Status">Bitnami; not CNCF</td></tr>
+							<tr><td>SOPS</td><td data-label="How it works">Encrypts the values in YAML or JSON files with a KMS, age or PGP, leaving keys readable and diffable</td><td data-label="Status">CNCF sandbox since 2023</td></tr>
+							<tr><td>HashiCorp Vault, OpenBao</td><td data-label="How it works">Dedicated secret stores with dynamic credentials and audit trails</td><td data-label="Status">Vault under BSL 1.1 since August 2023 (IBM since 2025); OpenBao is the MPL-2.0 fork under OpenSSF</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Pull the DB password from the company store (ExternalSecret)</span>
+<pre><code>apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: db-creds
+  namespace: shop
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: corp-vault
+  target:
+    <span class="c"># the Secret ESO writes</span>
+    name: db-creds
+    creationPolicy: Owner
+  data:
+  - secretKey: password
+    remoteRef:
+      key: shop/db
+      property: password</code></pre></div>
+				<p>A ClusterSecretStore is "a central gateway to your secret backend" for every namespace. Without <code>conditions</code> limiting which namespaces may use it, any namespace's ExternalSecret can pull any path the store's identity can read.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Approach</th><th>Gain</th><th>Remaining risk</th></tr></thead>
+						<tbody>
+							<tr><td>Sync into a Secret (ESO, CSI sync, Sealed Secrets)</td><td data-label="Gain">Apps unchanged; works for env vars, pull secrets, TLS</td><td data-label="Remaining risk">The value is again a normal Secret: still needs encryption at rest and RBAC</td></tr>
+							<tr><td>Mount only (CSI driver, sidecar agent, direct API calls)</td><td data-label="Gain">No copy in etcd or the API</td><td data-label="Remaining risk">Depends on the store at Pod start; privileged node plugin; rotation needs the app to reload</td></tr>
+							<tr><td>Encrypt in Git (Sealed Secrets, SOPS)</td><td data-label="Gain">Safe to commit</td><td data-label="Remaining risk">Solves only "Git is plaintext"; the decryption key becomes the crown jewel</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>The "secret zero" problem.</strong> Whatever authenticates to the external store is itself a secret. The cloud native answer is workload identity: the Pod's short-lived, audience-bound ServiceAccount token (<a href="d3-topic-3-2.html#s3">topic 3.2</a>) or a SPIFFE identity (<a href="index.html#d5">topic 5.3</a>), not a static token stored in yet another Secret.</p></div>
+				<div class="callout retired"><p><strong>Recent project changes.</strong> ESO paused releases from August to September 2025 for lack of maintainers, then resumed. Its <code>v1beta1</code> API stopped being served in v0.17.0 (May 2025). The Secrets Store CSI Driver's automatic rotation is still alpha and off by default. HashiCorp moved Vault to the Business Source License on 10 August 2023, and OpenBao, the open fork, moved from LF Edge to OpenSSF in June 2025. None of these are CNCF graduated projects.</p></div>
+			</div>
+
+			<!-- ===== TLS and CVEs ===== -->
+			<h2 id="s7">TLS Secrets and CVEs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 3.3</span><span class="skill-text">Certificate Secrets, and what past bugs teach about protecting Secrets.</span></p>
+				<p>Ingress and Gateway listeners terminate TLS using <code>kubernetes.io/tls</code> Secrets. An Ingress must use a Secret in its own namespace; a Gateway can use one in another namespace only if a ReferenceGrant in the Secret's namespace allows it. <strong>cert-manager</strong> (CNCF graduated, announced November 2024) issues and renews certificates from Issuers and ClusterIssuers and writes them into these Secrets. Certificates are covered in <a href="index.html#d5">topic 5.3</a>.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CVE</th><th>What happened</th></tr></thead>
+						<tbody>
+							<tr><td>CVE-2023-2728</td><td data-label="What happened">The mountable-secrets policy could be bypassed with ephemeral containers</td></tr>
+							<tr><td>CVE-2024-3177</td><td data-label="What happened">The same policy could be bypassed with <code>envFrom</code></td></tr>
+							<tr><td>CVE-2023-2878</td><td data-label="What happened">The Secrets Store CSI Driver logged ServiceAccount tokens at higher log levels</td></tr>
+							<tr><td>CVE-2025-7445</td><td data-label="What happened">secrets-store-sync-controller logged tokens that could be exchanged with cloud providers for secrets</td></tr>
+							<tr><td>CVE-2021-25742</td><td data-label="What happened">ingress-nginx snippets let users read the controller's token and Secrets in all namespaces</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout retired"><p><strong><code>kubernetes.io/enforce-mountable-secrets</code> is deprecated.</strong> This ServiceAccount annotation limited which Secrets its Pods could mount. It was bypassed twice (the first two CVEs above) and was deprecated in v1.32. The advice now: "Use separate namespaces to isolate access to mounted secrets."</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Secrets are plaintext in etcd by default and base64 is not encryption. Limits: 1 MiB, <code>type</code> fixed, <code>stringData</code> write-only. Types include Opaque, tls (<code>tls.crt</code>, <code>tls.key</code>), dockerconfigjson, basic-auth, ssh-auth, service-account-token and bootstrap token.</li>
+				<li>Readers: <code>get</code>, <code>list</code> or <code>watch</code> on secrets; anyone who can create Pods or workloads in the namespace; privileged containers on the node; etcd and backup access; cluster-wide controllers. Use a Role with <code>resourceNames</code> and <code>get</code> only, and namespaces as the boundary.</li>
+				<li>Mount as volumes (tmpfs, only on nodes that need them, <code>defaultMode</code> and <code>items</code> to narrow), only into the containers that need them. Env vars leak more and never update; subPath never updates; non-optional missing Secrets block the Pod.</li>
+				<li>Leaks: <code>kubectl get -o yaml</code>, <code>--from-literal</code> in shell history, Git, Helm release Secrets, audit logs above Metadata, verbose component logs, ConfigMaps.</li>
+				<li>KMS v2 (GA 1.29): envelope encryption, DEKs wrapped by a KEK in an external KMS via a local gRPC plugin; KMS v1 off by default since 1.29. First provider encrypts; drop <code>identity</code> after re-encrypting; verify with etcdctl (<code>k8s:enc:kms:v2:</code>).</li>
+				<li>External: ESO (sandbox, <code>external-secrets.io/v1</code>) and CSI sync create normal Secrets; mount-only CSI keeps values out of etcd; Sealed Secrets and SOPS make Git safe. Solve secret zero with workload identity. Vault is BSL; OpenBao is the open fork.</li>
+				<li>TLS Secrets for Ingress and Gateway (ReferenceGrant across namespaces), cert-manager graduated. <code>enforce-mountable-secrets</code> deprecated in 1.32 after two bypasses.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d3-topic-3-2.html"><small>Previous</small>3.2: Authentication and Authorization</a>
+				<a class="next" href="d3-topic-3-4.html"><small>Next</small>3.4: Isolation and Segmentation, Network Policy</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Vault is a trademark of HashiCorp, an IBM company. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the External Secrets Operator and Helm documentation; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
