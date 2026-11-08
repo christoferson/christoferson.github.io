@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.3: PKI and Connectivity | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 5.3: the Kubernetes PKI (three CAs, leaf certificates, ServiceAccount keys, external CA mode, rotation and the lack of revocation), certificates for workloads (built-in and custom signers, ClusterTrustBundle and Pod Certificates GA in 1.37, cert-manager), and secure connectivity: Ingress and Gateway API TLS, BackendTLSPolicy and gateway mTLS, API server access paths, Konnectivity, component TLS settings, egress control and multi-cluster links.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Platform Security &middot; 16%</span>
+		<h1>5.3: PKI and Connectivity</h1>
+		<p>The certificates that hold a Kubernetes&reg; cluster together, how workloads get their own, and how to secure every connection into, out of, within and between clusters.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Cluster CAs</span><span class="tag">CSR signers</span><span class="tag">ClusterTrustBundle</span><span class="tag">Pod Certificates</span><span class="tag">cert-manager</span><span class="tag">Gateway TLS</span><span class="tag">Egress</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The cluster's PKI</a></li>
+				<li><a href="#s2">Rotation and revocation</a></li>
+				<li><a href="#s3">Certificates for workloads</a></li>
+				<li><a href="#s4">cert-manager</a></li>
+				<li><a href="#s5">TLS at the edge</a></li>
+				<li><a href="#s6">Control plane connectivity</a></li>
+				<li><a href="#s7">Egress and multi-cluster</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 5.3</span>
+				<p><strong>PKI. Connectivity.</strong></p>
+			</div>
+			<p>The curriculum gives only the names. This page takes <strong>PKI</strong> to mean the cluster's own certificate infrastructure plus the ways workloads get certificates, and <strong>connectivity</strong> to mean securing connections into the cluster (Ingress, Gateway), to the control plane (API endpoints, Konnectivity), out of it (egress) and between clusters. Already covered: kubeadm certificate commands and lifetimes (<a href="d2-topic-2-1.html#s6">topic 2.1</a>), kubelet bootstrap and serving certificates (<a href="d2-topic-2-2.html#s3">topic 2.2</a>), user certificates through the CSR API (<a href="d3-topic-3-2.html#s4">topic 3.2</a>), TLS Secrets (<a href="d3-topic-3-3.html#s7">topic 3.3</a>) and mesh mTLS (<a href="d5-topic-5-2.html#s4">topic 5.2</a>).</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0), gateway-api.sigs.k8s.io, cert-manager.io and the Istio and Cilium documentation.</p>
+			<div class="callout note"><p><strong>Running example.</strong> Customers reach the shop at <code>shop.example.com</code> through a Gateway; its certificate comes from cert-manager. The Gateway re-encrypts traffic to the <code>web</code> Service, and the platform team manages the cluster's own CAs.</p></div>
+
+			<!-- ===== PKI ===== -->
+			<h2 id="s1">The cluster's PKI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">The certificate authorities a cluster runs on, and what each one signs.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CA (kubeadm path)</th><th>Signs</th></tr></thead>
+						<tbody>
+							<tr><td><code>kubernetes-ca</code> (<code>ca.crt</code>)</td><td data-label="Signs">The API server's serving certificate, its kubelet client certificate, kubelet client certificates, and the admin, controller manager and scheduler kubeconfigs; also the trust root for client certificates (<code>--client-ca-file</code>)</td></tr>
+							<tr><td><code>etcd-ca</code> (<code>etcd/ca.crt</code>)</td><td data-label="Signs">etcd server, peer and health-check certificates, and the API server's etcd client certificate</td></tr>
+							<tr><td><code>kubernetes-front-proxy-ca</code></td><td data-label="Signs">The front-proxy client certificate, used only by the aggregation layer for extension API servers</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The ServiceAccount key pair, <code>sa.key</code> and <code>sa.pub</code>, is separate: a bare key pair that signs and verifies tokens, not a CA. The API server's serving certificate must name every address clients use: its host name and IPs, the load balancer, and <code>kubernetes</code>, <code>kubernetes.default</code> through <code>kubernetes.default.svc.cluster.local</code>.</p>
+				<div class="code"><span class="file">Check a certificate's names and expiry (shell)</span>
+<pre><code>cd /etc/kubernetes/pki
+openssl x509 -in apiserver.crt -noout \
+  -subject -enddate -ext subjectAltName
+
+<span class="c"># exit code 1 if it expires in 30 days</span>
+openssl x509 -in apiserver.crt -noout \
+  -checkend 2592000</code></pre></div>
+				<h3>Protecting the CAs</h3>
+				<ul>
+					<li>The Security Checklist: "The root certificate is protected (either an offline CA, or a managed online CA with effective access controls)", "Intermediate and leaf certificates have an expiry date no more than 3 years in the future", and etcd's CA "should be unique to etcd".</li>
+					<li>The three cluster CAs can be intermediates under an organization root: "You can create a single root CA, controlled by an administrator. This root CA can then create multiple intermediate CAs".</li>
+					<li><strong>kubeadm external CA mode:</strong> provide <code>ca.crt</code> without <code>ca.key</code>, and kubeadm leaves signing to you, keeping the CA private key off the cluster. "kubeadm cannot manage certificates signed by an external CA." The controller manager can then run as a standalone CSR signer with the key elsewhere.</li>
+					<li><strong>Key algorithm:</strong> kubeadm's <code>encryptionAlgorithm</code> is RSA-2048 by default; RSA-3072, RSA-4096, ECDSA-P256 and ECDSA-P384 are allowed (the kubeadm certificate task page omits P384).</li>
+				</ul>
+				<div class="callout trap"><p><strong>Two certificate details people miss.</strong> The generic certificates table gives the API server's kubelet client certificate the group <code>system:masters</code>; kubeadm uses the less privileged <code>kubeadm:cluster-admins</code> instead. And the <code>CertificateSubjectRestriction</code> admission plugin (on by default) rejects CSRs that ask for the <code>system:masters</code> group, but it can't stop someone who has the CA key itself.</p></div>
+			</div>
+
+			<!-- ===== Rotation ===== -->
+			<h2 id="s2">Rotation and revocation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">Keeping certificates fresh, and why replacing a CA is hard.</span></p>
+				<ul>
+					<li><strong>Leaf certificates:</strong> kubeadm issues one-year certificates and renews them on every control plane upgrade, or with <code>kubeadm certs renew</code>. It never renews CAs.</li>
+					<li><strong>Kubelets:</strong> client certificates rotate automatically (stable since v1.19), renewing "between 30% and 10% of the time remaining". Serving certificates rotate with <code>serverTLSBootstrap</code>, but those requests are never auto-approved (<a href="d2-topic-2-2.html#s3">topic 2.2</a>).</li>
+					<li><strong>No revocation:</strong> Kubernetes doesn't check revocation lists, so a leaked client certificate works until it expires. Keep lifetimes short and grant access through RBAC bindings you can remove (<a href="d3-topic-3-2.html#s4">topic 3.2</a>).</li>
+				</ul>
+				<h3>Replacing a CA</h3>
+				<p>"Kubeadm does not support rotation or replacement of CA certificates out of the box." The manual procedure runs a dual-trust phase so nothing breaks mid-way:</p>
+				<ol class="steps">
+					<li><b>Trust both</b>Distribute the new CA, then configure the controller manager, API servers, scheduler, kubelets, kubeconfigs, webhooks and aggregated API servers to trust old and new together.</li>
+					<li><b>Reissue</b>Sign new certificates for the API server, kubelet client and front-proxy with the new CA, and restart each component in turn.</li>
+					<li><b>Roll workloads</b>Restart every Pod that talks to the API server so it picks up the new CA bundle, using PodDisruptionBudgets to keep services up.</li>
+					<li><b>Remove the old CA</b>Once nothing logs TLS errors, take the old CA out of every bundle and kubeconfig.</li>
+				</ol>
+				<div class="callout trap"><p><strong>Why CA rotation is disruptive.</strong> Every component, kubeconfig, kubelet and in-cluster client trusts the CA, so all of them must change and restart. The procedure assumes a highly available control plane: "Configurations with a single API server will experience unavailability while the API server is being restarted." That's a reason to protect CA keys well enough never to need it in a hurry.</p></div>
+			</div>
+
+			<!-- ===== Workload certs ===== -->
+			<h2 id="s3">Certificates for workloads</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">Signers, trust bundles and the new Pod Certificates.</span></p>
+				<p>The CertificateSigningRequest API (<code>certificates.k8s.io/v1</code>) routes each request to a signer named in <code>spec.signerName</code>:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Signer</th><th>For</th><th>Auto-approved?</th></tr></thead>
+						<tbody>
+							<tr><td><code>kubernetes.io/kube-apiserver-client</code></td><td data-label="For">Client certificates the API server accepts</td><td data-label="Auto-approved?">Never</td></tr>
+							<tr><td><code>kubernetes.io/kube-apiserver-client-kubelet</code></td><td data-label="For">Kubelet client certificates (<code>system:node:&lt;name&gt;</code>, no SANs)</td><td data-label="Auto-approved?">May be</td></tr>
+							<tr><td><code>kubernetes.io/kubelet-serving</code></td><td data-label="For">Kubelet serving certificates</td><td data-label="Auto-approved?">Never</td></tr>
+							<tr><td><code>kubernetes.io/kube-apiserver-serving</code></td><td data-label="For">API server serving certificates, CA published as a ClusterTrustBundle</td><td data-label="Auto-approved?">Signed outside the controller manager</td></tr>
+							<tr><td><code>kubernetes.io/legacy-unknown</code></td><td data-label="For">Old behaviour</td><td data-label="Auto-approved?">Can't be requested in the v1 API</td></tr>
+							<tr><td>Custom, such as <code>example.com/serving</code></td><td data-label="For">Your own CA, through a controller that holds the <code>sign</code> verb</td><td data-label="Auto-approved?">Your approver decides</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Approval decides who trusts whom: "The ability to approve CSRs should not be granted broadly or lightly." And for workload certificates, kubernetes.io warns that CSR-signed certificates use "a dedicated CA" and that relying on the cluster root for this is something "you should never rely on".</p>
+				<div class="callout trap"><p><strong><code>kube-root-ca.crt</code> isn't a workload CA.</strong> The controller manager publishes the ConfigMap <code>kube-root-ca.crt</code> in every namespace, and Pods mount it to verify the API server. Use it "to verify internal Kubernetes endpoints" only, not to trust your own services' certificates.</p></div>
+				<h3>ClusterTrustBundles (GA in v1.37)</h3>
+				<p>A <code>ClusterTrustBundle</code> is a cluster-scoped object holding CA certificates for Pods to trust. A bundle linked to a signer must be named <code>&lt;domain&gt;:&lt;path&gt;:&lt;suffix&gt;</code>, and writing it needs the <code>attest</code> verb on that signer. Pods mount bundles through a projected volume, and the kubelet keeps the file current.</p>
+				<div class="code"><span class="file">The shop's internal CA, as a trust bundle (ClusterTrustBundle)</span>
+<pre><code>apiVersion: certificates.k8s.io/v1
+kind: ClusterTrustBundle
+metadata:
+  <span class="c"># signer example.com/mtls as prefix</span>
+  name: example.com:mtls:roots-2026
+  labels:
+    trust: live
+spec:
+  signerName: example.com/mtls
+  trustBundle: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----</code></pre></div>
+				<div class="callout trap"><p><strong>Trust bundles are world-readable.</strong> "ClusterTrustBundle objects should be considered world-readable within the cluster": every ServiceAccount can list them by default. Put only public CA certificates in them, never keys.</p></div>
+				<h3>Pod Certificates (GA in v1.37)</h3>
+				<p>A <code>podCertificate</code> projected volume asks for an X.509 certificate for the Pod. The kubelet generates the private key on the node, creates a <code>PodCertificateRequest</code>, and a signer issues it with no separate approval step. Unlike a ServiceAccount token, which is a bearer token, the key never leaves the workload.</p>
+				<div class="code"><span class="file">An mTLS client certificate for a Pod (Pod volume excerpt)</span>
+<pre><code>volumes:
+- name: creds
+  projected:
+    sources:
+    - podCertificate:
+        signerName: example.com/mtls
+        keyType: ECDSAP256
+        maxExpirationSeconds: 86400
+        <span class="c"># key and chain in one file</span>
+        credentialBundlePath: bundle.pem
+    - clusterTrustBundle:
+        signerName: example.com/mtls
+        path: ca-roots.pem</code></pre></div>
+				<p>Lifetimes run from 1 hour to 91 days (default 24 hours). <code>credentialBundlePath</code> is preferred over separate key and certificate files, because otherwise the kubelet "may rotate the credentials after your first read and before your second read". NodeRestriction ensures a node can request certificates only for Pods actually running on it.</p>
+				<div class="callout trap"><p><strong>No signer comes with Kubernetes.</strong> The v1.37 announcement: "Because the Kubernetes project does not yet ship any Pod Certificate signers in core, in order to try these features out, you will need to install a third-party signer." What goes in the certificate (a SPIFFE ID or not) depends on that signer. SPIRE remains the established way to issue SPIFFE identities.</p></div>
+			</div>
+
+			<!-- ===== cert-manager ===== -->
+			<h2 id="s4">cert-manager</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">Automating certificates for Ingress, Gateways and Pods.</span></p>
+				<p>cert-manager (CNCF graduated) issues and renews certificates from <code>Issuer</code> (namespaced) or <code>ClusterIssuer</code> objects of type ACME (for example Let's Encrypt, with HTTP-01 or DNS-01 challenges), CA, Vault, CyberArk (formerly Venafi) or SelfSigned, plus external issuers for cloud CAs.</p>
+				<div class="code"><span class="file">The shop's public certificate (cert-manager Certificate)</span>
+<pre><code>apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web
+  namespace: shop
+spec:
+  <span class="c"># kubernetes.io/tls Secret it writes</span>
+  secretName: web-tls
+  dnsNames:
+  - shop.example.com
+  <span class="c"># 90 days, renew 15 days before</span>
+  duration: 2160h
+  renewBefore: 360h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: letsencrypt
+    kind: ClusterIssuer</code></pre></div>
+				<ul>
+					<li>Since v1.18 (June 2025), <code>rotationPolicy: Always</code> is the default: "a new private key is generated each time a re-issuance is triggered" (it used to be <code>Never</code>). By default a certificate lasts 90 days and renews at two-thirds of its life.</li>
+					<li>The annotation <code>cert-manager.io/cluster-issuer</code> on an Ingress or Gateway makes cert-manager create the Certificate automatically. Prefer <code>dnsNames</code> to <code>commonName</code>: clients match the subject alternative names.</li>
+					<li><strong>trust-manager</strong> distributes CA bundles to every namespace. Its v0.26.0 release removed two compromised roots from its default public CA bundle, a reminder that default trust stores need patching too.</li>
+					<li>The <strong>csi-driver</strong> mounts certificates straight into Pods without a Secret: "private keys never leave the node".</li>
+				</ul>
+				<div class="callout tip"><p><strong>Check version support.</strong> cert-manager 1.21 (current at v1.21.3) is tested on Kubernetes 1.33 to 1.36. Support for 1.37 is expected with cert-manager 1.22, due around November 2026.</p></div>
+			</div>
+
+			<!-- ===== Edge TLS ===== -->
+			<h2 id="s5">TLS at the edge</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">Terminating, passing through and re-encrypting TLS at Ingress and Gateways.</span></p>
+				<p>An Ingress "assumes TLS termination at the ingress point (traffic to the Service and its Pods is in plaintext)". The Ingress API is frozen, and kubernetes.io recommends Gateway API, whose TLS model is richer:</p>
+				<div class="code"><span class="file">HTTPS listener using a certificate in another namespace (Gateway and ReferenceGrant)</span>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: infra
+spec:
+  gatewayClassName: example
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: shop.example.com
+    tls:
+      <span class="c"># the default mode</span>
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        group: ""
+        name: web-tls
+        namespace: shop
+---
+<span class="c"># must live in the Secret's namespace</span>
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata:
+  name: infra-gw-to-secrets
+  namespace: shop
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: infra
+  to:
+  - group: ""
+    kind: Secret</code></pre></div>
+				<div class="code"><span class="file">Re-encrypt from the Gateway to the web Service (BackendTLSPolicy)</span>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: web-backend-tls
+  namespace: shop
+spec:
+  targetRefs:
+  - group: ""
+    kind: Service
+    name: web
+  validation:
+    <span class="c"># SNI; the backend cert must match</span>
+    hostname: web.shop.svc
+    caCertificateRefs:
+    - group: ""
+      kind: ConfigMap
+      name: shop-ca</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Gateway API TLS feature</th><th>What it does</th><th>Status</th></tr></thead>
+						<tbody>
+							<tr><td>Listener <code>Terminate</code> / <code>Passthrough</code></td><td data-label="What it does">Terminate at the Gateway, or pass encrypted traffic to the backend by SNI ("TLS settings do not take effect")</td><td data-label="Status">Core</td></tr>
+							<tr><td>ReferenceGrant</td><td data-label="What it does">Allows a cross-namespace reference; only valid in the target's namespace</td><td data-label="Status"><code>v1</code> since v1.5</td></tr>
+							<tr><td>BackendTLSPolicy</td><td data-label="What it does">TLS from the Gateway to a backend, verifying its certificate; the CA must be in the Service's namespace</td><td data-label="Status">Standard since v1.4 (October 2025)</td></tr>
+							<tr><td>Frontend client certificate validation</td><td data-label="What it does">mTLS from clients, set at Gateway level in <code>spec.tls.frontend</code></td><td data-label="Status">Standard since v1.5 (February 2026)</td></tr>
+							<tr><td>Backend client certificate</td><td data-label="What it does">The Gateway presents its own certificate to backends</td><td data-label="Status">Standard since v1.5</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Frontend mTLS is per Gateway, not per listener.</strong> It's configured once in <code>spec.tls.frontend</code> "to mitigate security risks associated with HTTP/2 and TLS connection coalescing", with optional per-port overrides. Its <code>AllowInsecureFallback</code> mode accepts clients without valid certificates and "should be used with caution". Material from before 2025 that calls BackendTLSPolicy <code>v1alpha3</code> or experimental is out of date.</p></div>
+			</div>
+
+			<!-- ===== Control plane ===== -->
+			<h2 id="s6">Control plane connectivity</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">How users and the control plane reach the cluster safely.</span></p>
+				<ul>
+					<li><strong>The API endpoint:</strong> "External Internet access to the Kubernetes API server should be restricted to not expose the API publicly. Be careful, as many managed Kubernetes distributions are publicly exposing the API server by default." Options: an IP allow-list on a public endpoint (which doesn't apply to the private one), a private endpoint reachable only from the cloud network or VPN, or a bastion host.</li>
+					<li><strong>Konnectivity</strong> (beta since v1.18) replaces the deprecated SSH tunnels for control-plane-to-node traffic. Agents on the nodes dial out to the Konnectivity server and authenticate with a ServiceAccount token (audience <code>system:konnectivity-server</code>), so nodes need no inbound port from the control plane. The API server is configured through an <code>EgressSelectorConfiguration</code> (<code>apiserver.k8s.io/v1beta1</code>) with <code>cluster</code>, <code>etcd</code> and <code>controlplane</code> routes, over a local socket or mutual TLS.</li>
+					<li><strong>TLS settings</strong> for the API server, controller manager, scheduler and kubelet: <code>--tls-min-version</code> (<code>VersionTLS12</code> or <code>VersionTLS13</code>), <code>--tls-cipher-suites</code> (the help text marks RC4, 3DES and plain <code>TLS_RSA_*</code> suites as "Insecure"; TLS 1.3 suites aren't configurable), and <code>--tls-curve-preferences</code> (new in v1.36) for key exchange.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Egress / multi ===== -->
+			<h2 id="s7">Egress and multi-cluster</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.3</span><span class="skill-text">Controlling traffic leaving the cluster, and linking clusters securely.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Egress control</th><th>Strength</th><th>Limit</th></tr></thead>
+						<tbody>
+							<tr><td>NetworkPolicy egress</td><td data-label="Strength">Enforced by the CNI for every Pod</td><td data-label="Limit">No domain names, no TLS, can't force traffic through a gateway (<a href="d3-topic-3-4.html#s6">topic 3.4</a>)</td></tr>
+							<tr><td>Mesh egress gateway</td><td data-label="Strength">Central point for TLS origination, logging and policy</td><td data-label="Limit">"Istio cannot securely enforce that all egress traffic actually flows through the egress gateways": pair it with NetworkPolicy</td></tr>
+							<tr><td>CNI egress gateway (for example Cilium)</td><td data-label="Strength">Sends chosen Pods' traffic out through set nodes with "predictable IPs" for external firewalls</td><td data-label="Limit">Plugin-specific; Cilium's doesn't work with Cluster Mesh</td></tr>
+							<tr><td>FQDN policies (Cilium, Calico)</td><td data-label="Strength">Allow named external domains</td><td data-label="Limit">Plugin-specific CRDs</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Multi-cluster option</th><th>Security notes</th></tr></thead>
+						<tbody>
+							<tr><td>Cilium ClusterMesh</td><td data-label="Security notes">"Uses mTLS to secure control plane connections"; clusters must share a root CA (or a CA bundle) and have unique cluster IDs; data encryption needs WireGuard or IPsec</td></tr>
+							<tr><td>Submariner (CNCF sandbox)</td><td data-label="Security notes">Gateway nodes link clusters; IPsec by default, WireGuard optional, VXLAN "unencrypted by design"</td></tr>
+							<tr><td>Mesh multi-cluster</td><td data-label="Security notes">A shared trust anchor across clusters, or SPIFFE federation between trust domains</td></tr>
+							<tr><td>Multi-Cluster Services API</td><td data-label="Security notes">ServiceExport and ServiceImport (<code>v1beta1</code> since May 2026); access control still comes from each cluster's policies</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Inside a cluster, node-to-node encryption comes from the CNI or a mesh (<a href="d2-topic-2-3.html#s1">topic 2.3</a>).</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Three CAs: kubernetes-ca, etcd-ca (unique to etcd), front-proxy-ca; plus <code>sa.key</code>/<code>sa.pub</code>, a key pair, not a CA. Protect the root (offline, or a well-controlled managed CA); leaf and intermediate certificates under 3 years. External CA mode keeps the CA key off the cluster.</li>
+				<li>kubeadm renews leaf certificates (one year) but never CAs. CA rotation is manual: trust both, reissue, roll Pods, remove the old one; single API servers go down. No revocation: keep certificates short-lived.</li>
+				<li>Signers: kube-apiserver-client and kubelet-serving are never auto-approved; kube-apiserver-client-kubelet may be; legacy-unknown can't be requested; custom signers need <code>sign</code>. <code>kube-root-ca.crt</code> verifies only the API server.</li>
+				<li>ClusterTrustBundle and Pod Certificates are GA in 1.37 (<code>certificates.k8s.io/v1</code>): world-readable CA bundles; kubelet-generated keys and per-Pod certificates (1 hour to 91 days, use <code>credentialBundlePath</code>). No signer ships in core.</li>
+				<li>cert-manager: Issuers and ClusterIssuers (ACME, CA, Vault, CyberArk, SelfSigned); 90-day default, renew at two-thirds; <code>rotationPolicy: Always</code> default since 1.18; trust-manager for bundles; csi-driver for Secret-free certificates.</li>
+				<li>Edge: Ingress terminates at the edge (plaintext behind). Gateway: Terminate (default) or Passthrough; ReferenceGrant in the Secret's namespace; BackendTLSPolicy GA (v1.4) re-encrypts; frontend mTLS at Gateway level (v1.5).</li>
+				<li>Control plane: don't expose the API publicly (managed defaults often do); Konnectivity (beta) instead of SSH tunnels; set TLS 1.2+ and strong ciphers. Egress: NetworkPolicy plus egress gateways (a mesh gateway alone isn't enforcement). Multi-cluster: shared roots, mTLS, encrypted tunnels.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d5-topic-5-2.html"><small>Previous</small>5.2: Observability and Service Mesh</a>
+				<a class="next" href="d5-topic-5-4.html"><small>Next</small>5.4: Admission Control</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the Gateway API, cert-manager, Istio and Cilium documentation; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>

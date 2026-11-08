@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.4: Admission Control | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 5.4: Kubernetes admission control. The two phases and what admission sees, built-in plugins and their defaults in v1.37, admission webhooks (fields, failure policy, ordering, TLS, good practices and risks), ValidatingAdmissionPolicy and MutatingAdmissionPolicy in CEL, manifest-based admission, and policy engines (Kyverno, OPA Gatekeeper, Kubewarden) with common security policies.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Platform Security &middot; 16%</span>
+		<h1>5.4: Admission Control</h1>
+		<p>The last checkpoint before an object is stored in a Kubernetes&reg; cluster: built-in admission plugins, webhooks, CEL policies and policy engines, and how to use them without opening new holes.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Admission plugins</span><span class="tag">Webhooks</span><span class="tag">ValidatingAdmissionPolicy</span><span class="tag">MutatingAdmissionPolicy</span><span class="tag">Kyverno</span><span class="tag">Gatekeeper</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How admission works</a></li>
+				<li><a href="#s2">Built-in plugins</a></li>
+				<li><a href="#s3">Admission webhooks</a></li>
+				<li><a href="#s4">Webhook good practices and risks</a></li>
+				<li><a href="#s5">CEL admission policies</a></li>
+				<li><a href="#s6">Policy engines</a></li>
+				<li><a href="#s7">Policies worth enforcing</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 5.4</span>
+				<p><strong>Admission Control.</strong></p>
+			</div>
+			<p>This page is the admission control deep dive: the two phases, the built-in plugins, webhooks, the in-process CEL policies, and the policy engines built on them. Pod Security Admission has its own page (<a href="d3-topic-3-1.html">topic 3.1</a>), image signature checks are in <a href="d5-topic-5-1.html#s8">topic 5.1</a>, and the request flow that leads to admission is in <a href="d2-topic-2-1.html#s2">topic 2.1</a>.</p>
+			<p>Quotes are from kubernetes.io (CC BY 4.0) and the Kyverno, Gatekeeper and Kubewarden documentation.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The platform team wants three rules for the shop: images only from <code>registry.example.com/</code> and never <code>:latest</code>, no ServiceAccount token unless asked for, and a company webhook that checks Pods, without ever locking up the cluster.</p></div>
+
+			<!-- ===== How ===== -->
+			<h2 id="s1">How admission works</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">What admission sees, in what order, and how it decides.</span></p>
+				<p>"An admission controller is a piece of code that intercepts requests to the Kubernetes API server prior to persistence of the resource, but after the request is authenticated and authorized."</p>
+				<ol class="steps">
+					<li><b>Mutating phase</b>Mutating controllers (built-in plugins, mutating webhooks, MutatingAdmissionPolicies) may change the object.</li>
+					<li><b>Schema validation</b>The API server validates the final object against its schema.</li>
+					<li><b>Validating phase</b>Validating controllers (built-in plugins, validating webhooks, ValidatingAdmissionPolicies) accept or reject it. Webhooks in this phase run in parallel.</li>
+					<li><b>Result</b>"If any of the controllers in either phase reject the request, the entire request is rejected immediately". Otherwise the object is stored.</li>
+				</ol>
+				<p>Admission sees four operations: <code>CREATE</code>, <code>UPDATE</code>, <code>DELETE</code> and <code>CONNECT</code>. Built-in plugins are compiled into kube-apiserver and turned on with <code>--enable-admission-plugins</code> or off with <code>--disable-admission-plugins</code>; the order you list them in "doesn't matter", because it's fixed in code. The old <code>--admission-control</code> flag is deprecated.</p>
+				<div class="callout trap"><p><strong>Reads skip admission; exec doesn't.</strong> Admission controllers "do <em>not</em> (and cannot) block requests to read (<strong>get</strong>, <strong>watch</strong> or <strong>list</strong>) objects". But <code>kubectl exec</code>, <code>attach</code> and port-forward are <code>CONNECT</code> requests, so an admission policy can block them. Paths that skip the API server entirely (etcd, the kubelet API, static Pods) skip admission too (<a href="d4-topic-4-1.html#s5">topic 4.1</a>).</p></div>
+			</div>
+
+			<!-- ===== Plugins ===== -->
+			<h2 id="s2">Built-in plugins</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">The compiled-in controllers that matter for security, and which are on by default.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Plugin</th><th>Default</th><th>Security purpose</th></tr></thead>
+						<tbody>
+							<tr><td>PodSecurity</td><td data-label="Default">On</td><td data-label="Security purpose">Enforces Pod Security Standards per namespace (<a href="d3-topic-3-1.html">topic 3.1</a>)</td></tr>
+							<tr><td>NodeRestriction</td><td data-label="Default">Off (kubeadm turns it on)</td><td data-label="Security purpose">Kubelets may change only their own Node and Pods (<a href="d2-topic-2-2.html#s3">topic 2.2</a>)</td></tr>
+							<tr><td>ServiceAccount</td><td data-label="Default">On</td><td data-label="Security purpose">Assigns ServiceAccounts and token volumes; kubernetes.io "strongly recommends enabling" it</td></tr>
+							<tr><td>LimitRanger, ResourceQuota</td><td data-label="Default">On</td><td data-label="Security purpose">Resource defaults and caps against denial of service (<a href="d3-topic-3-4.html#s3">topic 3.4</a>)</td></tr>
+							<tr><td>NamespaceLifecycle</td><td data-label="Default">On</td><td data-label="Security purpose">No new objects in terminating namespaces; protects <code>default</code>, <code>kube-system</code>, <code>kube-public</code> from deletion</td></tr>
+							<tr><td>CertificateApproval, CertificateSigning, Certificate<wbr>SubjectRestriction</td><td data-label="Default">On</td><td data-label="Security purpose">Require <code>approve</code> and <code>sign</code> on the signer; block CSRs for <code>system:masters</code></td></tr>
+							<tr><td>AlwaysPullImages</td><td data-label="Default">Off</td><td data-label="Security purpose">Forces credential checks for cached private images (<a href="d1-topic-1-3.html#s3">topic 1.3</a>)</td></tr>
+							<tr><td>DenyService<wbr>ExternalIPs</td><td data-label="Default">Off</td><td data-label="Security purpose">Blocks new <code>externalIPs</code> (CVE-2020-8554)</td></tr>
+							<tr><td>ImagePolicyWebhook</td><td data-label="Default">Off</td><td data-label="Security purpose">Asks an external service to approve images; <code>defaultAllow</code> omitted means false, failing closed</td></tr>
+							<tr><td>OwnerReferences<wbr>PermissionEnforcement</td><td data-label="Default">Off</td><td data-label="Security purpose">Changing owner references needs <code>delete</code> on the object</td></tr>
+							<tr><td>PodNodeSelector, PodTolerationRestriction</td><td data-label="Default">Off (alpha)</td><td data-label="Security purpose">Pin a namespace's Pods to nodes, and limit tolerations, for tenant isolation</td></tr>
+							<tr><td>EventRateLimit</td><td data-label="Default">Off (alpha)</td><td data-label="Security purpose">Limits floods of Event writes</td></tr>
+							<tr><td>Mutating and validating admission webhooks and policies</td><td data-label="Default">On</td><td data-label="Security purpose">The extension points below</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout retired"><p><strong>Plugins that are gone.</strong> PodSecurityPolicy was removed in v1.25, SecurityContextDeny in v1.30, and DenyEscalatingExec and DenyExecOnPrivileged (which blocked exec into privileged Pods) in v1.21, later than their promised v1.18. The kubernetes.io admission page lists 20 default plugins, but v1.37's code enables 25; its sections on the CEL policies still mention <code>v1alpha1</code>, though both are GA, and its ImagePolicyWebhook example sets <code>defaultAllow: true</code>, which isn't the default.</p></div>
+				<div class="code"><span class="file">See what's configured (shell)</span>
+<pre><code><span class="c"># the API server's admission flags</span>
+kubectl -n kube-system get pod \
+  -l component=kube-apiserver -o yaml \
+  | grep admission
+
+<span class="c"># webhooks and CEL policies in use</span>
+kubectl get \
+  validatingwebhookconfigurations,\
+mutatingwebhookconfigurations
+kubectl get validatingadmissionpolicies
+kubectl get mutatingadmissionpolicies</code></pre></div>
+			</div>
+
+			<!-- ===== Webhooks ===== -->
+			<h2 id="s3">Admission webhooks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">Calling out to your own service to accept, reject or change objects.</span></p>
+				<p>A <code>ValidatingWebhookConfiguration</code> or <code>MutatingWebhookConfiguration</code> (<code>admissionregistration.k8s.io/v1</code>, cluster-scoped) tells the API server to POST an <code>AdmissionReview</code> to a service over HTTPS. The reply carries <code>allowed</code>, an optional <code>status</code> message, <code>warnings</code>, and, for mutation, a base64-encoded JSON Patch.</p>
+				<div class="code"><span class="file">The company Pod check, failing safely (ValidatingWebhookConfiguration)</span>
+<pre><code>apiVersion: >-
+  admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: policy.example.com
+webhooks:
+- name: pods.policy.example.com
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  timeoutSeconds: 5
+  <span class="c"># reject if the webhook is unreachable</span>
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  clientConfig:
+    service:
+      namespace: policy-system
+      name: policy-webhook
+      path: /validate
+    caBundle: &lt;base64-PEM-CA&gt;
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    operations: ["CREATE", "UPDATE"]
+    resources: ["pods"]
+    scope: Namespaced
+  <span class="c"># skip kube-system and our namespace</span>
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: [kube-system, policy-system]</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Field</th><th>Default and rules</th></tr></thead>
+						<tbody>
+							<tr><td><code>failurePolicy</code></td><td data-label="Default and rules"><code>Fail</code> by default in v1, or <code>Ignore</code>; applies only to call errors: "An explicit rejection ... always denies the API request"</td></tr>
+							<tr><td><code>sideEffects</code>, <code>admissionReviewVersions</code></td><td data-label="Default and rules">Required; side effects <code>None</code> or <code>NoneOnDryRun</code></td></tr>
+							<tr><td><code>timeoutSeconds</code></td><td data-label="Default and rules">10 by default, 1 to 30; a timeout follows the failure policy</td></tr>
+							<tr><td><code>rules.resources</code></td><td data-label="Default and rules"><code>*</code> means all resources but not subresources; use <code>*/*</code> or <code>pods/exec</code> to include them</td></tr>
+							<tr><td><code>namespaceSelector</code>, <code>objectSelector</code></td><td data-label="Default and rules">Narrow what's sent; an object selector can be skipped by anyone who controls the labels</td></tr>
+							<tr><td><code>matchConditions</code></td><td data-label="Default and rules">Up to 64 CEL expressions (GA v1.30); all must be true to call the webhook</td></tr>
+							<tr><td><code>reinvocationPolicy</code> (mutating)</td><td data-label="Default and rules"><code>Never</code> by default, or <code>IfNeeded</code> to run again after later mutations</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Ordering:</strong> mutating webhooks run one after another, and "don't run in a consistent order", so "Don't rely on your webhook running at a specific point". Mutations must be idempotent. To check the final object, use a validating webhook or policy.</li>
+					<li><strong>TLS and identity:</strong> HTTPS is required, and the server certificate must be valid for <code>&lt;service&gt;.&lt;namespace&gt;.svc</code>, verified with <code>caBundle</code>. The API server can authenticate to webhooks using a kubeconfig named in its <code>AdmissionConfiguration</code>. Since v1.37 (beta), webhooks are no longer called for TokenReview and SubjectAccessReview requests.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Good practices ===== -->
+			<h2 id="s4">Webhook good practices and risks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">Keeping webhooks fast, safe and impossible to abuse.</span></p>
+				<p>kubernetes.io's admission webhook good practices start with a preference: "The Kubernetes project recommends that you use CEL-based admission control when possible." When a webhook is needed:</p>
+				<ul>
+					<li><strong>Avoid deadlocks:</strong> "Avoid matching objects in the <code>kube-system</code> namespace", and "Exclude the namespace where your webhook is running" with a namespace selector. Otherwise a fail-closed webhook can stop its own Pods from being recreated.</li>
+					<li><strong>Keep it fast:</strong> set a small timeout, run several replicas, and avoid extra API calls. Validating webhooks run in parallel; mutating ones add up in sequence.</li>
+					<li><strong>Fail open or closed:</strong> the page suggests letting mutating webhooks fail open (<code>Ignore</code>) while a validating control checks the final state; security-critical validation fails closed.</li>
+					<li><strong>Roll out gradually:</strong> start with <code>Ignore</code> and a test namespace, then widen.</li>
+					<li><strong>Protect the configuration:</strong> limit create, update, patch, delete and deletecollection on webhook configurations, and on the webhook server's namespace, to trusted administrators.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Admission can't protect itself.</strong> "Admission configuration resources (such as ValidatingWebhookConfiguration) are not themselves subject to webhook admission", and "you can't create a ValidatingAdmissionPolicy that prevents changes to ValidatingAdmissionPolicyBindings." So anyone who can write webhook configurations can intercept, or silently disable, enforcement for every object (<a href="d4-topic-4-3.html#s4">topic 4.3</a>). RBAC is the main defense. New in v1.37 (beta), <strong>manifest-based admission</strong> loads webhooks and policies from files on the API server host (<code>staticManifestsDir</code>); these can't be changed through the API and can protect the admission objects themselves.</p></div>
+				<div class="callout trap"><p><strong><code>Ignore</code> is a bypass waiting to happen.</strong> With <code>failurePolicy: Ignore</code>, a policy simply isn't enforced while its webhook is down, slow or overloaded, and an attacker who can knock the webhook over gets everything through. <code>Fail</code> keeps the policy but risks availability: hence the namespace exclusions and replicas above.</p></div>
+			</div>
+
+			<!-- ===== CEL ===== -->
+			<h2 id="s5">CEL admission policies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">Built-in, in-process policies written in the Common Expression Language.</span></p>
+				<p><strong>ValidatingAdmissionPolicy</strong> (VAP, GA v1.30) is "a declarative, in-process alternative to validating admission webhooks". It needs two objects: the policy (logic) and a binding (where it applies and what happens on failure). "At least a ValidatingAdmissionPolicy and a corresponding ValidatingAdmissionPolicyBinding must be defined for a policy to have an effect."</p>
+				<div class="code"><span class="file">Trusted registry, no :latest (ValidatingAdmissionPolicy and binding)</span>
+<pre><code>apiVersion: >-
+  admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: trusted-images
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["pods"]
+  validations:
+  - expression: >-
+      object.spec.containers.all(c,
+      c.image.startsWith(
+      'registry.example.com/'))
+    message: untrusted image registry
+  - expression: >-
+      !object.spec.containers.exists(c,
+      c.image.endsWith(':latest'))
+    message: ":latest tag not allowed"
+---
+apiVersion: >-
+  admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: trusted-images-shop
+spec:
+  policyName: trusted-images
+  <span class="c"># block, and record in the audit log</span>
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        env: prod</code></pre></div>
+				<ul>
+					<li><code>validationActions</code> lives on the binding: <code>Deny</code>, <code>Warn</code> and/or <code>Audit</code> (not <code>Deny</code> with <code>Warn</code>). <code>Audit</code> writes to the <code>validation.policy.admission.k8s.io/validation_failure</code> audit annotation (<a href="d3-topic-3-5.html#s4">topic 3.5</a>).</li>
+					<li>A policy can take parameters (<code>paramKind</code>, with <code>paramRef</code> in the binding), define <code>variables</code> and <code>matchConditions</code>, and use <code>messageExpression</code>. Expressions can read <code>object</code>, <code>oldObject</code>, <code>request</code>, <code>params</code>, <code>namespaceObject</code> and <code>authorizer</code>.</li>
+					<li>A real policy should also check <code>initContainers</code> and <code>ephemeralContainers</code>. Because the rule matches Pods, a Deployment with a bad image is accepted and its ReplicaSet then fails to create Pods.</li>
+				</ul>
+				<p><strong>MutatingAdmissionPolicy</strong> (MAP, GA v1.36 in <code>admissionregistration.k8s.io/v1</code>) changes objects in CEL, either as an apply configuration merged like server-side apply, or as JSON Patch:</p>
+				<div class="code"><span class="file">No ServiceAccount token for shop Pods (MutatingAdmissionPolicy and binding)</span>
+<pre><code>apiVersion: >-
+  admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: no-sa-token
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  mutations:
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: >-
+        Object{spec: Object.spec{
+        automountServiceAccountToken:
+        false}}
+---
+apiVersion: >-
+  admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: no-sa-token
+spec:
+  policyName: no-sa-token</code></pre></div>
+				<p>As written, this overrides Pods that explicitly ask for a token; a <code>matchCondition</code> can exempt them. A MAP binding has no <code>validationActions</code> and can't match <code>DELETE</code>.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CEL policies</th><th>Webhooks</th></tr></thead>
+						<tbody>
+							<tr><td>Run inside the API server: no network hop, no TLS, no server to keep up</td><td data-label="Webhooks">A separate service that can be down, slow or attacked</td></tr>
+							<tr><td>Bounded cost (1 million units per expression, 10 million per binding) and type checking</td><td data-label="Webhooks">Any logic, any duration up to the timeout</td></tr>
+							<tr><td>Can't call external services or look up other objects (only params and the namespace)</td><td data-label="Webhooks">Can query anything, such as registries or other objects</td></tr>
+							<tr><td>No background audit of existing objects</td><td data-label="Webhooks">Depends on the tool</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Type checking only warns.</strong> When a VAP is created, type errors appear as warnings in <code>status.typeChecking</code>; they don't stop the policy from being stored or evaluated. Test policies with <code>Warn</code> or <code>Audit</code> before switching to <code>Deny</code>.</p></div>
+			</div>
+
+			<!-- ===== Engines ===== -->
+			<h2 id="s6">Policy engines</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">Tools that add reporting, generation, external data and libraries on top of admission.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Engine</th><th>Policies written in</th><th>Beyond built-in CEL</th><th>Status</th></tr></thead>
+						<tbody>
+							<tr><td>Kyverno</td><td data-label="Policies written in">CEL policy types in <code>policies.kyverno.io/v1</code>: ValidatingPolicy, MutatingPolicy, GeneratingPolicy, DeletingPolicy, ImageValidatingPolicy</td><td data-label="Beyond built-in CEL">Generate and clean up resources, verify images, background scans with Policy Reports, external data, CLI tests; can generate native VAPs</td><td data-label="Status">CNCF graduated (March 2026)</td></tr>
+							<tr><td>OPA Gatekeeper</td><td data-label="Policies written in">Rego in ConstraintTemplates, instantiated as Constraints (CEL engine stable since v3.18)</td><td data-label="Beyond built-in CEL">Audit of existing objects, mutation, external data (for example Ratify for signatures); can generate native VAPs (beta, on by default since v3.20)</td><td data-label="Status">Sub-project of OPA (CNCF graduated)</td></tr>
+							<tr><td>Kubewarden</td><td data-label="Policies written in">WebAssembly modules, written in CEL, Rego, Rust, Go and others, distributed as OCI artifacts</td><td data-label="Beyond built-in CEL">Monitor and protect modes, background audit, policy groups</td><td data-label="Status">CNCF sandbox</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Gatekeeper's model: a <code>ConstraintTemplate</code> defines a new kind (for example <code>K8sRequiredLabels</code>) and its Rego or CEL logic; a <code>Constraint</code> of that kind sets the parameters, what it matches and the <code>enforcementAction</code> (<code>deny</code> by default, or <code>dryrun</code> or <code>warn</code>). Its audit controller also reports violations by objects that already exist.</p>
+				<div class="callout retired"><p><strong>Kyverno's classic policies are deprecated.</strong> "<code>ClusterPolicy</code>, <code>Policy</code>, <code>CleanupPolicy</code>, and the legacy <code>kyverno.io</code> PolicyException are deprecated as of Kyverno v1.19 and will be removed in v1.20." The replacements are the CEL-based types above; <code>kyverno migrate</code> helps convert. Material written before 2026 shows the older <code>kyverno.io/v1</code> style.</p></div>
+			</div>
+
+			<!-- ===== Policies ===== -->
+			<h2 id="s7">Policies worth enforcing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.4</span><span class="skill-text">Common security rules, and the simplest tool for each.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Rule</th><th>Simplest tool</th></tr></thead>
+						<tbody>
+							<tr><td>No privileged Pods, host namespaces or hostPath</td><td data-label="Simplest tool">PodSecurity first; a VAP or engine for exceptions and finer rules</td></tr>
+							<tr><td>Images from trusted registries, no <code>:latest</code>, pinned digests</td><td data-label="Simplest tool">A VAP, as above</td></tr>
+							<tr><td>Signed images</td><td data-label="Simplest tool">Kyverno ImageValidatingPolicy, Sigstore policy-controller, or Gatekeeper with Ratify; a VAP can't verify signatures (<a href="d5-topic-5-1.html#s8">topic 5.1</a>)</td></tr>
+							<tr><td>Resource limits on every container</td><td data-label="Simplest tool">LimitRanger defaults plus a VAP</td></tr>
+							<tr><td>No ServiceAccount token unless requested</td><td data-label="Simplest tool">A MAP, as above</td></tr>
+							<tr><td>No NodePort, LoadBalancer or <code>externalIPs</code> for tenants</td><td data-label="Simplest tool"><code>DenyServiceExternalIPs</code> plus a VAP on Services</td></tr>
+							<tr><td>No new bindings to <code>cluster-admin</code></td><td data-label="Simplest tool">RBAC (<code>bind</code> and <code>escalate</code>), plus a VAP on RoleBindings and ClusterRoleBindings</td></tr>
+							<tr><td>Required labels, such as an owner</td><td data-label="Simplest tool">A VAP, or Gatekeeper's K8sRequiredLabels</td></tr>
+							<tr><td>Unique Ingress or Gateway hostnames across namespaces</td><td data-label="Simplest tool">An engine that can look up other objects; a VAP can't</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>Choosing a mechanism.</strong> Built-in plugins for what they cover; CEL policies (VAP, MAP) for rules about the object in front of you; webhooks or engines when you need external data, lookups of other objects, signature checks, generation or reports. Whatever you use, protect its configuration with RBAC and roll out in warn or audit mode first.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Admission runs after authentication and authorization: mutating, then schema validation, then validating; any rejection fails the request. It sees CREATE, UPDATE, DELETE and CONNECT (so it can block exec), never reads.</li>
+				<li>Built-ins: PodSecurity, ServiceAccount, LimitRanger, ResourceQuota, NamespaceLifecycle and the certificate plugins are on; NodeRestriction (kubeadm enables it), AlwaysPullImages, DenyServiceExternalIPs and ImagePolicyWebhook are off. PSP, SecurityContextDeny and DenyEscalatingExec are gone.</li>
+				<li>Webhooks: <code>failurePolicy</code> Fail by default (Ignore = bypass when down); <code>sideEffects</code> and <code>admissionReviewVersions</code> required; timeout 10 s (max 30); <code>*</code> excludes subresources; mutating webhooks serial, unordered, must be idempotent; HTTPS with <code>caBundle</code>.</li>
+				<li>Good practice: prefer CEL; exclude <code>kube-system</code> and the webhook's own namespace; small timeouts and replicas; protect webhook configs with RBAC, since admission can't protect itself (manifest-based admission, beta in 1.37, can).</li>
+				<li>VAP (GA 1.30): policy plus binding; <code>validationActions</code> Deny, Warn, Audit on the binding; params, variables, matchConditions; type checking only warns. MAP (GA 1.36): ApplyConfiguration or JSONPatch; no validationActions; no DELETE.</li>
+				<li>Engines: Kyverno (graduated; CEL types in <code>policies.kyverno.io/v1</code>; ClusterPolicy deprecated in 1.19), Gatekeeper (Rego ConstraintTemplates, audit, generates VAPs), Kubewarden (sandbox, WebAssembly). Use them for signatures, lookups, generation and reports.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d5-topic-5-3.html"><small>Previous</small>5.3: PKI and Connectivity</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA and Kyverno are marks of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the Kyverno, OPA Gatekeeper and Kubewarden documentation; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
