@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.3: Container Networking, Client Security and Storage | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 2.3: the flat, unencrypted Pod network, CNI plugins and their privileges, CNI encryption, CoreDNS and dnsPolicy, NET_RAW spoofing, Service exposure and the ingress-nginx retirement; kubeconfig files, exec credential plugins, kuberc credential plugin allowlists, kubectl proxy and port-forward risks, impersonation and kubectl CVEs; volume access modes, fsGroup and supplementalGroupsPolicy, PV creation rights, volume encryption, reclaim policies, snapshots, CSI drivers and subPath CVEs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Kubernetes Cluster Component Security &middot; 22%</span>
+		<h1>2.3: Container Networking, Client Security and Storage</h1>
+		<p>Three more parts of a Kubernetes&reg; cluster to secure: the Pod network and the plugins that build it, the clients and kubeconfig files people use to reach the API, and the volumes that hold the cluster's data.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">CNI</span><span class="tag">CoreDNS</span><span class="tag">NET_RAW</span><span class="tag">kubeconfig</span><span class="tag">kuberc</span><span class="tag">Access modes</span><span class="tag">CSI</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The Pod network and CNI</a></li>
+				<li><a href="#s2">DNS and spoofing</a></li>
+				<li><a href="#s3">Exposing Services</a></li>
+				<li><a href="#s4">kubeconfig files</a></li>
+				<li><a href="#s5">Safe client habits</a></li>
+				<li><a href="#s6">Volumes and who can use them</a></li>
+				<li><a href="#s7">Protecting stored data</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.3</span>
+				<p><strong>Container Networking. Client Security. Storage.</strong></p>
+			</div>
+			<p>The curriculum gives only the names. This page treats each as a part of the cluster to secure. <strong>Container networking</strong>: the Pod network, CNI plugins, DNS and how Services are exposed. <strong>Client security</strong>: kubectl and other API clients, and the kubeconfig files that hold their credentials. <strong>Storage</strong>: volumes, who can create and mount them, and how their data is protected.</p>
+			<p>NetworkPolicy in depth is in <a href="index.html#d3">topic 3.4</a>, service mesh encryption in <a href="index.html#d5">topic 5.2</a>, TLS for Ingress and Gateway in <a href="index.html#d5">topic 5.3</a>, and Secrets in <a href="index.html#d3">topic 3.3</a>. Quotes are from kubernetes.io (CC BY 4.0) and the projects named.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's developers reach the cluster with kubectl from their laptops and from CI. The shop's database keeps its data on a PersistentVolume, and the frontend is exposed to the internet.</p></div>
+
+			<!-- ===== Network ===== -->
+			<h2 id="s1">The Pod network and CNI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">The default network model, and the plugins that implement it.</span></p>
+				<p>"Each pod in a cluster gets its own unique cluster-wide IP address", and "all pods can communicate with all other pods, whether they are on the same node or on different nodes", "without the use of proxies or address translation (NAT)". The multi-tenancy page spells out the security consequence:</p>
+				<div class="callout trap"><p><strong>Open and unencrypted by default.</strong> "By default, all pods in a Kubernetes cluster are allowed to communicate with each other, and all network traffic is unencrypted. This can lead to security vulnerabilities where traffic is accidentally or maliciously sent to an unintended destination, or is intercepted by a workload on a compromised node." NetworkPolicy fixes the first part, but only if the network plugin supports it: "Otherwise, NetworkPolicy resources will be ignored."</p></div>
+				<h3>How CNI plugins run</h3>
+				<p>Kubernetes doesn't build the Pod network itself. The container runtime calls a CNI (Container Network Interface) plugin for each Pod. CNI is "a specification and libraries for writing plugins to configure network interfaces in Linux containers" (spec version 1.1.0, a CNCF incubating project). Since v1.24 the kubelet no longer manages CNI.</p>
+				<ul>
+					<li>Plugin <strong>binaries</strong> live in <code>/opt/cni/bin</code> and <strong>configuration</strong> in <code>/etc/cni/net.d</code>. The runtime, running as root, executes the binary named in the config for every new Pod.</li>
+					<li>The plugin's <strong>agent</strong> usually runs as a DaemonSet with <code>hostNetwork</code> and <code>NET_ADMIN</code>, often more (Calico's node agent is privileged), plus a cluster-wide ServiceAccount.</li>
+				</ul>
+				<div class="callout trap"><p><strong>The CNI directories are root code execution.</strong> Write access to <code>/opt/cni/bin</code> or <code>/etc/cni/net.d</code>, for example through a hostPath volume, lets an attacker run code as root each time a Pod starts, and control its networking. A compromised CNI agent can read, redirect or drop Pod traffic and switch off policy enforcement. Keep CNI namespaces privileged-only and forbid hostPath elsewhere.</p></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Network project</th><th>CNCF status</th></tr></thead>
+						<tbody>
+							<tr><td>CNI (the spec)</td><td data-label="CNCF status">Incubating since 2017</td></tr>
+							<tr><td>Cilium</td><td data-label="CNCF status">Graduated (October 2023)</td></tr>
+							<tr><td>Antrea</td><td data-label="CNCF status">Sandbox</td></tr>
+							<tr><td>Calico, Flannel</td><td data-label="CNCF status">Not CNCF projects (Calico is Tigera's)</td></tr>
+							<tr><td>CoreDNS</td><td data-label="CNCF status">Graduated (January 2019)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Encrypting traffic between nodes</h3>
+				<p>Kubernetes doesn't encrypt Pod traffic. Some CNI plugins can: Cilium offers IPsec or WireGuard&reg;, and Calico offers WireGuard, encrypting traffic as it travels between nodes. The Security Checklist notes: "Not all CNI plugins provide encryption in transit. If the chosen plugin lacks this feature, an alternative solution could be to use a service mesh". CNI encryption covers the wire between nodes only: not traffic between Pods on the same node, and it says nothing about which workload is talking. Service mesh mTLS adds workload identity (<a href="index.html#d5">topic 5.2</a>).</p>
+			</div>
+
+			<!-- ===== DNS ===== -->
+			<h2 id="s2">DNS and spoofing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Cluster DNS settings that matter for security, and attacks from inside a node.</span></p>
+				<p>CoreDNS has been the default cluster DNS since v1.13. Every Pod can resolve the Services of every namespace (<code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code>), so DNS gives an attacker a map of the cluster. A default-deny network policy must still allow DNS: the multi-tenancy page recommends a deny-all policy "with another rule that allows all pods to query the DNS server".</p>
+				<ul>
+					<li><strong><code>dnsPolicy</code></strong>: <code>ClusterFirst</code>, <code>ClusterFirstWithHostNet</code>, <code>Default</code> (use the node's resolver) or <code>None</code> (use only <code>dnsConfig</code>). With <code>None</code>, a Pod can point at any resolver and skip cluster DNS logging and filtering.</li>
+					<li><strong>CoreDNS <code>pods</code> option</strong>: the plugin's default is <code>disabled</code>. <code>insecure</code> answers Pod-name queries "without checking k8s" and "is vulnerable to abuse if used maliciously in conjunction with wildcard SSL certs". kubeadm's CoreDNS configuration sets <code>pods insecure</code>, for compatibility with kube-dns.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Default" isn't the default.</strong> "'Default' is not the default DNS policy. If <code>dnsPolicy</code> is not explicitly specified, then 'ClusterFirst' is used."</p></div>
+				<h3>NET_RAW and spoofing on a node</h3>
+				<p>The <code>NET_RAW</code> capability lets a container craft raw packets: forged ARP replies, DNS answers or IPv6 router advertisements on the node's network. CVE-2020-10749 showed the danger: "By sending 'rogue' router advertisements, a malicious container can reconfigure the host to redirect part or all of the IPv6 traffic of the host to the attacker-controlled container". The advisory said "Kubernetes itself is not vulnerable"; the affected party was the networking implementation. Its mitigations included "Disallow <code>CAP_NET_RAW</code> for untrusted workloads or users."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Setting</th><th>NET_RAW?</th></tr></thead>
+						<tbody>
+							<tr><td>containerd default capabilities</td><td data-label="NET_RAW?">Included</td></tr>
+							<tr><td>CRI-O default capabilities</td><td data-label="NET_RAW?">Not included</td></tr>
+							<tr><td>Baseline Pod Security Standard</td><td data-label="NET_RAW?">Can't be added, but isn't dropped either</td></tr>
+							<tr><td>Restricted Pod Security Standard</td><td data-label="NET_RAW?">Removed: containers "must drop <code>ALL</code> capabilities"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>So on containerd, a Baseline Pod still has NET_RAW. Drop it explicitly with <code>capabilities: drop: ["ALL"]</code>.</p>
+				<div class="callout retired"><p><strong>kube-dns is deprecated.</strong> Kubernetes v1.37 deprecated the old kube-dns add-on, and no new packages are expected after v1.40. NodeLocal DNSCache moved to its own repository. Use CoreDNS.</p></div>
+			</div>
+
+			<!-- ===== Services ===== -->
+			<h2 id="s3">Exposing Services</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">How Service types and Ingress controllers widen the attack surface.</span></p>
+				<ul>
+					<li><strong>NodePort</strong>: "Every node in the cluster configures itself to listen on that assigned port" (30000-32767), even nodes that don't run the Pods.</li>
+					<li><strong>LoadBalancer</strong>: a cloud load balancer, often public by default. Restrict it with <code>spec.loadBalancerSourceRanges</code> or the provider's internal load balancer option. The checklist: "Use of LoadBalancer and ExternalIPs is restricted."</li>
+					<li><strong>Ingress and Gateway</strong>: the controller that implements them often holds read access to Secrets for TLS certificates, which makes it a high-value target.</li>
+				</ul>
+				<div class="callout retired"><p><strong>ingress-nginx is retired; <code>externalIPs</code> is deprecated.</strong> The Kubernetes project announced on 11 November 2025 that ingress-nginx would get only best-effort maintenance until March 2026, then "no further releases, no bugfixes, and no updates to resolve any security vulnerabilities". Its repository is archived. The Ingress API itself is frozen, not removed, and kubernetes.io recommends Gateway API instead. Service <code>externalIPs</code> was deprecated in v1.36 because of CVE-2020-8554 (<a href="d2-topic-2-2.html#s5">topic 2.2</a>).</p></div>
+				<div class="callout trap"><p><strong>Why the retirement matters: CVE-2025-1974.</strong> Published 23 March 2025 with CVSS 9.8, it meant "an unauthenticated attacker with access to the pod network can achieve arbitrary code execution in the context of the ingress-nginx controller". In the default installation, "the controller can access all Secrets cluster-wide." The pattern behind it and related bugs: a user who can create an Ingress injects configuration through annotations, takes over the controller, then reads every Secret. Find remaining installs with <code>kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx</code>.</p></div>
+			</div>
+
+			<!-- ===== kubeconfig ===== -->
+			<h2 id="s4">kubeconfig files</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">The files that hold every client's credentials, and how they can be abused.</span></p>
+				<p>"A file that is used to configure access to clusters is called a <em>kubeconfig file</em>." kubectl reads <code>$HOME/.kube/config</code> unless <code>--kubeconfig</code> or <code>KUBECONFIG</code> says otherwise. It holds cluster addresses, CA certificates and user credentials, so whoever can read it can act as you. Client tools write it with mode 0600.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Credential in the file</th><th>Risk</th></tr></thead>
+						<tbody>
+							<tr><td>Client certificate and key</td><td data-label="Risk">Long-lived; "cannot be individually revoked"; the key "cannot be password-protected"</td></tr>
+							<tr><td>Bearer token</td><td data-label="Risk">Works for anyone who copies it until it expires or is revoked</td></tr>
+							<tr><td>exec credential plugin (GA v1.22)</td><td data-label="Risk">Fetches short-lived tokens at run time, so no secret sits in the file, but runs a program with your privileges</td></tr>
+							<tr><td><code>auth-provider</code> (legacy)</td><td data-label="Risk">The gcp and azure providers were removed in v1.26; use their exec plugins</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>For people, the authentication hardening guide recommends "external authentication sources such as OIDC" with short-lived tokens. An exec entry for the shop's developers:</p>
+				<div class="code"><span class="file">Short-lived credentials via a plugin (kubeconfig excerpt)</span>
+<pre><code>users:
+- name: dev
+  user:
+    exec:
+      apiVersion: >-
+        client.authentication.k8s.io/v1
+      <span class="c"># runs with your privileges</span>
+      command: kubelogin
+      args: ["get-token"]
+      interactiveMode: IfAvailable</code></pre></div>
+				<div class="callout trap"><p><strong>A kubeconfig can run code.</strong> kubernetes.io warns: "Only use kubeconfig files from trusted sources. Using a specially-crafted kubeconfig file could result in malicious code execution or file exposure. If you must use an untrusted kubeconfig file, inspect it carefully first, much as you would a shell script." The <code>exec.command</code> field can name any program. When several files are merged through <code>KUBECONFIG</code>, "the first file to set a particular value or map key wins", so a planted file earlier in the list can redirect a context or swap a user's credentials.</p></div>
+				<h3>Allowlisting credential plugins with kuberc</h3>
+				<p>kuberc is kubectl's preferences file (<code>~/.kube/kuberc</code>; beta and on by default since v1.34). Unlike a kubeconfig, it "does <strong>not</strong> contain cluster details, usernames or passwords". Since v1.35 it can limit which credential plugins kubectl will run:</p>
+				<div class="code"><span class="file">Only run known plugins (kuberc)</span>
+<pre><code>apiVersion: kubectl.config.k8s.io/v1beta1
+kind: Preference
+credentialPluginPolicy: Allowlist
+credentialPluginAllowlist:
+- command: /usr/local/bin/kubelogin</code></pre></div>
+				<p>The policy can be <code>AllowAll</code>, <code>DenyAll</code> or <code>Allowlist</code>. If it's left unset, it's the same as <code>AllowAll</code>, so the protection is opt-in.</p>
+				<div class="code"><span class="file">Check your own client (shell)</span>
+<pre><code><span class="c"># who the API server thinks you are</span>
+kubectl auth whoami
+
+<span class="c"># current context only, secrets hidden</span>
+kubectl config view --minify
+
+<span class="c"># the file should be 600 and yours</span>
+stat -c '%a %U' ~/.kube/config
+chmod 600 ~/.kube/config</code></pre></div>
+			</div>
+
+			<!-- ===== Client habits ===== -->
+			<h2 id="s5">Safe client habits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">kubectl features that can leak your access, and keeping clients current.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Feature</th><th>Risk</th><th>Safe use</th></tr></thead>
+						<tbody>
+							<tr><td><code>--insecure-skip-tls-verify</code></td><td data-label="Risk">The server certificate isn't checked: "This will make your HTTPS connections insecure". A fake API server can collect your token</td><td data-label="Safe use">Never; fix the CA instead</td></tr>
+							<tr><td><code>kubectl proxy</code></td><td data-label="Risk">Adds <em>your</em> credentials to every request, with no authentication on the proxy port</td><td data-label="Safe use">Keep the default localhost address and host filter; never <code>--disable-filter</code>, which "can leave you vulnerable to XSRF attacks"</td></tr>
+							<tr><td><code>kubectl port-forward</code></td><td data-label="Risk"><code>--address 0.0.0.0</code> exposes a Pod's port, such as a database, to your local network, bypassing network policies</td><td data-label="Safe use">Keep the default <code>localhost</code></td></tr>
+							<tr><td>Impersonation (<code>--as</code>)</td><td data-label="Risk">The <code>impersonate</code> verb on users or groups can reach <code>system:masters</code></td><td data-label="Safe use">Grant rarely; constrained impersonation (beta in v1.36) scopes it</td></tr>
+							<tr><td><code>kubectl cp</code></td><td data-label="Risk">Relies on <code>tar</code> in the container; a malicious container has repeatedly been able to write files on the user's machine</td><td data-label="Safe use">Copy only from trusted containers; keep kubectl patched</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p><code>kubectl cp</code> path traversal bugs date from 2018 (CVE-2018-1002100) through several 2019 CVEs to CVE-2026-19444 (August 2026, Windows clients). kubectl "is supported within one minor version (older or newer) of <code>kube-apiserver</code>", so upgrade clients along with clusters. <code>kubectl version --client</code> shows yours.</p>
+				<ul>
+					<li><strong>CI systems</strong> hold some of the most valuable kubeconfigs. Prefer short-lived tokens through the CI provider's workload identity federation, namespace-scoped roles rather than <code>cluster-admin</code>, and never commit a kubeconfig.</li>
+					<li><strong>Web UIs</strong> are clients too. The Kubernetes Dashboard "has been archived and is no longer actively maintained"; kubernetes.io suggests Headlamp, now part of SIG UI. In-cluster UIs act through a ServiceAccount, so give it least privilege and don't expose it publicly.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Volumes ===== -->
+			<h2 id="s6">Volumes and who can use them</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Access modes, file ownership, and the permission to create storage.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Access mode</th><th>Meaning</th></tr></thead>
+						<tbody>
+							<tr><td>ReadWriteOnce (RWO)</td><td data-label="Meaning">Read-write by a single <em>node</em>; several Pods on that node can still use it</td></tr>
+							<tr><td>ReadOnlyMany (ROX)</td><td data-label="Meaning">Read-only by many nodes</td></tr>
+							<tr><td>ReadWriteMany (RWX)</td><td data-label="Meaning">Read-write by many nodes</td></tr>
+							<tr><td>ReadWriteOncePod (RWOP)</td><td data-label="Meaning">Read-write by a single Pod in the whole cluster; GA since v1.29, CSI volumes only</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Access modes aren't write protection.</strong> "Volume access modes do <strong>not</strong> enforce write protection once the storage has been mounted." Even a ReadOnlyMany volume "is no guarantee that it will be read-only". Only ReadWriteOncePod actually constrains access. For read-only, set <code>readOnly: true</code> on the volume mount.</p></div>
+				<h3>File ownership</h3>
+				<div class="code"><span class="file">The shop database's storage (Pod and PVC)</span>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+  namespace: shop
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 3000
+    <span class="c"># volume files get this group</span>
+    fsGroup: 2000
+    fsGroupChangePolicy: OnRootMismatch
+    <span class="c"># ignore the image's /etc/group</span>
+    supplementalGroupsPolicy: Strict
+  containers:
+  - name: db
+    image: shop/db:1.0
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/db
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: db-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data
+  namespace: shop
+spec:
+  <span class="c"># one Pod only, cluster-wide</span>
+  accessModes: ["ReadWriteOncePod"]
+  storageClassName: retained-enc
+  resources:
+    requests:
+      storage: 10Gi</code></pre></div>
+				<ul>
+					<li><code>fsGroup</code> makes Kubernetes change the ownership of volume files to that group; <code>OnRootMismatch</code> does so only when the volume's top directory doesn't already match, which is faster on large volumes.</li>
+					<li><code>supplementalGroupsPolicy: Strict</code> (GA in v1.35) attaches only the groups in the Pod spec. The default, <code>Merge</code>, also adds groups from the image's <code>/etc/group</code>, which could silently grant access to group-owned files. Strict needs containerd 2.0+ or CRI-O 1.31+.</li>
+				</ul>
+				<h3>The right to create storage</h3>
+				<p>PersistentVolumes, StorageClasses and CSIDrivers are cluster-scoped; PVCs are namespaced. RBAC good practices: "If someone - or some application - is allowed to create arbitrary PersistentVolumes, that access includes the creation of <code>hostPath</code> volumes". So "trusted administrators should create PersistentVolumes, and constrained users should use PersistentVolumeClaims".</p>
+				<div class="callout trap"><p><strong>Pod Security can't see a hostPath behind a claim.</strong> A Pod that mounts a PVC bound to a hostPath PersistentVolume lists only <code>persistentVolumeClaim</code> in its spec, so the Baseline standard passes it. Control hostPath at PV creation. Similarly, generic ephemeral volumes let anyone who can create Pods "create PVCs indirectly ... even if they do not have permission to create PVCs directly".</p></div>
+			</div>
+
+			<!-- ===== Data protection ===== -->
+			<h2 id="s7">Protecting stored data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Encryption, deletion, snapshots and the storage drivers on each node.</span></p>
+				<p>Kubernetes' <code>EncryptionConfiguration</code> encrypts API data in etcd (<a href="d1-topic-1-1.html#s6">topic 1.1</a>), not what's on a PersistentVolume. Volume encryption is the storage backend's job, usually chosen through StorageClass parameters that differ by driver:</p>
+				<div class="code"><span class="file">Encrypted, retained volumes (StorageClass, illustrative)</span>
+<pre><code>apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: retained-enc
+<span class="c"># example: the AWS EBS CSI driver</span>
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  <span class="c"># driver-specific keys</span>
+  encrypted: "true"
+  kmsKeyId: &lt;kms-key-arn&gt;</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Reclaim policy</th><th>When the claim is deleted</th><th>Security angle</th></tr></thead>
+						<tbody>
+							<tr><td>Delete (StorageClass default)</td><td data-label="When the claim is deleted">The PV and the backing storage are deleted</td><td data-label="Security angle">Relies on the backend to wipe the data</td></tr>
+							<tr><td>Retain</td><td data-label="When the claim is deleted">The PV stays "released"; "the previous claimant's data remains on the volume"</td><td data-label="Security angle">Good for recovery; someone must clean up and track released volumes</td></tr>
+							<tr><td>Recycle (deprecated)</td><td data-label="When the claim is deleted">"A basic scrub (<code>rm -rf /thevolume/*</code>)", then reuse</td><td data-label="Security angle">Not secure erasure; data remnants can reach the next claimant</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Snapshots</strong> (GA v1.20, installed as CRDs): anyone who can create a VolumeSnapshot and a PVC in a namespace can copy any volume there into a new one. Pre-provisioned VolumeSnapshotContents, which can point at any backend snapshot, should be admin-only.</li>
+					<li><strong>CSI drivers</strong>: "containerized CSI node plugins are typically deployed as privileged containers", and the controller part holds storage-admin credentials. In 2026, the NFS and SMB CSI drivers had path traversal bugs through crafted volume identifiers. The mitigation: "Restricting PersistentVolume creation privileges to trusted administrators".</li>
+					<li><strong>Secrets on disk</strong>: Secret volumes are tmpfs, "never written to non-volatile storage". For other sensitive scratch files, use <code>emptyDir</code> with <code>medium: Memory</code> and a <code>sizeLimit</code>.</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>CVE</th><th>What happened</th></tr></thead>
+						<tbody>
+							<tr><td>CVE-2017-1002101</td><td data-label="What happened">subPath mounts could follow symlinks "outside of the volume, including the host's filesystem"</td></tr>
+							<tr><td>CVE-2021-25741 (high)</td><td data-label="What happened">A symlink exchange gave "hostPath-like access without use of the hostPath feature", worst where hostPath was already banned</td></tr>
+							<tr><td>CVE-2023-3676, CVE-2023-3955, CVE-2023-5528</td><td data-label="What happened">On Windows nodes, input passed to PowerShell let Pod or PV creators become node administrators</td></tr>
+							<tr><td>CVE-2024-10220</td><td data-label="What happened">The <code>gitRepo</code> volume allowed arbitrary command execution; the volume type is gone from v1.36</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>New in v1.37 (alpha):</strong> <code>bindMountOptions</code> on a volume mount can add <code>noexec</code>, <code>nosuid</code> and <code>nodev</code>, so a compromised process can't download and run binaries from a writable volume, and <code>emptyDir.mode</code> sets the directory's permissions (default still 0777).</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>The Pod network is flat, allow-all and unencrypted by default; NetworkPolicy works only if the CNI plugin supports it. CNI encryption (WireGuard, IPsec) covers node-to-node traffic only.</li>
+				<li>CNI binaries in <code>/opt/cni/bin</code> run as root for every Pod; agents are host-network and highly privileged. Cilium and CoreDNS are CNCF graduated; CNI is incubating; Calico and Flannel aren't CNCF.</li>
+				<li>DNS: default <code>dnsPolicy</code> is ClusterFirst; kubeadm sets CoreDNS <code>pods insecure</code>; kube-dns deprecated (1.37). NET_RAW enables spoofing: containerd grants it, Baseline doesn't remove it, Restricted does.</li>
+				<li>NodePort opens every node; restrict LoadBalancers; <code>externalIPs</code> deprecated (1.36). ingress-nginx is retired (no fixes after March 2026); CVE-2025-1974 was 9.8 and exposed all Secrets.</li>
+				<li>kubeconfigs hold credentials (0600) and can run code through <code>exec</code>: only use trusted files. Prefer short-lived OIDC or exec tokens; kuberc <code>credentialPluginPolicy: Allowlist</code> (beta 1.35) limits plugins; unset = AllowAll.</li>
+				<li>Never <code>--insecure-skip-tls-verify</code>; keep <code>kubectl proxy</code> and <code>port-forward</code> on localhost; limit <code>impersonate</code>; kubectl within &plusmn;1 minor and patched (<code>kubectl cp</code> CVEs). Dashboard archived; Headlamp suggested.</li>
+				<li>Storage: access modes aren't write protection (only RWOP constrains); <code>fsGroup</code> and <code>supplementalGroupsPolicy: Strict</code> (GA 1.35); PV creation = hostPath, admin-only; volume encryption comes from the backend; Retain keeps data, Recycle is deprecated; CSI node plugins are privileged.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d2-topic-2-2.html"><small>Previous</small>2.2: Kubelet, Container Runtime, KubeProxy and Pod</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA is a mark of The Linux Foundation. WireGuard is a registered trademark of Jason A. Donenfeld. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the CNI, CoreDNS and Kubernetes security advisories; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
