@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.1: Supply Chain Security and Image Repository | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 5.1: the software supply chain and its threats (SLSA A to I), SLSA v1.2 build and source levels and provenance, signing with Sigstore cosign (keyless) and Notation, OCI referrers, verifying Kubernetes' own signed artifacts, SBOMs (SPDX, CycloneDX, CISA 2026 minimum elements), in-toto and TUF, securing image registries with Harbor and containerd mirrors, and verifying signatures at admission with Kyverno and policy-controller.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Platform Security &middot; 16%</span>
+		<h1>5.1: Supply Chain Security and Image Repository</h1>
+		<p>Proving that what runs in a Kubernetes&reg; cluster is what you meant to build: supply chain threats, SLSA levels and provenance, signatures and SBOMs, the registries that store it all, and checking it at deploy time.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">SLSA</span><span class="tag">Sigstore</span><span class="tag">Notation</span><span class="tag">SBOM</span><span class="tag">in-toto</span><span class="tag">TUF</span><span class="tag">Harbor</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The software supply chain</a></li>
+				<li><a href="#s2">SLSA and provenance</a></li>
+				<li><a href="#s3">Signing artifacts</a></li>
+				<li><a href="#s4">Kubernetes' own signatures</a></li>
+				<li><a href="#s5">SBOMs</a></li>
+				<li><a href="#s6">in-toto and TUF</a></li>
+				<li><a href="#s7">Securing the image repository</a></li>
+				<li><a href="#s8">Verifying at deploy time</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 5.1</span>
+				<p><strong>Supply Chain Security. Image Repository.</strong></p>
+			</div>
+			<p>The curriculum gives only these names. This page takes <strong>supply chain security</strong> to mean protecting every step from source code to running workload: the threats, SLSA levels, provenance, signatures, SBOMs, in-toto and TUF. It takes <strong>image repository</strong> to mean the registry side: Harbor and other registries, mirrors, and checking signatures before images run. Image basics (digests, pull secrets, scanning) are in <a href="d1-topic-1-3.html">topic 1.3</a>; admission control in general is in <a href="index.html#d5">topic 5.4</a>; supply chain <em>compliance</em> is in <a href="index.html#d6">topic 6.1</a>.</p>
+			<p>Sources: kubernetes.io and the CNCF&reg; TAG Security supply chain whitepaper (CC BY 4.0), slsa.dev, sigstore.dev, notaryproject.dev, in-toto.io, theupdateframework.io, the Harbor, containerd and Kyverno docs, and NIST and CISA publications.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's CI builds <code>shop/api</code> and pushes it to the company's Harbor registry. The goal: every image is built by CI, signed, comes with an SBOM, and the cluster refuses anything else.</p></div>
+
+			<!-- ===== Supply chain ===== -->
+			<h2 id="s1">The software supply chain</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">What the supply chain is, where it can be attacked, and recent examples.</span></p>
+				<p>The CNCF supply chain paper (v2, 2025): "Software supply chain attacks occur when the materials or processes of producing software are themselves compromised, resulting in vulnerabilities targeting downstream consumers." "The software supply chain consists of all of the steps taken to move code from source to production." It has five stages: <strong>source code</strong>, <strong>materials</strong> (dependencies), <strong>build pipelines</strong>, <strong>artifacts</strong>, and <strong>deployments and distribution</strong>.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>SLSA threat</th><th>Where</th><th>Example</th></tr></thead>
+						<tbody>
+							<tr><td>A, B, C</td><td data-label="Where">Producer, authoring and review, source control</td><td data-label="Example">A malicious change slips through review; the repository is compromised</td></tr>
+							<tr><td>Dependencies</td><td data-label="Where">Every upstream library, recursively</td><td data-label="Example">A compromised open source package</td></tr>
+							<tr><td>D, E</td><td data-label="Where">Build parameters, build process</td><td data-label="Example">The build system itself is compromised</td></tr>
+							<tr><td>F</td><td data-label="Where">Artifact publication</td><td data-label="Example">A different artifact is published than was built</td></tr>
+							<tr><td>G, H, I</td><td data-label="Where">Distribution channel, package selection, usage</td><td data-label="Example">A compromised registry or mirror; typosquatting</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>SolarWinds (2020):</strong> attackers had "longstanding, covert access to the build process" and inserted a backdoor into signed releases (threat E).</li>
+					<li><strong>Codecov (2021):</strong> a modified uploader script exfiltrated CI environment variables; a customer noticed because the checksum didn't match (F and G).</li>
+					<li><strong>xz-utils (2024, CVE-2024-3094, CVSS 10.0):</strong> after years of gaining a maintainer's trust, the attacker added a backdoor that appeared only in the release tarballs, not in the git source.</li>
+					<li><strong>Trivy (March 2026):</strong> release tags were repointed to malicious code; users pinned to digests were unaffected (<a href="d1-topic-1-3.html#s1">topic 1.3</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== SLSA ===== -->
+			<h2 id="s2">SLSA and provenance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Graded levels of build and source integrity, and the provenance that proves them.</span></p>
+				<p><strong>SLSA</strong> (Supply-chain Levels for Software Artifacts) is an OpenSSF project. The current spec is v1.2 (November 2025), with two tracks.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Build level</th><th>Requires</th><th>Protects against</th></tr></thead>
+						<tbody>
+							<tr><td>L0</td><td data-label="Requires">Nothing: "L0 represents the lack of SLSA"</td><td data-label="Protects against">-</td></tr>
+							<tr><td>L1: Provenance exists</td><td data-label="Requires">The build platform automatically generates provenance; it "may be incomplete and/or unsigned"</td><td data-label="Protects against">Mistakes</td></tr>
+							<tr><td>L2: Hosted build platform</td><td data-label="Requires">A hosted platform generates and <em>signs</em> the provenance</td><td data-label="Protects against">"Tampering after the build"</td></tr>
+							<tr><td>L3: Hardened builds</td><td data-label="Requires">Builds are isolated from each other, and signing secrets are kept away from user-defined build steps</td><td data-label="Protects against">"Tampering during the build"</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The <strong>Source track</strong>, new in v1.2, has four levels: version controlled, history and provenance, continuous technical controls, and two-party review ("The SCS requires two trusted persons to review all changes to protected branches").</p>
+				<p><strong>Provenance</strong> is verifiable information about where, when and how an artifact was built. SLSA provenance is an in-toto attestation: a statement whose <code>subject</code> lists the artifacts and their digests, with a <code>predicateType</code> of <code>https://slsa.dev/provenance/v1</code> and a predicate describing the build definition and the builder that ran it.</p>
+				<div class="callout trap"><p><strong>There's no Build L4.</strong> Material that mentions "SLSA 4" (two-person review plus hermetic builds) uses the old v0.1 draft. Since v1.0 (April 2023) the Build track stops at L3, and two-party review now sits at Source L4. Kubernetes announced SLSA Level 1 provenance for its releases in v1.23 (under the old numbering); kubernetes.io doesn't claim Build L3.</p></div>
+			</div>
+
+			<!-- ===== Signing ===== -->
+			<h2 id="s3">Signing artifacts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Keyless and key-based signing, and where signatures are stored.</span></p>
+				<p><strong>Sigstore</strong> (an OpenSSF project) has three parts. In its own words, artifacts are "Signed: By using a Sigstore client (Cosign). Associated: With an identity through our certificate authority (Fulcio). Witnessed: By recording the signing information in a permanent transparency log (Rekor)."</p>
+				<ol class="steps">
+					<li><b>Identify</b>cosign creates a one-time key pair and gets an OIDC token for the signer: a person's login, or a CI workflow's identity.</li>
+					<li><b>Certify</b>Fulcio "issues a short-lived certificate bound to the provided identity and public key", valid for 10 minutes.</li>
+					<li><b>Sign and record</b>The image digest is signed and the entry is written to Rekor, an append-only log; "the private key is discarded after a single signing".</li>
+					<li><b>Verify</b>The verifier checks the signature, that the certificate's identity "matches an expected identity", the chain to Sigstore's root, and the Rekor entry proving it was signed while the certificate was valid.</li>
+				</ol>
+				<div class="code"><span class="file">Sign and verify the shop image (shell)</span>
+<pre><code>IMG=registry.example.com/shop/api
+IMG=$IMG@sha256:&lt;digest&gt;
+ID=ci@shop.example.com
+ISS=https://accounts.google.com
+
+<span class="c"># keyless: OIDC login, Fulcio, Rekor</span>
+cosign sign "$IMG"
+
+<span class="c"># both identity and issuer required</span>
+cosign verify "$IMG" \
+  --certificate-identity "$ID" \
+  --certificate-oidc-issuer "$ISS"
+
+<span class="c"># key-based alternative</span>
+cosign generate-key-pair
+cosign sign --key cosign.key "$IMG"</code></pre></div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Approach</th><th>Trust comes from</th><th>Trade-off</th></tr></thead>
+						<tbody>
+							<tr><td>cosign keyless</td><td data-label="Trust comes from">An OIDC identity, Fulcio and the public Rekor log</td><td data-label="Trade-off">No long-lived keys to protect; depends on the identity provider and Sigstore (public or private instance)</td></tr>
+							<tr><td>cosign with keys</td><td data-label="Trust comes from">A key pair you manage, often in a cloud KMS</td><td data-label="Trade-off">Works offline; you must protect and rotate the key</td></tr>
+							<tr><td>Notation (Notary Project)</td><td data-label="Trust comes from">Your own X.509 CA, a trust store and a trust policy</td><td data-label="Trade-off">Fits existing PKI; no public transparency log</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Where signatures live</h3>
+				<p>Signatures, SBOMs and attestations are stored in the registry next to the image, without changing its digest. The older cosign scheme uses a tag named <code>sha256-&lt;digest&gt;.sig</code>, still used on registry.k8s.io. OCI 1.1 (2024) added a <code>subject</code> field and a <strong>referrers API</strong> that lists every artifact pointing at an image; cosign v3 (October 2025) and Notation use it by default. <code>cosign tree</code> and <code>oras discover</code> show what's attached.</p>
+				<div class="callout trap"><p><strong>Keyless doesn't mean no keys.</strong> A key still signs, but it's used once and thrown away; trust comes from the identity in a certificate that expires in minutes. That's why verification must name both the expected identity and the OIDC issuer: required since cosign 2.0. Checking only that "some valid signature exists" would accept anyone's signature.</p></div>
+			</div>
+
+			<!-- ===== Kubernetes signatures ===== -->
+			<h2 id="s4">Kubernetes' own signatures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Verifying the Kubernetes images and binaries you install.</span></p>
+				<p>The Kubernetes project signs its own release artifacts: container images since v1.24, and binaries, SBOMs and provenance since v1.26, when "All release artifacts are signed keyless using cosign". Images are signed by <code>krel-trust@</code> and binaries by <code>krel-staging@</code>, both service accounts of the release project, with issuer <code>https://accounts.google.com</code>.</p>
+				<div class="code"><span class="file">Verify a Kubernetes image and binary (shell)</span>
+<pre><code>SA=k8s-releng-prod.iam.gserviceaccount.com
+K=registry.k8s.io/kube-apiserver
+cosign verify "$K:v1.37.2" \
+  --certificate-identity \
+  "krel-trust@$SA" \
+  --certificate-oidc-issuer \
+  https://accounts.google.com
+
+U=https://dl.k8s.io/release/v1.37.2
+U=$U/bin/linux/amd64
+for f in kubectl kubectl.sig kubectl.cert
+do curl -sSfLO "$U/$f"; done
+cosign verify-blob kubectl \
+  --signature kubectl.sig \
+  --certificate kubectl.cert \
+  --certificate-identity \
+  "krel-staging@$SA" \
+  --certificate-oidc-issuer \
+  https://accounts.google.com</code></pre></div>
+				<p>After verifying, kubernetes.io advises: "specify the image by its digest in your Pod manifests". The release SBOM is an SPDX 2.3 document. The page still labels the feature beta (since v1.26) and refers to cosign 2.0.</p>
+			</div>
+
+			<!-- ===== SBOM ===== -->
+			<h2 id="s5">SBOMs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Software bills of materials: formats, generation and the minimum contents.</span></p>
+				<p>An SBOM is "a detailed inventory of all components, libraries, and dependencies used in a software application". The CNCF paper adds that "just having an SBOM has little value without tooling to interrogate, aggregate, and otherwise reason about it": its value is answering "are we affected?" the day a new CVE appears.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Format</th><th>Owner and standard</th><th>Origin</th></tr></thead>
+						<tbody>
+							<tr><td>SPDX</td><td data-label="Owner and standard">Linux Foundation; ISO/IEC 5962:2021; current version 3.0</td><td data-label="Origin">Licence compliance</td></tr>
+							<tr><td>CycloneDX</td><td data-label="Owner and standard">OWASP; ECMA-424; current version 1.7 (October 2025)</td><td data-label="Origin">Security; also covers VEX, hardware and AI models</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Generate and attach an SBOM (shell)</span>
+<pre><code><span class="c"># generate (Syft or Trivy)</span>
+syft "$IMG" -o spdx-json=sbom.json
+<span class="c"># sign it and attach it to the image</span>
+cosign attest --type spdxjson \
+  --predicate sbom.json "$IMG"
+cosign verify-attestation \
+  --type spdxjson \
+  --certificate-identity "$ID" \
+  --certificate-oidc-issuer "$ISS" \
+  "$IMG"</code></pre></div>
+				<p>The US Executive Order 14028 (May 2021) led to NTIA's 2021 SBOM minimum elements and NIST's Secure Software Development Framework (SP 800-218). VEX documents (<a href="d1-topic-1-3.html#s6">topic 1.3</a>) complement SBOMs by stating which listed vulnerabilities actually matter.</p>
+				<div class="callout retired"><p><strong>NTIA's minimum elements were replaced in 2026.</strong> CISA's "2026 Minimum Elements for a Software Bill of Materials" (29 July 2026), written with the NSA, FBI and international partners, "updates and replaces" the 2021 NTIA list. It adds component hashes, licences, SBOM tool name and version, the generation context (before, during or after the build) and an author signature, and replaces "Supplier Name" with "Component Producer".</p></div>
+			</div>
+
+			<!-- ===== in-toto, TUF ===== -->
+			<h2 id="s6">in-toto and TUF</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Two CNCF frameworks: one for the steps that produce software, one for delivering it.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Project</th><th>Purpose</th><th>CNCF status</th></tr></thead>
+						<tbody>
+							<tr><td>in-toto</td><td data-label="Purpose">"Designed to ensure the integrity of a software product from initiation to end-user installation" by "making it transparent to the user what steps were performed, by whom and in what order". Its attestation format (a statement in a signed DSSE envelope) carries SLSA provenance and cosign attestations</td><td data-label="CNCF status">Graduated (2025)</td></tr>
+							<tr><td>TUF (The Update Framework)</td><td data-label="Purpose">"A framework for securing software update systems", "providing protection even against attackers that compromise the repository or signing keys"</td><td data-label="CNCF status">Graduated (2019), the first security project to graduate</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>TUF separates trust into four roles, each with its own keys and signature thresholds: <strong>root</strong> (delegates to the others; its keys "should be kept offline"), <strong>targets</strong> (signs what files are trustworthy), <strong>snapshot</strong> (the current set of metadata, preventing mix-and-match attacks) and <strong>timestamp</strong> (re-signed often, so clients can't be fed stale metadata). Sigstore distributes its own root of trust using TUF.</p>
+				<div class="callout tip"><p><strong>Telling them apart.</strong> in-toto proves <em>how</em> something was made (the steps). TUF secures <em>delivering</em> it (updates and metadata). SLSA grades how trustworthy the build is. Sigstore and Notation sign the result. Of these, only in-toto, TUF and the Notary Project (incubating) are CNCF projects; Sigstore and SLSA belong to OpenSSF.</p></div>
+			</div>
+
+			<!-- ===== Registry ===== -->
+			<h2 id="s7">Securing the image repository</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Registry features that keep images trustworthy, and safe mirroring.</span></p>
+				<p><strong>Harbor</strong> (CNCF graduated) is the shop's registry. Beyond the scanning and tag immutability in <a href="d1-topic-1-3.html#s4">topic 1.3</a>, it offers:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Feature</th><th>Security use</th></tr></thead>
+						<tbody>
+							<tr><td>Private projects with member roles</td><td data-label="Security use">Only named people and accounts can pull or push</td></tr>
+							<tr><td>Robot accounts</td><td data-label="Security use">Scoped credentials for CI (push) and nodes (pull); they "cannot log in to the Harbor interface", and the secret is shown once</td></tr>
+							<tr><td>Signature policy (Cosign and/or Notation)</td><td data-label="Security use">"Harbor will only allow verified images to be pulled from the project"</td></tr>
+							<tr><td>Replication</td><td data-label="Security use">Copies images, and their Cosign signatures, between registries</td></tr>
+							<tr><td>Proxy cache</td><td data-label="Security use">Pulls public images through a controlled cache; you can't push to a proxy project. "Only configure proxy cache endpoints that are within your trust boundary"</td></tr>
+							<tr><td>Tag retention</td><td data-label="Security use">Removes stale images by rule; "You cannot revert a rule after you run it", so use Dry Run</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<h3>Mirrors on the nodes</h3>
+				<p>containerd reads per-registry mirror settings from <code>hosts.toml</code> files under the directory named by <code>config_path</code> in its CRI registry plugin settings. The older <code>registry.mirrors</code> configuration is deprecated.</p>
+				<div class="code"><span class="file">Pull Docker Hub images through an internal mirror (hosts.toml)</span>
+<pre><code># /etc/containerd/certs.d/
+#   docker.io/hosts.toml
+server = "https://registry-1.docker.io"
+
+[host."https://mirror.internal"]
+  capabilities = ["pull", "resolve"]
+  ca = "/etc/certs/mirror-ca.pem"</code></pre></div>
+				<div class="callout trap"><p><strong>Only trusted mirrors may resolve tags.</strong> containerd's docs: "Resolving (the process of converting a name into a digest) must be considered a trusted operation", and "A public mirror should never be trusted to do a resolve action." Give a public mirror only <code>pull</code>, and push only to the real upstream. Remove the <code>server</code> line to stop falling back to the upstream at all.</p></div>
+				<ul>
+					<li><strong>Credentials:</strong> push only from CI; nodes pull with read-only credentials; no shared admin accounts; TLS everywhere, never "insecure registry" settings.</li>
+					<li><strong>Air-gapped clusters:</strong> copy images together with their signatures and SBOMs (<code>cosign copy</code>, <code>oras copy</code>) into an internal registry, and use key-based signatures, Notation, or a private Sigstore instance, since the public Fulcio and Rekor can't be reached. kubernetes.io recommends mirroring release images "to a private registry" in restricted environments.</li>
+					<li><strong>Other CNCF projects:</strong> Distribution (the reference registry, sandbox), zot (an OCI-native registry, sandbox) and Dragonfly (peer-to-peer image distribution, graduated in 2025-2026).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Admission ===== -->
+			<h2 id="s8">Verifying at deploy time</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.1</span><span class="skill-text">Making the cluster refuse images that aren't signed by the right identity.</span></p>
+				<p>Signing helps only if something checks. In Kubernetes that check happens at admission (<a href="index.html#d5">topic 5.4</a>):</p>
+				<div class="code"><span class="file">Only CI-signed shop images may run (Kyverno ImageValidatingPolicy)</span>
+<pre><code>apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: require-signed-shop
+spec:
+  validationActions: [Deny]
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      resources: [pods]
+      operations: [CREATE, UPDATE]
+  matchImageReferences:
+  - glob: "registry.example.com/shop/*"
+  attestors:
+  - name: ci
+    cosign:
+      keyless:
+        identities:
+        - subject: ci@shop.example.com
+          issuer: >-
+            https://accounts.google.com
+      ctlog:
+        url: https://rekor.sigstore.dev
+  validations:
+  - expression: >-
+      images.containers.map(i,
+      verifyImageSignatures(i,
+      [attestors.ci])).all(e, e > 0)
+    message: image not signed by CI</code></pre></div>
+				<div class="callout retired"><p><strong>Kyverno's <code>verifyImages</code> is deprecated.</strong> Kyverno (CNCF graduated, March 2026) introduced the dedicated <code>ImageValidatingPolicy</code> in v1.14 (2025). In v1.19 (August 2026) it deprecated <code>ClusterPolicy</code>, including its <code>verifyImages</code> rules, with removal planned for v1.20. Older material and exam questions may still show <code>verifyImages</code> with <code>imageReferences</code> and keyless <code>attestors</code>; know both.</p></div>
+				<ul>
+					<li><strong>Sigstore policy-controller</strong>, the tool kubernetes.io names: <code>ClusterImagePolicy</code> objects with keyless or key authorities. It applies only to namespaces labelled <code>policy.sigstore.dev/include=true</code>, and in those namespaces images that match no policy are rejected by default.</li>
+					<li><strong>Ratify</strong> (CNCF sandbox, now under the Notary Project) runs with OPA Gatekeeper and verifies Notation and Cosign signatures and other attached artifacts.</li>
+					<li><strong>Connaisseur</strong> (not CNCF) is another admission controller for Notary and Cosign signatures. CRI-O can also verify Sigstore signatures at pull time.</li>
+				</ul>
+				<div class="callout tip"><p><strong>Pin what you verified.</strong> Verifying a tag at admission and then pulling it later leaves a gap if the tag moves. Policy engines can replace the tag with the verified digest (Kyverno's <code>mutateDigest</code>), and policy-controller resolves tags to digests, so the Pod runs exactly what was checked.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Supply chain stages: source, materials, build, artifacts, deployment and distribution. SLSA threats A to I. Examples: SolarWinds (build), Codecov (artifact), xz-utils (maintainer and tarball), Trivy (mutable tags).</li>
+				<li>SLSA v1.2: Build L1 provenance exists, L2 hosted and signed, L3 hardened (isolation, signing secrets out of reach); no Build L4. Source track L1 to L4 (L4 two-party review). Provenance is an in-toto attestation with subject digests.</li>
+				<li>Sigstore (OpenSSF): cosign signs, Fulcio issues 10-minute certificates from OIDC identities, Rekor logs. Verify with identity and issuer. Notation uses your own PKI. Signatures live as <code>.sig</code> tags or OCI 1.1 referrers.</li>
+				<li>Kubernetes signs images (since 1.24) and binaries and SBOMs (since 1.26), keyless: <code>krel-trust@</code> for images, <code>krel-staging@</code> for binaries, issuer accounts.google.com. Pin verified images by digest.</li>
+				<li>SBOMs: SPDX (ISO/IEC 5962) and CycloneDX (ECMA-424); <code>syft</code> or <code>trivy</code>, then <code>cosign attest</code>. CISA's 2026 minimum elements replace NTIA 2021. in-toto (steps) and TUF (delivery: root, targets, snapshot, timestamp) are CNCF graduated.</li>
+				<li>Registry: Harbor private projects, robot accounts, Cosign and Notation pull policy, replication, proxy cache, retention. containerd <code>hosts.toml</code>: public mirrors pull only, never resolve.</li>
+				<li>Enforce at admission: Kyverno <code>ImageValidatingPolicy</code> (<code>verifyImages</code> deprecated in 1.19), Sigstore policy-controller (opt-in namespaces), Ratify with Gatekeeper; mutate tags to verified digests.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d4-topic-4-3.html"><small>Previous</small>4.3: Network Attacker, Sensitive Data, Privilege Escalation</a>
+				<a class="next" href="d5-topic-5-2.html"><small>Next</small>5.2: Observability and Service Mesh</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA and in-toto are marks of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), the CNCF TAG Security Software Supply Chain Best Practices v2 and the Harbor documentation, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from slsa.dev, sigstore.dev, in-toto.io, theupdateframework.io, the containerd documentation and CISA; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>

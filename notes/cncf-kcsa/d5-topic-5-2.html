@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.2: Observability and Service Mesh | Study Notes for KCSA</title>
+	<meta name="description" content="Study notes for KCSA topic 5.2: observability for security (signals, log and metrics pipelines, Prometheus' security model, OpenTelemetry Collector hardening and redaction, Kubernetes Events) and runtime security tools (Falco, Tetragon, KubeArmor); service meshes as a security layer: mTLS and SPIFFE identities, Istio PeerAuthentication, AuthorizationPolicy and ambient mode, Linkerd policy, Cilium, and the limits of a mesh next to NetworkPolicy.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcsa.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCSA</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Platform Security &middot; 16%</span>
+		<h1>5.2: Observability and Service Mesh</h1>
+		<p>Two platform layers seen as security tools: the telemetry that lets you notice an attack in a Kubernetes&reg; cluster (and must itself be protected), and the service mesh that gives every workload an identity, encrypts traffic between them and decides who may call whom.</p>
+		<div class="tags"><span class="tag code">KCSA</span><span class="tag">Security signals</span><span class="tag">Prometheus</span><span class="tag">OpenTelemetry</span><span class="tag">Falco</span><span class="tag">mTLS</span><span class="tag">Istio</span><span class="tag">Linkerd</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Observability for security</a></li>
+				<li><a href="#s2">Protecting the telemetry pipeline</a></li>
+				<li><a href="#s3">Runtime security tools</a></li>
+				<li><a href="#s4">What a service mesh adds</a></li>
+				<li><a href="#s5">Istio security policies</a></li>
+				<li><a href="#s6">Ambient mode, Linkerd and others</a></li>
+				<li><a href="#s7">Limits of a mesh</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 5.2</span>
+				<p><strong>Observability. Service Mesh.</strong></p>
+			</div>
+			<p>The curriculum gives only the names. This page takes both from a security angle: <strong>observability</strong> as the signals for detecting and investigating attacks, the protection those signals need, and runtime security tools; <strong>service mesh</strong> as a layer that adds workload identity, encryption and authorization between services. Observability basics (metrics, logs, traces, OpenTelemetry, Prometheus) and mesh basics are in the KCNA notes on <a href="../cncf-kcna/d4-topic-4-1.html">observability</a> and <a href="../cncf-kcna/d2-topic-2-1.html">networking</a>; audit logging is in <a href="d3-topic-3-5.html">topic 3.5</a>.</p>
+			<p>Quotes are from kubernetes.io and the CNCF&reg; Cloud Native Security Whitepaper (CC BY 4.0), and from the Prometheus, OpenTelemetry, Falco, Tetragon, Istio and Linkerd documentation.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's services run in a mesh. The goal: <code>web</code> may call <code>api</code> only with <code>GET /api/*</code>; all traffic between them is encrypted; and the security team can see, from outside the cluster, when a shell starts in a container or a Secret is read.</p></div>
+
+			<!-- ===== Signals ===== -->
+			<h2 id="s1">Observability for security</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">The signals that reveal attacks, and what the guidance says about them.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Signal</th><th>Security use</th><th>Caveat</th></tr></thead>
+						<tbody>
+							<tr><td>API server audit log</td><td data-label="Security use">Who did what to which object</td><td data-label="Caveat">Off by default (<a href="d3-topic-3-5.html">topic 3.5</a>)</td></tr>
+							<tr><td>Container and app logs</td><td data-label="Security use">Login failures, errors, application attacks</td><td data-label="Caveat">Rotated at 10 MiB &times; 5 files by default; lost when a Pod is evicted</td></tr>
+							<tr><td>Node logs</td><td data-label="Security use">Kubelet and runtime problems, tampering</td><td data-label="Caveat">In journald or <code>/var/log</code> on each node</td></tr>
+							<tr><td>Metrics</td><td data-label="Security use">Spikes in 401s and 403s, unexplained CPU (mining)</td><td data-label="Caveat">"May expose sensitive information"</td></tr>
+							<tr><td>Traces</td><td data-label="Security use">The path of a request across services</td><td data-label="Caveat">Captured headers can contain tokens</td></tr>
+							<tr><td>Kubernetes Events</td><td data-label="Security use">Admission denials, image pull failures, crash loops</td><td data-label="Caveat">Kept only 1 hour by default (<code>--event-ttl</code>)</td></tr>
+							<tr><td>Runtime events</td><td data-label="Security use">Shells in containers, sensitive file reads, unexpected connections</td><td data-label="Caveat">Need an eBPF or kernel-level agent</td></tr>
+							<tr><td>Mesh telemetry</td><td data-label="Security use">Which identity called which service, and whether mTLS was used</td><td data-label="Caveat">Only for traffic in the mesh</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The CNCF whitepaper: "Through the use of behavioral and heuristic analysis, teams can detect and escalate outliers, suspicious events, and unexplained calls". On runtime: "The runtime environment of a container needs to be monitored and secured from a process, file, and network perspective", and some threats, such as "time or event delayed trojan horses", are "only detectable by comparing to baseline expected behavior".</p>
+				<p>kubernetes.io's Cloud Native Security page has an "Observability and runtime security" subsection. It asks you to review "the chain of components that populate data into that dashboard ... so that you can rely on it even during an incident", to consider "cryptographically measured boot or authenticated distribution of time (which helps ensure the fidelity of logs and audit records)", and, "for a high-assurance environment", to "ensure that logs are both tamper-proof and confidential."</p>
+				<div class="callout tip"><p><strong>Get evidence out fast.</strong> The whitepaper's key point on log handling: "Immediate forwarding of logs to a location inaccessible via cluster-level credentials also defeats an attacker's attempt to cover their tracks." It also warns that alerts must be "tuned for false positives to avoid alert flooding, fatigue, and false negatives".</p></div>
+			</div>
+
+			<!-- ===== Pipeline ===== -->
+			<h2 id="s2">Protecting the telemetry pipeline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">Logs, metrics and traces are data an attacker wants too: secure how they're collected and kept.</span></p>
+				<h3>Logs</h3>
+				<p>"In a cluster, logs should have a separate storage and lifecycle independent of nodes, pods, or containers", and "Kubernetes does not provide a native storage solution for log data." The usual pattern is a logging agent DaemonSet that reads every Pod's log files on its node. That makes it a high-value target: it sees all logs on the node and holds the backend's credentials, so keep its mounts and RBAC minimal. A logging sidecar in each Pod spreads those credentials into every Pod, and its logs aren't visible to <code>kubectl logs</code>.</p>
+				<h3>Metrics</h3>
+				<ul>
+					<li>Kubernetes components serve <code>/metrics</code>, which needs authorization. The built-in <code>system:monitoring</code> role grants it, and kubernetes.io notes that "individual health check endpoints and the metric endpoint may expose sensitive information."</li>
+					<li>A scraper reading kubelet metrics needs <code>nodes/metrics</code> (and <code>nodes/stats</code>), never <code>nodes/proxy</code>, which allows exec into any container (<a href="d2-topic-2-2.html#s2">topic 2.2</a>).</li>
+					<li>Prometheus' own security model is blunt: "It is presumed that untrusted users have access to the Prometheus HTTP endpoint and logs", and "metrics are not considered secret." So never put secrets in labels, and keep Prometheus endpoints off public networks, since they're easy to overload. Server-side TLS and basic authentication arrived only in Prometheus 2.24 (2021), through <code>--web.config.file</code>, and are still marked experimental. The admin and lifecycle APIs are off by default.</li>
+				</ul>
+				<h3>OpenTelemetry Collector</h3>
+				<p>The OpenTelemetry Collector (OpenTelemetry graduated in the CNCF in May 2026) gathers all three signals, so its configuration holds tokens and keys. Its security guidance:</p>
+				<ul>
+					<li>Encrypt and authenticate receivers and exporters.</li>
+					<li>Bind to <code>localhost</code> or the Pod IP rather than <code>0.0.0.0</code>; since v0.110.0, localhost is the default.</li>
+					<li>Ship only the components you use ("Minimizing the number of components you use minimizes the attack surface exposed"), and avoid running as root.</li>
+					<li>Scrub sensitive data before it leaves, using the <code>redaction</code> or <code>attributes</code> processor:</li>
+				</ul>
+				<div class="code"><span class="file">Strip auth headers and tokens from traces (Collector config excerpt)</span>
+<pre><code>processors:
+  attributes/scrub:
+    actions:
+    <span class="c"># http.request.header.authorization</span>
+    - pattern: header\.authorization$
+      action: delete
+  redaction:
+    allow_all_keys: true
+    <span class="c"># mask values of matching keys</span>
+    blocked_key_patterns:
+    - ".*token.*"
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+      - attributes/scrub
+      - redaction
+      exporters: [otlp]</code></pre></div>
+				<p>The <code>redaction</code> processor ships only in the contrib and Kubernetes Collector builds; <code>attributes</code> is also in the core build. OpenTelemetry's HTTP conventions warn that capturing request headers "can be a security risk".</p>
+				<div class="callout trap"><p><strong>Events aren't an audit trail.</strong> Kubernetes Events are ordinary API objects kept for an hour by default. They're useful hints (an admission denial in <code>FailedCreate</code>, a blocked image in <code>ErrImagePull</code>), but for evidence, ship them off-cluster and rely on the audit log for who did what.</p></div>
+			</div>
+
+			<!-- ===== Runtime ===== -->
+			<h2 id="s3">Runtime security tools</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">Watching, and sometimes blocking, what processes do inside containers.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Tool</th><th>How it works</th><th>Detects or blocks</th><th>Status</th></tr></thead>
+						<tbody>
+							<tr><td>Falco</td><td data-label="How it works">Modern eBPF probe (default since 0.38) or kernel module; rules on system call events; k8saudit plugin for audit logs</td><td data-label="Detects or blocks">Detects and alerts; response is out of band</td><td data-label="Status">CNCF graduated (February 2024)</td></tr>
+							<tr><td>Tetragon</td><td data-label="How it works">eBPF hooks with in-kernel filtering, configured by <code>TracingPolicy</code> objects</td><td data-label="Detects or blocks">Both: can kill the process or override a call's return value</td><td data-label="Status">Part of the Cilium project</td></tr>
+							<tr><td>KubeArmor</td><td data-label="How it works">Enforces through Linux security modules (AppArmor, SELinux, BPF-LSM)</td><td data-label="Detects or blocks">Blocks (Allow, Audit or Block actions)</td><td data-label="Status">CNCF sandbox</td></tr>
+							<tr><td>Tracee</td><td data-label="How it works">eBPF tracing and forensics</td><td data-label="Detects or blocks">Detects</td><td data-label="Status">Aqua Security; not CNCF</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">A simple detection rule (Falco)</span>
+<pre><code>- rule: Shell in container
+  desc: A shell started in a container
+  condition: >
+    spawned_process and container
+    and shell_procs
+  output: >
+    Shell in container
+    (user=%user.name
+    cmd=%proc.cmdline
+    container=%container.id)
+  priority: WARNING
+  tags: [container, shell, T1059]</code></pre></div>
+				<p>The rule uses Falco's built-in macros. The stock rule, "Terminal shell in container", adds conditions for an interactive terminal and the container's entrypoint. Falco's rule text suggests correlating such alerts with audit exec events to find the user or token behind them.</p>
+				<div class="callout trap"><p><strong>Blocking has edges.</strong> Tetragon notes that "sending a <code>SIGKILL</code> signal does not always stop the operation": a <code>write()</code> already under way may complete, so combine the signal with an <code>Override</code> action. Start any enforcing tool in an audit mode first. Also, Falco 0.44 (May 2026) removed the legacy eBPF probe and the gVisor engine, so older install guides may no longer work.</p></div>
+			</div>
+
+			<!-- ===== Mesh ===== -->
+			<h2 id="s4">What a service mesh adds</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">Identity, encryption and authorization between services.</span></p>
+				<p>The CNCF whitepaper: "organizations should implement a service mesh to eliminate implicit trust within and across workloads, achieved through data-in-motion encryption. Utilization of a service mesh also resolves identity issues where traditional static identities, like IP addresses, no longer cleanly map to workloads." A mesh puts a proxy in the path of every call (a sidecar per Pod, or per-node proxies) and adds:</p>
+				<ul>
+					<li><strong>Mutual TLS</strong>: both sides present certificates, so traffic is encrypted and each side knows who the other is.</li>
+					<li><strong>Workload identity</strong> taken from the Pod's ServiceAccount, written as a SPIFFE ID such as <code>spiffe://cluster.local/ns/shop/sa/web</code>.</li>
+					<li><strong>Authorization</strong> on that identity, and at layer 7 on methods, paths and JWT claims.</li>
+					<li><strong>Telemetry</strong> on who called whom, plus traffic policy such as egress control.</li>
+				</ul>
+				<p>SPIFFE and its reference implementation SPIRE (both CNCF graduated, 2022) standardize these identities. NIST SP 800-207A (2023) describes the same model: zero trust for cloud native apps moves from "security controls based on segmentation and isolation using network parameters ... to identities", using "sidecar proxies, and application identity infrastructures (e.g., SPIFFE)".</p>
+			</div>
+
+			<!-- ===== Istio ===== -->
+			<h2 id="s5">Istio security policies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">Requiring mTLS and authorizing calls by identity in Istio.</span></p>
+				<p>Istio (CNCF graduated, 2023) gives every workload an X.509 certificate signed by its control plane, <code>istiod</code>, and rotates it automatically. Its policies use <code>security.istio.io/v1</code> (v1 since Istio 1.22).</p>
+				<div class="code"><span class="file">Require mTLS into every shop Pod (PeerAuthentication)</span>
+<pre><code>apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: shop
+spec:
+  mtls:
+    mode: STRICT</code></pre></div>
+				<div class="callout trap"><p><strong>Istio starts in PERMISSIVE mode.</strong> "Mesh-wide peer authentication policies with an unset mode use the <code>PERMISSIVE</code> mode by default": each workload accepts both mTLS and plaintext, which "weakens the security stance". Apply <code>STRICT</code> per namespace, or mesh-wide in the root namespace (usually <code>istio-system</code>). And "Mutual TLS alone is not always enough ... it provides only authentication, not authorization. This means that anyone with a valid certificate can still access a service."</p></div>
+				<div class="code"><span class="file">Deny everything in shop by default (AuthorizationPolicy)</span>
+<pre><code>apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-nothing
+  namespace: shop
+<span class="c"># ALLOW with no rules never matches</span>
+spec: {}</code></pre></div>
+				<div class="code"><span class="file">Only web may GET /api/* on the api Pods (AuthorizationPolicy)</span>
+<pre><code>apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: api-allow-web
+  namespace: shop
+spec:
+  selector:
+    matchLabels:
+      app: api
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        <span class="c"># no spiffe:// prefix here</span>
+        principals:
+        - cluster.local/ns/shop/sa/web
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/api/*"]</code></pre></div>
+				<p>How Istio decides, in its own words: "the CUSTOM action is evaluated first, then the DENY action, and finally the ALLOW action". If no ALLOW policies apply to a workload, the request is allowed; if any do, the request needs to match one. <code>AUDIT</code> policies never allow or deny anything. A <code>RequestAuthentication</code> validates end-user JWTs, but "When requests carry no token, they are accepted by default", so pair it with an AuthorizationPolicy that requires <code>requestPrincipals</code>.</p>
+				<div class="callout trap"><p><strong>Two Istio identity traps.</strong> <code>principals</code> are written as <code>cluster.local/ns/&lt;ns&gt;/sa/&lt;sa&gt;</code>, without the <code>spiffe://</code> that appears in the certificate. And identity fields such as <code>principals</code> and <code>namespaces</code> "will never match when the traffic is plain text", so in PERMISSIVE mode a request might be "allowed unexpectedly". Istio strongly recommends using them only with STRICT mTLS.</p></div>
+			</div>
+
+			<!-- ===== Ambient, Linkerd ===== -->
+			<h2 id="s6">Ambient mode, Linkerd and others</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">Sidecarless Istio, Linkerd's defaults and policy objects, and other options.</span></p>
+				<p>Istio's <strong>ambient mode</strong> (GA in Istio 1.24, November 2024) replaces sidecars with a per-node proxy, <strong>ztunnel</strong>, for layer 4 mTLS and authorization, plus optional <strong>waypoint</strong> proxies for layer 7. Namespaces opt in with the label <code>istio.io/dataplane-mode=ambient</code>.</p>
+				<div class="callout trap"><p><strong>ztunnel ignores layer 7 rules.</strong> "A <code>DENY</code> policy whose rules contain only L7 attributes, such as <code>notRequestPrincipals</code>, <code>paths</code> or <code>methods</code>, is not enforced by ztunnel and does not block any traffic." (An ALLOW policy with L7 attributes fails closed instead: traffic is denied.) For layer 7 rules, deploy a waypoint and attach the policy to it with <code>targetRefs</code>; waypoints ignore <code>selector</code> policies.</p></div>
+				<h3>Linkerd</h3>
+				<p>Linkerd (CNCF graduated, 2021, the first mesh to graduate) "automatically enables mutually-authenticated Transport Layer Security (mTLS) for all TCP traffic between meshed pods". Proxy certificates are tied to the ServiceAccount and "expire after 24 hours and are automatically rotated". But encryption isn't authorization: the default inbound policy is <code>all-unauthenticated</code>, which allows all traffic. Policies use <code>policy.linkerd.io</code>: a <code>Server</code> defines a port, and once a Server exists, traffic to it "will be denied unless explicitly authorized".</p>
+				<div class="code"><span class="file">Only the web ServiceAccount may call api (Linkerd)</span>
+<pre><code>apiVersion: policy.linkerd.io/v1alpha1
+kind: MeshTLSAuthentication
+metadata:
+  name: web-only
+  namespace: shop
+spec:
+  identityRefs:
+  - kind: ServiceAccount
+    name: web
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: api-from-web
+  namespace: shop
+spec:
+  <span class="c"># a Server for the api port</span>
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: api-http
+  requiredAuthenticationRefs:
+  - group: policy.linkerd.io
+    kind: MeshTLSAuthentication
+    name: web-only</code></pre></div>
+				<ul>
+					<li><strong>Cilium</strong> offers a sidecarless mesh with per-node Envoy. Its mutual authentication (with SPIRE) is still beta and doesn't encrypt on its own, and its ztunnel-based encryption is beta too.</li>
+					<li><strong>cert-manager's istio-csr</strong> lets an external CA, through cert-manager, sign mesh certificates instead of istiod.</li>
+					<li><strong>Gateway API's GAMMA</strong> work lets mesh routes use the same Route objects as ingress; authorization still uses each mesh's own policy objects.</li>
+				</ul>
+				<div class="callout retired"><p><strong>Mesh project changes.</strong> Since February 2024 the Linkerd open source project has published only edge releases ("the vendor community around Linkerd is responsible for creating stable release artifacts"); 2.20 corresponds to edge-26.6.3. Its AuthorizationPolicy and MeshTLSAuthentication are still <code>v1alpha1</code>, and <code>ServerAuthorization</code> is being phased out. Open Service Mesh and the Service Mesh Interface (SMI) were archived in 2023.</p></div>
+			</div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s7">Limits of a mesh</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 5.2</span><span class="skill-text">What a mesh doesn't protect, and how it complements NetworkPolicy.</span></p>
+				<ul>
+					<li><strong>Pods outside the mesh:</strong> Pods with <code>hostNetwork</code> are never injected, Pods can opt out with <code>sidecar.istio.io/inject: "false"</code>, and Pods created before a namespace was labelled have no sidecar until they restart.</li>
+					<li><strong>A sidecar can't protect its own Pod:</strong> Istio notes "there is minimal security boundary between an application and its sidecar proxy". A compromised app can remove the traffic redirection. Only TCP is captured.</li>
+					<li><strong>Egress:</strong> Istio's default outbound policy is <code>ALLOW_ANY</code>. <code>REGISTRY_ONLY</code> "is not a strong security boundary ... should be considered best-effort". Use an egress gateway together with NetworkPolicy.</li>
+					<li><strong>The control plane:</strong> istiod signs every workload certificate and pushes all configuration, so compromising it means minting any identity. Lock down its debug and plaintext ports, and keep it patched: Istio published eight security bulletins in 2026 alone.</li>
+					<li><strong>Privileges:</strong> the sidecar's init container needs <code>NET_ADMIN</code> and <code>NET_RAW</code> in every Pod, which conflicts with Pod Security. The istio-cni (or Linkerd CNI) node agent moves that into one privileged DaemonSet per node; ambient mode requires it.</li>
+				</ul>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Aspect</th><th>NetworkPolicy</th><th>Service mesh</th></tr></thead>
+						<tbody>
+							<tr><td>Layer</td><td data-label="NetworkPolicy">L3 and L4: IPs, labels, ports</td><td data-label="Service mesh">L4 identity plus L7: methods, paths, JWTs</td></tr>
+							<tr><td>Identity</td><td data-label="NetworkPolicy">None: selectors and IPs</td><td data-label="Service mesh">Cryptographic, from the ServiceAccount</td></tr>
+							<tr><td>Encryption</td><td data-label="NetworkPolicy">No</td><td data-label="Service mesh">mTLS</td></tr>
+							<tr><td>Coverage</td><td data-label="NetworkPolicy">Every Pod, enforced in the kernel by the CNI</td><td data-label="Service mesh">Only meshed traffic; bypassable from inside a compromised Pod</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Use both: Istio says its policies "can be layered with Kubernetes Network Policies" for defense in depth, and the CNCF whitepaper lists "orchestrator network policies as well as use of a service mesh" as parts of "a comprehensive zero trust solution" (<a href="d3-topic-3-4.html#s4">topic 3.4</a>).</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Security signals: audit log, app and node logs, metrics, traces, Events (1 hour), runtime events, mesh telemetry. Forward them off-cluster to a store cluster credentials can't reach; protect their integrity (authenticated time, tamper-proof logs).</li>
+				<li>Protect the pipeline: logging agents are high-value; <code>/metrics</code> "may expose sensitive information"; scrapers need <code>nodes/metrics</code>, not <code>nodes/proxy</code>; Prometheus assumes untrusted readers (no secrets in labels; TLS and basic auth only since 2.24); OTel Collector on localhost (default since v0.110.0), minimal components, <code>redaction</code> and <code>attributes</code> processors.</li>
+				<li>Runtime tools: Falco detects (graduated; modern eBPF default); Tetragon (Cilium) and KubeArmor (sandbox) can block; Tracee isn't CNCF. Blocking has edges: pair SIGKILL with Override, audit first.</li>
+				<li>A mesh adds mTLS, SPIFFE workload identities from ServiceAccounts, L7 authorization and telemetry; it removes implicit trust (SP 800-207A).</li>
+				<li>Istio: PERMISSIVE by default, so apply <code>PeerAuthentication</code> STRICT. <code>AuthorizationPolicy</code>: <code>spec: {}</code> allows nothing; order CUSTOM, DENY, ALLOW; principals without <code>spiffe://</code>; identity fields never match plaintext. RequestAuthentication alone accepts token-less requests.</li>
+				<li>Ambient: ztunnel can't enforce L7, so an L7-only DENY blocks nothing; use waypoints. Linkerd: mTLS on by default but inbound policy allows all until a Server and AuthorizationPolicy exist; edge releases only since 2024. Cilium mutual auth is beta.</li>
+				<li>Mesh limits: unmeshed and hostNetwork Pods, a sidecar can't protect its own Pod, egress <code>REGISTRY_ONLY</code> is best-effort, istiod is a crown jewel, init containers need NET_ADMIN (use CNI agents). Layer the mesh with NetworkPolicy.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d5-topic-5-1.html"><small>Previous</small>5.1: Supply Chain Security and Image Repository</a>
+				<a class="next" href="index.html"><small>Next</small>KCSA overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Security Associate (KCSA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCSA, Falco and SPIFFE are marks of The Linux Foundation. Quotes and adapted examples from kubernetes.io (The Kubernetes Authors), the CNCF TAG Security Cloud Native Security Whitepaper and the Falco documentation, licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; short quotes from the Prometheus, OpenTelemetry, Tetragon, Istio and Linkerd documentation and NIST SP 800-207A; topic names from the <a href="https://github.com/cncf/curriculum">KCSA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
