@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.5: Iterative Refinement | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 3.5: giving Claude Code a check to iterate against, test-driven iteration with real failures fed back, concrete input/output examples, the interview pattern, steering with Esc, /rewind and /clear, sequential versus combined fixes, parallel work in worktrees, and what checkpoints can and can't undo.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Claude Code Configuration &amp; Workflows &middot; 20%</span>
+		<h1>3.5: Iterative Refinement</h1>
+		<p>Getting from a first attempt to the right result in as few rounds as possible: give Claude something to check its work against, show it examples instead of describing them, let it ask the questions, and know when to correct, rewind or start over.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Test-driven</span><span class="tag">I/O examples</span><span class="tag">Interview</span><span class="tag">/rewind</span><span class="tag">Worktrees</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Give Claude a check</a></li>
+				<li><a href="#s2">Test-driven iteration</a></li>
+				<li><a href="#s3">Input/output examples</a></li>
+				<li><a href="#s4">The interview pattern</a></li>
+				<li><a href="#s5">Steering a session</a></li>
+				<li><a href="#s6">One issue or all at once</a></li>
+				<li><a href="#s7">Checkpoints and their limits</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.5</span>
+				<p><strong>Apply iterative refinement techniques for progressive improvement.</strong></p>
+			</div>
+			<p>The exam guide asks for four techniques: concrete input/output examples when prose descriptions get interpreted inconsistently; test-driven iteration, writing the tests first and sharing the failures; the interview pattern, where Claude asks questions that surface things you hadn't considered; and knowing when to send interacting issues together and independent ones one at a time.</p>
+			<p>Sources: the Claude Code documentation (best practices, common workflows, checkpointing, worktrees, tools reference), Anthropic's prompting best-practices page and the changelog, checked on 8 November 2026, paraphrased. The test code below was run with Vitest 5.1.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop needs a <code>formatPrice</code> function that turns integer cents into a display string. A first attempt from the prompt "format prices nicely" got negative amounts and missing prices wrong.</p></div>
+
+			<!-- ===== Check ===== -->
+			<h2 id="s1">Give Claude a check</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Iterating against something that passes or fails.</span></p>
+				<p>The best-practices page's main point: Claude stops when the work looks done, and without something to run, "that makes you the test suite". Give it a check that returns pass or fail, and it can change, run, read the failure and fix on its own. Checks it lists include a test file, a build's exit code, a linter, a script that compares output with a fixture, and a browser screenshot next to the design.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>How firmly</th><th>How</th></tr></thead>
+						<tbody>
+							<tr><td>Ask</td><td data-label="How">In the prompt: "run the pricing tests and keep going until they pass". Claude decides when it's satisfied</td></tr>
+							<tr><td>Goal</td><td data-label="How"><code>/goal &lt;condition&gt;</code>: a separate model checks the condition after every turn, and Claude continues until it's met</td></tr>
+							<tr><td>Enforce</td><td data-label="How">A <code>Stop</code> hook that runs the check and exits with code 2 sends Claude back to work until it passes</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Ask for evidence, too: the command Claude ran and its output. "All tests pass" on its own tells you little. And put the command that runs the check in CLAUDE.md, so Claude never has to guess it.</p>
+			</div>
+
+			<!-- ===== TDD ===== -->
+			<h2 id="s2">Test-driven iteration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Tests first, then implement, feeding real failures back.</span></p>
+				<div class="code"><span class="file">Prompt sequence</span>
+<pre><code>1) Write tests only, in
+   src/pricing.test.ts, for
+   formatPrice(cents) using the
+   examples below. No pricing.ts yet.
+2) Run them and confirm they fail.
+3) Implement src/pricing.ts. Don't
+   edit the tests. Run pnpm vitest
+   until everything passes.
+4) Show me the command and output.</code></pre></div>
+				<div class="code"><span class="file">src/pricing.test.ts (TypeScript, Vitest)</span>
+<pre><code>import {
+  describe, expect, it,
+} from "vitest";
+import { formatPrice } from "./pricing";
+
+describe("formatPrice", () =&gt; {
+  it.each([
+    [1999, "$19.99"], <span class="c">// normal</span>
+    [5, "$0.05"], <span class="c">// pad the cents</span>
+    [0, "$0.00"], <span class="c">// zero</span>
+    [123456, "$1,234.56"], <span class="c">// thousands</span>
+    [-250, "-$2.50"], <span class="c">// refund</span>
+  ])("%i -&gt; %s", (cents, want) =&gt; {
+    expect(formatPrice(cents)).toBe(want);
+  });
+
+  it("null price is N/A", () =&gt; {
+    expect(formatPrice(null)).toBe("N/A");
+  });
+
+  it("rejects fractional cents", () =&gt; {
+    expect(() =&gt; formatPrice(19.99))
+      .toThrow(TypeError);
+  });
+});</code></pre></div>
+				<p>Claude's first implementation passed six tests and failed one. The useful next prompt passes on the actual failure, not "it's still broken":</p>
+				<div class="code"><span class="file">Feeding the failure back (prompt)</span>
+<pre><code>"rejects fractional cents" fails:
+expected function to throw an error,
+but it didn't. Throw a TypeError when
+cents isn't an integer. Keep the
+other tests green.</code></pre></div>
+				<div class="code"><span class="file">src/pricing.ts (after the fix)</span>
+<pre><code>export function formatPrice(
+  cents: number | null,
+): string {
+  if (cents === null) return "N/A";
+  if (!Number.isInteger(cents)) {
+    throw new TypeError("not cents");
+  }
+  const sign = cents &lt; 0 ? "-" : "";
+  const abs = Math.abs(cents);
+  const dollars = Math.floor(abs / 100)
+    .toLocaleString("en-US");
+  const c = String(abs % 100)
+    .padStart(2, "0");
+  return `${sign}$${dollars}.${c}`;
+}</code></pre></div>
+				<div class="callout trap"><p><strong>Tests define correctness, not the solution.</strong> Anthropic's prompting guide warns against code that only passes the tests: ask for a general solution, no hard-coding for test inputs, and a report if a test itself looks wrong rather than a workaround. Tell Claude not to edit the tests to make them pass.</p></div>
+			</div>
+
+			<!-- ===== Examples ===== -->
+			<h2 id="s3">Input/output examples</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Showing the transformation instead of describing it.</span></p>
+				<p>"Format prices nicely" can be read many ways. A few concrete pairs, including the edge cases, pin it down:</p>
+				<div class="code"><span class="file">Examples in the prompt</span>
+<pre><code>&lt;examples&gt;
+&lt;example&gt;1999 -&gt; $19.99&lt;/example&gt;
+&lt;example&gt;5 -&gt; $0.05&lt;/example&gt;
+&lt;example&gt;123456 -&gt; $1,234.56&lt;/example&gt;
+&lt;example&gt;-250 -&gt; -$2.50&lt;/example&gt;
+&lt;example&gt;null -&gt; N/A&lt;/example&gt;
+&lt;/examples&gt;</code></pre></div>
+				<p>Anthropic's prompting guide calls examples "one of the most reliable ways" to steer output. Make them relevant, varied enough to cover the edge cases, and clearly marked with tags. The exam guide says two or three examples; the prompting guide suggests three to five. Either way the point is a few concrete cases rather than more adjectives. (Few-shot prompting in API applications is task 4.2.)</p>
+			</div>
+
+			<!-- ===== Interview ===== -->
+			<h2 id="s4">The interview pattern</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Letting Claude ask the questions before it builds.</span></p>
+				<p>When you're not sure exactly what you want, the docs' advice is to "ask Claude to interview you instead". Claude asks multiple-choice questions (its <code>AskUserQuestion</code> tool) about the parts you haven't pinned down, keeps going until it could write a spec, and writes it to a file such as <code>SPEC.md</code>. Then start a <strong>fresh session</strong> to build from the spec: clean context, a written definition of done, and something to review the result against.</p>
+				<div class="code"><span class="file">Starting an interview (prompt)</span>
+<pre><code>I want discount codes at checkout
+but haven't thought it through.
+Interview me until you could write
+the spec, then save it to SPEC.md.</code></pre></div>
+				<p>The questions are where the value is: they surface things you hadn't considered, such as whether codes stack, whether they apply before or after tax, and what happens to a code when an order is refunded. This matters most in an unfamiliar domain.</p>
+			</div>
+
+			<!-- ===== Steering ===== -->
+			<h2 id="s5">Steering a session</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Correcting early, rewinding, and starting over.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Action</th><th>Use it when</th></tr></thead>
+						<tbody>
+							<tr><td><code>Esc</code></td><td data-label="Use it when">Claude starts going the wrong way: stop it straight away; the work so far is kept</td></tr>
+							<tr><td><code>/rewind</code> (or <code>Esc</code> twice on an empty prompt)</td><td data-label="Use it when">You want to go back to an earlier point: restore the code, the conversation or both, or summarize part of it</td></tr>
+							<tr><td><code>/clear</code></td><td data-label="Use it when">Between unrelated tasks, or after two corrections that didn't work: start fresh with one better prompt</td></tr>
+							<tr><td><code>/compact</code></td><td data-label="Use it when">The session is long but still on track; optionally say what to keep</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p><strong>Two failed corrections, then start over.</strong> The docs' advice: a third correction adds to a context already holding two failed attempts. <code>/clear</code> plus a single new prompt that folds in what you learned works better "almost every time".</p></div>
+			</div>
+
+			<!-- ===== Sequential ===== -->
+			<h2 id="s6">One issue or all at once</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">Deciding how to hand over several problems.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>The issues</th><th>Hand them over</th><th>Shop example</th></tr></thead>
+						<tbody>
+							<tr><td>Interact (fixing one changes another)</td><td data-label="Hand them over">Together, in one detailed message</td><td data-label="Shop example">Rounding and currency formatting in the same price string</td></tr>
+							<tr><td>Independent</td><td data-label="Hand them over">One at a time, checking each fix</td><td data-label="Shop example">A price bug and a typo in the order email</td></tr>
+							<tr><td>Independent and large</td><td data-label="Hand them over">In parallel, in separate Git worktrees</td><td data-label="Shop example">Two features worked on by two sessions</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The together-or-separately split is the exam guide's framing; the docs support it indirectly (give everything Claude needs up front; refactor in "small, testable increments"). For parallel work, <code>claude --worktree &lt;name&gt;</code> (or <code>-w</code>) starts a session in its own worktree under <code>.claude/worktrees/</code> on a new branch, so two sessions never edit the same checkout. A <code>.worktreeinclude</code> file copies gitignored files such as <code>.env</code> into new worktrees.</p>
+			</div>
+
+			<!-- ===== Checkpoints ===== -->
+			<h2 id="s7">Checkpoints and their limits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.5</span><span class="skill-text">What rewinding restores, and what it doesn't.</span></p>
+				<p>Claude Code takes a checkpoint before each prompt and keeps file snapshots for the last 100 checkpoints, saved with the conversation, so you can try a bolder approach knowing you can step back. Checkpoints arrived with Claude Code 2.0 in September 2025.</p>
+				<div class="callout trap"><p><strong>Checkpoints aren't Git.</strong> They track changes made by Claude's file-editing tools. They don't undo files changed only through Bash commands, edits you made yourself or another session made, most subagent edits, linked files, or anything outside the repository such as a database change or a deployment. Commit before risky work.</p></div>
+				<div class="callout retired"><p><strong>The old named workflows are gone.</strong> The 2025 engineering blog post on Claude Code best practices now redirects to a rewritten docs page. Recipes such as "write tests, commit; code, iterate, commit" are no longer there under those names; the ideas live on as "give Claude a check to run", "brainstorm with Claude first" and "steer the session". The page also drops older habits: no ALL-CAPS emphasis, no "think hard" phrases (effort is the control), and no "keep going, don't be lazy" lines, which cause over-work.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Give Claude a pass/fail check (tests, build, linter, screenshot) and ask for evidence; make it stricter with <code>/goal</code> or a <code>Stop</code> hook.</li>
+				<li>Test-driven: write tests first, confirm they fail, implement without editing the tests, and feed back the actual failure output.</li>
+				<li>Use a few concrete input/output pairs, edge cases included, when prose gets read inconsistently (guide: 2 to 3; prompting docs: 3 to 5).</li>
+				<li>Interview pattern: Claude asks you multiple-choice questions, writes <code>SPEC.md</code>, and you build in a fresh session.</li>
+				<li>Interacting issues go in one message; independent ones one at a time; independent large work in parallel worktrees (<code>claude -w</code>).</li>
+				<li><code>Esc</code> early, <code>/rewind</code> to step back, <code>/clear</code> after two failed corrections. Checkpoints don't cover Bash-only changes, outside edits or external effects.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-4.html"><small>Previous</small>3.4: Plan Mode or Direct Execution</a>
+				<a class="next" href="d3-task-3-6.html"><small>Next</small>3.6: Claude Code in CI/CD</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Claude Code and prompting documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

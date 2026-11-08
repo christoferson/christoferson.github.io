@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.3: Tools Across Agents and tool_choice | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 2.3: why fewer, role-specific tools per agent improve selection, scoping tools per subagent with AgentDefinition, tools versus allowed_tools versus disallowed_tools, MCP tool names and wildcards, tool_choice auto, any, tool and none and which models reject forced tool use, strict tools, disable_parallel_tool_use, and tool search for large catalogs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Tool Design &amp; MCP Integration &middot; 18%</span>
+		<h1>2.3: Tools Across Agents and tool_choice</h1>
+		<p>Which agent gets which tools, and how far you can steer whether Claude calls a tool at all: role-scoped tool sets for subagents, the Agent SDK options that make tools available or pre-approve them, and the tool_choice settings, which the newest models partly reject.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">AgentDefinition</span><span class="tag">allowed_tools</span><span class="tag">tool_choice</span><span class="tag">strict</span><span class="tag">Tool search</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Fewer tools per agent</a></li>
+				<li><a href="#s2">Scoping tools per subagent</a></li>
+				<li><a href="#s3">Available or pre-approved</a></li>
+				<li><a href="#s4">tool_choice</a></li>
+				<li><a href="#s5">When forcing isn't allowed</a></li>
+				<li><a href="#s6">Large tool catalogs</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.3</span>
+				<p><strong>Distribute tools appropriately across agents and configure tool choice.</strong></p>
+			</div>
+			<p>The exam guide asks you to know that giving an agent too many tools makes its choices less reliable, that agents given tools outside their specialty tend to misuse them, that scoped access with a few limited cross-role tools works better, and what the <code>tool_choice</code> options do. In practice: restrict each subagent to the tools its role needs, replace generic tools with constrained ones, force a particular first tool where needed, and use <code>any</code> to guarantee some tool is called. That last point now needs care, because the newest models reject forced tool use.</p>
+			<p>Sources: the Claude API tool-use documentation (define tools, tool search, parallel tool use, strict tool use, errors, release notes), the Claude Agent SDK documentation (subagents, permissions, MCP, Python reference) and Anthropic's engineering posts on tools and on its multi-agent research system, checked on 8 November 2026, paraphrased. The SDK code was built and inspected with claude-agent-sdk 0.2.179, but not run as an agent.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's support system has a coordinator that talks to the customer, an order-lookup subagent, and a refunds subagent. Order tools and refund tools come from two MCP servers.</p></div>
+
+			<!-- ===== Fewer tools ===== -->
+			<h2 id="s1">Fewer tools per agent</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">Why role-specific tool sets help.</span></p>
+				<ul>
+					<li><strong>Selection degrades with numbers.</strong> The tool search docs say accuracy falls once more than about 30 to 50 tools are loaded. (The exam guide's own illustration is far smaller: 18 tools against 4 or 5.) Definitions also cost context: Anthropic's example five-server MCP setup took about 55,000 tokens.</li>
+					<li><strong>Off-role tools get misused.</strong> Anthropic's tool-writing guide warns that too many or overlapping tools distract agents from efficient strategies, and its multi-agent research post gives each subagent "clear task boundaries" and guidance on which tools and sources to use.</li>
+					<li><strong>Constrained beats generic.</strong> Rather than a general <code>fetch_url</code>, give an agent a narrow tool that does one job safely, such as one that only loads documents from approved locations. The tool-writing guide makes the same point: build a few tools shaped around real workflows instead of wrapping every endpoint.</li>
+					<li><strong>Limited cross-role tools.</strong> If the refunds agent often needs to check an order, give it just the one read-only order tool it needs, not the whole order toolkit; anything more complex goes back through the coordinator. This is the exam guide's framing; the docs support it through per-subagent tool lists.</li>
+				</ul>
+			</div>
+
+			<!-- ===== AgentDefinition ===== -->
+			<h2 id="s2">Scoping tools per subagent</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">Giving each subagent only its role's tools in the Agent SDK.</span></p>
+				<div class="code"><span class="file">support_agents.py (Python, Agent SDK)</span>
+<pre><code>from claude_agent_sdk import (
+    AgentDefinition,
+    ClaudeAgentOptions,
+)
+
+
+def server(name):
+    <span class="c"># stdio MCP server for one domain</span>
+    return {name: {
+        "type": "stdio",
+        "command": "python",
+        "args": [f"{name}_mcp.py"],
+    }}
+
+
+agents = {
+    "order-lookup": AgentDefinition(
+        description=(
+            "Order status and tracking"
+            " questions. Read-only."),
+        prompt=(
+            "Look up orders and report"
+            " status. Never refund."),
+        <span class="c"># inline server: subagent only</span>
+        mcpServers=[server("orders")],
+        tools=["mcp__orders__*"],
+        model="haiku",
+    ),
+    "refunds": AgentDefinition(
+        description=(
+            "Refund and return requests"
+            " for gear orders."),
+        prompt=(
+            "Check the order, then refund"
+            " within the 60-day policy."),
+        mcpServers=[
+            server("orders"),
+            server("refunds"),
+        ],
+        tools=[
+            <span class="c"># one cross-role tool only</span>
+            "mcp__orders__get_order",
+            "mcp__refunds__issue_refund",
+        ],
+        model="sonnet",
+    ),
+}
+
+options = ClaudeAgentOptions(
+    agents=agents,
+    <span class="c"># coordinator's built-ins: Agent</span>
+    tools=["Agent"],
+    <span class="c"># pre-approval only, not a limit</span>
+    allowed_tools=[
+        "mcp__orders__*",
+        "mcp__refunds__issue_refund",
+    ],
+    <span class="c"># anything else that asks: denied</span>
+    permission_mode="dontAsk",
+)</code></pre></div>
+				<ul>
+					<li><strong><code>description</code></strong> is what the coordinator matches tasks against; <strong><code>prompt</code></strong> is the subagent's system prompt.</li>
+					<li><strong><code>tools</code></strong> lists exactly what the subagent can use. Leave it out and the subagent inherits <em>every</em> available tool.</li>
+					<li><strong>Inline <code>mcpServers</code></strong> connect only for that subagent: per the docs, the subagent gets the tools and the parent doesn't, which also keeps their descriptions out of the coordinator's context.</li>
+					<li><strong>MCP tool names</strong> are <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>, where the server name is the key you gave it; <code>mcp__orders__*</code> means every tool from that server.</li>
+					<li>Note the naming: <code>AgentDefinition</code> fields stay camelCase in Python (<code>mcpServers</code>, <code>disallowedTools</code>), while <code>ClaudeAgentOptions</code> uses snake_case (<code>allowed_tools</code>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Available vs approved ===== -->
+			<h2 id="s3">Available or pre-approved</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">The three options that sound alike and do different things.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Option</th><th>Controls</th><th>Watch out</th></tr></thead>
+						<tbody>
+							<tr><td><code>tools</code> (and <code>AgentDefinition.tools</code>)</td><td data-label="Controls">Which tools exist for the agent</td><td data-label="Watch out">At session level it covers built-in tools only, not MCP tools</td></tr>
+							<tr><td><code>disallowed_tools</code></td><td data-label="Controls">Deny rules: a bare name removes the tool; a scoped rule such as <code>Bash(rm *)</code> blocks matching calls in every mode</td><td data-label="Watch out"><code>"mcp__*"</code> removes every MCP tool</td></tr>
+							<tr><td><code>allowed_tools</code></td><td data-label="Controls">Which calls run without asking</td><td data-label="Watch out">The docs: it "does not restrict Claude to only these tools". Unlisted tools still exist and fall back to the permission mode</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The docs' locked-down pattern is <code>allowed_tools</code> plus <code>permission_mode="dontAsk"</code>: listed tools run, anything that would ask is refused. MCP tools always need approval; <code>acceptEdits</code> doesn't cover them. A wildcard in <code>allowed_tools</code> only works after a literal server prefix: <code>mcp__orders__*</code> works, a bare <code>mcp__*</code> is silently ignored.</p>
+				<div class="callout retired"><p><strong>"allowedTools must include Task."</strong> The exam guide says a coordinator needs <code>"Task"</code> in <code>allowedTools</code> to start subagents. The tool is now called <strong>Agent</strong> (renamed in Claude Code 2.1.63; <code>Task</code> still works as an alias), and since <code>allowed_tools</code> only pre-approves, and Agent doesn't ask before running, what really controls delegation is whether Agent is in the agent's <code>tools</code>. The docs' examples still list <code>"Agent"</code> in <code>allowed_tools</code>, so "include it" remains the expected exam answer.</p></div>
+			</div>
+
+			<!-- ===== tool_choice ===== -->
+			<h2 id="s4">tool_choice</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">The four settings in the Claude API.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
+						<tbody>
+							<tr><td><code>{"type": "auto"}</code></td><td data-label="Meaning">Claude decides whether to call a tool (the default when tools are provided)</td></tr>
+							<tr><td><code>{"type": "any"}</code></td><td data-label="Meaning">Claude must call one of the tools, any of them</td></tr>
+							<tr><td><code>{"type": "tool", "name": "..."}</code></td><td data-label="Meaning">Claude must call that tool</td></tr>
+							<tr><td><code>{"type": "none"}</code></td><td data-label="Meaning">No tools (the default when none are provided)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>With <code>any</code> or a named tool, the API prefills the response, so Claude writes no text and does no thinking before the tool call. <code>disable_parallel_tool_use: true</code> goes <em>inside</em> <code>tool_choice</code>: with <code>auto</code> it means at most one call per response; with forced use, exactly one. Changing <code>tool_choice</code> between requests invalidates cached message blocks, though cached tools and system prompt survive.</p>
+				<div class="code"><span class="file">Request with auto and a strict tool (JSON)</span>
+<pre><code>{
+  "model": "claude-opus-5-5",
+  "max_tokens": 1024,
+  "tool_choice": {"type": "auto"},
+  "tools": [{
+    "name": "lookup_order",
+    "description": "...",
+    "strict": true,
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "order_id": {"type": "string"}
+      },
+      "required": ["order_id"],
+      "additionalProperties": false
+    }
+  }],
+  "messages": [{
+    "role": "user",
+    "content": "Where is ORD-104233?"
+  }]
+}</code></pre></div>
+				<p>(The description is elided here; a real one needs several sentences, as in <a href="d2-task-2-1.html#s2">task 2.1</a>.)</p>
+			</div>
+
+			<!-- ===== Forcing ===== -->
+			<h2 id="s5">When forcing isn't allowed</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">Which models accept forced tool use, and what to do instead.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Models</th><th>Forcing a tool</th></tr></thead>
+						<tbody>
+							<tr><td>Claude Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1</td><td data-label="Forcing a tool">Rejected with a 400 error, whatever the thinking settings (released September 2026)</td></tr>
+							<tr><td>Claude Haiku 5.5, Opus 5 and earlier models</td><td data-label="Forcing a tool">Accepted (but a forced call skips thinking)</td></tr>
+							<tr><td>Any model with manual extended thinking enabled</td><td data-label="Forcing a tool">Rejected</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The docs' alternatives on models that reject forcing: use <code>auto</code> with <code>strict: true</code> tools, or structured outputs (<code>output_config.format</code>) when you need a fixed JSON response rather than a tool call (<span>task 4.3</span>). Prompting still steers <code>auto</code>: "Call extract_metadata first" in the user message. For the guide's pattern of forcing a first step and then letting Claude continue, force the first tool and switch to <code>auto</code> afterwards on models that allow it; elsewhere, instruct it and offer only that tool on the first request.</p>
+				<div class="callout trap"><p><strong><code>strict</code> doesn't force a call.</strong> Strict tool use guarantees that <em>if</em> Claude calls the tool, the input matches the schema and the tool name is valid. With <code>auto</code>, Claude may still answer in plain text. Only <code>any</code> or a named tool guarantees a call, on the models that support them. The exam guide predates the September 2026 releases and presents forcing as always available.</p></div>
+			</div>
+
+			<!-- ===== Tool search ===== -->
+			<h2 id="s6">Large tool catalogs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.3</span><span class="skill-text">Keeping hundreds of tools available without loading them all.</span></p>
+				<p>When an agent really does need a large catalog (many MCP servers, say), the tool search tool avoids loading every definition. Mark tools with <code>defer_loading: true</code>; Claude searches by name and description and only the matching definitions (five by default) are loaded. The docs report context savings of typically over 85%. Rules: you still send every definition with each request, at least one tool must stay non-deferred, and the three to five most-used tools should stay loaded. In Claude Code and the Agent SDK, tool search is on by default for MCP tools.</p>
+				<div class="callout tip"><p><strong>Choosing the right fix.</strong> Too many tools for one role: split the work across subagents with scoped tool lists. A genuinely large catalog in one agent: tool search. The wrong tool chosen between two similar ones: better names and descriptions (<a href="d2-task-2-1.html">task 2.1</a>), not forcing.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Fewer, role-specific tools per agent improve selection (the docs' threshold is about 30 to 50 tools); give cross-role access as one narrow tool and route complex cases through the coordinator.</li>
+				<li><code>AgentDefinition.tools</code> sets a subagent's tools (omit it and it inherits everything); inline <code>mcpServers</code> keep a server's tools out of the coordinator.</li>
+				<li><code>tools</code> = available (built-ins at session level), <code>disallowed_tools</code> = removed or denied, <code>allowed_tools</code> = pre-approved, not restricted. MCP names are <code>mcp__server__tool</code>.</li>
+				<li><code>tool_choice</code>: <code>auto</code>, <code>any</code>, a named tool, <code>none</code>. Forced use skips text and thinking; <code>disable_parallel_tool_use</code> sits inside <code>tool_choice</code>.</li>
+				<li>Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1 reject <code>any</code> and named tools: use <code>auto</code> plus <code>strict</code>, prompting, or structured outputs. <code>strict</code> validates inputs but doesn't force a call.</li>
+				<li>The subagent tool is now Agent (formerly Task). Large catalogs: tool search with <code>defer_loading</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-2.html"><small>Previous</small>2.2: Structured Error Responses</a>
+				<a class="next" href="d2-task-2-4.html"><small>Next</small>2.4: MCP Servers in Claude Code</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Claude API and Agent SDK documentation and Anthropic's engineering articles summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

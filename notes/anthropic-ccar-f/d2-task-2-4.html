@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.4: MCP Servers in Claude Code | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 2.4: Claude Code's local, project and user MCP scopes, .mcp.json with ${VAR} environment variable expansion, claude mcp add, project-server approval, using resources and prompts, several servers at once, tool search, output limits, MCP in the Agent SDK including in-process servers, transports and SSE deprecation, and the API MCP connector.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Tool Design &amp; MCP Integration &middot; 18%</span>
+		<h1>2.4: MCP Servers in Claude Code</h1>
+		<p>Connecting MCP servers to Claude Code and to Agent SDK applications: which scope to configure a server in, keeping its credentials out of Git, how several servers work together, and how resources and prompts reach the conversation.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">.mcp.json</span><span class="tag">claude mcp add</span><span class="tag">${VAR}</span><span class="tag">Scopes</span><span class="tag">Agent SDK</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Three scopes</a></li>
+				<li><a href="#s2">A shared .mcp.json</a></li>
+				<li><a href="#s3">Adding servers from the CLI</a></li>
+				<li><a href="#s4">Approval and trust</a></li>
+				<li><a href="#s5">Using servers in a session</a></li>
+				<li><a href="#s6">MCP in the Agent SDK</a></li>
+				<li><a href="#s7">Choosing and building servers</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.4</span>
+				<p><strong>Integrate MCP servers into Claude Code and agent workflows.</strong></p>
+			</div>
+			<p>The exam guide asks you to know project-level <code>.mcp.json</code> for shared team tooling versus user-level <code>~/.claude.json</code> for personal or experimental servers, environment variable expansion (such as <code>${GITHUB_TOKEN}</code>) to keep secrets out of version control, that tools from all configured servers are available together, and that MCP resources can expose content catalogs so the agent needs fewer exploratory calls. In practice: configure shared servers with expanded tokens, keep personal ones in user scope, write descriptions good enough that Claude doesn't fall back to built-in tools such as Grep, and prefer an existing community server over building your own unless the workflow is specific to your team.</p>
+			<p>Sources: the Claude Code MCP documentation and settings reference, the Agent SDK MCP and custom tools documentation, the MCP specification and the Claude API MCP connector page, checked on 8 November 2026 against Claude Code 2.1.303 (<code>claude mcp --help</code>), paraphrased. The JSON was validated, the Python was run with claude-agent-sdk 0.2.179 (the tool handler only), and no servers were actually added.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's developers want two servers in their repository: an inventory server that runs locally against the stock database, and the company's hosted orders server. One developer also wants to try an experimental analytics server without affecting anyone else.</p></div>
+
+			<!-- ===== Scopes ===== -->
+			<h2 id="s1">Three scopes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">Where a server's configuration lives, and who gets it.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Scope</th><th>Stored in</th><th>Reaches</th></tr></thead>
+						<tbody>
+							<tr><td><code>local</code> (the default)</td><td data-label="Stored in"><code>~/.claude.json</code>, under the current project's path</td><td data-label="Reaches">Only you, only in this project</td></tr>
+							<tr><td><code>project</code></td><td data-label="Stored in"><code>.mcp.json</code> at the project root, committed</td><td data-label="Reaches">Everyone who clones the repository</td></tr>
+							<tr><td><code>user</code></td><td data-label="Stored in"><code>~/.claude.json</code>, top level</td><td data-label="Reaches">Only you, in all your projects</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>When the same server name appears in more than one place, local beats project, which beats user (then plugin servers and claude.ai connectors). The winning entry is used whole; fields aren't merged.</p>
+				<div class="callout trap"><p><strong>Plain <code>claude mcp add</code> is local, not user.</strong> The exam guide describes two scopes, project and user. There's a third, <strong>local</strong>, and it's the default: a server added without <code>--scope</code> is stored in <code>~/.claude.json</code> but only for the current project. Use <code>--scope user</code> for your personal servers everywhere, and <code>--scope project</code> to write <code>.mcp.json</code>. (MCP's local scope has nothing to do with <code>.claude/settings.local.json</code>.)</p></div>
+			</div>
+
+			<!-- ===== .mcp.json ===== -->
+			<h2 id="s2">A shared .mcp.json</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">Team servers with credentials kept out of Git.</span></p>
+				<div class="code"><span class="file">.mcp.json (project, committed)</span>
+<pre><code>{
+  "mcpServers": {
+    "inventory": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "gear-stock-mcp"],
+      "env": {
+        "DB_URL": "${INVENTORY_DB_URL}"
+      }
+    },
+    "orders": {
+      "type": "http",
+      "url": "https://orders.example/mcp",
+      "headers": {
+        "X-Api-Key": "${ORDERS_API_KEY}"
+      }
+    }
+  }
+}</code></pre></div>
+				<ul>
+					<li><code>${VAR}</code> is replaced with each developer's own environment variable; <code>${VAR:-default}</code> supplies a fallback. Expansion works in <code>command</code>, <code>args</code>, <code>env</code>, <code>url</code> and <code>headers</code>.</li>
+					<li>An unset variable with no default doesn't stop the server from loading: the literal <code>${VAR}</code> text is used and <code>claude mcp list</code> shows a warning. So a server that "connects but fails to authenticate" may just be missing a variable.</li>
+					<li>Always set <code>"type": "http"</code> for remote servers: an entry with a <code>url</code> but no <code>type</code> is treated as stdio.</li>
+					<li>As a safeguard, Anthropic credential variables such as <code>ANTHROPIC_API_KEY</code> expand to nothing in a remote server's <code>url</code> and <code>headers</code>, so a repository can't send your key to its server.</li>
+				</ul>
+			</div>
+
+			<!-- ===== CLI ===== -->
+			<h2 id="s3">Adding servers from the CLI</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">claude mcp commands that produce the file above.</span></p>
+				<div class="code"><span class="file">Adding the servers (shell)</span>
+<pre><code><span class="c"># stdio server, shared via .mcp.json</span>
+claude mcp add --transport stdio \
+  --scope project inventory \
+  --env 'DB_URL=${INVENTORY_DB_URL}' \
+  -- npx -y gear-stock-mcp
+
+<span class="c"># http server, shared via .mcp.json</span>
+claude mcp add --transport http \
+  --scope project orders \
+  https://orders.example/mcp \
+  --header 'X-Api-Key: ${ORDERS_API_KEY}'
+
+<span class="c"># personal experiment, all projects</span>
+claude mcp add --transport http \
+  --scope user analytics \
+  https://analytics.example/mcp
+
+claude mcp list</code></pre></div>
+				<p>Single quotes stop the shell expanding <code>${...}</code>, so the reference itself is saved. Everything after <code>--</code> is the server's own command. Other commands: <code>claude mcp add-json</code> (paste a JSON entry), <code>get</code>, <code>remove</code>, and <code>login</code> or <code>/mcp</code> in a session for OAuth.</p>
+				<div class="callout trap"><p><strong>Two small CLI traps.</strong> <code>--env</code> accepts several values, so putting the server name straight after it makes the CLI read the name as another variable; put another option in between, as above. And <code>claude mcp remove</code> deletes stored OAuth tokens without revoking them; run <code>claude mcp logout</code> first.</p></div>
+			</div>
+
+			<!-- ===== Approval ===== -->
+			<h2 id="s4">Approval and trust</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">Why a cloned repository's servers don't just start.</span></p>
+				<p>In an interactive session, Claude Code asks before it uses servers from a project's <code>.mcp.json</code>; <code>claude mcp list</code> shows them as "Pending approval" until then, and <code>claude mcp reset-project-choices</code> clears your answers. The settings <code>enableAllProjectMcpServers</code>, <code>enabledMcpjsonServers</code> and <code>disabledMcpjsonServers</code> approve or reject servers, but a repository can't approve its own: committed in <code>.claude/settings.json</code>, they're ignored in a folder you haven't trusted. Non-interactive runs (<code>claude -p</code>) and Agent SDK sessions skip the prompt, which is why CI should run only trusted repositories (<a href="d3-task-3-6.html#s3">task 3.6</a>). Organizations can allow or deny servers centrally with managed settings.</p>
+			</div>
+
+			<!-- ===== Session ===== -->
+			<h2 id="s5">Using servers in a session</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">Tools, resources and prompts from several servers at once.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Primitive</th><th>How it appears in Claude Code</th></tr></thead>
+						<tbody>
+							<tr><td>Tools</td><td data-label="How it appears in Claude Code">As <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>, alongside built-in tools; all connected servers' tools are available together</td></tr>
+							<tr><td>Resources</td><td data-label="How it appears in Claude Code">Type <code>@</code> to pick them next to files, as <code>@server:scheme://path</code> (for example <code>@orders:catalog://categories</code>); a mentioned resource is fetched and attached</td></tr>
+							<tr><td>Prompts</td><td data-label="How it appears in Claude Code">As commands: <code>/mcp__server__prompt</code>, listed in the <code>/</code> menu</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<ul>
+					<li><strong>Tool search is on by default.</strong> At the start of a session only tool names (and server instructions) load; full definitions load when needed. The exam guide's "discovered at connection time and available simultaneously" still holds, but the details now arrive on demand, and servers connect in the background, so a slow server's tools may appear after the first turn. <code>"alwaysLoad": true</code> on a server opts it out.</li>
+					<li><strong>Output limits.</strong> A warning appears when one tool result exceeds 10,000 tokens, and results are capped at 25,000 tokens by default (<code>MAX_MCP_OUTPUT_TOKENS</code> changes it). <code>MCP_TIMEOUT</code> is the server <em>startup</em> timeout, not a per-call limit.</li>
+					<li><strong><code>/mcp</code></strong> shows each server's status, runs OAuth sign-in, reconnects, and switches a server off for the project.</li>
+				</ul>
+				<div class="callout tip"><p><strong>When Claude ignores your server.</strong> If Claude greps the repository instead of using your issue-tracker server, the fix is usually the server's tool descriptions: say what the tool covers that the built-ins can't (<a href="d2-task-2-1.html">task 2.1</a>). Exposing a catalog (issue summaries, documentation structure, database schema) as a resource also saves a series of exploratory calls.</p></div>
+			</div>
+
+			<!-- ===== SDK ===== -->
+			<h2 id="s6">MCP in the Agent SDK</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">External and in-process servers for your own agents.</span></p>
+				<p>Pass servers in <code>mcp_servers</code> (a dictionary keyed by name; the key becomes the <code>mcp__key__tool</code> prefix), or let the SDK read <code>.mcp.json</code> through the project setting source. For a small tool that lives in your application, an in-process server needs no subprocess:</p>
+				<div class="code"><span class="file">stock_tools.py (Python, Agent SDK)</span>
+<pre><code>from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    create_sdk_mcp_server,
+    tool,
+)
+
+STOCK = {"tent-2p": 14, "stove": 0}
+
+
+@tool(
+    "check_stock",
+    "Units in stock for one gear SKU. "
+    "Returns a count; 0 means sold out.",
+    {"sku": str},
+)
+async def check_stock(args):
+    sku = args["sku"]
+    if sku not in STOCK:
+        <span class="c"># tell Claude it failed, and why</span>
+        return {
+            "content": [{
+                "type": "text",
+                "text": f"Bad SKU {sku}",
+            }],
+            "is_error": True,
+        }
+    n = STOCK[sku]
+    return {"content": [{
+        "type": "text",
+        "text": f"{sku}: {n} in stock",
+    }]}
+
+
+gear = create_sdk_mcp_server(
+    name="gear",
+    version="1.0.0",
+    tools=[check_stock],
+)
+
+options = ClaudeAgentOptions(
+    <span class="c"># key "gear" -&gt; mcp__gear__&lt;tool&gt;</span>
+    mcp_servers={"gear": gear},
+    allowed_tools=[
+        "mcp__gear__check_stock",
+    ],
+)</code></pre></div>
+				<ul>
+					<li>MCP tools need approval: list them in <code>allowed_tools</code> (or use a permission callback). <code>acceptEdits</code> doesn't cover them.</li>
+					<li>A server that fails to connect doesn't raise an exception. Check each server's status in the session's init message, or Claude may quietly carry on with built-in tools.</li>
+					<li>The SDK doesn't run interactive OAuth: get the token in your application and pass it in <code>headers</code>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Choosing ===== -->
+			<h2 id="s7">Choosing and building servers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.4</span><span class="skill-text">Existing servers versus your own, and transports.</span></p>
+				<p>For a common system such as an issue tracker, an existing community or vendor server is usually the better choice: it's maintained by others and already well described. Build your own when the workflow is specific to your team (the shop's refund rules, say). The docs also warn to trust each server you install: one that fetches outside content can expose you to prompt injection.</p>
+				<div class="callout retired"><p><strong>Transports and versions.</strong> MCP's standard transports are stdio and Streamable HTTP. The older HTTP+SSE transport was replaced in the 2025-03-26 spec and is formally deprecated; Claude Code labels <code>--transport sse</code> deprecated and falls back to SSE automatically when an <code>http</code> server needs it. The current spec revision, 2026-07-28, makes MCP stateless (no initialization handshake or sessions). On the API side, the MCP connector lets the Messages API call remote MCP servers directly; it's still in beta, supports tools only (no resources or prompts), and can't reach local stdio servers.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Scopes: local (default; <code>~/.claude.json</code>, this project), project (<code>.mcp.json</code>, committed, team), user (<code>~/.claude.json</code>, all your projects). Local beats project beats user.</li>
+				<li>Keep secrets out of <code>.mcp.json</code> with <code>${VAR}</code> or <code>${VAR:-default}</code>; an unset variable only warns. Set <code>"type": "http"</code> on remote servers.</li>
+				<li><code>claude mcp add --scope project|user</code>; project servers need approval in interactive sessions and can't approve themselves.</li>
+				<li>All servers' tools are available as <code>mcp__server__tool</code>, loaded on demand through tool search; resources via <code>@server:...</code>, prompts as <code>/mcp__server__prompt</code>. Output is capped at 25,000 tokens by default.</li>
+				<li>Agent SDK: <code>mcp_servers</code> plus <code>allowed_tools</code>; in-process tools with <code>@tool</code> and <code>create_sdk_mcp_server</code>; failed servers don't raise.</li>
+				<li>Prefer existing servers for common systems; build custom ones for team-specific workflows. SSE is deprecated in favour of Streamable HTTP.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-3.html"><small>Previous</small>2.3: Tools Across Agents</a>
+				<a class="next" href="d2-task-2-5.html"><small>Next</small>2.5: Built-in Tools</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Claude Code, Agent SDK and Claude API documentation and the Model Context Protocol specification summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

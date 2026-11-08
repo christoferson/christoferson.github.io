@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.6: Claude Code in CI/CD | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 3.6: running Claude Code non-interactively with -p, JSON output and --json-schema structured results, permissions when nobody can answer prompts, the claude-code-action GitHub Action (v1) for pull request review, CLAUDE.md as CI context, independent reviewer sessions, avoiding duplicate findings, GitLab, and CI security and cost controls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.6</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Claude Code Configuration &amp; Workflows &middot; 20%</span>
+		<h1>3.6: Claude Code in CI/CD</h1>
+		<p>Running Claude Code where nobody is at the keyboard: non-interactive runs that return machine-readable results, the GitHub Action for pull request review, and the permissions, context and safeguards that make automated reviews useful and safe.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">claude -p</span><span class="tag">--json-schema</span><span class="tag">GitHub Actions</span><span class="tag">dontAsk</span><span class="tag">Code review</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Non-interactive runs</a></li>
+				<li><a href="#s2">Structured results</a></li>
+				<li><a href="#s3">Permissions with nobody to ask</a></li>
+				<li><a href="#s4">The GitHub Action</a></li>
+				<li><a href="#s5">Context and review quality</a></li>
+				<li><a href="#s6">Security and cost</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.6</span>
+				<p><strong>Integrate Claude Code into CI/CD pipelines.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the <code>-p</code> (<code>--print</code>) flag for non-interactive runs, <code>--output-format json</code> with <code>--json-schema</code> for structured CI output, CLAUDE.md as the way to give CI runs project context (test standards, fixtures, review criteria), and why a fresh, independent session reviews code better than the one that wrote it. In practice: avoid runs that wait for input, turn findings into pull request comments, send previous findings on re-runs so only new issues are reported, and give Claude the existing tests so it doesn't duplicate them.</p>
+			<p>Sources: the Claude Code documentation (programmatic usage, CLI reference, permissions, permission modes, GitHub Actions, GitLab CI/CD, best practices), the claude-code-action repository (MIT licence) and the changelog, checked on 8 November 2026 against Claude Code 2.1.303, paraphrased. The JSON schema and the <code>jq</code> filters below were checked against sample output; the workflows weren't run.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop wants every pull request reviewed for bugs and security problems in the cart and checkout code, with comments on the PR, and a CI job that fails when a high-severity finding appears.</p></div>
+
+			<!-- ===== -p ===== -->
+			<h2 id="s1">Non-interactive runs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">The -p flag and the options that only work with it.</span></p>
+				<p><code>claude -p "prompt"</code> runs the task without the interactive interface, prints the result and exits: 0 on success, non-zero when the run fails. Input can be piped in (up to 10 MB), so <code>git diff main | claude -p "review this"</code> hands Claude the diff without needing any Bash permission to read it.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+						<tbody>
+							<tr><td><code>--output-format</code></td><td data-label="Effect"><code>text</code> (default), <code>json</code> (one result object) or <code>stream-json</code> (one event per line)</td></tr>
+							<tr><td><code>--json-schema</code></td><td data-label="Effect">Returns data matching your JSON Schema in the result's <code>structured_output</code> field</td></tr>
+							<tr><td><code>--max-turns</code></td><td data-label="Effect">Caps the agent's turns; no limit by default</td></tr>
+							<tr><td><code>--max-budget-usd</code></td><td data-label="Effect">Stops once the estimated cost reaches the amount</td></tr>
+							<tr><td><code>--allowedTools</code>, <code>--disallowedTools</code></td><td data-label="Effect">Tools that may run without asking, and tools that are denied</td></tr>
+							<tr><td><code>--permission-mode</code></td><td data-label="Effect">For example <code>dontAsk</code> for locked-down CI (<a href="#s3">below</a>)</td></tr>
+							<tr><td><code>--append-system-prompt</code></td><td data-label="Effect">Adds instructions while keeping the default system prompt</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The first four work only with <code>-p</code>. The JSON result includes <code>result</code> (the text), <code>session_id</code>, <code>is_error</code>, <code>num_turns</code> and <code>total_cost_usd</code>, and a <code>subtype</code> that is <code>success</code> or an error such as <code>error_max_turns</code>, <code>error_max_budget_usd</code> or <code>error_max_structured_output_retries</code>. Error results have no <code>result</code> field.</p>
+			</div>
+
+			<!-- ===== Structured ===== -->
+			<h2 id="s2">Structured results</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">Getting findings a pipeline can act on.</span></p>
+				<div class="code"><span class="file">review.sh (shell, CI step)</span>
+<pre><code><span class="c"># findings schema: list of issues</span>
+SCHEMA='{"type":"object",
+ "properties":{"findings":{
+  "type":"array","items":{
+   "type":"object","properties":{
+    "file":{"type":"string"},
+    "line":{"type":"integer"},
+    "severity":{"enum":
+     ["high","medium","low"]},
+    "issue":{"type":"string"}},
+   "required":["file","line",
+    "severity","issue"]}}},
+ "required":["findings"]}'
+
+<span class="c"># diff via stdin: no Bash grant needed</span>
+git diff origin/main...HEAD \
+ | claude -p \
+  "Review this diff for bugs in the
+cart and checkout code. Use CLAUDE.md
+criteria. Skip style issues." \
+  --output-format json \
+  --json-schema "$SCHEMA" \
+  --permission-mode dontAsk \
+  --allowedTools "Read" \
+  --max-turns 5 \
+  &gt; review.json
+
+<span class="c"># no structured output = failed run</span>
+jq -e '.structured_output' \
+  review.json &gt; /dev/null || exit 1
+
+<span class="c"># fail on any high-severity finding</span>
+HIGH=$(jq '[
+  .structured_output.findings[]
+  | select(.severity=="high")]
+  | length' review.json)
+[ "$HIGH" -eq 0 ] || exit 1</code></pre></div>
+				<div class="callout trap"><p><strong>Look in <code>structured_output</code>, and check it's there.</strong> With <code>--json-schema</code>, the data is in <code>structured_output</code>, not <code>result</code>. The field is missing if the run failed or Claude declined, even on a result marked <code>success</code>, so test for it before using it. Schemas are checked as JSON Schema draft-07; since 2.1.205 an invalid schema is an error (before that it was silently ignored).</p></div>
+				<p>Each finding has a file, a line and a message, which is exactly what a script needs to post inline pull request comments through the GitHub API, or to raise annotations.</p>
+			</div>
+
+			<!-- ===== Permissions ===== -->
+			<h2 id="s3">Permissions with nobody to ask</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">What happens to permission prompts in CI, and how to grant just enough.</span></p>
+				<p>The exam guide's reason for <code>-p</code> is to avoid jobs that hang waiting for input. In a <code>-p</code> run, a tool call that nothing approves is <strong>denied</strong>, not left waiting: the run carries on, and the denials are listed in <code>permission_denials</code>. Since 2.1.302, <code>-p</code> runs with no mode set start in <code>default</code> (Manual) mode.</p>
+				<ul>
+					<li><code>--permission-mode dontAsk</code> denies anything that would prompt; the docs call it useful for locked-down CI. Combine it with <code>--allowedTools</code> for exactly what the job needs.</li>
+					<li>Rule syntax: <code>Bash(pnpm test *)</code> allows any command starting <code>pnpm test</code>. The older form <code>Bash(npm test:*)</code> still works and means the same. An allow rule doesn't cover <code>cmd &amp;&amp; other</code>: every part must be allowed.</li>
+					<li>Deny rules apply in every mode. <code>bypassPermissions</code> belongs only in isolated containers or VMs.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Untrusted folders and <code>--bare</code>.</strong> When <code>-p</code> runs in a folder nobody has trusted, the repository's <code>.claude/settings.json</code> allow rules are ignored, but its hooks still run and its <code>.mcp.json</code> servers still connect. The docs recommend <code>--bare</code> for scripted runs: it skips hooks, skills, plugins, MCP servers and auto memory, but also <strong>CLAUDE.md</strong>. So with <code>--bare</code>, pass context explicitly (for example with <code>--append-system-prompt-file</code>); without it, CLAUDE.md loads as usual.</p></div>
+			</div>
+
+			<!-- ===== Action ===== -->
+			<h2 id="s4">The GitHub Action</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">anthropics/claude-code-action for mentions and automated reviews.</span></p>
+				<p>The action (v1, generally available since August 2025) runs Claude Code inside a GitHub Actions job. Run <code>/install-github-app</code> in Claude Code to set it up: it installs the Claude GitHub App, stores the API key as a repository secret and opens a pull request adding the workflow. It works in two ways, picked automatically:</p>
+				<ul>
+					<li><strong>Interactive:</strong> no <code>prompt</code> input, so it waits for <code>@claude</code> in an issue or PR comment and replies there.</li>
+					<li><strong>Automation:</strong> a <code>prompt</code> input, so it runs on the event itself (a pull request, a schedule).</li>
+				</ul>
+				<div class="code"><span class="file">.github/workflows/claude-review.yml</span>
+<pre><code>name: Claude PR review
+on:
+  pull_request:
+    types: [opened, synchronize,
+      ready_for_review, reopened]
+concurrency:
+  group: review-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  review:
+    if: &gt;-
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: &gt;-
+          anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: &gt;-
+            ${{secrets.ANTHROPIC_API_KEY}}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR: ${{ github.event.number }}
+            Review the cart and checkout
+            changes against the review
+            criteria in CLAUDE.md. Report
+            only bugs and security issues;
+            skip style. Post one summary
+            with gh pr comment.
+          claude_args: |
+            --max-turns 8
+            --allowedTools "Bash(gh pr *)"</code></pre></div>
+				<p><code>Bash(gh pr *)</code> lets Claude read the diff and comment; the job's read-only <code>contents</code> permission stops it from merging. For comments on specific lines, the action provides an inline-comment tool that must be named in <code>--allowedTools</code> (its full name, <code>mcp__github_inline_comment__create_inline_comment</code>, is too long for this layout). Pass <code>--json-schema</code> in <code>claude_args</code>, and the action exposes the result as a <code>structured_output</code> step output for later steps.</p>
+				<div class="callout retired"><p><strong>Beta inputs removed in v1.</strong> Older workflows use <code>@beta</code> with <code>direct_prompt</code>, <code>mode</code>, <code>model</code>, <code>max_turns</code>, <code>allowed_tools</code> and <code>custom_instructions</code>. In v1, <code>mode</code> is gone (detected automatically), <code>direct_prompt</code> became <code>prompt</code>, and the rest moved into <code>claude_args</code> as CLI flags (<code>--model</code>, <code>--max-turns</code>, <code>--allowedTools</code>, <code>--append-system-prompt</code>).</p></div>
+				<p><strong>GitLab:</strong> the GitLab CI/CD integration is in beta and maintained by GitLab, not Anthropic. There's no packaged action: a job installs Claude Code and runs <code>claude -p</code>, with the API key in a masked CI/CD variable.</p>
+			</div>
+
+			<!-- ===== Context and quality ===== -->
+			<h2 id="s5">Context and review quality</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">Making automated reviews accurate, independent and not repetitive.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Technique</th><th>Why</th></tr></thead>
+						<tbody>
+							<tr><td>Put review criteria, test standards and fixtures in CLAUDE.md</td><td data-label="Why">CI runs read it like any session, so every review uses the same rules (keep it short: it's read on every run)</td></tr>
+							<tr><td>Review in a fresh session, not the one that wrote the code</td><td data-label="Why">The docs: a fresh reviewer helps "because it hasn't seen your reasoning", so it isn't swayed by it</td></tr>
+							<tr><td>Say what not to report ("skip style")</td><td data-label="Why">A reviewer asked to find problems "will always find something"; narrow criteria cut false positives (task 4.1)</td></tr>
+							<tr><td>On re-runs, include the previous findings and ask only for new or unresolved ones</td><td data-label="Why">Avoids posting the same comments on every push</td></tr>
+							<tr><td>When generating tests, give Claude the existing tests</td><td data-label="Why">Stops it proposing scenarios that are already covered</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Anthropic also offers a managed Code Review service for Team and Enterprise plans, where several agents look for issues and a verification step filters out false positives before comments are posted.</p>
+			</div>
+
+			<!-- ===== Security ===== -->
+			<h2 id="s6">Security and cost</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 3.6</span><span class="skill-text">Safe defaults for a job that reads untrusted pull requests.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Risk</th><th>Control</th></tr></thead>
+						<tbody>
+							<tr><td>Leaked keys</td><td data-label="Control">Keys only in repository secrets or masked variables; prefer OIDC or workload identity federation over long-lived keys</td></tr>
+							<tr><td>Too much power</td><td data-label="Control">Minimal workflow <code>permissions</code>, narrow <code>--allowedTools</code>, <code>dontAsk</code></td></tr>
+							<tr><td>Prompt injection in PR text or code</td><td data-label="Control">The action strips hidden content such as HTML comments and invisible characters, but treat PR content as untrusted; filter by comment author where possible</td></tr>
+							<tr><td>Fork pull requests</td><td data-label="Control">Public-repo forks get no secrets; with <code>pull_request_target</code>, never check out the untrusted head at the workspace root</td></tr>
+							<tr><td>Secrets in logs</td><td data-label="Control">Leave <code>show_full_output</code> off, especially on public repositories</td></tr>
+							<tr><td>Runaway cost</td><td data-label="Control"><code>--max-turns</code>, <code>--max-budget-usd</code>, job timeouts, concurrency groups; log <code>total_cost_usd</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Only users with write access can trigger the action, and bots are blocked unless listed. Commits pushed with the default <code>GITHUB_TOKEN</code> don't trigger other workflows, so CI won't run on Claude's commits unless you use a different token.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li><code>claude -p</code> runs non-interactively and exits 0 or non-zero; pipe input in. <code>--output-format</code>, <code>--json-schema</code>, <code>--max-turns</code> and <code>--max-budget-usd</code> are <code>-p</code>-only.</li>
+				<li><code>--json-schema</code> results are in <code>structured_output</code>; check the field exists. Error results have no <code>result</code>.</li>
+				<li>In <code>-p</code>, unapproved tool calls are denied, not left hanging. Use <code>dontAsk</code> plus narrow <code>--allowedTools</code>; <code>Bash(x:*)</code> equals <code>Bash(x *)</code>.</li>
+				<li><code>--bare</code> is recommended for scripts but skips CLAUDE.md; an untrusted folder ignores the repo's allow rules but runs its hooks and MCP servers.</li>
+				<li><code>anthropics/claude-code-action@v1</code>: <code>prompt</code> means automation, none means <code>@claude</code> mode; CLI options go in <code>claude_args</code>; set up with <code>/install-github-app</code>. Beta inputs such as <code>direct_prompt</code> and <code>mode</code> are gone.</li>
+				<li>Quality: CLAUDE.md for criteria, an independent reviewer session, "skip style", previous findings on re-runs, existing tests when generating tests.</li>
+				<li>Security: secrets or OIDC, minimal permissions, treat PR content as untrusted, care with forks, cost caps.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-5.html"><small>Previous</small>3.5: Iterative Refinement</a>
+				<a class="next" href="index.html"><small>Next</small>CCAR-F overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Claude Code documentation summarized in the author's own words; claude-code-action is MIT-licensed; examples are original.</div>
+</footer>
+
+</body>
+</html>

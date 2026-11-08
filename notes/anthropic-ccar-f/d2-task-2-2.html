@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.2: Structured Error Responses | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 2.2: MCP protocol errors versus tool execution errors (isError), designing error payloads with a category, a retryable flag and a next step, transient, validation, business and permission errors, empty results versus failures, how errors reach Claude as is_error tool results, and the MCP Python SDK's error behaviour.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Tool Design &amp; MCP Integration &middot; 18%</span>
+		<h1>2.2: Structured Error Responses</h1>
+		<p>When a tool fails, the agent can only recover sensibly if the failure says what kind it was, whether trying again could help, and what to do next. This page covers how MCP reports tool errors and how to design error payloads an agent can act on.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">MCP</span><span class="tag">isError</span><span class="tag">is_error</span><span class="tag">Retryable</span><span class="tag">Error categories</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Two kinds of MCP error</a></li>
+				<li><a href="#s2">Why "Operation failed" fails</a></li>
+				<li><a href="#s3">Error categories</a></li>
+				<li><a href="#s4">An MCP tool with structured errors</a></li>
+				<li><a href="#s5">What Claude receives</a></li>
+				<li><a href="#s6">Empty results and recovery</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.2</span>
+				<p><strong>Implement structured error responses for MCP tools.</strong></p>
+			</div>
+			<p>The exam guide asks you to know MCP's <code>isError</code> flag; the four kinds of failure (transient, validation, business-rule and permission); why a generic error stops the agent choosing the right recovery; and the difference between errors worth retrying and errors that aren't. In practice: return an error category, a retryable flag and a readable description; mark policy violations as not retryable and explain them in customer-friendly words; let subagents fix transient failures locally; and keep access failures distinct from valid empty results.</p>
+			<p>Sources: the MCP specification (revision 2026-07-28), the MCP Python SDK, the Claude API tool-use documentation and Anthropic's "Writing effective tools for agents" (September 2025), checked on 8 November 2026; Anthropic's pages are paraphrased. The server code below was run with the MCP Python SDK 2.3.0 through an in-memory client.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's support agent can refund orders through an MCP tool, <code>process_refund</code>. Refunds over US$500 need a manager, and the payments API sometimes times out.</p></div>
+
+			<!-- ===== Layers ===== -->
+			<h2 id="s1">Two kinds of MCP error</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">Protocol errors versus tool execution errors.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Kind</th><th>Used for</th><th>Shape</th></tr></thead>
+						<tbody>
+							<tr><td>Protocol error</td><td data-label="Used for">Problems with the request itself: an unknown tool, a malformed request, a server fault</td><td data-label="Shape">A JSON-RPC <code>error</code>, for example code <code>-32602</code></td></tr>
+							<tr><td>Tool execution error</td><td data-label="Used for">The tool ran and failed: an API failure, invalid input values, a business rule</td><td data-label="Shape">A normal <code>result</code> with <code>isError: true</code> and the details in <code>content</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The spec says clients <em>should</em> pass tool execution errors to the model so it can correct itself, while protocol errors may never reach the model at all. So failures the agent could recover from belong in the result, with <code>isError: true</code>. Since the 2025-11-25 revision, the spec says explicitly that input validation errors are execution errors, for this reason.</p>
+				<div class="callout trap"><p><strong>The category fields are yours, not MCP's.</strong> MCP gives you only the <code>isError</code> boolean and free-form content. Fields such as <code>errorCategory</code> and <code>isRetryable</code> are a convention you define (the exam guide uses those names, spelled a few different ways). Pick one shape and use it in every tool.</p></div>
+			</div>
+
+			<!-- ===== Generic ===== -->
+			<h2 id="s2">Why "Operation failed" fails</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">What a generic error costs the agent.</span></p>
+				<p>Given only "Operation failed", the agent has to guess. It may retry something that can never succeed (a refund over the limit), wasting calls and annoying the customer, or give up on something that would have worked a few seconds later (a timeout). The Claude API docs ask for <em>instructive</em> errors that say what went wrong and what to try next, and Anthropic's tool-writing guide says error responses should give specific, actionable fixes, not opaque codes or tracebacks.</p>
+			</div>
+
+			<!-- ===== Categories ===== -->
+			<h2 id="s3">Error categories</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">Four kinds of failure and the right reaction to each.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Category</th><th>Example</th><th>Retry?</th><th>The agent should</th></tr></thead>
+						<tbody>
+							<tr><td>Transient</td><td data-label="Example">Timeout, service unavailable, rate limit</td><td data-label="Retry?">Yes, after a delay, a few times</td><td data-label="The agent should">Retry, then report what it tried if it still fails</td></tr>
+							<tr><td>Validation</td><td data-label="Example">Amount of zero, badly formatted date</td><td data-label="Retry?">Not with the same input</td><td data-label="The agent should">Fix the input, or ask the customer for the missing detail</td></tr>
+							<tr><td>Business rule</td><td data-label="Example">Refund over the policy limit</td><td data-label="Retry?">No</td><td data-label="The agent should">Explain in plain words and offer a handoff to a person</td></tr>
+							<tr><td>Permission</td><td data-label="Example">The caller can't issue refunds</td><td data-label="Retry?">No</td><td data-label="The agent should">Stop and escalate, or ask for authorization</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== Example ===== -->
+			<h2 id="s4">An MCP tool with structured errors</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">One error shape for every failure, with a next step.</span></p>
+				<div class="code"><span class="file">refund_server.py (Python, MCP server)</span>
+<pre><code>import json
+from mcp.server.mcpserver import (
+    MCPServer)
+from mcp.types import (
+    CallToolResult, TextContent)
+
+mcp = MCPServer("shop-support")
+LIMIT = 500  <span class="c"># refund cap in USD</span>
+
+
+def fail(category, retryable, msg,
+         **extra):
+    <span class="c"># One error shape for every tool</span>
+    body = {"errorCategory": category,
+            "isRetryable": retryable,
+            "message": msg, **extra}
+    return CallToolResult(
+        content=[TextContent(
+            type="text",
+            text=json.dumps(body))],
+        structured_content=body,
+        is_error=True)
+
+
+def charge_back(order_id, amount):
+    <span class="c"># Stand-in for the payments API</span>
+    if order_id == "ORD-SLOW":
+        raise TimeoutError
+    return "RF-" + order_id[4:]
+
+
+@mcp.tool()
+def process_refund(order_id: str,
+                   amount: float):
+    """Refund part or all of an order."""
+    if amount &lt;= 0:
+        return fail(
+            "validation", False,
+            "amount must be above 0")
+    if amount &gt; LIMIT:
+        return fail(
+            "business", False,
+            f"Refunds over ${LIMIT} need "
+            "a manager. Offer a handoff.",
+            limit=LIMIT)
+    try:
+        ref = charge_back(
+            order_id, amount)
+    except TimeoutError:
+        return fail(
+            "transient", True,
+            "Payments API timed out. "
+            "Retry in 5 seconds.",
+            retryAfterSeconds=5)
+    return {"status": "refunded",
+            "refundId": ref,
+            "amount": amount}</code></pre></div>
+				<p>Each failure returns <code>isError: true</code> with the same body: the category, whether a retry could help, a message that says what to do next (safe to show a customer), and extra details such as the limit or how long to wait. The body goes in the text content, which is what the model reads, and in <code>structuredContent</code> for programs.</p>
+				<div class="callout retired"><p><strong>FastMCP is now MCPServer.</strong> Version 2.0 of the MCP Python SDK (July 2026) renamed <code>FastMCP</code> to <code>MCPServer</code> (<code>from mcp.server.mcpserver import MCPServer</code>); the old import fails. It also changed error handling: a plain exception raised in a tool now reaches the model only as "Error executing tool <em>name</em>", with the details hidden (version 1 passed the exception text through). Raise <code>ToolError("...")</code> for a message the model should see, or return a <code>CallToolResult</code> with <code>is_error=True</code> as above. Raising <code>MCPError</code> now produces a protocol error, which most clients don't show the model.</p></div>
+			</div>
+
+			<!-- ===== What Claude receives ===== -->
+			<h2 id="s5">What Claude receives</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">From MCP result to Claude tool result.</span></p>
+				<div class="code"><span class="file">MCP result for a refund over the limit (JSON)</span>
+<pre><code>{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "resultType": "complete",
+    "content": [{
+      "type": "text",
+      "text": "{\"errorCategory\": ..."
+    }],
+    "structuredContent": {
+      "errorCategory": "business",
+      "isRetryable": false,
+      "message": "Refunds over ...",
+      "limit": 500
+    },
+    "isError": true
+  }
+}</code></pre></div>
+				<p>The application or host running the agent loop turns this into a Claude API <code>tool_result</code> with <code>is_error: true</code> (<a href="d1-task-1-1.html#s4">task 1.1</a>). Note the spelling: MCP uses camelCase <code>isError</code>, the Claude API uses snake_case <code>is_error</code>. Claude then works the error into its next step. For a missing or invalid parameter, the docs say Claude typically retries two or three times with corrections before apologizing; <code>strict: true</code> on the tool definition prevents invalid calls in the first place.</p>
+				<div class="callout tip"><p><strong>Keep the useful part in the text.</strong> A Claude API <code>tool_result</code> carries text, images and documents, not MCP's <code>structuredContent</code>. Hosts differ in what they forward, so make sure the category and the next step are in the text block.</p></div>
+			</div>
+
+			<!-- ===== Empty and recovery ===== -->
+			<h2 id="s6">Empty results and recovery</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 2.2</span><span class="skill-text">Telling "nothing found" from "couldn't look", and where to recover.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Situation</th><th>Return</th><th>If you get it wrong</th></tr></thead>
+						<tbody>
+							<tr><td>The search worked and found nothing</td><td data-label="Return">Success with an explicit empty result, such as <code>{"orders": [], "count": 0}</code></td><td data-label="If you get it wrong">Reported as an error, the agent retries pointlessly</td></tr>
+							<tr><td>The search couldn't run (timeout, no access)</td><td data-label="Return"><code>isError: true</code> with the category</td><td data-label="If you get it wrong">Reported as empty, the agent tells the customer they have no orders</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>In a multi-agent system, a subagent should retry transient failures itself and pass up only what it can't resolve, together with the failure type, what it tried and any partial results, so the coordinator can decide what to do. Both silently swallowing an error and aborting the whole workflow over one failure are mistakes. Error propagation across agents is covered in depth in task 5.3.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>MCP protocol errors (JSON-RPC <code>error</code>) are for bad requests; tool failures go in the result with <code>isError: true</code> so the model can see and react to them. Input validation errors are execution errors.</li>
+				<li>Give every failure a category, a retryable flag and a message with the next step. These fields are your convention; MCP only has <code>isError</code>.</li>
+				<li>Transient: retry with a delay. Validation: fix the input. Business rule: don't retry; explain and offer a handoff. Permission: don't retry; escalate.</li>
+				<li>"Nothing found" is a success with an empty result; "couldn't look" is an error. Never confuse the two.</li>
+				<li>MCP <code>isError</code> becomes the Claude API's <code>is_error</code>; keep the important details in the text content.</li>
+				<li>MCP Python SDK 2.x: <code>FastMCP</code> is now <code>MCPServer</code>; plain exceptions are masked, so use <code>ToolError</code> or return an <code>is_error</code> result.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-1.html"><small>Previous</small>2.1: Tool Interfaces</a>
+				<a class="next" href="d2-task-2-3.html"><small>Next</small>2.3: Tools Across Agents</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect – Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.0. Model Context Protocol specification, Claude API documentation and Anthropic's engineering article summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
