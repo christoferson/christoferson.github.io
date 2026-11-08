@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.4: Storage | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 2.4, Kubernetes storage: volumes and their lifetimes, emptyDir and hostPath, PersistentVolumes and PersistentVolumeClaims, access modes, reclaim policies, StorageClasses and dynamic provisioning, CSI drivers and the end of in-tree plugins, snapshots and cloning, ephemeral volumes, StatefulSet storage and CNCF storage projects, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Container Orchestration &middot; 28%</span>
+		<h1>2.4: Storage</h1>
+		<p>How data survives in Kubernetes&reg;: volumes that live with a Pod, persistent volumes that outlive it, StorageClasses that create storage on demand, the CSI drivers behind them, and snapshots, ephemeral volumes and stateful apps.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">Volumes</span><span class="tag">PV and PVC</span><span class="tag">StorageClass</span><span class="tag">CSI</span><span class="tag">Snapshots</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Volumes</a></li>
+				<li><a href="#s2">PersistentVolumes and claims</a></li>
+				<li><a href="#s3">StorageClasses</a></li>
+				<li><a href="#s4">CSI drivers</a></li>
+				<li><a href="#s5">Snapshots and cloning</a></li>
+				<li><a href="#s6">Ephemeral volumes</a></li>
+				<li><a href="#s7">Stateful apps</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.4</span>
+				<p><strong>Storage.</strong></p>
+			</div>
+			<p>Files written inside a container are lost when it restarts: "After a crash, kubelet restarts the container with a clean state." This page takes the topic to cover <strong>volumes</strong>, the <strong>PersistentVolume</strong> system and <strong>StorageClasses</strong>, the <strong>CSI</strong> drivers that provide real storage, <strong>snapshots</strong>, <strong>ephemeral volumes</strong>, and storage for <strong>stateful apps</strong>.</p>
+			<p>Quotes are from the <a href="https://kubernetes.io/docs/concepts/storage/">Kubernetes documentation</a> (&copy; The Kubernetes Authors) and the <a href="https://glossary.cncf.io/">CNCF Glossary</a>, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>, and from the <a href="https://github.com/container-storage-interface/spec">CSI specification</a>, for Kubernetes v1.37.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The web shop's <code>shop-db</code> database needs 10 GiB of fast disk that survives restarts, <code>shop-api</code> needs a small in-memory cache, and the platform team wants nightly snapshots of the database volume.</p></div>
+
+			<!-- ===== Volumes ===== -->
+			<h2 id="s1">Volumes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Giving containers a directory that outlives a container restart, or the Pod itself, and picking the right volume type.</span></p>
+				<p>"At its core, a volume is a directory, possibly with some data in it, which is accessible to the containers in a pod." Volumes solve two problems: data lost when a container crashes, and containers in one Pod that need to share files. They come in two lifetimes: "When a Pod ceases to exist, Kubernetes destroys ephemeral volumes; however, Kubernetes does not destroy persistent volumes. For any kind of volume in a given Pod, data is preserved across container restarts."</p>
+				<p>A Pod lists its volumes in <code>spec.volumes</code>, and each container mounts the ones it needs in <code>volumeMounts</code>, at a <code>mountPath</code>, optionally <code>readOnly</code> or only a <code>subPath</code> of the volume.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Type</th><th>What it provides</th><th>Lifetime</th></tr></thead>
+						<tbody>
+							<tr><td><code>emptyDir</code></td><td data-label="What it provides">An empty scratch directory shared by the Pod's containers; RAM-backed with <code>medium: Memory</code></td><td data-label="Lifetime">Deleted "when a Pod is removed from a node for any reason"</td></tr>
+							<tr><td><code>configMap</code>, <code>secret</code>, <code>downwardAPI</code>, <code>projected</code></td><td data-label="What it provides">Configuration, secrets (on RAM-backed tmpfs) and Pod information as read-only files</td><td data-label="Lifetime">Ephemeral</td></tr>
+							<tr><td><code>persistentVolumeClaim</code></td><td data-label="What it provides">Durable storage claimed through a PVC (<a href="#s2">below</a>)</td><td data-label="Lifetime">Persistent</td></tr>
+							<tr><td><code>csi</code></td><td data-label="What it provides">Storage from a CSI driver</td><td data-label="Lifetime">Either</td></tr>
+							<tr><td><code>nfs</code></td><td data-label="What it provides">An existing NFS share; "can be mounted by multiple writers simultaneously"</td><td data-label="Lifetime">Data kept; "merely unmounted"</td></tr>
+							<tr><td><code>local</code></td><td data-label="What it provides">A disk on one node, as a static PersistentVolume with node affinity</td><td data-label="Lifetime">Persistent, but tied to that node</td></tr>
+							<tr><td><code>hostPath</code></td><td data-label="What it provides">A file or directory from the node's filesystem</td><td data-label="Lifetime">Stays on that node</td></tr>
+							<tr><td><code>image</code></td><td data-label="What it provides">An OCI image or artifact, read-only (stable since v1.36)</td><td data-label="Lifetime">Ephemeral</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">An in-memory cache for shop-api</span>
+<pre><code>  volumes:
+  - name: cache
+    emptyDir:
+      medium: Memory
+      sizeLimit: 256Mi
+  containers:
+  - name: api
+    image: nginx:1.14.2
+    volumeMounts:
+    - name: cache
+      mountPath: /cache</code></pre></div>
+				<p>"A container crashing does <em>not</em> remove a Pod from a node. The data in an <code>emptyDir</code> volume is safe across container crashes." But with <code>medium: Memory</code>, "files you write count against the memory limit of the container that wrote them".</p>
+				<div class="callout trap"><p><strong>Avoid hostPath.</strong> "Using the <code>hostPath</code> volume type presents many security risks. If you can avoid using a <code>hostPath</code> volume, you should." Access to the node's files can expose kubelet credentials or the container runtime socket "that can be used for container escape". As a PersistentVolume it is "for single node testing only"; use a <code>local</code> volume instead.</p></div>
+				<div class="callout retired"><p><strong>The in-tree volume plugins are gone.</strong> Volume types built into Kubernetes for specific clouds and systems have been removed in favour of CSI drivers: <code>awsElasticBlockStore</code> and <code>azureDisk</code> (v1.27), <code>gcePersistentDisk</code> (v1.28), <code>azureFile</code> and <code>vsphereVolume</code> (v1.30), <code>cephfs</code> and <code>rbd</code> (v1.31), and Portworx (v1.36). The <code>gitRepo</code> volume is also gone: "The last version that provided a way to use this driver was Kubernetes v1.35"; use an init container that runs <code>git clone</code> into an emptyDir instead.</p></div>
+			</div>
+
+			<!-- ===== PV / PVC ===== -->
+			<h2 id="s2">PersistentVolumes and claims</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Separating how storage is provided from how it is used, through PersistentVolumes and the claims that request them.</span></p>
+				<p>"The PersistentVolume subsystem provides an API for users and administrators that abstracts details of how storage is provided from how it is consumed."</p>
+				<ul>
+					<li>A <strong>PersistentVolume</strong> (PV) "is a piece of storage in the cluster that has been provisioned by an administrator or dynamically provisioned using Storage Classes. It is a resource in the cluster just like a node". It is cluster-wide.</li>
+					<li>A <strong>PersistentVolumeClaim</strong> (PVC) "is a request for storage by a user. It is similar to a Pod. Pods consume node resources and PVCs consume PV resources." It is namespaced, and "claims must exist in the same namespace as the Pod using the claim."</li>
+				</ul>
+				<ol class="flow">
+					<li><b>Provision</b><em>Static</em>: an administrator creates PVs in advance. <em>Dynamic</em>: a StorageClass creates a PV for the claim on demand.</li>
+					<li><b>Bind</b>A controller matches each claim to a PV, one to one. "The user will always get at least what they asked for". If nothing matches, the claim stays <code>Pending</code>.</li>
+					<li><b>Use</b>"Pods use claims as volumes." While in use, finalizers stop the PVC and its PV from being deleted, to avoid data loss.</li>
+					<li><b>Reclaim</b>When the claim is deleted, the PV's reclaim policy decides what happens to the data.</li>
+				</ol>
+				<div class="code"><span class="file">data-pvc.yaml (PersistentVolumeClaim)</span>
+<pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: fast
+  resources:
+    requests:
+      storage: 10Gi</code></pre></div>
+				<div class="code"><span class="file">Using the claim in a Pod</span>
+<pre><code>  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: data
+  containers:
+  - name: db
+    image: postgres:16
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql</code></pre></div>
+
+				<h3>Access modes</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Mode</th><th>Short</th><th>Meaning</th></tr></thead>
+						<tbody>
+							<tr><td>ReadWriteOnce</td><td data-label="Short">RWO</td><td data-label="Meaning">Read-write "by a single node"</td></tr>
+							<tr><td>ReadOnlyMany</td><td data-label="Short">ROX</td><td data-label="Meaning">Read-only "by many nodes"</td></tr>
+							<tr><td>ReadWriteMany</td><td data-label="Short">RWX</td><td data-label="Meaning">Read-write "by many nodes"</td></tr>
+							<tr><td>ReadWriteOncePod</td><td data-label="Short">RWOP</td><td data-label="Meaning">Read-write by a single Pod in the whole cluster; CSI volumes only; stable since v1.29</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>RWO is one node, not one Pod.</strong> "ReadWriteOnce access mode still can allow multiple pods to access (read from or write to) that volume when the pods are running on the same node. For single pod access, please see ReadWriteOncePod." Also, access modes "do <strong>not</strong> enforce write protection once the storage has been mounted", and a storage backend may support only some modes.</p></div>
+
+				<h3>Reclaim policies and phases</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Policy</th><th>When the claim is deleted</th><th>Default for</th></tr></thead>
+						<tbody>
+							<tr><td><code>Delete</code></td><td data-label="When the claim is deleted">Removes the PV "as well as the associated storage asset in the external infrastructure"</td><td data-label="Default for">Dynamically provisioned PVs</td></tr>
+							<tr><td><code>Retain</code></td><td data-label="When the claim is deleted">The PV is kept as <code>Released</code>, "not yet available for another claim because the previous claimant's data remains on the volume"; an administrator cleans up</td><td data-label="Default for">Manually created PVs</td></tr>
+							<tr><td><code>Recycle</code></td><td data-label="When the claim is deleted">Deprecated; a basic scrub, for NFS and hostPath only</td><td data-label="Default for">&mdash;</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A PV's phase is <code>Available</code>, <code>Bound</code>, <code>Released</code> or <code>Failed</code>; a PVC's is <code>Pending</code>, <code>Bound</code> or <code>Lost</code>. Change a dynamically created PV to <code>Retain</code> with <code>kubectl patch pv</code> before deleting its claim if you need to keep the data.</p>
+				<div class="callout trap"><p><strong>Deleting a claim can delete the data.</strong> With the default <code>Delete</code> policy of dynamic provisioning, deleting the PVC deletes the actual disk.</p></div>
+				<p><strong>Expanding</strong> a claim (stable since v1.24) works only if its StorageClass sets <code>allowVolumeExpansion: true</code>: edit the PVC to a larger size and the existing volume is resized. Volumes can only grow, never shrink.</p>
+			</div>
+
+			<!-- ===== StorageClasses ===== -->
+			<h2 id="s3">StorageClasses</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Offering kinds of storage that are created automatically when a claim asks for them.</span></p>
+				<p>"A StorageClass provides a way for administrators to describe the <em>classes</em> of storage they offer", for example fast SSDs or cheaper disks. "Dynamic volume provisioning allows storage volumes to be created on-demand." Without it, administrators must create disks and PVs by hand.</p>
+				<div class="code"><span class="file">fast.yaml (StorageClass)</span>
+<pre><code>apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+provisioner: csi.example.com
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: ssd</code></pre></div>
+				<ul>
+					<li><code>provisioner</code> names the volume plugin, usually a CSI driver; it "must be specified".</li>
+					<li><code>reclaimPolicy</code> is <code>Delete</code> or <code>Retain</code>; if unset, "it will default to <code>Delete</code>".</li>
+					<li><code>parameters</code> are passed to the provisioner and depend on the driver.</li>
+				</ul>
+
+				<h3>When the volume is created</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>volumeBindingMode</th><th>Behaviour</th></tr></thead>
+						<tbody>
+							<tr><td><code>Immediate</code> (default)</td><td data-label="Behaviour">Provisioned as soon as the PVC is created, "without knowledge of the Pod's scheduling requirements. This may result in unschedulable Pods", for example a disk in a zone where the Pod cannot run</td></tr>
+							<tr><td><code>WaitForFirstConsumer</code></td><td data-label="Behaviour">Delays "binding and provisioning of a PersistentVolume until a Pod using the PersistentVolumeClaim is created", so the volume is created where the Pod is scheduled</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>The default StorageClass</h3>
+				<p>A class marked with the annotation <code>storageclass.kubernetes.io/<wbr>is-default-class: "true"</code> is used by claims that do not name a class, and <code>kubectl get sc</code> shows it as <code>(default)</code>. There should be only one; if several are marked, the newest wins. Since v1.28, claims created before a default existed are updated when one appears.</p>
+				<div class="callout trap"><p><strong>Empty is not the same as missing.</strong> Leaving out <code>storageClassName</code> means "use the default class". Setting <code>storageClassName: ""</code> means "no class": such a claim "is always interpreted to be requesting a PV with no class" and disables dynamic provisioning.</p></div>
+				<p>For changing performance later, a <strong>VolumeAttributesClass</strong> (stable since v1.34) describes mutable settings such as IOPS or throughput; switching a claim to another class modifies the existing volume, if its CSI driver supports it.</p>
+			</div>
+
+			<!-- ===== CSI ===== -->
+			<h2 id="s4">CSI drivers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Knowing how storage vendors plug into Kubernetes through the Container Storage Interface.</span></p>
+				<p>The Container Storage Interface aims "to define an industry standard ... that will enable storage vendors (SP) to develop a plugin once and have it work across a number of container orchestration (CO) systems". Kubernetes has supported it since v1.13 (GA, 2019); the specification's latest release is v1.13.0 (July 2026).</p>
+				<p>Why it matters: previously, "all volume plugins were 'in-tree'", so adding a storage system "required checking code into the core Kubernetes code repository". With CSI, "third-party storage providers can write and deploy plugins exposing new storage systems in Kubernetes without ever having to touch the core Kubernetes code."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Part</th><th>Role</th></tr></thead>
+						<tbody>
+							<tr><td>Controller plugin</td><td data-label="Role">"A gRPC endpoint serving CSI RPCs that MAY be run anywhere": creates, deletes, attaches and snapshots volumes</td></tr>
+							<tr><td>Node plugin</td><td data-label="Role">Runs on each node "whereupon an SP-provisioned volume will be published": mounts volumes for Pods</td></tr>
+							<tr><td>external-provisioner sidecar</td><td data-label="Role">Watches PVCs and calls <code>CreateVolume</code></td></tr>
+							<tr><td>external-attacher, external-resizer, external-snapshotter</td><td data-label="Role">Handle attaching (via <code>VolumeAttachment</code> objects), expanding and snapshotting</td></tr>
+							<tr><td>node-driver-registrar sidecar</td><td data-label="Role">Registers the driver with the kubelet on each node</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Kubernetes records installed drivers in <code>CSIDriver</code> objects and per-node driver information in <code>CSINode</code> objects.</p>
+				<div class="callout trap"><p><strong>You install the driver.</strong> CSI migration (stable since v1.25) transparently redirects old in-tree volume types to CSI drivers, but "you - or another cluster administrator - <strong>must</strong> have installed and configured the appropriate CSI driver for that storage. The core of Kubernetes does not install that software for you."</p></div>
+			</div>
+
+			<!-- ===== Snapshots ===== -->
+			<h2 id="s5">Snapshots and cloning</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Taking point-in-time copies of volumes and creating new volumes from existing data.</span></p>
+				<p>Snapshots mirror the PV and PVC pattern: "A <code>VolumeSnapshot</code> is a request for snapshot of a volume by a user. It is similar to a PersistentVolumeClaim", a <code>VolumeSnapshotContent</code> is the actual snapshot, like a PV, and a <code>VolumeSnapshotClass</code> sets the driver and deletion policy. Snapshots are stable since v1.20.</p>
+				<div class="code"><span class="file">Snapshot the database volume</span>
+<pre><code>apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: data-snap
+spec:
+  volumeSnapshotClassName: csi-snap
+  source:
+    persistentVolumeClaimName: data</code></pre></div>
+				<p>To restore, create a new PVC whose <code>dataSource</code> names the VolumeSnapshot. A <strong>clone</strong> is similar: a new PVC whose <code>dataSource</code> is an existing PVC in the same namespace (stable since v1.18). <strong>Volume populators</strong> (stable since v1.33) generalize this with <code>dataSourceRef</code> to fill a new volume from other sources.</p>
+				<div class="callout trap"><p><strong>Snapshots are an add-on.</strong> "<code>VolumeSnapshot</code>, <code>VolumeSnapshotContent</code>, and <code>VolumeSnapshotClass</code> are CRDs, not part of the core API", "support is only available for CSI drivers", and "the CRDs and snapshot controller installations are the responsibility of the Kubernetes distribution." <strong>VolumeGroupSnapshot</strong>, for crash-consistent snapshots of several volumes at once, reached GA in v1.36.</p></div>
+			</div>
+
+			<!-- ===== Ephemeral ===== -->
+			<h2 id="s6">Ephemeral volumes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Giving Pods storage that is created and deleted with them, so they can run anywhere.</span></p>
+				<p>Ephemeral volumes "follow the Pod's lifetime and get created and deleted along with the Pod", so Pods "can be stopped and restarted without being limited to where some persistent volume is available". They are specified inline in the Pod spec:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Kind</th><th>Provided by</th></tr></thead>
+						<tbody>
+							<tr><td><code>emptyDir</code>, <code>configMap</code>, <code>downwardAPI</code>, <code>secret</code></td><td data-label="Provided by">The kubelet, as local ephemeral storage</td></tr>
+							<tr><td><code>image</code></td><td data-label="Provided by">The container runtime (stable since v1.36)</td></tr>
+							<tr><td>CSI ephemeral volumes</td><td data-label="Provided by">A CSI driver that supports them (stable since v1.25)</td></tr>
+							<tr><td>Generic ephemeral volumes</td><td data-label="Provided by">Any dynamic provisioner (stable since v1.23)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>A <strong>generic ephemeral volume</strong> embeds a claim template (<code>ephemeral.volumeClaimTemplate</code>): Kubernetes creates a real PVC for the Pod, named <code>&lt;pod&gt;-&lt;volume&gt;</code>, and "ensures that the PersistentVolumeClaim gets deleted when the Pod gets deleted". It is useful for large scratch space with features of real storage, such as a specific StorageClass.</p>
+			</div>
+
+			<!-- ===== Stateful ===== -->
+			<h2 id="s7">Stateful apps</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.4</span><span class="skill-text">Running applications that keep state, with storage that follows each replica, and knowing the CNCF projects that provide it.</span></p>
+				<p>The CNCF Glossary: in stateful apps, "state refers to any data the app needs to store to function as designed. Any kind of online shop that remembers your cart is a stateful app". "Stateless applications handle each request independently without remembering any previous interactions or user data."</p>
+				<p>A <strong>StatefulSet</strong> (topic 1.1) gives each replica its own storage: "For each VolumeClaimTemplate entry defined in a StatefulSet, each Pod receives one PersistentVolumeClaim", so <code>shop-db-0</code> always gets back the same volume.</p>
+				<div class="callout trap"><p><strong>StatefulSet volumes are kept.</strong> "Deleting and/or scaling a StatefulSet down will <em>not</em> delete the volumes associated with the StatefulSet. This is done to ensure data safety". Since v1.32 (stable), <code>persistentVolumeClaimRetentionPolicy</code> can change that; both settings default to <code>Retain</code>.</p></div>
+				<div class="code"><span class="file">Keep data on delete, clean up on scale-down</span>
+<pre><code>  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete</code></pre></div>
+				<p>Two scheduling aids help stateful Pods find storage: <strong>storage capacity tracking</strong> (stable since v1.24) lets the scheduler avoid nodes whose storage is full, when the class uses <code>WaitForFirstConsumer</code>, and <strong>node volume limits</strong> stop too many volumes being attached to one node.</p>
+
+				<h3>Cloud native storage projects</h3>
+				<p>"Cloud native storage is a specialized storage technology tailored to meet the demands of cloud native environments ... A cloud native storage platform primarily caters to stateful applications."</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Project</th><th>What it is</th><th>CNCF status</th></tr></thead>
+						<tbody>
+							<tr><td>Rook</td><td data-label="What it is">"Storage Orchestration for Kubernetes", typically running Ceph</td><td data-label="CNCF status">Graduated (2020)</td></tr>
+							<tr><td>Longhorn</td><td data-label="What it is">"Cloud-native distributed storage for Kubernetes"</td><td data-label="CNCF status">Incubating</td></tr>
+							<tr><td>CubeFS</td><td data-label="What it is">Distributed file system and object store</td><td data-label="CNCF status">Graduated (2024)</td></tr>
+							<tr><td>OpenEBS</td><td data-label="What it is">Container-native storage for stateful applications</td><td data-label="CNCF status">Sandbox</td></tr>
+							<tr><td>Velero</td><td data-label="What it is">"Backup and migrate Kubernetes applications and their persistent volumes"</td><td data-label="CNCF status">Sandbox (March 2026)</td></tr>
+							<tr><td>Vitess, TiKV</td><td data-label="What it is">Cloud native databases (MySQL-compatible; distributed key-value)</td><td data-label="CNCF status">Graduated</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="code"><span class="file">Inspect storage</span>
+<pre><code>kubectl get sc
+kubectl get pv
+kubectl get pvc -n shop
+kubectl describe pvc data -n shop
+kubectl get volumesnapshot -n shop</code></pre></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Volumes survive container restarts. <strong>Ephemeral</strong> volumes (emptyDir, configMap, secret, image...) die with the Pod; <strong>persistent</strong> volumes do not. emptyDir is erased when the Pod leaves the node but survives container crashes.</li>
+				<li>Avoid <code>hostPath</code> (container escape risk; single-node testing only). In-tree cloud plugins and <code>gitRepo</code> are removed: use CSI drivers.</li>
+				<li><strong>PV</strong> = cluster-wide piece of storage; <strong>PVC</strong> = namespaced request, bound one-to-one. Provision (static or dynamic) &rarr; bind &rarr; use &rarr; reclaim.</li>
+				<li>Access modes: RWO (one <em>node</em>), ROX, RWX, RWOP (one Pod, CSI, stable v1.29).</li>
+				<li>Reclaim: <strong>Delete</strong> (default for dynamic; deletes the disk), <strong>Retain</strong> (PV becomes Released; manual cleanup), Recycle deprecated. Expansion needs <code>allowVolumeExpansion</code>; grow only.</li>
+				<li><strong>StorageClass</strong>: provisioner, parameters, reclaimPolicy (default Delete). <code>WaitForFirstConsumer</code> avoids zone mismatches; <code>Immediate</code> is the default. Omitted class = default class; <code>""</code> = no class.</li>
+				<li><strong>CSI</strong> (GA v1.13): controller and node plugins plus sidecars; vendors ship drivers outside Kubernetes. You must install the driver.</li>
+				<li>Snapshots (VolumeSnapshot, stable v1.20) are CRDs plus a controller from your distribution; restore or clone with <code>dataSource</code>. Group snapshots GA v1.36.</li>
+				<li>StatefulSets give each replica its own PVC and keep PVCs on scale-down and delete unless the retention policy says otherwise. CNCF storage: Rook and CubeFS (graduated), Longhorn (incubating), OpenEBS and Velero (sandbox).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d2-topic-2-3.html"><small>Previous</small>2.3: Troubleshooting</a>
+				<a class="next" href="d3-topic-3-1.html"><small>Next</small>3.1: Application Delivery</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Quotes from kubernetes.io &copy; The Kubernetes Authors and from glossary.cncf.io, both <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>

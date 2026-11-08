@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.3: Troubleshooting | Study Notes for KCNA</title>
+	<meta name="description" content="Study notes for KCNA topic 2.3, Kubernetes cluster troubleshooting: a layered approach, events and their one-hour retention, node conditions and NotReady causes, kubelet and runtime logs, crictl and kubectl debug node, API server livez and readyz, static Pods, debugging Services and DNS, capacity, stuck Terminating objects, and logging architecture, for Kubernetes v1.37.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="kcna.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-cncf.html">CNCF</a><span class="sep">/</span><a href="index.html">KCNA</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Container Orchestration &middot; 28%</span>
+		<h1>2.3: Troubleshooting</h1>
+		<p>Finding out why a Kubernetes&reg; cluster is unhealthy: reading events, diagnosing nodes and the control plane, tracing broken Services and DNS, spotting capacity problems and stuck objects, and knowing where every log lives.</p>
+		<div class="tags"><span class="tag code">KCNA</span><span class="tag">Events</span><span class="tag">Nodes</span><span class="tag">Control plane</span><span class="tag">Services</span><span class="tag">Logs</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">A layered approach</a></li>
+				<li><a href="#s2">Cluster state and events</a></li>
+				<li><a href="#s3">Node problems</a></li>
+				<li><a href="#s4">Control plane problems</a></li>
+				<li><a href="#s5">Service and DNS problems</a></li>
+				<li><a href="#s6">Capacity and stuck objects</a></li>
+				<li><a href="#s7">Where the logs are</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Topic 2.3</span>
+				<p><strong>Troubleshooting.</strong></p>
+			</div>
+			<p>The curriculum lists both "Troubleshooting" here and "Debugging" in Domain 3. This page takes troubleshooting to mean problems with the <strong>cluster itself</strong>: nodes, control plane, networking, capacity and logs. It follows the Kubernetes documentation's own split, whose cluster guide "assume[s] you have already ruled out your application as the root cause". Application-level debugging (crashing containers, probes, debug containers) is topic 3.2.</p>
+			<p>Quotes are from the <a href="https://kubernetes.io/docs/tasks/debug/">Kubernetes documentation</a> (&copy; The Kubernetes Authors, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>) for Kubernetes v1.37.</p>
+			<div class="callout note"><p><strong>Running example.</strong> One morning the web shop is slow and the frontend cannot reach <code>shop-api</code>. Node <code>node-2</code> shows <code>NotReady</code>, and some <code>shop-api</code> Pods are stuck. Each section below is one step in finding out why.</p></div>
+
+			<!-- ===== Approach ===== -->
+			<h2 id="s1">A layered approach</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Working through a cluster problem in a sensible order, from your own connection down to the network.</span></p>
+				<p>Each layer depends on the one before it, so checking them in order avoids chasing symptoms. This order is assembled from the Kubernetes troubleshooting guides:</p>
+				<ol class="flow">
+					<li><b>Your client</b>Can kubectl reach the cluster at all? <code>kubectl version</code>, the right context, valid certificates. "If you see <code>Unable to connect to the server: dial tcp ... i/o timeout</code>", the problem is connectivity, not the cluster.</li>
+					<li><b>The API server</b>Is it live and ready? <code>/livez</code> and <code>/readyz</code> (<a href="#s4">below</a>).</li>
+					<li><b>The nodes</b>"The first thing to debug in your cluster is if your nodes are all registered correctly" and <code>Ready</code>.</li>
+					<li><b>Control plane and system Pods</b>Are the Pods in <code>kube-system</code> running?</li>
+					<li><b>The node agent</b>On a problem node: the kubelet, the container runtime and their logs.</li>
+					<li><b>Events</b>Recent warnings across the cluster.</li>
+					<li><b>The network</b>CNI Pods, DNS, then Service &rarr; EndpointSlice &rarr; Pods &rarr; kube-proxy, and NetworkPolicy.</li>
+					<li><b>Capacity</b>Resource use, pressure conditions, stuck objects.</li>
+				</ol>
+			</div>
+
+			<!-- ===== Events ===== -->
+			<h2 id="s2">Cluster state and events</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Getting an overview of the cluster's health and reading the events that explain what changed.</span></p>
+				<div class="code"><span class="file">First look</span>
+<pre><code>kubectl get nodes
+kubectl cluster-info
+kubectl get pods -n kube-system
+
+<span class="c"># everything, for a bug report</span>
+kubectl cluster-info dump \
+  --output-directory=/tmp/state</code></pre></div>
+				<p><strong>Events</strong> record what controllers and the kubelet did and why: scheduling failures, image pulls, evictions, failed mounts. "Events are namespaced", so add <code>-A</code> to see all of them.</p>
+				<div class="code"><span class="file">Read events</span>
+<pre><code><span class="c"># newest last</span>
+kubectl get events -A \
+  --sort-by=.metadata.creationTimestamp
+
+<span class="c"># only warnings</span>
+kubectl events -A --types=Warning
+
+<span class="c"># one object, live</span>
+kubectl events --for pod/shop-api-0 \
+  --watch</code></pre></div>
+				<div class="callout trap"><p><strong>Events disappear after an hour.</strong> The API server keeps them for <code>--event-ttl</code>, "Default: 1h0m0s", and the documentation calls them "informative, best-effort, supplemental data". Look at events soon after a problem, and use a logging or monitoring system for history. <code>kubectl events</code> became a regular command (out of alpha) in v1.26.</p></div>
+			</div>
+
+			<!-- ===== Nodes ===== -->
+			<h2 id="s3">Node problems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Working out why a node is NotReady or under pressure, from its conditions, its kubelet and its runtime.</span></p>
+				<p><code>kubectl describe node node-2</code> shows the node's <strong>conditions</strong>, taints, capacity, allocated resources and events:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Condition</th><th>Meaning when not healthy</th></tr></thead>
+						<tbody>
+							<tr><td><code>Ready</code></td><td data-label="Meaning when not healthy"><code>False</code>: "not healthy and is not accepting pods"; <code>Unknown</code>: the node controller "has not heard from the node in the last <code>node-monitor-grace-period</code> (default is 50 seconds)"</td></tr>
+							<tr><td><code>MemoryPressure</code>, <code>DiskPressure</code>, <code>PIDPressure</code></td><td data-label="Meaning when not healthy"><code>True</code> when memory, disk or process IDs are running low (eviction, topic 1.3)</td></tr>
+							<tr><td><code>NetworkUnavailable</code></td><td data-label="Meaning when not healthy"><code>True</code> "if the network for the node is not correctly configured"; usually set by the network plugin</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Cause</th><th>What the node shows</th></tr></thead>
+						<tbody>
+							<tr><td>kubelet stopped, or node unreachable</td><td data-label="What the node shows"><code>Ready</code> is <code>Unknown</code>, "Kubelet stopped posting node status.", and an <code>unreachable</code> taint</td></tr>
+							<tr><td>Container runtime down</td><td data-label="What the node shows"><code>Ready</code> is <code>False</code>, reason KubeletNotReady, "container runtime is down"</td></tr>
+							<tr><td>No CNI plugin installed or ready</td><td data-label="What the node shows"><code>Ready</code> is <code>False</code>, "container runtime network not ready"; on a new kubeadm cluster CoreDNS stays <code>Pending</code> too</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Timing matters: the kubelet renews its <strong>Lease</strong> in <code>kube-node-lease</code> every 10 seconds. After the 50-second grace period the node is tainted and marked <code>Unknown</code>; "the node controller waits 5 minutes" before evicting its Pods. If every zone looks unhealthy at once, it assumes a control-plane connectivity problem and "doesn't perform any evictions".</p>
+				<div class="callout trap"><p><strong>A missing CNI shows in <code>Ready</code>, not necessarily <code>NetworkUnavailable</code>.</strong> The kubelet reports the runtime's network as not ready through the <code>Ready</code> condition. And on a fresh kubeadm cluster, CoreDNS stuck in <code>Pending</code> "is <strong>expected</strong>": "You have to install a Pod Network before CoreDNS may be deployed fully." (Older material says the grace period is 40 seconds; it became 50 in v1.32.)</p></div>
+
+				<h3>On the node</h3>
+				<p>"On Linux nodes that use systemd, the kubelet and container runtime write to journald by default." When the API server or kubelet is down, kubectl cannot help, so you look on the machine itself:</p>
+				<div class="code"><span class="file">Inspect node-2 directly</span>
+<pre><code>systemctl status kubelet
+journalctl -u kubelet --since "1 hour ago"
+journalctl -u containerd
+
+<span class="c"># containers the runtime knows about</span>
+crictl ps -a
+crictl logs &lt;container-id&gt;</code></pre></div>
+				<p>Without SSH access, <code>kubectl debug node/node-2 -it --image=ubuntu</code> starts a Pod on the node with its root filesystem mounted at <code>/host</code>. <code>kubectl debug</code> has been stable since v1.30, and since v1.36 its default profile is <code>general</code> instead of <code>legacy</code>. But it "won't work if the Node is down". In v1.36, reading node service logs through the API (node log query) also became stable, though it must be enabled on the kubelet.</p>
+				<p><strong>Node Problem Detector</strong> is an add-on "daemon for monitoring and reporting about a node's health", which turns problems such as kernel errors into node conditions and events; the documentation recommends running it.</p>
+			</div>
+
+			<!-- ===== Control plane ===== -->
+			<h2 id="s4">Control plane problems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Checking whether the API server and other control plane components are healthy, and what fails when they are not.</span></p>
+				<p>The API server has health endpoints. "<strong>livez</strong>: Use this to determine if the API server should be restarted." "<strong>readyz</strong>: Use this to determine if the API server is ready to accept traffic", for example after waiting for etcd. Add <code>?verbose</code> to see each check:</p>
+				<div class="code"><span class="file">API server health</span>
+<pre><code>kubectl get --raw='/readyz?verbose'
+<span class="c"># [+]ping ok</span>
+<span class="c"># [+]etcd ok</span>
+<span class="c"># ...</span>
+<span class="c"># readyz check passed</span></code></pre></div>
+				<div class="callout retired"><p><strong>Two old health checks are deprecated.</strong> The <code>/healthz</code> endpoint is "deprecated (since Kubernetes v1.16)", and <code>kubectl get componentstatuses</code> (<code>kubectl get cs</code>) uses an API "deprecated in v1.19+". Many older guides still use them; use <code>/livez</code>, <code>/readyz</code> and the <code>kube-system</code> Pods instead.</p></div>
+
+				<h3>Static Pods</h3>
+				<p>In kubeadm clusters, "kubeadm uses static Pods to run <code>kube-apiserver</code>, <code>kube-controller-manager</code>, <code>kube-scheduler</code>, and <code>etcd</code>". Their manifests are in <code>/etc/kubernetes/manifests</code>, and "the kubelet watches each static Pod and restarts it if it fails." You see them as mirror Pods in <code>kube-system</code>, named after the node, and read their logs with <code>kubectl logs -n kube-system kube-apiserver-&lt;node&gt;</code>, or with <code>crictl</code> if the API server itself is down.</p>
+				<div class="callout trap"><p><strong>Two static Pod surprises.</strong> Deleting a mirror Pod with kubectl does nothing: "the kubelet <em>does not</em> remove the static Pod". And the kubelet reads "all files not starting with a dot" in the manifest folder, so a backup copy such as <code>kube-apiserver.yaml.bak</code> left there is also started. Keep backups elsewhere.</p></div>
+				<p>Other control plane checks: certificate expiry shows up as <code>x509</code> errors (check with <code>kubeadm certs check-expiration</code>, topic 1.2), and etcd health with <code>etcdctl endpoint health</code>.</p>
+
+				<h3>How clusters fail</h3>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Failure</th><th>Result (kubernetes.io)</th><th>Mitigation</th></tr></thead>
+						<tbody>
+							<tr><td>API server down</td><td data-label="Result (kubernetes.io)">Cannot "stop, update, or start new pods"; "existing pods and services should continue to work normally unless they depend on the Kubernetes API"</td><td data-label="Mitigation">High-availability control plane, automatic VM restart</td></tr>
+							<tr><td>etcd data lost</td><td data-label="Result (kubernetes.io)">The API server cannot start; manual recovery needed</td><td data-label="Mitigation">HA etcd, snapshots, reliable storage</td></tr>
+							<tr><td>A node shuts down</td><td data-label="Result (kubernetes.io)">"Pods on that Node stop running"</td><td data-label="Mitigation">Deployments with several replicas behind Services</td></tr>
+							<tr><td>Network partition</td><td data-label="Result (kubernetes.io)">Each side thinks the other is down</td><td data-label="Mitigation">None specific listed in the guide</td></tr>
+							<tr><td>kubelet fault</td><td data-label="Result (kubernetes.io)">The node cannot start new Pods and is marked unhealthy</td><td data-label="Mitigation">Apps that "tolerate unexpected restarts"</td></tr>
+							<tr><td>Operator error</td><td data-label="Result (kubernetes.io)">Lost Pods, Services or even the API server's data</td><td data-label="Mitigation">Periodic snapshots (help in "some cases of operator error")</td></tr>
+						</tbody>
+					</table>
+				</div>
+			</div>
+
+			<!-- ===== Network ===== -->
+			<h2 id="s5">Service and DNS problems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Tracing a Service that does not work, step by step, from its name to the Pods behind it.</span></p>
+				<p>"An issue that comes up rather frequently for new installations of Kubernetes is that a Service is not working properly." The documentation's <em>Debug Services</em> guide checks, in order:</p>
+				<ol class="flow">
+					<li><b>Does the Service exist?</b>"This is a step that sometimes gets forgotten, and is the first thing to check."</li>
+					<li><b>Is a NetworkPolicy blocking it?</b>Policies that select the target Pods may drop the traffic.</li>
+					<li><b>Does it work by DNS name?</b>Try <code>shop-api</code>, then <code>shop-api.shop</code>, then the full name; if only the longer names work, the client is in another namespace.</li>
+					<li><b>Does it work by IP?</b>If the cluster IP works but the name does not, the problem is DNS.</li>
+					<li><b>Is it defined correctly?</b>Is the port in <code>spec.ports</code>, is <code>targetPort</code> the Pods' port, is the protocol right?</li>
+					<li><b>Does it have EndpointSlices?</b>If not, the selector matches no Pods.</li>
+					<li><b>Are the Pods working?</b>Call each Pod on its own port.</li>
+					<li><b>Is kube-proxy working?</b>Is it running, and are its rules programmed?</li>
+				</ol>
+				<div class="code"><span class="file">Check the Service's endpoints</span>
+<pre><code>kubectl get endpointslices -l \
+  kubernetes.io/service-name=shop-api
+
+<span class="c"># compare selector and Pod labels</span>
+kubectl describe svc shop-api
+kubectl get pods --show-labels</code></pre></div>
+				<div class="callout trap"><p><strong>No endpoints means a label mismatch.</strong> "If the <code>ENDPOINTS</code> column is <code>&lt;none&gt;</code>, you should check that the <code>spec.selector</code> field of your Service actually selects for <code>metadata.labels</code> values on your Pods. A common mistake is to have a typo".</p></div>
+
+				<h3>DNS</h3>
+				<div class="code"><span class="file">Test DNS from inside the cluster</span>
+<pre><code>U=https://k8s.io/examples/admin/dns
+kubectl apply -f $U/dnsutils.yaml
+kubectl exec -it dnsutils -- \
+  nslookup kubernetes.default
+kubectl exec -it dnsutils -- \
+  cat /etc/resolv.conf
+
+<span class="c"># is CoreDNS running and logging?</span>
+kubectl get pods -n kube-system \
+  -l k8s-app=kube-dns
+kubectl logs -n kube-system \
+  -l k8s-app=kube-dns</code></pre></div>
+				<ul>
+					<li>"The value for label <code>k8s-app</code> for CoreDNS is <code>kube-dns</code>, for backward compatibility", and so is its Service name.</li>
+					<li>The <code>nameserver</code> in <code>resolv.conf</code> must be the cluster DNS Service, and <code>ndots</code> is 5 by default.</li>
+					<li>To see queries arriving, add the <code>log</code> plugin to the CoreDNS configuration (the <code>coredns</code> ConfigMap).</li>
+					<li>Known issue: on nodes using <code>systemd-resolved</code>, a stub <code>resolv.conf</code> can cause "a fatal forwarding loop"; kubeadm detects and handles this.</li>
+				</ul>
+				<p>If CNI Pods in <code>kube-system</code> are crashing, everything networked fails; check them with <code>kubectl get pods -n kube-system -o wide</code>.</p>
+				<div class="callout retired"><p><strong>Guides still check iptables and IPVS.</strong> The Debug Services page shows <code>iptables-save</code> and <code>ipvsadm</code> checks, but IPVS mode is deprecated since v1.35, and nftables mode (stable since v1.33) is the future default. Adjust the kube-proxy check to the mode your cluster uses.</p></div>
+			</div>
+
+			<!-- ===== Capacity ===== -->
+			<h2 id="s6">Capacity and stuck objects</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Seeing whether the cluster is out of resources, and freeing objects that will not finish deleting.</span></p>
+				<div class="code"><span class="file">Resource use (needs metrics-server)</span>
+<pre><code>kubectl top nodes
+kubectl top pods -A --sort-by=cpu
+kubectl describe node node-2</code></pre></div>
+				<p><code>kubectl top</code> uses the Metrics API, which "only offers the minimum CPU and memory metrics", and needs the metrics-server add-on; without it the command fails. The Metrics API became stable as <code>metrics.k8s.io/v1</code> in v1.37. <code>describe node</code> shows <em>Allocated resources</em>, where "total limits may be over 100 percent", and the pressure conditions above.</p>
+
+				<h3>Stuck in Terminating</h3>
+				<ul>
+					<li>A Pod stuck <code>Terminating</code> means "a deletion has been issued for the Pod, but the control plane is unable to delete the Pod object", typically because of a <strong>finalizer</strong> plus an admission webhook that blocks removing it. On a node that is down, deletion also takes much longer.</li>
+					<li>A namespace can stay <code>Terminating</code> if a finalizer on it is never removed; the documentation warns that a nonexistent finalizer leaves it "stuck in the <code>Terminating</code> state".</li>
+					<li>A PersistentVolumeClaim stuck <code>Pending</code> has no matching volume or StorageClass (topic 2.4).</li>
+				</ul>
+				<div class="callout trap"><p><strong>Force deletion is a last resort.</strong> <code>kubectl delete pod shop-api-0 --grace-period=0 --force</code> removes the object from the API at once, but "does not wait for confirmation that the pod's processes have been terminated". For a StatefulSet this can leave two copies running and "may lead to data corruption". The documentation also advises: "avoid manually removing finalizers".</p></div>
+			</div>
+
+			<!-- ===== Logs ===== -->
+			<h2 id="s7">Where the logs are</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Topic 2.3</span><span class="skill-text">Knowing where each kind of log is kept, how long it lasts, and how to collect logs cluster-wide.</span></p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Logs of</th><th>Where</th><th>How to read</th></tr></thead>
+						<tbody>
+							<tr><td>Application containers</td><td data-label="Where">Files under <code>/var/log/pods</code> on the node, written by the runtime</td><td data-label="How to read"><code>kubectl logs</code>: "the kubelet on the node handles the request and reads directly from the log file"</td></tr>
+							<tr><td>kubelet, container runtime</td><td data-label="Where">The systemd journal ("do not run in containers")</td><td data-label="How to read"><code>journalctl -u kubelet</code> on the node</td></tr>
+							<tr><td>API server, scheduler, controller manager, etcd</td><td data-label="Where">Usually static Pods</td><td data-label="How to read"><code>kubectl logs -n kube-system ...</code>, or <code>crictl logs</code></td></tr>
+							<tr><td>kube-proxy</td><td data-label="Where">Usually a DaemonSet</td><td data-label="How to read"><code>kubectl logs -n kube-system ...</code></td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p><strong>Node logs are short-lived.</strong> The kubelet rotates container logs at <code>containerLogMaxSize</code> (default 10Mi), keeping <code>containerLogMaxFiles</code> (default 5), and "only the contents of the latest log file are available through <code>kubectl logs</code>". "If a pod is evicted from the node, all corresponding containers are also evicted, along with their logs." Because <code>kubectl logs</code> goes through the kubelet, it fails if the node is down.</p></div>
+
+				<h3>Cluster-level logging</h3>
+				<p>"Kubernetes does not provide a native storage solution for log data", so logs must be shipped elsewhere. The documentation lists three patterns:</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Pattern</th><th>Notes</th></tr></thead>
+						<tbody>
+							<tr><td>Node-level agent</td><td data-label="Notes">One agent per node, run as a DaemonSet; "doesn't require any changes to the applications"</td></tr>
+							<tr><td>Sidecar container</td><td data-label="Notes">Streams an app's log files to stdout, or runs its own agent; can double storage or use "significant resource consumption"</td></tr>
+							<tr><td>Push from the app</td><td data-label="Notes">The application sends logs to a backend itself; "outside the scope of Kubernetes"</td></tr>
+						</tbody>
+					</table>
+				</div>
+
+				<h3>More detail from kubectl</h3>
+				<p>Adding <code>-v=6</code> to any kubectl command shows the API requests it makes ("Display requested resources"); <code>-v=8</code> shows request contents. Components also expose Prometheus metrics on <code>/metrics</code>; monitoring is topic 4.1.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Troubleshoot in layers: client &rarr; API server &rarr; nodes &rarr; <code>kube-system</code> Pods &rarr; kubelet and runtime &rarr; events &rarr; network &rarr; capacity. Application debugging is topic 3.2.</li>
+				<li>Events are namespaced (<code>-A</code> for all) and kept only <strong>one hour</strong> by default. <code>kubectl events --types=Warning</code>.</li>
+				<li>Node <code>Ready=Unknown</code> after 50 s without heartbeats (kubelet down or unreachable); <code>Ready=False</code> for a runtime or CNI problem. Pods are evicted 5 minutes later. Without a CNI, CoreDNS stays Pending.</li>
+				<li>On the node: <code>systemctl status kubelet</code>, <code>journalctl -u kubelet</code>, <code>crictl ps -a</code>; or <code>kubectl debug node/...</code> (needs a working node). Node Problem Detector reports node issues.</li>
+				<li>API server health: <code>/livez</code> and <code>/readyz?verbose</code>. <code>/healthz</code> and <code>componentstatuses</code> are deprecated. kubeadm control plane = static Pods in <code>/etc/kubernetes/manifests</code>.</li>
+				<li>Broken Service: exists? NetworkPolicy? DNS? IP? ports? <strong>EndpointSlices empty = selector does not match Pod labels</strong>. Pods? kube-proxy? DNS: dnsutils, <code>nslookup kubernetes.default</code>, CoreDNS Pods labelled <code>k8s-app=kube-dns</code>.</li>
+				<li><code>kubectl top</code> needs metrics-server. Stuck Terminating usually means finalizers; force delete only as a last resort.</li>
+				<li>Container logs live on the node, rotate at 10Mi &times; 5 files, and vanish on eviction; kubelet and runtime log to journald. Ship logs with a node-level agent DaemonSet.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Topic navigation">
+				<a href="d2-topic-2-2.html"><small>Previous</small>2.2: Security</a>
+				<a class="next" href="d2-topic-2-4.html"><small>Next</small>2.4: Storage</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Kubernetes and Cloud Native Associate (KCNA) exam. Not affiliated with or endorsed by The Linux Foundation or the Cloud Native Computing Foundation. Kubernetes&reg; and CNCF&reg; are registered trademarks of The Linux Foundation; KCNA is a mark of The Linux Foundation. Quotes from kubernetes.io &copy; The Kubernetes Authors, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>; topic name from the <a href="https://github.com/cncf/curriculum">KCNA curriculum</a>, CNCF, CC BY 4.0.</div>
+</footer>
+
+</body>
+</html>
