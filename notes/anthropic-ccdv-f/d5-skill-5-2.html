@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.2: Technical Fundamentals | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 5.2: the official Claude SDKs and what they do over raw REST (credentials, typed models, raw responses, request IDs, pagination, middleware, HTTP clients, platform clients), SSE versus WebSockets and where Claude products use WebSockets, the OpenAI compatibility layer, and basic practices: one shared client, timeouts, logging and testing with a mock transport.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Model Selection and Optimization &middot; 16.8%</span>
+		<h1>5.2: Technical Fundamentals</h1>
+		<p>Integrating Claude through its SDKs: what the official client libraries give you on top of the REST API, how streaming over server-sent events differs from WebSockets (and where WebSockets do appear), and the everyday practices that keep an integration reliable and testable.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Client SDKs</span><span class="tag">SSE</span><span class="tag">WebSockets</span><span class="tag">Testing</span><span class="tag">Logging</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The official SDKs</a></li>
+				<li><a href="#s2">What an SDK does for you</a></li>
+				<li><a href="#s3">SSE and WebSockets</a></li>
+				<li><a href="#s4">Where WebSockets appear</a></li>
+				<li><a href="#s5">A shared client</a></li>
+				<li><a href="#s6">Testing without the network</a></li>
+				<li><a href="#s7">The OpenAI compatibility layer</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.2</span>
+				<p><strong>Technical Fundamentals</strong> (6.1% of the exam): "Foundational technical concepts supporting AI application development, including basic engineering practices (integrating with SDKs that wrap REST APIs, websockets)."</p>
+			</div>
+			<p>The REST API itself, status codes, retries, rate limits and async calls are covered in <a href="d2-skill-2-4.html">skill 2.4</a>, and streaming events in <a href="d2-skill-2-3.html#s3">skill 2.3</a>. This page covers what's left: the SDKs as products, WebSockets, and the basic practices around them.</p>
+			<p>Sources: Anthropic's client SDK, middleware, migration and OpenAI compatibility documentation, the Claude Code MCP, tools, IDE and Agent SDK documentation, and the release notes, checked on 8 November 2026 and paraphrased; the WebSocket and server-sent events standards (RFC 6455 and the WHATWG HTML standard) for the general comparison. The client and test examples were run with anthropic 2.6.0 and pytest against a mocked network.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's backend calls Claude to write product blurbs, and the team wants one well-configured client for the whole service, logs that help support, and unit tests that don't need an API key.</p></div>
+
+			<!-- ===== SDKs ===== -->
+			<h2 id="s1">The official SDKs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Anthropic's client libraries and where they sit.</span></p>
+				<p>Anthropic publishes client SDKs in seven languages (Python, TypeScript, C#, Go, Java, PHP and Ruby) plus a command-line tool, <code>ant</code> (since April 2026). As of November 2026 the latest versions are Python 2.6.0, TypeScript 1.6.0, C# 13.6.0, Go 2.7.0, Java 3.6.0, PHP 1.6.0, Ruby 2.6.0 and <code>ant</code> 2.7.1. They cover the Messages API, batches, files, Managed Agents and most of the Admin API, with typed interfaces, streaming, retries, error handling and OpenTelemetry tracing. Two further "libraries", an OpenAI SDK compatibility layer and an Apple Swift package, expose Claude through other frameworks' interfaces but aren't general-purpose clients.</p>
+				<p>Each SDK major version sends one API version. The October 2026 majors (Python 2.0, TypeScript 1.0 and their counterparts) switched to API version <code>2026-10-21</code>, send the key as <code>Authorization: Bearer</code>, accept only one credential per client, and moved from the MIT to the Apache 2.0 licence. Above the client SDKs sit higher-level options that run the agent loop for you: the Claude Agent SDK (which runs Claude Code as a subprocess, talking to it over standard input and output), Claude Code itself, and Claude Managed Agents.</p>
+			</div>
+
+			<!-- ===== What SDK does ===== -->
+			<h2 id="s2">What an SDK does for you</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">The features you'd otherwise write yourself.</span></p>
+				<ul>
+					<li><strong>Credentials from the environment.</strong> <code>Anthropic()</code> reads <code>ANTHROPIC_API_KEY</code>; the docs suggest a <code>.env</code> file so the key stays out of source control. A client holds one credential: passing two is an error.</li>
+					<li><strong>Typed requests and responses.</strong> In Python, responses are Pydantic models with <code>.to_json()</code> and <code>.to_dict()</code>; unknown fields are kept rather than dropped.</li>
+					<li><strong>Raw responses.</strong> <code>client.messages.with_raw_response.create(...)</code> gives you the HTTP headers (rate-limit counters, request ID) and <code>.parse()</code> returns the normal message. Errors still raise typed exceptions.</li>
+					<li><strong>Request IDs.</strong> Every response object has <code>_request_id</code> (public despite the underscore); log it.</li>
+					<li><strong>Pagination, streaming helpers and the tool runner</strong> (beta), plus a <code>beta</code> namespace that sends the right beta headers.</li>
+					<li><strong>Middleware.</strong> Functions passed as <code>Anthropic(middleware=[...])</code> run before and after each request, for logging, custom retries or a built-in refusal fallback.</li>
+					<li><strong>Logging and tracing.</strong> <code>ANTHROPIC_LOG=debug</code> turns on the SDK's own logs; if your application registers an OpenTelemetry tracer, the SDKs emit a span per request (since October 2026, in beta).</li>
+					<li><strong>Platform clients.</strong> Separate classes for each cloud (<code>AnthropicBedrockMantle</code>, <code>AnthropicVertex</code>, <code>AnthropicFoundry</code>, <code>AnthropicAWS</code>, <code>AnthropicGoogleCloud</code>) handle their authentication and URLs (<a href="d2-skill-2-3.html#s7">skill 2.3</a>).</li>
+				</ul>
+				<div class="callout trap"><p><strong>Python SDK 2.x uses httpx2.</strong> Since Python SDK 1.0 (August 2026), the SDK uses <code>httpx2</code>, a compatible fork of <code>httpx</code>. A custom HTTP client must come from <code>anthropic.DefaultHttpxClient</code> (passing a plain <code>httpx</code> client raises an error, and a raw <code>httpx2</code> client loses the SDK's default timeouts and limits). Mocking tools that patch <code>httpx</code>, such as respx, don't see the SDK's requests unless you call <code>httpx2.alias_httpx()</code> first.</p></div>
+			</div>
+
+			<!-- ===== SSE vs WS ===== -->
+			<h2 id="s3">SSE and WebSockets</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Two ways to push data from server to client.</span></p>
+				<p><strong>Server-sent events</strong> (defined in the HTML standard) are one-way: the server streams text events over an ordinary HTTP response with the <code>text/event-stream</code> content type, and clients reconnect automatically and can resume from the last event ID. Input travels in separate HTTP requests. Because it's plain HTTP, SSE passes through ordinary proxies and load balancers.</p>
+				<p><strong>WebSockets</strong> (RFC 6455) are two-way: an HTTP request asks to upgrade the connection (<code>101 Switching Protocols</code>), and from then on both sides send text or binary frames over the same connection, using <code>ws://</code> or, over TLS, <code>wss://</code>. There's no built-in resume, so the application handles reconnecting and heartbeats.</p>
+				<p>The Claude API uses <strong>SSE</strong>: a request goes up as a <code>POST</code> and the response streams down. Managed Agents follow the same split, with events streamed down over SSE and new events sent up with <code>POST</code>.</p>
+				<div class="callout trap"><p><strong>The Claude API has no WebSocket interface.</strong> The guide's mention of "websockets" next to SDKs can suggest otherwise, but Anthropic's API documentation has no WebSocket, real-time or voice endpoint: streaming is server-sent events. The Agent SDK's "streaming input mode" isn't a WebSocket either; it's an in-process stream of messages to a local Claude Code subprocess.</p></div>
+			</div>
+
+			<!-- ===== Where WS ===== -->
+			<h2 id="s4">Where WebSockets appear</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">WebSockets in the tooling around the API.</span></p>
+				<ul>
+					<li><strong>MCP servers in Claude Code</strong> can use <code>"type": "ws"</code>, which suits a server that pushes events without being asked. They can only be added as JSON (in <code>.mcp.json</code> or with <code>claude mcp add-json</code>; <code>--transport ws</code> is rejected), authenticate with headers only (no OAuth), and drop the connection on a single message over 16 MiB. WebSocket isn't one of MCP's standard transports, which are stdio and Streamable HTTP; for a server that only answers requests, the docs recommend HTTP.</li>
+					<li><strong>The Monitor tool</strong> in Claude Code can watch a WebSocket and treat each text frame as an event (opening one needs approval).</li>
+					<li><strong>Internal plumbing:</strong> the VS Code and JetBrains integrations talk to the CLI over a local <code>ws://</code> connection, and voice dictation and some hosted features use WebSockets too. These aren't things you configure.</li>
+				</ul>
+				<div class="code"><span class="file">.mcp.json with a WebSocket and an HTTP server (JSON)</span>
+<pre><code>{
+  "mcpServers": {
+    "stock-events": {
+      "type": "ws",
+      "url": "wss://mcp.gear-shop.example.com/stock",
+      "headers": {
+        "Authorization": "Bearer ${STOCK_MCP_TOKEN}"
+      }
+    },
+    "orders": {
+      "type": "http",
+      "url": "https://mcp.gear-shop.example.com/orders"
+    }
+  }
+}</code></pre></div>
+				<p>The stock server pushes stock-level changes, so it uses a WebSocket; the orders server only answers requests, so it uses HTTP, which also allows OAuth. The token comes from the shop's own variable name: Anthropic credential variables such as <code>ANTHROPIC_API_KEY</code> expand to nothing in a remote server's headers, by design.</p>
+			</div>
+
+			<!-- ===== Shared client ===== -->
+			<h2 id="s5">A shared client</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Configuring one client well and reusing it.</span></p>
+				<div class="code"><span class="file">shop_ai.py (Python, anthropic SDK)</span>
+<pre><code><span class="c"># shop_ai.py - one shared Claude client for the whole gear-shop backend</span>
+import logging
+
+import anthropic
+import httpx2
+
+log = logging.getLogger("shop_ai")
+
+MODEL = "claude-haiku-5-5"
+
+
+def make_client(**overrides) -&gt; anthropic.Anthropic:
+    <span class="c"># The key comes from ANTHROPIC_API_KEY in the environment, never from code.</span>
+    <span class="c"># Build this once at startup and reuse it: the client keeps a pool of open connections,</span>
+    <span class="c"># so creating a new client per request throws that away.</span>
+    settings = {
+        "timeout": httpx2.Timeout(30.0, connect=5.0),  <span class="c"># the default is 10 minutes</span>
+        "max_retries": 3,                              <span class="c"># retries 408, 409, 429 and 5xx with backoff</span>
+    }
+    settings.update(overrides)  <span class="c"># tests pass a mock http_client here</span>
+    return anthropic.Anthropic(**settings)
+
+
+def describe_product(client: anthropic.Anthropic, product: dict) -&gt; str:
+    <span class="c"># with_raw_response gives the HTTP headers as well as the parsed Message.</span>
+    raw = client.messages.with_raw_response.create(
+        model=MODEL,
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": f"Two-sentence shop blurb for {product['name']} ({product['weight_kg']} kg).",
+        }],
+    )
+    message = raw.parse()  <span class="c"># the same object messages.create() returns</span>
+
+    <span class="c"># Log the request ID: support asks for it when a call misbehaves. Never log the key.</span>
+    log.info(
+        "sku=%s request_id=%s tokens_left=%s",
+        product["sku"],
+        raw.headers.get("request-id"),
+        raw.headers.get("anthropic-ratelimit-tokens-remaining"),
+    )
+    return "".join(b.text for b in message.content if b.type == "text")</code></pre></div>
+				<ul>
+					<li><strong>One client, reused.</strong> Each SDK client owns its own pool of connections; creating one per request discards it. (The docs don't say "create one client" in so many words; it follows from how the client manages connections.)</li>
+					<li><strong>Shorter timeouts</strong> on interactive paths; the default of 10 minutes suits long jobs, not a web request.</li>
+					<li><strong>Idempotent side effects.</strong> The SDK retries requests automatically and the API has no idempotency key, so make your own actions safe to repeat, for example by keying them on the order ID or the tool call ID.</li>
+					<li><strong>Keys stay server-side.</strong> The TypeScript SDK refuses to run in a browser unless you set <code>dangerouslyAllowBrowser</code>, which would expose the key; call Claude from your backend instead.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Testing ===== -->
+			<h2 id="s6">Testing without the network</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Unit tests that check what you send, with no key and no cost.</span></p>
+				<div class="code"><span class="file">test_shop_ai.py (Python, pytest)</span>
+<pre><code><span class="c"># test_shop_ai.py - unit test with a fake HTTP layer; no network, no API key</span>
+import json
+
+import httpx2
+from anthropic import DefaultHttpxClient
+
+import shop_ai
+
+FAKE_REPLY = {
+    "id": "msg_test",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-haiku-5-5",
+    "content": [{"type": "text", "text": "Light, roomy and quick to pitch."}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": {"input_tokens": 20, "output_tokens": 9},
+}
+
+
+def test_describe_product_sends_expected_body(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    seen = []
+
+    def handler(request: httpx2.Request) -&gt; httpx2.Response:
+        seen.append(request)  <span class="c"># keep it so the test can inspect it</span>
+        return httpx2.Response(200, json=FAKE_REPLY, headers={"request-id": "req_test123"})
+
+    client = shop_ai.make_client(
+        max_retries=0,  <span class="c"># a test should fail fast, not back off</span>
+        http_client=DefaultHttpxClient(transport=httpx2.MockTransport(handler)),
+    )
+    text = shop_ai.describe_product(client, {"sku": "TENT-2P", "name": "Ridgeline 2-person tent", "weight_kg": 1.9})
+
+    assert text == "Light, roomy and quick to pitch."
+    request = seen[0]
+    assert request.url.path == "/v1/messages"
+    body = json.loads(request.content)
+    assert body["model"] == "claude-haiku-5-5"
+    assert "Ridgeline 2-person tent (1.9 kg)" in body["messages"][0]["content"]
+    <span class="c"># The SDK adds the auth and version headers for you.</span>
+    assert request.headers["authorization"] == "Bearer test-key"
+    assert request.headers["anthropic-version"] == "2026-10-21"</code></pre></div>
+				<p>Injecting a mock transport keeps the SDK's real request building, headers and error handling in the test, which is more faithful than replacing the client with a fake object. Set <code>max_retries=0</code> in tests so failures surface immediately.</p>
+			</div>
+
+			<!-- ===== OpenAI compat ===== -->
+			<h2 id="s7">The OpenAI compatibility layer</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Calling Claude through OpenAI's SDK, and its limits.</span></p>
+				<p>Since February 2025 you can point an official OpenAI SDK at <code>https://api.anthropic.com/v1/</code> with a Claude key and model ID. Anthropic describes it as stable but "primarily intended to test and compare model capabilities", not a long-term production solution. It ignores <code>strict</code> on functions, has no prompt caching, returns no thinking, merges system and developer messages into one system prompt, and silently ignores many OpenAI fields. It's only on the Claude API, not the cloud platforms. For full features, use Anthropic's own SDK.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Seven official client SDKs plus the <code>ant</code> CLI; each SDK major sends one API version. The October 2026 majors use <code>2026-10-21</code>, Bearer auth, one credential per client and Apache 2.0.</li>
+				<li>SDKs add environment credentials, typed models, raw responses with headers, request IDs, pagination, middleware, logging, tracing and per-cloud clients. Python 2.x needs <code>httpx2</code>-based HTTP clients.</li>
+				<li>The Claude API streams over SSE (one-way, over HTTP); it has no WebSocket endpoint. WebSockets appear in Claude Code's <code>ws</code> MCP servers (JSON-only, header auth), the Monitor tool and internal plumbing.</li>
+				<li>Practices: one shared, reused client; shorter timeouts on interactive paths; idempotent side effects; keys only on the server; log request IDs, never keys.</li>
+				<li>Test with a mock transport and <code>max_retries=0</code>. The OpenAI compatibility layer is for testing, not production.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-1.html"><small>Previous</small>5.1: LLM Fundamentals</a>
+				<a class="next" href="d5-skill-5-3.html"><small>Next</small>5.3: Model Selection and Tradeoffs</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer – Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.0. Anthropic's documentation summarized in the author's own words; RFC 6455 and the WHATWG HTML standard (CC BY 4.0) for the general comparison; examples are original.</div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.4: Cost and Token Management | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 5.4: Claude pricing and multipliers, reading the usage object correctly, pricing a response in code, tracking spend in the Console, the Usage and Cost Analytics API and Claude Code, budgets and spend limits, placing and moving cache breakpoints, choosing the cache lifetime, keep-alives, and modelling monthly cost with caching and batches.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Model Selection and Optimization &middot; 16.8%</span>
+		<h1>5.4: Cost and Token Management</h1>
+		<p>Knowing what a Claude application costs and keeping it under control: how prices and multipliers combine, how to read usage correctly, where to track spend, which limits stop it, and how to place prompt-cache breakpoints so a growing conversation stays cheap.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Pricing</span><span class="tag">Usage tracking</span><span class="tag">Spend limits</span><span class="tag">Prompt caching</span><span class="tag">Cost model</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Prices and multipliers</a></li>
+				<li><a href="#s2">Reading usage, and pricing a response</a></li>
+				<li><a href="#s3">Tracking spend</a></li>
+				<li><a href="#s4">Budgets and limits</a></li>
+				<li><a href="#s5">Placing cache breakpoints</a></li>
+				<li><a href="#s6">Choosing the cache lifetime</a></li>
+				<li><a href="#s7">Modelling monthly cost</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.4</span>
+				<p><strong>Cost and Token Management</strong> (2.8% of the exam): "Token budgeting and cost management techniques for Claude applications, including token usage tracking, cost modeling, and caching techniques (prompt caching, cache check-pointing) for cost optimization."</p>
+			</div>
+			<p>How prompt caching and batches work is explained in <a href="d2-skill-2-3.html#s6">skill 2.3</a>; this page is about cost: what to pay, how to measure it, and how to use caching well. "Cache check-pointing" isn't a term Anthropic's documentation uses; it calls the markers <strong>cache breakpoints</strong>. This page takes the guide's phrase to mean choosing where breakpoints go and moving them forward as a conversation grows. (In Claude Code, "checkpointing" is something else: <code>/rewind</code>.)</p>
+			<p>Sources: Anthropic's pricing, prompt caching, cost-and-intelligence optimization, token counting, rate limit, workspace, task budget, effort and cache diagnostics pages, the Usage and Cost Analytics API and legacy Usage and Cost API documentation, the Claude Code cost documentation, and the release notes, checked on 8 November 2026 and paraphrased. The three examples were run against the anthropic 2.6.0 SDK with a mocked API, and their arithmetic was checked by hand.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's support assistant answers about 2,000 questions a day using a 6,000-token guide to its products and policies, and the team wants to know what it costs and how to bring that down.</p></div>
+
+			<!-- ===== Prices ===== -->
+			<h2 id="s1">Prices and multipliers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">What each kind of token costs.</span></p>
+				<p>List prices per million tokens, input and output: Claude Fable 5.1 $10 and $50, Opus 5.5 $4 and $20, Sonnet 5.5 $2 and $10, Haiku 5.5 $0.10 and $0.50 (for prompts up to 100,000 tokens). Output costs five times input on all four, which matters in agent loops, where each turn's output comes back as input on every later turn. Multipliers then apply:</p>
+				<ul>
+					<li><strong>Cache writes:</strong> 1.25 times the input price for the 5-minute cache, 2 times for the 1-hour cache.</li>
+					<li><strong>Cache reads:</strong> 0.1 times on most models, but 0.05 on Opus 5.5 and Sonnet 5.5 and 0.025 on Fable 5.1. A 5-minute write pays for itself after one read; a 1-hour write after two.</li>
+					<li><strong>Batch API:</strong> half price on input and output, combined with the cache multipliers.</li>
+					<li><strong>Haiku 5.5 over 100,000 tokens:</strong> if a request's prompt (cache reads and writes included) is over 100,000 tokens, the whole request, output included, is billed at five times the rate ($0.50 and $2.50).</li>
+					<li><strong>US-only processing</strong> (<code>inference_geo: "us"</code>) adds 10% to every token type. A workspace can make <code>us</code> its default, which raises the bill with no change in code.</li>
+					<li><strong>Fast mode</strong> doubles Opus 5.5's price ($8 and $40).</li>
+					<li><strong>Tools:</strong> tool definitions, calls and results are tokens, plus a hidden tool-use system prompt (286 tokens on the Claude 5.5 models). Web search adds $10 per 1,000 searches; code execution is free alongside the current web tools, otherwise 1,550 free hours a month per organization, then $0.05 per container-hour.</li>
+				</ul>
+				<p>Remember too that Claude 4.7 and later models count about 30% more tokens for the same text (<a href="d5-skill-5-1.html#s1">skill 5.1</a>), so recount before reusing an old estimate.</p>
+			</div>
+
+			<!-- ===== Usage ===== -->
+			<h2 id="s2">Reading usage, and pricing a response</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Turning a response's usage into dollars.</span></p>
+				<p>Each response's <code>usage</code> reports <code>input_tokens</code>, <code>output_tokens</code> (including thinking, billed even when it isn't shown), <code>cache_creation_input_tokens</code> (split into 5-minute and 1-hour writes in <code>cache_creation</code>), <code>cache_read_input_tokens</code>, server tool use, the service tier, the inference location and the speed.</p>
+				<div class="callout trap"><p><strong><code>input_tokens</code> isn't the total input.</strong> It counts only the tokens after the last cache breakpoint. Total input is cache reads plus cache writes plus <code>input_tokens</code>. Cost code that prices only <code>input_tokens</code> badly undercounts. And with server-side compaction turned on, the top-level counts leave out the compaction step; add up <code>usage.iterations</code> for the billed total.</p></div>
+				<div class="code"><span class="file">cost_calc.py (Python, anthropic SDK)</span>
+<pre><code>"""Price one Claude response from its usage object."""
+import anthropic
+
+<span class="c"># USD per million tokens, from the pricing page (November 2026). Keep prices as data, not code.</span>
+PRICES = {
+    "claude-sonnet-5-5": {
+        "input": 2.00,
+        "cache_write_5m": 2.50,  <span class="c"># 1.25x input</span>
+        "cache_write_1h": 4.00,  <span class="c"># 2x input</span>
+        "cache_read": 0.10,      <span class="c"># 0.05x input on this model (0.1x on most others)</span>
+        "output": 10.00,
+    },
+    "claude-haiku-5-5": {        <span class="c"># prompts up to 100,000 tokens</span>
+        "input": 0.10, "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01, "output": 0.50,
+    },
+    "claude-haiku-5-5 long": {   <span class="c"># prompts over 100,000 tokens: every token of the request costs 5x</span>
+        "input": 0.50, "cache_write_5m": 0.625, "cache_write_1h": 1.00, "cache_read": 0.05, "output": 2.50,
+    },
+}
+WEB_SEARCH_PER_SEARCH = 10.00 / 1000  <span class="c"># $10 per 1,000 searches, on top of tokens</span>
+
+
+def request_cost(model: str, usage) -&gt; float:
+    """Dollar cost of one response, at list prices."""
+    if usage.cache_creation:  <span class="c"># writes split by lifetime</span>
+        write_5m = usage.cache_creation.ephemeral_5m_input_tokens
+        write_1h = usage.cache_creation.ephemeral_1h_input_tokens
+    else:
+        write_5m, write_1h = usage.cache_creation_input_tokens or 0, 0
+    read = usage.cache_read_input_tokens or 0
+    uncached = usage.input_tokens  <span class="c"># only the tokens after the last cache breakpoint</span>
+
+    rates = PRICES[model]
+    prompt_tokens = uncached + write_5m + write_1h + read  <span class="c"># cache reads and writes count too</span>
+    if model == "claude-haiku-5-5" and prompt_tokens &gt; 100_000:
+        rates = PRICES["claude-haiku-5-5 long"]
+
+    dollars = (
+        uncached * rates["input"]
+        + write_5m * rates["cache_write_5m"]
+        + write_1h * rates["cache_write_1h"]
+        + read * rates["cache_read"]
+        + usage.output_tokens * rates["output"]  <span class="c"># includes thinking tokens</span>
+    ) / 1_000_000
+
+    if usage.service_tier == "batch":
+        dollars *= 0.5   <span class="c"># Batch API: half price, cache multipliers still apply</span>
+    if usage.inference_geo == "us":
+        dollars *= 1.1   <span class="c"># US-only inference</span>
+    if usage.server_tool_use:
+        dollars += usage.server_tool_use.web_search_requests * WEB_SEARCH_PER_SEARCH
+    return dollars
+
+
+if __name__ == "__main__":
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": "Which of your tents pack smallest?"}],
+    )
+    print(f"cost: ${request_cost(response.model, response.usage):.6f}")</code></pre></div>
+				<p>Logging this per request (with the model, route and request ID) is what makes cost per <em>completed task</em> measurable, which is the comparison Anthropic recommends between models (<a href="d5-skill-5-3.html#s4">skill 5.3</a>). The calculator leaves out fast mode, code execution time and Managed Agents runtime. Before sending, the free token counting endpoint estimates input tokens, though it ignores caching.</p>
+			</div>
+
+			<!-- ===== Tracking ===== -->
+			<h2 id="s3">Tracking spend</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Where to see what's being spent, across the organization.</span></p>
+				<ul>
+					<li><strong>Console:</strong> the Usage page charts tokens, requests and rate-limit use, including the <strong>cache rate</strong> (the share of input read from cache); the Cost page shows spend; both can be grouped by API key.</li>
+					<li><strong>Usage and Cost Analytics API</strong> (beta since 29 October 2026): <code>/v1/organizations/analytics/usage</code> and <code>/v1/organizations/analytics/cost</code>, with an Admin API credential, grouped by up to five dimensions such as model, workspace, API key, product or inference location, in time buckets. Data usually arrives within four hours (up to 24), may be revised for about a week after month end, and cost amounts come back as strings in <strong>cents</strong>.</li>
+					<li><strong>Legacy Usage and Cost API</strong> (since August 2025, now legacy but supported): fresher data (within about five minutes), with cost reported daily.</li>
+					<li><strong>Claude Code:</strong> <code>/usage</code> shows the session's estimated cost, usage by model and a prompt-cache line with the hit rate and likely causes of misses; <code>/cost</code> and <code>/stats</code> are now aliases. For scripted runs, <code>--max-budget-usd</code> stops at an estimated spend.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Budgets ===== -->
+			<h2 id="s4">Budgets and limits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Controls that cap or steer spending.</span></p>
+				<h3>Hard limits</h3>
+				<ul>
+					<li><strong>Tier spend cap</strong> per organization (Start $500, Build $1,000, Scale $200,000 a month). At the cap, requests fail with a 429 that has no <code>retry-after</code> until the next month, unless the cap is raised.</li>
+					<li><strong>Your own spend limits</strong>, for the organization or per workspace (with alerts at thresholds). Reaching one returns a 400. The Default Workspace can't have a spend limit, which is one reason to put each application in its own workspace.</li>
+					<li><strong><code>max_tokens</code></strong> caps one response's output, thinking included. The model can't see it, so a lower value doesn't make Claude economize; it just cuts the answer off, and the truncated output is still billed.</li>
+					<li><strong>Managed Agents session budgets</strong> pause a session when it reaches a dollar cap.</li>
+				</ul>
+				<h3>Soft controls</h3>
+				<ul>
+					<li><strong>Effort</strong> is the main lever: lower effort means fewer and shorter tokens and tool calls. On Anthropic's coding benchmark, Opus 5.5 cost about $0.21 per solved task at medium and $0.74 at xhigh; running at low and re-running only the failures at high reached about 97% for about $0.17 per task.</li>
+					<li><strong>Task budgets</strong> (beta, <code>output_config.task_budget</code>, at least 20,000 tokens) tell the model how many tokens a multi-step task may use, through a countdown it can see. They're advisory, not a hard cap, and aren't available on Sonnet 5 or in Claude Code.</li>
+					<li><strong>Shorter outputs:</strong> ask for a compact format; in Anthropic's measurement a one-line answer format cost about a third of a memo format, at the same accuracy.</li>
+					<li><strong>Less context:</strong> tool search instead of loading hundreds of tools, uploading files rather than pasting them, and compaction for long sessions (on Haiku 5.5, set its trigger below 100,000 tokens to stay in the cheaper tier).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Breakpoints ===== -->
+			<h2 id="s5">Placing cache breakpoints</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Where to put cache markers so they're read, not rewritten.</span></p>
+				<p>Caching matters most in multi-turn work, because every turn resends the whole conversation: a 40-turn task sends turn one forty times. Anthropic measured agent runs costing about three times as much without caching, and reports a median of 84% of input read from cache on real agent traffic; below about 80%, something is probably breaking the cache.</p>
+				<ul>
+					<li><strong>Writes happen only at breakpoints</strong>, and each read looks back at most 20 blocks from a breakpoint for an entry an earlier request wrote.</li>
+					<li><strong>Mark the last block that's identical across requests.</strong> A breakpoint on content that changes every time (a timestamp, the customer's question) writes a new entry on every request and never reads one.</li>
+					<li><strong>Move breakpoints forward</strong> as the conversation grows; use up to four to cover parts that change at different rates (tools rarely, retrieved context daily, the conversation every turn) and to bridge the 20-block lookback.</li>
+					<li><strong>Automatic caching</strong> (one top-level <code>cache_control</code>, since February 2026) does the moving for you, and is the recommended start for chat, but it's the wrong choice when the last block varies per request.</li>
+					<li><strong>Don't break the prefix.</strong> Changing the system prompt, tools, effort, thinking settings or speed mid-conversation invalidates the cache. In Anthropic's measurements, editing the top-level system prompt cost 25 to 50 times as much as sending the same text as a mid-conversation system message. Caches are also per model, so switching models starts again.</li>
+				</ul>
+				<div class="code"><span class="file">chat_checkpoints.py (Python, anthropic SDK)</span>
+<pre><code>"""A support chat that moves its cache breakpoints forward each turn and logs the cache hit ratio."""
+from pathlib import Path
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+<span class="c"># Long and identical on every turn: the stable prefix worth caching (over the 512-token minimum).</span>
+SYSTEM = [{
+    "type": "text",
+    "text": Path("shop-guide.md").read_text(encoding="utf-8"),
+    "cache_control": {"type": "ephemeral"},  <span class="c"># breakpoint 1: tools + system</span>
+}]
+
+messages = []
+total = {"read": 0, "all": 0}
+
+
+def move_breakpoints(history):
+    """Mark the newest two user turns and unmark older ones (at most 4 breakpoints per request)."""
+    user_turns = [m for m in history if m["role"] == "user"]
+    for m in user_turns:
+        for block in m["content"]:
+            block.pop("cache_control", None)
+    for m in user_turns[-2:]:
+        m["content"][-1]["cache_control"] = {"type": "ephemeral"}
+
+
+def chat(text: str) -&gt; str:
+    messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
+    move_breakpoints(messages)
+    response = client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=2048,
+        system=SYSTEM,
+        messages=messages,
+    )
+    <span class="c"># Append the reply exactly as returned, so the next turn's prefix matches byte for byte.</span>
+    messages.append({"role": "assistant", "content": response.content})
+
+    u = response.usage
+    read, written = u.cache_read_input_tokens or 0, u.cache_creation_input_tokens or 0
+    prompt = read + written + u.input_tokens
+    total["read"] += read
+    total["all"] += prompt
+    print(f"turn {len(messages) // 2}: read {read:&gt;5}  written {written:&gt;5}  uncached {u.input_tokens:&gt;3}  "
+          f"hit {read / prompt:.0%}  (whole chat {total['read'] / total['all']:.0%})")
+    <span class="c"># Thinking blocks can come first on Claude 5 models, so pick the text by type.</span>
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+for question in [
+    "I'm planning a three-day hike in October. Which sleeping bag rating do I need?",
+    "Does the 0 °C bag fit in a 45 L pack with a tent?",
+    "Can I return it if I find it too warm?",
+    "Okay, add the bag and a liner to my order.",
+]:
+    chat(question)
+
+<span class="c"># Simpler alternative: pass cache_control={"type": "ephemeral"} at the top level of</span>
+<span class="c"># messages.create (automatic caching), and the API moves one breakpoint for you.</span></code></pre></div>
+				<p>The pattern (one breakpoint on the system prompt and one on each of the two newest user turns) is the one Anthropic's own guidance uses when adding caching to a chat integration. From the second turn, almost all of each request is read from cache; the whole-conversation ratio lags behind because the first turn was all writes. When a hit rate looks wrong, cache diagnostics (generally available since September 2026) report why a request missed: model, system prompt, tools or messages changed, or the entry expired.</p>
+			</div>
+
+			<!-- ===== TTL ===== -->
+			<h2 id="s6">Choosing the cache lifetime</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">5 minutes or 1 hour, and keeping a cache warm.</span></p>
+				<ul>
+					<li><strong>5 minutes</strong> (the default) suits turns that follow each other quickly; every hit refreshes it for free. With no pauses, Anthropic measured it about 15 to 19% cheaper than the 1-hour cache on the Claude 5.5 models.</li>
+					<li><strong>1 hour</strong> pays off when roughly one turn in twenty (or more) follows a pause of 5 to 60 minutes, such as a customer who comes back after a while, or a long side task. If most long pauses exceed an hour anyway, both expire and the 5-minute cache is cheaper.</li>
+					<li><strong>Keep-alive:</strong> resending the previous request with <code>max_tokens: 0</code> refreshes the cache and bills no output tokens. Done every four minutes, it can beat the 1-hour cache on models with cheap reads (Opus 5.5, Sonnet 5.5, Fable 5.1) when pauses are short.</li>
+					<li><strong>Pick at the start:</strong> switching a conversation from 5 minutes to 1 hour rewrites the whole prompt once. The lifetime is counted from the <em>start</em> of the request, so a four-minute streamed answer leaves about a minute for the reply on the 5-minute cache.</li>
+					<li><strong>Batches:</strong> cache hits are best-effort because batch requests run in parallel; send one request with the shared prefix and a 1-hour breakpoint first, then the rest.</li>
+				</ul>
+				<div class="callout trap"><p><strong>A miss costs more than no caching.</strong> When the cache has expired, the whole prefix is billed at the <em>write</em> price (1.25 or 2 times input), more than sending it uncached. A low hit rate can make caching a net loss, which is why it's worth watching. And prompts below the minimum (512 tokens on the Claude 5 models, up to 4,096 on some older ones) aren't cached at all, silently.</p></div>
+			</div>
+
+			<!-- ===== Model ===== -->
+			<h2 id="s7">Modelling monthly cost</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Estimating a month's spend, with and without caching and batches.</span></p>
+				<div class="code"><span class="file">monthly_model.py (Python)</span>
+<pre><code>"""Monthly cost model for a support assistant: no caching, caching, and batch."""
+PRICES = {  <span class="c"># USD per million tokens</span>
+    "claude-sonnet-5-5": {"input": 2.00, "write_5m": 2.50, "read": 0.10, "output": 10.00},
+    "claude-haiku-5-5": {"input": 0.10, "write_5m": 0.125, "read": 0.01, "output": 0.50},  <span class="c"># prompts &lt;= 100K</span>
+}
+
+REQUESTS_PER_DAY = 2_000
+DAYS = 30
+PREFIX = 6_000     <span class="c"># product and policy guide: identical on every request</span>
+VARIABLE = 400     <span class="c"># the customer's message and order details</span>
+OUTPUT = 400       <span class="c"># the reply (thinking tokens would count here too)</span>
+HIT_RATE = 0.98    <span class="c"># share of requests that find the prefix still cached (steady daytime traffic)</span>
+
+
+def per_request(p, cached: bool) -&gt; float:
+    if not cached:
+        return ((PREFIX + VARIABLE) * p["input"] + OUTPUT * p["output"]) / 1e6
+    prefix = HIT_RATE * PREFIX * p["read"] + (1 - HIT_RATE) * PREFIX * p["write_5m"]
+    return (prefix + VARIABLE * p["input"] + OUTPUT * p["output"]) / 1e6
+
+
+for model, p in PRICES.items():
+    plain = per_request(p, cached=False) * REQUESTS_PER_DAY * DAYS
+    cached = per_request(p, cached=True) * REQUESTS_PER_DAY * DAYS
+    print(model)
+    print(f"  no caching          ${plain:&gt;9,.2f} a month")
+    print(f"  prompt caching      ${cached:&gt;9,.2f}  ({1 - cached / plain:.0%} less)")
+    print(f"  batch, no caching   ${plain * 0.5:&gt;9,.2f}  (only for work nobody waits on)")
+    print(f"  batch and caching   ${cached * 0.5:&gt;9,.2f}  (cache hits in batches are best-effort)")</code></pre></div>
+				<div class="code"><span class="file">Output</span>
+<pre><code>claude-sonnet-5-5
+  no caching          $ 1,008.00 a month
+  prompt caching      $   341.28  (66% less)
+  batch, no caching   $   504.00  (only for work nobody waits on)
+  batch and caching   $   170.64  (cache hits in batches are best-effort)
+claude-haiku-5-5
+  no caching          $    50.40 a month
+  prompt caching      $    18.83  (63% less)
+  batch, no caching   $    25.20  (only for work nobody waits on)
+  batch and caching   $     9.41  (cache hits in batches are best-effort)</code></pre></div>
+				<p>For Sonnet 5.5 with caching, each request costs 98% of 6,000 tokens at $0.10 plus 2% at $2.50 (888 millionths of a dollar), plus 400 input tokens at $2 (800) and 400 output tokens at $10 (4,000): $0.005688, times 60,000 requests a month, is $341.28. Replace the guessed <code>OUTPUT</code> with real <code>usage.output_tokens</code> measurements, since thinking adds to it, and check that prompts stay above the caching minimum and, on Haiku 5.5, below 100,000 tokens.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Output costs five times input; cache writes cost 1.25 times (5 minutes) or 2 times (1 hour); reads cost 0.1, 0.05 (Opus and Sonnet 5.5) or 0.025 times (Fable 5.1); batches halve everything; US-only adds 10%; Haiku 5.5 over 100,000 tokens costs five times as much.</li>
+				<li>Total input is cache reads plus writes plus <code>input_tokens</code>; price each type separately and track cost per completed task.</li>
+				<li>Track spend in the Console, the Usage and Cost Analytics API (beta, values in cents, up to 24 hours late) and Claude Code's <code>/usage</code>.</li>
+				<li>Hard limits: tier caps (429 with no retry), your own spend limits (400), <code>max_tokens</code>. Soft: effort, task budgets, shorter outputs, less context.</li>
+				<li>Cache check-pointing: breakpoints on the last stable block, moved forward each turn, up to four; don't edit the prefix mid-conversation; caches are per model. Aim for a hit rate above about 80%.</li>
+				<li>Choose 5 minutes for quick turns, 1 hour when pauses of 5 to 60 minutes are common, or keep-alives with <code>max_tokens: 0</code>; a miss costs the write price.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-3.html"><small>Previous</small>5.3: Model Selection and Tradeoffs</a>
+				<a class="next" href="index.html"><small>Next</small>CCDV-F overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer – Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.0. Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

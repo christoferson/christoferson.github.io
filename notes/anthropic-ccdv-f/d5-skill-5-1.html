@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.1: LLM Fundamentals | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 5.1: tokens and tokenizers, token counting, context windows and what counts toward them, next-token generation, sampling and why outputs vary, fast mode, adaptive versus extended thinking, effort levels, and zero-shot, one-shot and multishot prompting.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Model Selection and Optimization &middot; 16.8%</span>
+		<h1>5.1: LLM Fundamentals</h1>
+		<p>The ideas underneath every Claude application: what tokens and context windows are, how a model produces text one token at a time and why the same prompt can give different answers, which options change speed and reasoning, and how examples in a prompt steer the result.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Tokens</span><span class="tag">Context window</span><span class="tag">Sampling</span><span class="tag">Fast mode</span><span class="tag">Effort</span><span class="tag">Few-shot</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Tokens</a></li>
+				<li><a href="#s2">Context windows</a></li>
+				<li><a href="#s3">Next-token generation and variation</a></li>
+				<li><a href="#s4">Fast mode</a></li>
+				<li><a href="#s5">Thinking and effort</a></li>
+				<li><a href="#s6">Zero-shot, one-shot and multishot</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.1</span>
+				<p><strong>LLM Fundamentals</strong> (5.2% of the exam): "Basic understanding of LLMs (tokens, context windows, sampling, non-determinism, next-token generation), model options (fast mode, extended thinking, adaptive thinking, effort levels), and fundamental prompting techniques (zero-shot, single-shot, multi-shot)."</p>
+			</div>
+			<p>This page explains the concepts. The request fields for thinking and effort are in <a href="d2-skill-2-3.html#s5">skill 2.3</a>, choosing between models is <a href="d5-skill-5-3.html">skill 5.3</a>, and turning tokens into cost is <a href="d5-skill-5-4.html">skill 5.4</a>.</p>
+			<p>Sources: Anthropic's glossary and its documentation on token counting, pricing, context windows, models, versioning, fast mode, thinking, effort and prompting best practices, plus the release notes, checked on 8 November 2026 and paraphrased. A few general explanations of how sampling works are marked as general knowledge. The examples were run against the anthropic 2.6.0 SDK with a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop sorts incoming customer emails into four categories before they reach a person, and wants to know how much text it can send, how predictable the answers are, and whether examples help.</p></div>
+
+			<!-- ===== Tokens ===== -->
+			<h2 id="s1">Tokens</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">The unit models read, write and bill in.</span></p>
+				<p>Anthropic's glossary defines a token as the smallest unit a language model works with: a word, part of a word, a character, or a byte. Text is split into tokens before the model sees it; larger tokens make processing more efficient, smaller ones let the model handle rare words. Everything is measured in tokens: context limits, rate limits and prices.</p>
+				<ul>
+					<li><strong>How much text is a token?</strong> On models before Claude Opus 4.7, roughly 3.5 English characters. Claude Opus 4.7 and later models (including all the Claude 5 models) use a newer tokenizer that produces about <strong>30% more tokens</strong> for the same text; on it, 1M tokens is about 555,000 words, against about 750,000 before. The figure varies by language.</li>
+					<li><strong>Why it matters:</strong> moving a prompt to a newer model can raise its token count, and so its cost, even at the same price per token. The docs say to recount on the model you plan to use rather than reuse old counts.</li>
+					<li><strong>Counting before you send.</strong> The token counting endpoint returns the input token count for a request on a given model. It's free, has its own rate limits, gives an estimate, ignores prompt caching, and can't count requests that use server tools or images and files sent by URL or ID.</li>
+				</ul>
+				<div class="code"><span class="file">count_email.py (Python, anthropic SDK)</span>
+<pre><code>import anthropic
+
+client = anthropic.Anthropic()  <span class="c"># reads ANTHROPIC_API_KEY from the environment</span>
+
+email = "Hi, the sole of my left hiking boot started peeling after two weeks. Can I swap the pair?"
+request = {
+    "system": "You sort customer emails for an outdoor-gear shop.",
+    "messages": [{"role": "user", "content": email}],
+}
+
+<span class="c"># Count before you send. Token counting is free and uses the tokenizer of the model you name.</span>
+for model in ["claude-haiku-5-5", "claude-sonnet-4-6"]:
+    count = client.messages.count_tokens(model=model, **request)
+    print(f"{model}: {count.input_tokens} input tokens")
+
+<span class="c"># Claude Opus 4.7 and later models use a newer tokenizer: about 30% more tokens for the same text.</span></code></pre></div>
+				<p>Claude Sonnet 4.6 is an older model still available on the previous tokenizer, so counting the same request on both shows the difference.</p>
+			</div>
+
+			<!-- ===== Context ===== -->
+			<h2 id="s2">Context windows</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">How much the model can consider at once, and what counts.</span></p>
+				<p>The context window is everything the model can refer to while generating a response, <em>including the response itself</em>: its working memory for that request, not what it learned in training. It holds the system prompt, every message (with tool results, images and documents), the tool definitions, and the output, thinking included. Cached tokens count too; caching changes the price, not the size.</p>
+				<ul>
+					<li><strong>Sizes.</strong> All current models (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) have a 1M-token window by default, at standard prices, except that Haiku 5.5 charges more for prompts over 100,000 tokens. Maximum output is 128,000 tokens per request. Some older models have 200,000.</li>
+					<li><strong>Stateless.</strong> Each turn of a conversation resends the whole history, so the context grows with every exchange; the API doesn't drop old turns for you.</li>
+					<li><strong>Overflow.</strong> If the input alone is too long, the request fails ("prompt is too long"). If the input fits but input plus <code>max_tokens</code> doesn't, newer models accept it and stop with <code>model_context_window_exceeded</code> if they run out of room.</li>
+					<li><strong>Bigger isn't automatically better.</strong> The docs describe context rot: accuracy and recall fall as the token count grows, so what you put in matters as much as how much fits.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Context awareness isn't on every model.</strong> Some older models (Sonnet 5, Sonnet 4.6 and 4.5, Haiku 4.5) are told their remaining token budget automatically through injected tags. The newest models, including Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1, don't get these tags; they use task budgets (a beta) instead.</p></div>
+			</div>
+
+			<!-- ===== Generation and variation ===== -->
+			<h2 id="s3">Next-token generation and variation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">How text is produced, and why answers vary between runs.</span></p>
+				<p>The glossary describes Claude's underlying model as autoregressive: pretrained to predict the next word from the text before it, then fine-tuned (including with reinforcement learning from human feedback) to follow instructions. In general terms, at each step the model produces a probability for every possible next token, one token is <strong>sampled</strong> from those probabilities and added to the text, and the loop repeats until a stop condition such as the end of the turn or <code>max_tokens</code>. That's why responses stream token by token, and why <code>max_tokens</code> can cut an answer mid-sentence.</p>
+				<p><strong>Sampling settings.</strong> Temperature controls how random that choice is: higher gives more varied output, lower sticks to the most likely wording. Top-p and top-k limit which tokens can be chosen at all. Even at temperature 0, the glossary notes, results were never fully deterministic: the same input can give different outputs across calls, on Anthropic's service and on cloud providers alike.</p>
+				<div class="callout retired"><p><strong>Sampling can no longer be tuned.</strong> Since Claude Opus 4.7 (April 2026), sending a non-default <code>temperature</code>, <code>top_p</code> or <code>top_k</code> returns an error, and API version <code>2026-10-21</code> removed the three parameters for every model; the current SDKs don't have them. The migration guide says plainly that no other setting replaces them. Treat sampling as the explanation for why outputs vary, not as a control.</p></div>
+				<p><strong>Designing for variation.</strong> What still makes output consistent: structured outputs with a JSON schema (which guarantees the shape, not identical content), a precisely specified format, examples in the prompt, grounding in retrieved information, validation and retries in code, and evaluating across many runs rather than one. Some teams also run a prompt several times and compare answers to spot unreliable ones. Effort changes how much work Claude does, not how random it is, and a prefilled assistant reply (an old consistency trick) is rejected on Claude 4.6 and later models.</p>
+			</div>
+
+			<!-- ===== Fast mode ===== -->
+			<h2 id="s4">Fast mode</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Paying more for faster output from the same model.</span></p>
+				<p>Fast mode runs the <em>same</em> model on a faster serving setup: up to 2.5 times more output tokens per second, with unchanged quality. It doesn't shorten the time to the first token, so the benefit shows most on long, streamed answers. You turn it on with <code>speed: "fast"</code> on a request, and <code>usage.speed</code> reports which speed was used.</p>
+				<ul>
+					<li><strong>Price and availability:</strong> double the standard rate; on Claude Opus 5.5 (generally available since 15 October 2026), US$8 per million input tokens and US$40 per million output tokens instead of $4 and $20. Older Opus models only had it as a research preview.</li>
+					<li><strong>Limits:</strong> its own rate limits; not available with batches; a fallback to standard speed misses the prompt cache, because the two speeds don't share cached prefixes.</li>
+					<li><strong>Contrast:</strong> fast mode spends more for speed on the same model; a smaller model or lower effort saves money instead.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Thinking ===== -->
+			<h2 id="s5">Thinking and effort</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Reasoning before answering, and how much work to put in.</span></p>
+				<ul>
+					<li><strong>Thinking</strong> lets Claude reason in separate thinking blocks before answering: restating the problem, trying approaches, checking results. It helps with maths, code, analysis and long agent tasks. Thinking tokens are billed as output (even when not shown) and count toward <code>max_tokens</code>.</li>
+					<li><strong>Adaptive thinking</strong> is the current mode: Claude decides for each request whether to think and how much, and may not think at all on a simple question, so don't assume every response starts with a thinking block. It's on by default on the Claude 5 models, and can't be turned off on Opus 5.5 or Fable 5.1.</li>
+					<li><strong>Extended thinking</strong>, a fixed budget set with <code>budget_tokens</code>, is now labelled legacy. It's rejected on Claude 4.7 and later models; replace a budget with an effort level.</li>
+					<li><strong>Effort</strong> (<code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>) guides how much work goes into the whole answer, including text and tool calls, so it works without thinking too. It's guidance, not a cap (<code>max_tokens</code> is the cap). The default is <code>high</code> on most models and <code>medium</code> on Opus 5.5 and Haiku 5.5. Anthropic suggests <code>low</code> for simple, high-volume tasks such as classification.</li>
+				</ul>
+				<p>The exam guide lists extended and adaptive thinking side by side, which matches how the docs use the terms today: "extended thinking" means only the old manual-budget mode. On the newest top models, a prompt asking Claude to write out its reasoning in tags "may be declined"; rely on built-in thinking instead.</p>
+			</div>
+
+			<!-- ===== Shots ===== -->
+			<h2 id="s6">Zero-shot, one-shot and multishot</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Steering output with examples.</span></p>
+				<p>In general usage, a <strong>zero-shot</strong> prompt gives instructions only; a <strong>one-shot</strong> (single-shot) prompt adds one example; a <strong>few-shot</strong> or, in Anthropic's word, <strong>multishot</strong> prompt adds several. Anthropic's prompting guide calls examples one of the most reliable ways to steer format, tone and structure, and gives three rules: make them <strong>relevant</strong> to the real task, <strong>diverse</strong> enough to cover edge cases without creating patterns Claude might copy, and <strong>structured</strong> in <code>&lt;example&gt;</code> tags (inside <code>&lt;examples&gt;</code>). It recommends three to five examples. A single example tends to be copied too literally (its length, wording or label), which is the main weakness of one-shot prompts.</p>
+				<div class="code"><span class="file">classify_email.py (Python, anthropic SDK)</span>
+<pre><code>import anthropic
+
+client = anthropic.Anthropic()
+
+LABELS = "order_status, return_or_exchange, product_question, complaint"
+
+<span class="c"># Zero-shot: instructions only, no examples.</span>
+ZERO_SHOT = f"""Classify the customer email into exactly one of: {LABELS}.
+Reply with the label only."""
+
+<span class="c"># Multishot: the same instructions plus varied examples in &lt;example&gt; tags.</span>
+<span class="c"># The gloves example settles an edge case: an angry email that asks for a refund is a return.</span>
+FEW_SHOT = f"""Classify the customer email into exactly one of: {LABELS}.
+Reply with the label only.
+
+&lt;examples&gt;
+&lt;example&gt;
+&lt;email&gt;Where is my order 10482? The tracking page hasn't changed since Monday.&lt;/email&gt;
+&lt;label&gt;order_status&lt;/label&gt;
+&lt;/example&gt;
+&lt;example&gt;
+&lt;email&gt;These gloves fell apart on the first trip. Poor quality. I want a refund.&lt;/email&gt;
+&lt;label&gt;return_or_exchange&lt;/label&gt;
+&lt;/example&gt;
+&lt;example&gt;
+&lt;email&gt;Is the 45-litre pack's rain cover big enough for a sleeping mat strapped on top?&lt;/email&gt;
+&lt;label&gt;product_question&lt;/label&gt;
+&lt;/example&gt;
+&lt;example&gt;
+&lt;email&gt;Third time I've called about a broken stove and nobody has called me back.&lt;/email&gt;
+&lt;label&gt;complaint&lt;/label&gt;
+&lt;/example&gt;
+&lt;/examples&gt;"""
+
+
+def classify(system_prompt: str, email: str) -&gt; str:
+    response = client.messages.create(
+        model="claude-haiku-5-5",           <span class="c"># fast, low-cost model for high-volume classification</span>
+        max_tokens=1024,
+        output_config={"effort": "low"},    <span class="c"># simple task: less work, faster and cheaper</span>
+        system=system_prompt,
+        messages=[{"role": "user", "content": f"&lt;email&gt;{email}&lt;/email&gt;"}],
+    )
+    <span class="c"># Thinking can be on by default, so pick the text block by type, not by position.</span>
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+
+email = "My boots leak after a month. I want my money back, and I'm not impressed."
+print("zero-shot:", classify(ZERO_SHOT, email))
+print("few-shot: ", classify(FEW_SHOT, email))</code></pre></div>
+				<p>The test email is deliberately ambiguous: angry <em>and</em> asking for a refund. The examples teach the shop's rule that this counts as a return, which a zero-shot prompt leaves to chance. Examples cost input tokens on every request, which prompt caching offsets; and for guaranteed label values, structured outputs with an enum schema are the next step.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Tokens are the unit of limits and prices. Claude 4.7 and later models produce about 30% more tokens for the same text; recount on the target model. Token counting is free and an estimate.</li>
+				<li>The context window includes the output and thinking, tool definitions and cached tokens; 1M tokens on current models, 128,000 output; input too long fails, input plus <code>max_tokens</code> too long may stop with <code>model_context_window_exceeded</code>.</li>
+				<li>Models generate one sampled token at a time, so outputs vary, and were never fully deterministic. Sampling parameters are gone (rejected since Opus 4.7, removed in API 2026-10-21); get consistency from schemas, formats, examples and validation.</li>
+				<li>Fast mode: same model, up to 2.5 times faster output, double the price, Opus 5.5 only, no batches.</li>
+				<li>Adaptive thinking decides per request; extended thinking (<code>budget_tokens</code>) is legacy; effort steers all output and defaults to medium on Opus 5.5 and Haiku 5.5.</li>
+				<li>Zero-shot: no examples; one-shot: one (easily over-copied); multishot: three to five relevant, diverse examples in <code>&lt;example&gt;</code> tags.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-6.html"><small>Previous</small>2.6: Configuration Management</a>
+				<a class="next" href="d5-skill-5-2.html"><small>Next</small>5.2: Technical Fundamentals</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer – Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.0. Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
