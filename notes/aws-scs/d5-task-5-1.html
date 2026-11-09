@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 5.1: Controls for Data in Transit | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 5.1 study guide: ELB security policies including post-quantum and FIPS, HTTPS redirects, ALB mutual TLS and backend encryption, enforcing TLS for S3, AWS APIs, RDS, Aurora, ElastiCache, OpenSearch, MSK and API Gateway, ACM certificate lifetimes, VPC endpoint types, PrivateLink endpoint services and cross-Region PrivateLink, Nitro encryption between instances, VPC Encryption Controls, EMR, EKS, SageMaker AI and ECS Service Connect encryption in transit.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">Task 5.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Data Protection &middot; 18%</span>
+		<h1>Task 5.1: Design and implement controls for data in transit</h1>
+		<p>Making sure data is encrypted while it moves: TLS required at every listener and endpoint with modern policies, private paths that never touch the internet, and encryption between the instances, containers and nodes inside a cluster.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">ELB</span><span class="tag">TLS</span><span class="tag">ACM</span><span class="tag">PrivateLink</span><span class="tag">Nitro</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Requiring encryption on connections</a></li>
+				<li><a href="#s2">Secure and private access</a></li>
+				<li><a href="#s3">Encryption between resources</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.1</span>
+				<p><strong>Design and implement controls for data in transit.</strong></p>
+			</div>
+			<p>Domain 5 is 18% of the exam. In-transit questions usually turn on a default that isn't what you'd expect (a listener created from the CLI accepting TLS 1.0, a load balancer that doesn't check the target's certificate, a Direct Connect link that isn't encrypted), or on choosing between TLS at the application and encryption the network provides. Encrypting links to on premises (VPN, MACsec) is in <a href="d3-task-3-3.html#s2">Task 3.3</a>; CloudFront viewer TLS and mutual TLS in <a href="d3-task-3-1.html#s2">Task 3.1</a>; private certificate authorities in Task 5.3.</p>
+			<p><strong>Running example.</strong> The same company. The web application and APIs run behind CloudFront, an Application Load Balancer and API Gateway; data sits in Aurora MySQL, RDS for PostgreSQL, ElastiCache for Valkey, OpenSearch and MSK; the analytics team runs EMR and SageMaker AI training jobs; containers run on EKS and on ECS with Service Connect; and a payments partner offers its API to the company through PrivateLink.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>5.1.1</td><td data-label="What you need to be able to do">Require encryption on connections: load balancer security policies and TLS settings for each service</td></tr>
+						<tr><td>5.1.2</td><td data-label="What you need to be able to do">Give private access to services with VPC endpoints and PrivateLink (and Client VPN, Verified Access)</td></tr>
+						<tr><td>5.1.3</td><td data-label="What you need to be able to do">Encrypt traffic between instances, nodes and containers</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout retired"><p><strong>Status changes.</strong> <strong>AWS App Mesh</strong> reached end of support on 30 September 2026; its console and resources are no longer accessible, so service mesh answers now point to ECS Service Connect, VPC Lattice or open-source meshes on EKS. All AWS API endpoints require at least <strong>TLS 1.2</strong> (since February 2024) and support TLS 1.3 (since June 2024). The RDS <code>rds-ca-2019</code> certificate authority expired in August 2024.</p></div>
+
+			<!-- Skill 5.1.1 -->
+			<h2 id="s1">Requiring encryption on connections</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1.1</span><span class="skill-text">Design and configure mechanisms to require encryption when connecting to resources (for example, by configuring Elastic Load Balancing [ELB] security policies, by enforcing TLS configurations).</span></p>
+
+				<h3>Load balancer security policies</h3>
+				<div class="entry">
+					<h4>Choosing the policy</h4>
+					<p>An ALB HTTPS listener or NLB TLS listener uses a predefined <strong>security policy</strong> for TLS versions and ciphers. Names describe them: <code>TLS13-1-2</code> supports TLS 1.3 with a minimum of 1.2, <code>TLS13-1-3</code> is TLS 1.3 only, <code>Res</code> means a restricted cipher set, <code>FIPS</code> uses FIPS-validated cryptography, and <code>PQ</code> (2025-09) adds <strong>hybrid post-quantum key exchange</strong> (ML-KEM) for clients that support it while staying compatible with others. AWS now recommends <code>ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09</code> (or its FIPS variant). ALBs don't accept custom policies; Classic Load Balancers do.</p>
+				</div>
+				<div class="callout trap"><p>The default policy depends on <strong>how the listener is created</strong>. The console uses the PQ TLS 1.3 policy, but the <strong>CLI, CloudFormation and CDK use <code>ELBSecurityPolicy-2016-08</code></strong>, which still allows TLS 1.0 and 1.1. Always set the policy in infrastructure as code. Also note that the long-recommended <code>ELBSecurityPolicy-TLS13-1-2-2021-06</code> no longer passes Security Hub CSPM control ELB.17.</p></div>
+				<span class="file">An HTTPS listener with the post-quantum policy, and port 80 redirecting to it (AWS CLI)</span>
+<pre><code>aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/shop-web/50dc6c495c0c9188 \
+  --protocol HTTPS --port 443 \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09 \
+  --certificates CertificateArn=arn:aws:acm:us-east-1:111111111111:certificate/12345678-1234-1234-1234-123456789012 \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:us-east-1:111111111111:targetgroup/shop-web/73e2d6bc24d8a067
+
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/shop-web/50dc6c495c0c9188 \
+  --protocol HTTP --port 80 \
+  --default-actions '[{"Type": "redirect", "RedirectConfig": {"Protocol": "HTTPS", "Port": "443", "Host": "#{host}", "Path": "/#{path}", "Query": "#{query}", "StatusCode": "HTTP_301"}}]'</code></pre>
+				<p>To stop teams creating weak listeners, IAM and SCP conditions can test <code>elasticloadbalancing:ListenerProtocol</code> (HTTPS, TLS) and <code>elasticloadbalancing:SecurityPolicy</code> on <code>CreateListener</code> and <code>ModifyListener</code>. Security Hub CSPM controls ELB.1 (HTTP redirects to HTTPS), ELB.17 (recommended policies), ELB.18 (encrypted listeners), ELB.21 (encrypted health checks) and ELB.22 (encrypted target groups) cover ALBs and NLBs; ELB.2, ELB.3 and ELB.8 are for Classic Load Balancers.</p>
+
+				<div class="entry">
+					<h4>Behind the listener</h4>
+					<ul>
+						<li><strong>Re-encryption:</strong> HTTPS or TLS target groups encrypt from the load balancer to targets. The load balancer <strong>doesn't validate target certificates</strong> (self-signed or expired ones work), and you can't choose the backend policy; it's derived from the listener policies. CloudFront, by contrast, <strong>does</strong> validate origin certificates and returns 502 for a self-signed or expired one.</li>
+						<li><strong>End-to-end TLS:</strong> an ALB always terminates TLS. If the target itself must decrypt (or do client-certificate checks itself), use an NLB with a <strong>TCP listener on 443</strong>, which passes TLS through untouched.</li>
+						<li><strong>Mutual TLS on ALB:</strong> in <strong>verify</strong> mode the ALB checks client certificates against a <strong>trust store</strong> (CA bundle and optional CRLs from S3, from AWS Private CA or another CA); in <strong>passthrough</strong> mode it forwards the certificate chain to targets in the <code>X-Amzn-Mtls-Clientcert</code> header for them to verify. NLB doesn't do mutual TLS.</li>
+					</ul>
+					<span class="file">Require partner client certificates on the API listener (AWS CLI)</span>
+<pre><code>aws elbv2 create-trust-store --name partner-cas \
+  --ca-certificates-bundle-s3-bucket shop-pki-111111111111 \
+  --ca-certificates-bundle-s3-key trust/partner-ca-bundle.pem
+
+aws elbv2 modify-listener \
+  --listener-arn arn:aws:elasticloadbalancing:us-east-1:111111111111:listener/app/shop-api/50dc6c495c0c9188/f2f7dc8efc522ab2 \
+  --mutual-authentication "Mode=verify,TrustStoreArn=arn:aws:elasticloadbalancing:us-east-1:111111111111:truststore/partner-cas/73e2d6bc24d8a067"</code></pre>
+				</div>
+
+				<h3>Requiring TLS service by service</h3>
+				<div class="entry">
+					<h4>S3 and other resource policies</h4>
+					<p>S3 accepts HTTP unless a bucket policy denies it. Deny requests where <code>aws:SecureTransport</code> is false (Security Hub CSPM control S3.5), and optionally require a minimum version with <code>s3:TlsVersion</code>, a <strong>numeric</strong> key. Because AWS services calling S3 on your behalf don't carry this network context, AWS recommends excluding them with <code>aws:PrincipalIsAWSService</code>:</p>
+					<span class="file">TLS only, version 1.2 or later, for callers other than AWS services (S3 bucket policy, JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::shop-data-111111111111", "arn:aws:s3:::shop-data-111111111111/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false", "aws:PrincipalIsAWSService": "false" } }
+    },
+    {
+      "Sid": "DenyOldTls",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::shop-data-111111111111", "arn:aws:s3:::shop-data-111111111111/*"],
+      "Condition": {
+        "NumericLessThan": { "s3:TlsVersion": "1.2" },
+        "Bool": { "aws:PrincipalIsAWSService": "false" }
+      }
+    }
+  ]
+}</code></pre>
+					<p>SNS topic and SQS queue policies use the same <code>aws:SecureTransport</code> deny pattern; encrypting a topic or queue with KMS protects data at rest and doesn't reject HTTP. S3 website endpoints don't support HTTPS at all; put CloudFront in front.</p>
+				</div>
+				<div class="entry">
+					<h4>Databases and caches</h4>
+					<ul>
+						<li><strong>RDS for PostgreSQL:</strong> <code>rds.force_ssl</code> (default on for PostgreSQL 15 and later). <strong>RDS for MySQL:</strong> <code>require_secure_transport</code>, no reboot. <strong>Aurora MySQL:</strong> <code>require_secure_transport</code> is a <strong>cluster</strong> parameter (on by default from 8.4). <strong>RDS for SQL Server:</strong> <code>rds.force_ssl</code> is static, so it needs a reboot. <strong>DocumentDB:</strong> the <code>tls</code> parameter is on by default and static. <strong>Redshift:</strong> <code>require_ssl</code>. Neptune accepts only TLS.</li>
+						<li><strong>RDS certificates:</strong> the default CA is now <code>rds-ca-rsa2048-g1</code> (with RSA 4096 and ECC 384 options); move instances with <code>aws rds modify-db-instance --ca-certificate-identifier rds-ca-rsa2048-g1</code>, and have clients trust the RDS root bundle and verify the hostname (for PostgreSQL, <code>sslmode=verify-full</code>).</li>
+						<li><strong>ElastiCache (Valkey, Redis OSS):</strong> in-transit encryption encrypts client and node-to-node traffic. On an existing replication group, switch <code>--transit-encryption-mode</code> to <code>preferred</code>, move clients to TLS, then to <code>required</code>. Memcached TLS can only be set at creation. TLS 1.2 has been the minimum since April 2026; ElastiCache doesn't do mutual TLS.</li>
+						<li><strong>OpenSearch:</strong> <code>EnforceHTTPS</code> with a TLS policy such as <code>Policy-Min-TLS-1-2-PFS-2023-10</code>, and <strong>node-to-node encryption</strong>, which is required for fine-grained access control and can't be turned off once on.</li>
+						<li><strong>MSK:</strong> client-broker encryption (TLS only by default) and in-cluster encryption between brokers (on by default, set at creation), and since 2026 TLS security policies such as <code>MSK-TLSv1.3-2026</code>.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>API Gateway</h4>
+					<p>REST APIs choose a security policy, and the defaults are weak: Regional and edge-optimized REST APIs default to <code>TLS_1_0</code> (private APIs and custom domains to <code>TLS_1_2</code>). The newer enhanced policies (<code>SecurityPolicy_TLS13_1_3_2025_09</code>, PQ and FIPS variants) require an <strong>endpoint access mode</strong>; <code>STRICT</code> also rejects requests arriving through the wrong endpoint type or with mismatched host names. HTTP and WebSocket APIs are fixed at TLS 1.2.</p>
+					<span class="file">TLS 1.3 only, and strict endpoint access, for the orders API (AWS CLI)</span>
+<pre><code>aws apigateway update-rest-api --rest-api-id a1b2c3d4e5 \
+  --patch-operations '[{"op": "replace", "path": "/securityPolicy", "value": "SecurityPolicy_TLS13_1_3_2025_09"},
+                       {"op": "replace", "path": "/endpointAccessMode", "value": "STRICT"}]'</code></pre>
+					<p>AWS suggests BASIC first, checking access logs (<code>$context.tlsVersion</code>), then STRICT.</p>
+				</div>
+
+				<h3>Certificates</h3>
+				<div class="entry">
+					<h4>AWS Certificate Manager</h4>
+					<p>ACM issues public certificates for ELB, CloudFront, API Gateway and other integrated services, with DNS validation and <strong>managed renewal</strong> (the private key never leaves AWS). Public certificates are now valid for <strong>198 days</strong>, following the CA/Browser Forum schedule (shorter again from March 2027), and ACM renews them 45 days before expiry if they're in use and the validation CNAME records still exist. Imported certificates are never renewed by ACM; watch their expiry with the ACM certificate expiration events. <strong>Exportable</strong> public certificates (with their private key, for EC2, containers or on premises) are a paid option, and ACM now also supports ACME-based issuance, but those certificates can't be attached to ELB, CloudFront or API Gateway. Internal certificates come from AWS Private CA (Task 5.3).</p>
+				</div>
+				<div class="callout tip"><p>"Encrypt end to end, including from the load balancer to the instances" points to an <strong>HTTPS target group</strong> (or NLB TCP passthrough). "Clients must present a certificate" points to <strong>ALB mutual TLS in verify mode</strong>. "Make sure no listener allows TLS 1.0" points to <strong>a modern security policy set explicitly</strong> plus an SCP condition and Security Hub ELB.17.</p></div>
+			</div>
+
+			<!-- Skill 5.1.2 -->
+			<h2 id="s2">Secure and private access</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1.2</span><span class="skill-text">Design and configure mechanisms for secure and private access to resources (for example, AWS PrivateLink, VPC endpoints, AWS Client VPN, AWS Verified Access).</span></p>
+
+				<h3>VPC endpoint types</h3>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>Gateway endpoint</th><th>Interface endpoint</th><th>Resource endpoint</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Reaches</th></tr>
+							<tr><td data-label="Gateway endpoint">S3 and DynamoDB only</td><td data-label="Interface endpoint">AWS services, partner and your own endpoint services (PrivateLink)</td><td data-label="Resource endpoint">A specific shared resource (database, instance, IP or DNS name) without a load balancer</td></tr>
+							<tr class="group"><th colspan="3">How</th></tr>
+							<tr><td data-label="Gateway endpoint">Route table entry to a prefix list; service keeps its public IPs</td><td data-label="Interface endpoint">Network interfaces with private IPs in your subnets, security groups, private DNS</td><td data-label="Resource endpoint">Resource configuration behind a resource gateway, shared through AWS RAM</td></tr>
+							<tr class="group"><th colspan="3">From on premises or other Regions</th></tr>
+							<tr><td data-label="Gateway endpoint">No</td><td data-label="Interface endpoint">Yes, over VPN or Direct Connect, and cross-Region for supported services</td><td data-label="Resource endpoint">Endpoint side in the VPC only; TCP only</td></tr>
+							<tr class="group"><th colspan="3">Cost</th></tr>
+							<tr><td data-label="Gateway endpoint">Free</td><td data-label="Interface endpoint">Hourly per AZ plus per GB</td><td data-label="Resource endpoint">PrivateLink charges plus resource gateway data</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Other types: <strong>Gateway Load Balancer</strong> endpoints (inspection appliances), <strong>service network</strong> endpoints (all services in a VPC Lattice service network through one endpoint) and newer <strong>tunnel</strong> endpoints. Every endpoint can carry an <strong>endpoint policy</strong>, which by default allows everything; the organization data perimeter version is in <a href="d3-task-3-3.html#s4">Task 3.3</a>.</p>
+				<div class="entry">
+					<h4>DNS for interface endpoints</h4>
+					<p>With <strong>private DNS</strong> enabled (the VPC needs DNS hostnames and DNS support), the service's normal name, such as <code>kms.us-east-1.amazonaws.com</code>, resolves to the endpoint's private IPs, so SDKs need no changes. On-premises clients can't use the VPC resolver directly; they need <strong>Route 53 Resolver inbound endpoints</strong> and forwarding rules. Deploy endpoints in at least two Availability Zones.</p>
+				</div>
+				<div class="entry">
+					<h4>S3: gateway and interface together</h4>
+					<p>A gateway endpoint is free but only serves the VPC; on-premises servers need an S3 interface endpoint. With both, the interface endpoint's <strong>private DNS only for inbound endpoints</strong> option keeps VPC traffic on the free gateway endpoint and sends only traffic arriving through the inbound Resolver endpoint to the interface endpoint:</p>
+					<span class="file">S3 interface endpoint for the warehouses, while VPC traffic keeps using the gateway endpoint (AWS CLI)</span>
+<pre><code>aws ec2 create-vpc-endpoint --region us-east-1 \
+  --vpc-id vpc-0shop1234567890ab \
+  --vpc-endpoint-type Interface \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --subnet-ids subnet-0app1a234567890ab subnet-0app1b234567890ab \
+  --security-group-ids sg-0s3endpoint123456 \
+  --private-dns-enabled \
+  --dns-options PrivateDnsOnlyForInboundResolverEndpoint=true</code></pre>
+				</div>
+				<div class="callout trap"><p>S3 <strong>interface endpoints support only TLS 1.2</strong>: no TLS 1.3 and no post-quantum TLS. A requirement for TLS 1.3 to S3 can't be met through an interface endpoint. Gateway endpoints can't be reached from on premises or another Region at all.</p></div>
+
+				<h3>PrivateLink for your own services</h3>
+				<div class="entry">
+					<h4>Endpoint services</h4>
+					<p>The payments partner exposes its API as an <strong>endpoint service</strong> in front of a Network Load Balancer (or a Gateway Load Balancer for appliances). Nobody can connect until the provider adds <strong>allowed principals</strong> (accounts, roles or users; <code>*</code> with automatic acceptance would make it effectively public), and with <strong>acceptance required</strong> the provider approves each endpoint connection. Traffic flows only from consumer to provider; the provider can't open connections into the consumer's VPC. A private DNS name for the service requires the provider to prove ownership of the domain with a TXT record. The provider sees the NLB's addresses as the source unless Proxy Protocol v2 is enabled.</p>
+				</div>
+				<div class="entry">
+					<h4>Cross-Region PrivateLink</h4>
+					<p>Interface endpoints can now reach endpoint services, and a set of AWS services (S3, IAM, KMS, ECR, ECS, Lambda, Data Firehose, Managed Service for Apache Flink and Route 53), in <strong>another Region</strong>. The caller needs the permission-only action <code>vpce:AllowMultiRegion</code>, allowed in both IAM and SCPs, and the condition keys <code>ec2:VpceServiceRegion</code> and <code>ec2:VpceSupportedRegion</code> restrict which Regions are allowed, which is how data residency rules are enforced. Only Regional DNS names work across Regions, and PrivateLink doesn't fail over between Regions.</p>
+					<span class="file">An endpoint in us-east-1 for S3 in us-west-2 (AWS CLI)</span>
+<pre><code>aws ec2 create-vpc-endpoint --region us-east-1 \
+  --vpc-id vpc-0shop1234567890ab \
+  --vpc-endpoint-type Interface \
+  --service-name com.amazonaws.us-west-2.s3 \
+  --service-region us-west-2 \
+  --subnet-ids subnet-0app1a234567890ab subnet-0app1b234567890ab</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Users: Client VPN and Verified Access</h4>
+					<p>For people rather than workloads, <strong>Client VPN</strong> gives TLS-encrypted network access to VPC ranges, and <strong>Verified Access</strong> gives per-application access over HTTPS (or TCP through its client) checked against identity and device posture, both covered with their policies in <a href="d3-task-3-3.html#s3">Task 3.3</a>. Either way the traffic is encrypted and no application is exposed to the internet.</p>
+				</div>
+				<div class="callout tip"><p>"On-premises servers must reach S3 privately over Direct Connect" points to an <strong>S3 interface endpoint</strong> (not a gateway endpoint) with inbound Resolver DNS. "Offer our service to customer VPCs without peering or exposing our network" points to a <strong>PrivateLink endpoint service</strong>. "Private access to one database in another account without a load balancer" points to a <strong>resource endpoint</strong>.</p></div>
+			</div>
+
+			<!-- Skill 5.1.3 -->
+			<h2 id="s3">Encryption between resources</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1.3</span><span class="skill-text">Design and configure inter-resource encryption in transit (for example, inter-node encryption configurations for Amazon EMR, Amazon EKS, SageMaker AI, Nitro encryption).</span></p>
+
+				<h3>What AWS encrypts for you</h3>
+				<div class="entry">
+					<h4>The network and Nitro</h4>
+					<p>AWS encrypts traffic between Availability Zones and across Regions at the physical layer, and cross-Region peering and Transit Gateway peering traffic when it leaves a Region. Between instances, many current instance types use the <strong>Nitro</strong> system to encrypt traffic automatically (256-bit AEAD, no performance cost), but only when <strong>all three</strong> conditions hold:</p>
+					<ul>
+						<li>both instances are supported types (for example M6i, C7g, R8g, the "n" variants such as M5n and C5n; not older M5, C5 or T3);</li>
+						<li>they're in the same Region;</li>
+						<li>they're in the same VPC or peered VPCs, and the traffic doesn't pass through a load balancer, transit gateway or similar device.</li>
+					</ul>
+					<span class="file">Which instance types encrypt traffic between instances automatically (AWS CLI)</span>
+<pre><code>aws ec2 describe-instance-types \
+  --filters Name=network-info.encryption-in-transit-supported,Values=true \
+  --query "InstanceTypes[*].InstanceType" --output text</code></pre>
+					<p><strong>VPC Encryption Controls</strong> (<a href="d1-task-1-2.html#s6">Task 1.2</a> shows the flow log field) turns this into a guarantee: monitor mode reports unencrypted flows, and enforce mode blocks resources that can't encrypt. In enforce mode an NLB can't offload TLS on a TLS listener, and Gateway Load Balancer and Network Firewall aren't supported in the VPC.</p>
+				</div>
+				<div class="callout trap"><p>Nitro encryption <strong>stops at a load balancer or transit gateway</strong>. Two supported instances talking through an internal ALB or across a transit gateway aren't covered, so a requirement to encrypt all traffic between tiers still needs TLS on that hop.</p></div>
+
+				<h3>Cluster services</h3>
+				<div class="entry">
+					<h4>Amazon EMR</h4>
+					<p>An EMR <strong>security configuration</strong> turns on the open-source TLS features of the cluster's applications (the list varies by release) using certificates from one of three providers: <code>EMR</code> (EMR creates and manages the certificates, storing the CA in Secrets Manager), <code>PEM</code> (a zip in S3) or <code>Custom</code> (your own provider class). EMRFS traffic to S3 always uses TLS; Security Hub CSPM control EMR.4 checks in-transit encryption.</p>
+					<span class="file">In-transit encryption with certificates from S3 (EMR security configuration, AWS CLI)</span>
+<pre><code>aws emr create-security-configuration --name analytics-tls --security-configuration '{
+  "EncryptionConfiguration": {
+    "EnableInTransitEncryption": true,
+    "EnableAtRestEncryption": false,
+    "InTransitEncryptionConfiguration": {
+      "TLSCertificateConfiguration": {
+        "CertificateProviderType": "PEM",
+        "S3Object": "s3://shop-pki-111111111111/emr/analytics-certs.zip"
+      }
+    }
+  }
+}'</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Amazon EKS</h4>
+					<p>AWS's EKS best practices list four ways to encrypt pod traffic: Nitro instances (same limits as above), TLS at ingress and load balancers (AWS Load Balancer Controller annotations), a <strong>service mesh</strong> with mutual TLS (Istio or Linkerd; App Mesh has reached end of support), and <strong>cert-manager with AWS Private CA</strong> to issue short-lived certificates to pods. End-to-end encryption means the pod terminates TLS. Network policies control flows but don't encrypt.</p>
+				</div>
+				<div class="entry">
+					<h4>SageMaker AI</h4>
+					<p>Distributed training jobs exchange model weights between instances. <strong>Inter-container traffic encryption</strong> (<code>EnableInterContainerTrafficEncryption</code> on training and tuning jobs) protects them with IPsec, so the job's security group must allow UDP 500 and ESP (protocol 50) from itself; it can make distributed training slower and more expensive, and does nothing for single-instance jobs. <strong>Network isolation</strong> (<code>EnableNetworkIsolation</code>) is a separate control: the container can't make any outbound call, not even to S3.</p>
+				</div>
+				<div class="entry">
+					<h4>ECS Service Connect, VPC Lattice and data services</h4>
+					<ul>
+						<li><strong>ECS Service Connect TLS</strong> encrypts service-to-service traffic with certificates ECS issues from an AWS Private CA (tagged <code>AmazonECSManaged: true</code>), TLS 1.3 only, rotated every 5 days by default; the private keys are stored as Secrets Manager secrets prefixed <code>ecs-sc!</code>, which other roles shouldn't be able to read. It's the AWS migration path from App Mesh.</li>
+						<li><strong>VPC Lattice</strong> HTTPS listeners terminate TLS 1.2 or 1.3 and can re-encrypt to HTTPS target groups; TLS listeners pass TLS through to the target.</li>
+						<li><strong>Node-to-node</strong>: OpenSearch node-to-node encryption, ElastiCache in-transit encryption and MSK in-cluster encryption cover traffic inside those clusters. Amazon MQ for RabbitMQ doesn't encrypt traffic between cluster nodes with TLS.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"Encrypt traffic between training instances" points to <strong>inter-container traffic encryption</strong> (with UDP 500 and ESP allowed). "Encrypt service-to-service traffic for ECS services with managed certificates" points to <strong>Service Connect TLS</strong>. "Encrypt pod-to-pod traffic on EKS with mutual TLS" points to a <strong>service mesh</strong> or cert-manager with Private CA.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>ELB policies: <code>TLS13-1-2-Res-PQ-2025-09</code> is AWS's recommendation; console defaults to it, but CLI, CloudFormation and CDK default to <code>2016-08</code>; <code>TLS13-1-2-2021-06</code> fails ELB.17. Enforce with <code>elasticloadbalancing:SecurityPolicy</code> conditions.</li>
+				<li>Load balancers don't validate target certificates; CloudFront validates origin certificates. NLB TCP passthrough for end-to-end TLS; ALB mutual TLS in verify (trust store) or passthrough mode; NLB has no mutual TLS.</li>
+				<li>S3: deny <code>aws:SecureTransport</code> false and <code>s3:TlsVersion</code> below 1.2 (numeric), excluding AWS service principals. Database parameters: <code>rds.force_ssl</code>, <code>require_secure_transport</code> (cluster-level on Aurora), DocumentDB <code>tls</code>, Redshift <code>require_ssl</code>; RDS CA now <code>rds-ca-rsa2048-g1</code>.</li>
+				<li>ElastiCache preferred then required (Memcached only at creation); OpenSearch HTTPS plus node-to-node (irreversible); MSK TLS policies; API Gateway REST defaults to TLS 1.0, enhanced policies need an endpoint access mode.</li>
+				<li>ACM public certificates last 198 days and renew 45 days ahead if in use and validated by DNS; imported ones don't renew; exportable and ACME certificates are separate options.</li>
+				<li>Endpoints: gateway (S3, DynamoDB, free, VPC only), interface (PrivateLink, private DNS, on premises via inbound Resolver, cross-Region with <code>vpce:AllowMultiRegion</code>), resource endpoints for single resources; S3 interface endpoints are TLS 1.2 only.</li>
+				<li>Endpoint services: NLB or GWLB, allowed principals, acceptance, verified private DNS, consumer-to-provider only.</li>
+				<li>Between resources: Nitro encryption only for supported types in the same or peered VPC with no load balancer or transit gateway; VPC Encryption Controls to enforce; EMR security configurations; EKS mesh or Private CA certificates; SageMaker inter-container encryption (UDP 500, ESP); ECS Service Connect TLS; App Mesh is gone.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-2.html"><small>Previous</small>Task 4.2: Authorization strategies</a>
+				<a class="next" href="d5-task-5-2.html"><small>Next</small>Task 5.2: Data at rest</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
