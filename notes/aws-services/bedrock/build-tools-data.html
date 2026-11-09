@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Bedrock Prompts, Flows, Data Automation and Marketplace | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock Prompt management and prompt optimization, Flows (nodes, definitions, versions, aliases and InvokeFlow), Bedrock Data Automation (projects, blueprints, profiles, async and sync calls, pricing) and Bedrock Marketplace endpoints, with notes on Bedrock in SageMaker Unified Studio, session management APIs and Agents Classic.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Prompts, Flows, Data Automation and Marketplace</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Building blocks &middot; Last checked 10 November 2026</span>
+		<h1>Prompts, Flows, Data Automation and Marketplace</h1>
+		<p>The remaining building blocks: versioned prompts your applications call by ARN, prompt optimization, fixed workflows of prompts, retrieval and Lambda steps, structured extraction from documents, images, audio and video, and specialized models on your own endpoints.</p>
+		<div class="tags"><span class="tag code">Prompt management</span><span class="tag">Flows</span><span class="tag">Data Automation</span><span class="tag">Marketplace</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Prompt management</a></li>
+				<li><a href="#s2">Prompt optimization</a></li>
+				<li><a href="#s3">Flows</a></li>
+				<li><a href="#s4">Bedrock Data Automation</a></li>
+				<li><a href="#s5">Bedrock Marketplace</a></li>
+				<li><a href="#s6">Other notes</a></li>
+				<li><a href="#s7">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Prompt management</h2>
+			<p>Prompt management (generally available November 2024) stores prompt templates with <code>{{variable}}</code> placeholders, the model and inference settings, and immutable <strong>versions</strong>, so prompts can change without redeploying code and every call is traceable to a version. It runs in 22 Regions, with no separate charge listed: you pay for the model calls.</p>
+			<span class="file">Create a chat prompt, version it, and call it by ARN (Python, boto3)</span>
+<pre><code>import boto3
+
+agent = boto3.client("bedrock-agent", region_name="us-east-1")
+runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+p = agent.create_prompt(
+    name="SupportReply",
+    defaultVariant="v1",
+    variants=[{
+        "name": "v1",
+        "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "templateType": "CHAT",
+        "templateConfiguration": {"chat": {
+            "system": [{"text": "You are a concise support agent for {{product}}."}],
+            "messages": [{"role": "user", "content": [{"text": "Customer question: {{question}}"}]}],
+            "inputVariables": [{"name": "product"}, {"name": "question"}],
+        }},
+        "inferenceConfiguration": {"text": {"maxTokens": 400, "temperature": 0.2}},
+    }],
+)
+<span class="c"># Version 1 is immutable: the application pins this ARN</span>
+prompt_arn = agent.create_prompt_version(promptIdentifier=p["id"], description="first release")["arn"]
+
+resp = runtime.converse(
+    modelId=prompt_arn,
+    promptVariables={"product": {"text": "Home Router X"}, "question": {"text": "How do I reset it?"}},
+)
+print(resp["output"]["message"]["content"][0]["text"])</code></pre>
+			<ul>
+				<li>With a prompt ARN as <code>modelId</code>, you <strong>can't</strong> send <code>system</code>, <code>inferenceConfig</code>, <code>toolConfig</code> or <code>additionalModelRequestFields</code> (define them in the prompt), and any messages you send are appended after the template's. Guardrails apply to the whole prompt.</li>
+				<li>Callers need <code>bedrock:RenderPrompt</code> on the prompt as well as <code>bedrock:InvokeModel</code>; RenderPrompt is logged as a CloudTrail data event (<code>AWS::Bedrock::Prompt</code>), off by default.</li>
+				<li>Use the <strong>version</strong> ARN (<code>prompt/ID:N</code>) in production; the DRAFT keeps changing. Up to 10 versions per prompt (not adjustable) and 500 prompts per account. The API takes one variant per prompt (the console compares up to three); prompt caching needs the <code>CHAT</code> template type. With InvokeModel, managed prompts work only for Claude and Llama models: prefer Converse.</li>
+			</ul>
+
+			<h2 id="s2">Prompt optimization</h2>
+			<ul>
+				<li><strong>Simple optimization</strong> (<code>OptimizePrompt</code>, generally available April 2025): rewrites one short prompt for one target model, with no evaluation data; $0.03 per 1,000 tokens. Its supported-model list is old, so check your model.</li>
+				<li><strong>Advanced Prompt Optimization</strong> (14 May 2026): an asynchronous job (<code>create_advanced_prompt_optimization_job</code> on the <code>bedrock</code> client) that rewrites up to 10 templates using up to 100 evaluation samples each, scores the results with your criteria, an LLM judge rubric or a Lambda, and compares up to 5 models, including latency, so you can also <strong>migrate</strong> a prompt to a new model. Mark parts to change or keep with <code>&lt;advpo:optimize&gt;</code> and <code>&lt;advpo:exclude&gt;</code> tags.</li>
+				<li>Since October 2026 it can <strong>shorten</strong> prompts (set <code>optimizationConfig.shortenPrompt</code> per template in the input file; if the shorter prompt doesn't score at least as well you get the original back, with <code>compressionRatio</code> 1.0) and accepts application inference profiles.</li>
+				<li>There's no service fee, but it runs many model calls (the default optimizer is Claude Sonnet 4.6) billed at on-demand prices: estimate with the formulas on the pricing page. Up to 20 active jobs per Region, in 14 Regions.</li>
+			</ul>
+
+			<h2 id="s3">Flows</h2>
+			<p><strong>Amazon Bedrock Flows</strong> (generally available November 2024) is a fixed workflow of steps you design visually or as JSON: <strong>nodes</strong> joined by data and conditional <strong>connections</strong>, with versions and aliases. Use it when the steps are known in advance; when the model should decide the steps, use an <a href="agentcore.html">AgentCore agent</a>; for long-running orchestration with retries and human approval, consider AWS Step Functions. It costs $0.035 per 1,000 node transitions plus the services the nodes call.</p>
+			<div class="entry">
+				<h4>Nodes</h4>
+				<ul>
+					<li><strong>Input</strong> (exactly one; output <code>document</code>) and <strong>Output</strong> (input <code>document</code>; up to 20).</li>
+					<li><strong>Prompt</strong>: a managed prompt by ARN or an inline template; one input per variable, output <code>modelCompletion</code>; optional guardrail.</li>
+					<li><strong>Knowledge base</strong>: without a model it returns retrieval results; with a model it generates an answer (guardrails only then). <strong>Lambda</strong>, <strong>Lex</strong> (single utterance), <strong>S3 storage</strong> and <strong>S3 retrieval</strong> (UTF-8 text).</li>
+					<li><strong>Condition</strong> (conditions checked in order, first true wins), <strong>Iterator</strong> and <strong>Collector</strong> (one each; items run one at a time), and a <strong>loop</strong> node (the API models it as <code>Loop</code>, <code>LoopInput</code> and <code>LoopController</code> with up to 1,000 iterations).</li>
+					<li><strong>Inline code</strong> (preview; Python 3.12, no internet) and <strong>Agent</strong> (needs an Agents Classic agent, so unavailable to new accounts).</li>
+				</ul>
+				<p>Inputs pick data with a JSONPath-style expression rooted at <code>$.data</code> (for example <code>$.data.topic</code>). Limits: 40 nodes, 5 condition nodes of 5 conditions, 10 versions and 10 aliases per flow.</p>
+			</div>
+			<span class="file">A three-node flow (input, managed prompt, output), released through an alias and invoked (Python, boto3)</span>
+<pre><code>agent = boto3.client("bedrock-agent", region_name="us-east-1")
+rt = boto3.client("bedrock-agent-runtime", region_name="us-east-1")
+
+nodes = [
+    {"type": "Input", "name": "FlowInput", "outputs": [{"name": "document", "type": "Object"}]},
+    {"type": "Prompt", "name": "Summarize",
+     "configuration": {"prompt": {"sourceConfiguration": {"resource": {"promptArn": SUMMARY_PROMPT_ARN}}}},
+     <span class="c"># Input name = the prompt's variable name</span>
+     "inputs": [{"name": "topic", "type": "String", "expression": "$.data.topic"}],
+     "outputs": [{"name": "modelCompletion", "type": "String"}]},
+    {"type": "Output", "name": "FlowOutput",
+     "inputs": [{"name": "document", "type": "String", "expression": "$.data"}]},
+]
+connections = [
+    {"name": "InToSummarize", "source": "FlowInput", "target": "Summarize", "type": "Data",
+     "configuration": {"data": {"sourceOutput": "document", "targetInput": "topic"}}},
+    {"name": "SummarizeToOut", "source": "Summarize", "target": "FlowOutput", "type": "Data",
+     "configuration": {"data": {"sourceOutput": "modelCompletion", "targetInput": "document"}}},
+]
+flow = agent.create_flow(name="Summarizer", executionRoleArn="arn:aws:iam::111111111111:role/FlowsRole",
+                         definition={"nodes": nodes, "connections": connections})
+<span class="c"># Apply the DRAFT, freeze a version, and point an alias at it</span>
+agent.prepare_flow(flowIdentifier=flow["id"])
+version = agent.create_flow_version(flowIdentifier=flow["id"])["version"]
+alias = agent.create_flow_alias(flowIdentifier=flow["id"], name="prod", routingConfiguration=[{"flowVersion": version}])
+
+resp = rt.invoke_flow(
+    flowIdentifier=flow["id"],
+    flowAliasIdentifier=alias["id"],
+    inputs=[{"content": {"document": {"topic": "S3 storage classes"}}, "nodeName": "FlowInput", "nodeOutputName": "document"}],
+)
+for event in resp["responseStream"]:
+    if "flowOutputEvent" in event:
+        print(event["flowOutputEvent"]["content"]["document"])
+    elif "flowCompletionEvent" in event:
+        print("done:", event["flowCompletionEvent"]["completionReason"])</code></pre>
+			<ul>
+				<li><code>InvokeFlow</code> streams output, completion (<code>SUCCESS</code> or <code>INPUT_REQUIRED</code>) and, with <code>enableTrace</code>, per-node traces. The AWS CLI can't call it. An alias points to exactly one version; the test alias <code>TSTALIASID</code> always runs the DRAFT. Connection and node names allow letters, digits and single underscores, no hyphens.</li>
+				<li><strong>Asynchronous executions</strong> (preview): <code>StartFlowExecution</code> runs a flow for up to 24 hours (nodes up to 5 minutes), with <code>GetFlowExecution</code> and per-node events; results are kept 90 days; inline code nodes aren't supported there. Multi-turn flows are also preview and need an agent node.</li>
+				<li>The service role (trusted by <code>bedrock.amazonaws.com</code> for <code>flow/*</code>) needs the permissions of each node: <code>bedrock:InvokeModel</code>, <code>bedrock:RenderPrompt</code>, <code>bedrock:Retrieve</code>, <code>lambda:InvokeFunction</code>, S3 and guardrail actions. <code>InvokeFlow</code> is a CloudTrail data event.</li>
+			</ul>
+
+			<h2 id="s4">Bedrock Data Automation</h2>
+			<p><strong>Bedrock Data Automation</strong> (BDA, generally available March 2025) turns documents, images, audio and video into structured JSON with one API. <strong>Standard output</strong> gives each modality's defaults (document text, tables and summaries with bounding boxes and confidence; image summaries and text; transcripts, scene summaries and speaker labels for media). <strong>Custom output</strong> uses <strong>blueprints</strong>: a schema of fields, each with a natural-language instruction, such as the fields of an invoice. It's also a parser option for <a href="knowledge-bases-custom.html#s5">customer-managed Knowledge Bases</a>.</p>
+			<span class="file">An invoice blueprint, a project, an async job and reading the result (Python, boto3)</span>
+<pre><code>import json
+import time
+
+import boto3
+
+region, account = "us-east-1", "111111111111"
+bda = boto3.client("bedrock-data-automation", region_name=region)
+bda_rt = boto3.client("bedrock-data-automation-runtime", region_name=region)
+s3 = boto3.client("s3", region_name=region)
+
+schema = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "class": "Invoice",
+    "description": "Supplier invoice",
+    "type": "object",
+    "properties": {
+        "invoice_number": {"type": "string", "inferenceType": "explicit", "instruction": "The invoice number"},
+        "invoice_date": {"type": "string", "inferenceType": "inferred", "instruction": "Invoice date in YYYY-MM-DD format"},
+        "total_amount": {"type": "number", "inferenceType": "explicit", "instruction": "Grand total including tax"},
+    },
+}
+bp_arn = bda.create_blueprint(blueprintName="invoice-v1", type="DOCUMENT", schema=json.dumps(schema))["blueprint"]["blueprintArn"]
+
+project = bda.create_data_automation_project(
+    projectName="invoices",
+    <span class="c"># ASYNC projects work only with the async API, SYNC only with the sync API</span>
+    projectType="ASYNC",
+    standardOutputConfiguration={},
+    customOutputConfiguration={"blueprints": [{"blueprintArn": bp_arn, "blueprintStage": "LIVE"}]},
+)
+<span class="c"># Wait until get_data_automation_project shows the project as COMPLETED before invoking</span>
+
+job = bda_rt.invoke_data_automation_async(
+    inputConfiguration={"s3Uri": "s3://docs-111111111111/in/invoice-123.pdf"},
+    outputConfiguration={"s3Uri": "s3://docs-111111111111/out/"},
+    dataAutomationConfiguration={"dataAutomationProjectArn": project["projectArn"], "stage": "LIVE"},
+    <span class="c"># Required on every call, with your own account ID</span>
+    dataAutomationProfileArn=f"arn:aws:bedrock:{region}:{account}:data-automation-profile/us.data-automation-v1",
+)
+while (st := bda_rt.get_data_automation_status(invocationArn=job["invocationArn"]))["status"] in ("Created", "InProgress"):
+    time.sleep(5)
+
+
+def read_s3(uri):
+    bucket, key = uri.replace("s3://", "").split("/", 1)
+    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+
+
+if st["status"] == "Success":
+    meta = read_s3(st["outputConfiguration"]["s3Uri"])
+    seg = meta["output_metadata"][0]["segment_metadata"][0]
+    if seg.get("custom_output_status") == "MATCH":
+        print(read_s3(seg["custom_output_path"]))</code></pre>
+			<ul>
+				<li><strong>Profiles:</strong> BDA always runs through a cross-Region <strong>data automation profile</strong> (<code>us</code>, <code>na</code>, <code>eu</code>, <code>apac</code>, <code>us-gov</code>, and an opt-in <code>global</code> profile only in Singapore), so IAM needs <code>bedrock:InvokeDataAutomationAsync</code> on the profile in every Region of the geography. Data at rest stays in your Region.</li>
+				<li><strong>Blueprints:</strong> JSON Schema with <code>explicit</code> fields (read directly) or <code>inferred</code> fields (derived or normalized); up to 40 document blueprints per project (matched to each document automatically), with a fallback; catalog blueprints exist for invoices, bank statements, driving licences and more. Blueprint instruction optimization (December 2025) tunes the instructions against up to 10 labelled examples.</li>
+				<li><strong>Sync API</strong> (<code>InvokeDataAutomation</code>, November 2025): images, and documents up to 10 pages with up to 15 fields, returned inline.</li>
+				<li><strong>Limits:</strong> documents up to 3,000 pages and 500 MB (PDF, TIFF, JPEG, PNG, DOC, DOCX; six European languages), video and audio up to 240 minutes. Custom vocabulary through a Data Automation Library (April 2026, free) improves transcription of domain terms. EventBridge notifications avoid polling.</li>
+				<li><strong>Pricing:</strong> documents $0.010 per page standard, $0.040 per page custom (up to 30 fields, then $0.0005 per extra field per page); images $0.003 standard, $0.005 custom; video $0.050 and audio $0.006 per minute standard.</li>
+			</ul>
+			<div class="callout trap"><p>Choosing Data Automation (or a model) as a Knowledge Base parser bills <strong>every PDF page</strong> in the data source, even text-only ones. DOCX files are converted to PDF, so page mapping is lost. And only trusted people should write blueprint instructions: they're prompts.</p></div>
+
+			<h2 id="s5">Bedrock Marketplace</h2>
+			<p><strong>Bedrock Marketplace</strong> (December 2024) offers more than 100 specialized and emerging models (the compatibility table lists 140) that you deploy to a <strong>SageMaker-managed endpoint</strong> you size, then call through Bedrock's APIs, Knowledge Bases, Prompt management and Flows.</p>
+			<span class="file">Deploy a Marketplace model, call it with Converse, and delete the endpoint (Python, boto3)</span>
+<pre><code>bedrock = boto3.client("bedrock", region_name="us-west-2")
+runtime = boto3.client("bedrock-runtime", region_name="us-west-2")
+
+ep = bedrock.create_marketplace_model_endpoint(
+    modelSourceIdentifier="arn:aws:sagemaker:us-west-2:aws:hub-content/SageMakerPublicHub/Model/MODEL_NAME/VERSION",
+    <span class="c"># Up to 30 characters</span>
+    endpointName="mp-demo-1",
+    endpointConfig={"sageMaker": {
+        "initialInstanceCount": 1,
+        "instanceType": "ml.g5.2xlarge",
+        "executionRole": "arn:aws:iam::111111111111:role/SagemakerExecutionRoleForBedrock",
+    }},
+    <span class="c"># Only for gated models</span>
+    acceptEula=True,
+)["marketplaceModelEndpoint"]
+arn = ep["endpointArn"]
+<span class="c"># Ready when endpointStatus is InService and status is REGISTERED (10-15 minutes)</span>
+while bedrock.get_marketplace_model_endpoint(endpointArn=arn)["marketplaceModelEndpoint"]["endpointStatus"] in ("Creating", "Updating"):
+    time.sleep(30)
+
+out = runtime.converse(modelId=arn, messages=[{"role": "user", "content": [{"text": "Hello"}]}])
+print(out["output"]["message"]["content"][0]["text"])
+
+<span class="c"># Instances bill per hour while the endpoint exists, even when idle</span>
+bedrock.delete_marketplace_model_endpoint(endpointArn=arn)</code></pre>
+			<ul>
+				<li>Every Marketplace model supports InvokeModel (with its native body); only some support Converse and streaming. Guardrails go through <code>ApplyGuardrail</code>.</li>
+				<li><strong>IAM:</strong> <code>bedrock:InvokeModel</code> on <code>arn:aws:bedrock:REGION:ACCOUNT:marketplace/model-endpoint/all-access</code> plus <code>sagemaker:InvokeEndpoint</code> with the condition <code>aws:CalledViaLast</code> equal to <code>bedrock.amazonaws.com</code>. Tag conditions on the <code>bedrock:*MarketplaceModelEndpoint</code> actions are ignored: put them on the <code>sagemaker:*</code> actions.</li>
+				<li><strong>Cost:</strong> the provider's software fee (none for open models) plus SageMaker instance-hours. Change endpoints only through Bedrock: turning off network isolation or changing the container in SageMaker breaks the link. Existing SageMaker endpoints can be registered with <code>RegisterMarketplaceModelEndpoint</code>.</li>
+				<li>Separately, since October 2026 a management account that accepts a <strong>private offer</strong> for a third-party <em>serverless</em> model can choose <strong>Distribute</strong> on the purchase confirmation page to give every account in the organization the private price; otherwise member accounts pay public rates.</li>
+			</ul>
+
+			<h2 id="s6">Other notes</h2>
+			<ul>
+				<li><strong>Bedrock in SageMaker Unified Studio</strong> (formerly Bedrock Studio, then Bedrock IDE; generally available March 2025): a governed, no-code workspace in SageMaker Unified Studio projects, with playgrounds, chat agent and flow apps, knowledge bases, guardrails, prompts and evaluation, where administrators control which models and features each project gets. Separately, a redesigned Bedrock <strong>console</strong> (June 2026) organizes work into projects around the <code>bedrock-mantle</code> APIs.</li>
+				<li><strong>Session management APIs</strong> (still preview since February 2025): <code>CreateSession</code>, <code>CreateInvocation</code> and <code>PutInvocationStep</code> checkpoint state for open-source frameworks, for example LangGraph's <code>BedrockSessionSaver</code> from <code>langgraph-checkpoint-aws</code>; 1,000 steps per session, 1-hour idle timeout, 30-day retention. For new agent state, prefer <a href="agentcore-memory-tools.html">AgentCore Memory</a>.</li>
+				<li><strong>Agents Classic</strong> (formerly Bedrock Agents): closed to new customers since 30 July 2026, in maintenance mode with no end-of-life date. Action groups, knowledge bases, multi-agent collaboration and inline agents keep working for existing users. New work should use the <a href="agentcore.html#s11">AgentCore Harness or Runtime</a>; the Flows agent node and agent prompt variants depend on Classic.</li>
+			</ul>
+
+			<h2 id="s7">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> Data Automation custom vocabulary (3 April); Advanced Prompt Optimization (14 May); redesigned Bedrock console (4 June); Agents Classic closed to new customers (30 July); prompt shortening and application profiles in prompt optimization (20 October); private-offer distribution for serverless models (22 October).</li>
+				<li><strong>2025:</strong> Flows multi-turn preview (January); session management preview (February); Data Automation generally available (3 March); Bedrock in SageMaker Unified Studio generally available (13 March); prompt optimization generally available (23 April); Data Automation custom audio and video output (May); Flows asynchronous executions and inline code preview (June); Flows loop node (September); Data Automation sync API (November) and blueprint optimization (December).</li>
+				<li><strong>2024:</strong> Prompt management and Prompt Flows preview (10 July); Prompt management generally available (7 November); Flows generally available and renamed (22 November); Marketplace and Data Automation preview (4 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d1-task-1-6.html">AIP-C01 Task 1.6: prompt engineering and governance</a>, <a href="../../aws-aip/d1-task-1-3.html">AIP-C01 Task 1.3: data validation and processing</a> and <a href="../../aws-aip/d2-task-2-5.html">AIP-C01 Task 2.5: integration patterns</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="customization.html"><small>Previous</small>Model customization</a>
+				<a class="next" href="index.html"><small>Back</small>Bedrock overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock Prompt management, Flows, Data Automation and Marketplace, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>

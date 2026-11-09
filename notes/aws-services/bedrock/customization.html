@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock Model Customization | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock model customization: supervised fine-tuning, reinforcement fine-tuning with Lambda graders, distillation and Custom Model Import, which models can be customized today, JSONL data formats, CreateModelCustomizationJob code, hyperparameters, monitoring, on-demand deployment, copying and sharing, the service role, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Model customization</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Customization &middot; Last checked 10 November 2026</span>
+		<h1>Model customization</h1>
+		<p>Changing how a model behaves with your data: supervised fine-tuning on examples, reinforcement fine-tuning with a reward function, distillation from a bigger teacher model, and importing models you trained elsewhere, then serving the result on demand or with Provisioned Throughput.</p>
+		<div class="tags"><span class="tag code">Fine-tuning</span><span class="tag">Reinforcement fine-tuning</span><span class="tag">Distillation</span><span class="tag">Custom Model Import</span><span class="tag">Nova</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Which method, and when</a></li>
+				<li><a href="#s2">What you can customize today</a></li>
+				<li><a href="#s3">Training data</a></li>
+				<li><a href="#s4">Supervised fine-tuning</a></li>
+				<li><a href="#s5">Distillation</a></li>
+				<li><a href="#s6">Reinforcement fine-tuning</a></li>
+				<li><a href="#s7">Monitoring and results</a></li>
+				<li><a href="#s8">Custom Model Import</a></li>
+				<li><a href="#s9">Using, copying and sharing custom models</a></li>
+				<li><a href="#s10">Security, quotas and pricing</a></li>
+				<li><a href="#s11">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Which method, and when</h2>
+			<ul>
+				<li><strong>Try prompting and RAG first.</strong> AWS's own guidance: fine-tuning "teaches the model how to respond, not what to know". For facts that change, use a <a href="knowledge-bases-managed.html">Knowledge Base</a>; customize for format, tone, domain style, workflows and cost.</li>
+				<li><strong>Supervised fine-tuning (SFT):</strong> you provide input and expected-output pairs and the model's weights adjust. Best when you have a few hundred to a few thousand high-quality examples of the exact behaviour you want.</li>
+				<li><strong>Reinforcement fine-tuning (RFT, December 2025):</strong> you provide prompts and a <strong>reward function</strong> (a Lambda that scores each answer) and the model learns from many attempts. Best when success is measurable but good examples are hard to write: maths, code, extraction, multi-step reasoning. AWS reports up to 66% average accuracy gains. If rewards start near 0%, do SFT first; if they're already above 95%, RFT may be unnecessary.</li>
+				<li><strong>Distillation:</strong> a large <strong>teacher</strong> model answers your prompts and those answers fine-tune a smaller <strong>student</strong>, giving a faster, cheaper model for one use case with no labelled data (AWS's claim: up to 500% faster and 75% cheaper, with under 2% accuracy loss for uses such as RAG).</li>
+				<li><strong>Custom Model Import:</strong> bring open-weight models you customized elsewhere (Llama, Mistral, Mixtral, Qwen, GPT-OSS, Flan and more) and serve them serverlessly on Bedrock.</li>
+				<li><strong>SageMaker AI</strong> is the place for more control (LoRA or full-rank training, continued pre-training, Nova Forge from early checkpoints); SageMaker-trained Nova models can then be imported into Bedrock.</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes.</strong> Most of the classic fine-tuning base models have reached Legacy or end of life: Claude 3 Haiku (end of life 10 September 2026, so <strong>no Claude model can be fine-tuned or distilled</strong> on Bedrock now), Llama 3.2 and Llama 3.1 405B (7 July 2026), Llama 3.1 8B and 70B and Llama 3.3 70B (Legacy since 30 September 2026: no new jobs), and Nova Canvas (30 September 2026). Continued pre-training no longer has a page in the Bedrock guide. The supported-models table still lists several retired models, so check each model's lifecycle before planning.</p></div>
+
+			<h2 id="s2">What you can customize today</h2>
+			<ul>
+				<li><strong>Supervised fine-tuning:</strong> Amazon Nova Micro, Lite, Pro and Nova 2 Lite (us-east-1), using the context-length variant IDs <code>amazon.nova-micro-v1:0:128k</code>, <code>amazon.nova-lite-v1:0:300k</code>, <code>amazon.nova-pro-v1:0:300k</code> and <code>amazon.nova-2-lite-v1:0:256k</code>; also Titan Image Generator v2 and Titan Multimodal Embeddings (us-east-1, us-west-2).</li>
+				<li><strong>Reinforcement fine-tuning:</strong> Nova 2 Lite (us-east-1, with <code>CreateModelCustomizationJob</code>); OpenAI gpt-oss-20b and Qwen3 32B (us-west-2, through the OpenAI-compatible fine-tuning API on <code>bedrock-mantle</code>).</li>
+				<li><strong>Distillation:</strong> Nova Pro as teacher for Nova Lite or Micro; Nova Premier (through an inference profile) for Nova Lite, Micro or Pro (us-east-1). Text only. Anthropic distillation isn't available, with no timeline.</li>
+				<li><strong>Iterative customization</strong> (October 2025): a fine-tuned or distilled model can be the base for another round.</li>
+			</ul>
+			<p>When a base model becomes Legacy you can't start new customization jobs or buy new Provisioned Throughput on it, though existing custom models can still get a new on-demand deployment until end of life. Custom models don't migrate automatically.</p>
+
+			<h2 id="s3">Training data</h2>
+			<p>JSONL files (one JSON object per line, no blank lines) in an S3 bucket in the job's Region. Expect about 6 characters per token.</p>
+			<span class="file">Nova supervised fine-tuning record (one line; the Bedrock conversation format)</span>
+<pre><code>{"schemaVersion": "bedrock-conversation-2024", "system": [{"text": "You are a friendly support agent for a home internet provider."}], "messages": [{"role": "user", "content": [{"text": "My router keeps dropping the connection."}]}, {"role": "assistant", "content": [{"text": "Sorry about that. Let's restart it first: unplug it for 30 seconds, then plug it back in."}]}]}</code></pre>
+			<ul>
+				<li><strong>Nova rules:</strong> the first turn is user and the last assistant; 8 to 20,000 examples (AWS recommends at least 100 per task, 2,000 to 10,000 for Nova 2); images (up to 10 per example, 10 MB each) or one video (up to 90 seconds) in user turns, stored in the same bucket, but never images and videos in the same dataset. The strings <code>User:</code>, <code>Bot:</code>, <code>Assistant:</code>, <code>System:</code>, <code>&lt;image&gt;</code>, <code>&lt;video&gt;</code> and <code>[EOS]</code> anywhere in the data fail the job. Nova 2 can include <code>reasoningContent</code> in assistant turns, but tool sections fail the job and validation sets are ignored.</li>
+				<li><strong>Distillation</strong> takes prompts in the same format (up to 15,000; an optional assistant turn is a "golden" example), or your <strong>model invocation logs</strong>: <code>invocationLogsConfig</code> with <code>requestMetadataFilters</code> on the metadata you attached to calls, and <code>usePromptResponse</code> to reuse the logged answers (only when the logged model is the teacher; no synthetic data is generated then).</li>
+				<li><strong>Reinforcement fine-tuning</strong> takes OpenAI chat-format prompts, at least 100 and up to 20,000, each with a <code>reference_answer</code> (any shape) and optional extra fields passed to your grader, or invocation logs for Nova.</li>
+			</ul>
+			<span class="file">Reinforcement fine-tuning record (one line)</span>
+<pre><code>{"id": "sample-001", "messages": [{"role": "system", "content": "You are a maths tutor."}, {"role": "user", "content": "Solve: 2x + 5 = 13"}], "reference_answer": {"solution": "x = 4"}}</code></pre>
+
+			<h2 id="s4">Supervised fine-tuning</h2>
+			<span class="file">Fine-tune Nova Micro on support conversations (Python, boto3; shape from the API reference)</span>
+<pre><code>import boto3
+
+bedrock = boto3.client("bedrock", region_name="us-east-1")
+
+resp = bedrock.create_model_customization_job(
+    jobName="support-tone-sft-01",
+    customModelName="support-tone-micro-v1",
+    roleArn="arn:aws:iam::111111111111:role/BedrockCustomizationRole",
+    <span class="c"># The context-length variant ID</span>
+    baseModelIdentifier="amazon.nova-micro-v1:0:128k",
+    customizationType="FINE_TUNING",
+    <span class="c"># Values are strings</span>
+    hyperParameters={"epochCount": "2", "learningRate": "0.00001", "learningRateWarmupSteps": "10"},
+    trainingDataConfig={"s3Uri": "s3://training-111111111111/sft/train.jsonl"},
+    validationDataConfig={"validators": [{"s3Uri": "s3://training-111111111111/sft/val.jsonl"}]},
+    outputDataConfig={"s3Uri": "s3://training-111111111111/sft/output/"},
+    customModelKmsKeyId="arn:aws:kms:us-east-1:111111111111:key/KEY_ID",
+)
+job_arn = resp["jobArn"]
+status = bedrock.get_model_customization_job(jobIdentifier=job_arn)["status"]</code></pre>
+			<ul>
+				<li><strong>Nova hyperparameters:</strong> <code>epochCount</code> 1 to 5 (default 2, which "works for most cases"), <code>learningRate</code> 1e-6 to 1e-4 (default 1e-5), <code>learningRateWarmupSteps</code> 0 to 100 (default 10; AWS suggests dataset size divided by 640 for Micro, 160 for Lite, 320 for Pro). Other models have their own names and ranges.</li>
+				<li>For a previously customized model as the base, pass its custom-model ARN as <code>baseModelIdentifier</code>. Jobs can run in your VPC (<code>vpcConfig</code> with <code>subnetIds</code> and <code>securityGroupIds</code>).</li>
+			</ul>
+
+			<h2 id="s5">Distillation</h2>
+			<span class="file">Distill Nova Pro's answers into Nova Micro for an FAQ assistant (Python, boto3)</span>
+<pre><code>resp = bedrock.create_model_customization_job(
+    jobName="faq-distill-01",
+    customModelName="faq-micro-distilled",
+    roleArn="arn:aws:iam::111111111111:role/BedrockCustomizationRole",
+    <span class="c"># The student</span>
+    baseModelIdentifier="amazon.nova-micro-v1:0:128k",
+    customizationType="DISTILLATION",
+    trainingDataConfig={"s3Uri": "s3://training-111111111111/distill/prompts.jsonl"},
+    outputDataConfig={"s3Uri": "s3://training-111111111111/distill/output/"},
+    customizationConfig={"distillationConfig": {"teacherModelConfig": {
+        <span class="c"># The teacher uses the plain model ID</span>
+        "teacherModelIdentifier": "amazon.nova-pro-v1:0",
+        "maxResponseLengthForInference": 1000,
+    }}},
+)</code></pre>
+			<p>To train from production traffic instead, use <code>trainingDataConfig={"invocationLogsConfig": {"invocationLogSource": {"s3Uri": "s3://LOG_BUCKET/prefix/"}, "requestMetadataFilters": {"equals": {"use_case": "faq"}}, "usePromptResponse": False}}</code>. Bedrock may generate extra synthetic examples (up to 15,000 pairs, billed at the teacher's on-demand price) and produces a report of accepted and rejected prompts with reasons.</p>
+
+			<h2 id="s6">Reinforcement fine-tuning</h2>
+			<div class="entry">
+				<h4>The reward function</h4>
+				<p>Your Lambda receives a batch of samples (the conversation including the model's answer, and your <code>reference_answer</code> and extra fields in <code>metadata</code>) and returns a score for each. Use rules for verifiable tasks, or call a Bedrock model inside the Lambda as a judge for subjective ones; the console offers templates for both. Raise the Lambda timeout from the default 3 seconds (up to 15 minutes), but keep grading to seconds.</p>
+				<span class="file">A grader that rewards correct final answers and penalizes rambling (Python, Lambda; input and output shapes from the RFT guide)</span>
+<pre><code>def lambda_handler(event, context):
+    results = []
+    for sample in event:
+        answer = sample["messages"][-1]["content"]
+        expected = sample["metadata"]["reference_answer"]["solution"]
+        correct = 1.0 if expected.replace(" ", "") in answer.replace(" ", "") else 0.0
+        concise = 1.0 if len(answer) &lt; 600 else 0.5
+        results.append({
+            "id": sample["id"],
+            "aggregate_reward_score": 0.8 * correct + 0.2 * concise,
+            "metrics_list": [
+                {"name": "correct", "value": correct, "type": "Metric"},
+                {"name": "concise", "value": concise, "type": "Metric"},
+            ],
+        })
+    return results</code></pre>
+			</div>
+			<div class="entry">
+				<h4>Starting the job</h4>
+				<span class="file">Reinforcement fine-tuning of Nova 2 Lite with that grader (Python, boto3; RFT hyperparameters are typed numbers)</span>
+<pre><code>resp = bedrock.create_model_customization_job(
+    jobName="maths-rft-01",
+    customModelName="maths-nova2-rft-v1",
+    roleArn="arn:aws:iam::111111111111:role/BedrockCustomizationRole",
+    baseModelIdentifier="arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-lite-v1:0:256k",
+    customizationType="REINFORCEMENT_FINE_TUNING",
+    trainingDataConfig={"s3Uri": "s3://training-111111111111/rft/train.jsonl"},
+    outputDataConfig={"s3Uri": "s3://training-111111111111/rft/output/"},
+    customizationConfig={"rftConfig": {
+        "graderConfig": {"lambdaGrader": {"lambdaArn": "arn:aws:lambda:us-east-1:111111111111:function:maths-grader"}},
+        "hyperParameters": {
+            "batchSize": 64,
+            "epochCount": 2,
+            "learningRate": 0.00001,
+            <span class="c"># How many answers to try per prompt (2-16)</span>
+            "trainingSamplePerPrompt": 4,
+            "inferenceMaxTokens": 8192,
+            "maxPromptLength": 4096,
+            "reasoningEffort": "high",
+            "evalInterval": 10,
+        },
+    }},
+)</code></pre>
+				<p>The service role needs <code>lambda:InvokeFunction</code> on the grader. Watch the mean reward and validation reward in the console. The resulting Nova model can be deployed on demand in one click.</p>
+			</div>
+			<div class="entry">
+				<h4>Open-weight models with the OpenAI SDK</h4>
+				<span class="file">Reinforcement fine-tuning of gpt-oss-20b through the OpenAI-compatible API (Python, OpenAI SDK; OPENAI_API_KEY is a Bedrock API key)</span>
+<pre><code>import os
+
+from openai import OpenAI
+
+client = OpenAI(base_url="https://bedrock-mantle.us-west-2.api.aws/v1", api_key=os.environ["OPENAI_API_KEY"])
+f = client.files.create(file=open("train.jsonl", "rb"), purpose="fine-tune")
+job = client.fine_tuning.jobs.create(
+    model="openai.gpt-oss-20b",
+    training_file=f.id,
+    extra_body={"method": {"type": "reinforcement", "reinforcement": {
+        "grader": {"type": "lambda", "lambda": {"function": "arn:aws:lambda:us-west-2:111111111111:function:maths-grader"}},
+        "hyperparameters": {"n_epochs": 1, "batch_size": 4, "learning_rate_multiplier": 1.0},
+    }}},
+)</code></pre>
+				<p>Jobs can be listed, followed through events, cancelled (not resumable) and have checkpoints; the fine-tuned model is usable straight away through Chat Completions or Responses on <code>bedrock-mantle</code>. Billed at $80 per training hour for gpt-oss-20b and Qwen3 32B.</p>
+			</div>
+
+			<h2 id="s7">Monitoring and results</h2>
+			<ul>
+				<li>Job status: <code>InProgress</code>, <code>Completed</code>, <code>Failed</code>, <code>Stopping</code>, <code>Stopped</code>, with stages for validation, data processing (distillation) and training, and EventBridge events.</li>
+				<li>Your output bucket gets <code>step_wise_training_metrics.csv</code> (step, epoch, training loss, perplexity) and validation loss; the model itself stays in AWS-managed storage in your account. Validation loss that rises while training loss falls means overfitting: use fewer epochs or more data.</li>
+				<li><code>StopModelCustomizationJob</code> is final: you pay for tokens used so far and get no partial model.</li>
+				<li>Evaluate the result before switching traffic, with the same dataset and judge as the base model (<a href="evaluation.html">Model and RAG evaluation</a>). Fine-tuned models can repeat training data, so remove personal and confidential data first.</li>
+			</ul>
+
+			<h2 id="s8">Custom Model Import</h2>
+			<span class="file">Import a fine-tuned Llama model from S3 (Python, boto3)</span>
+<pre><code>job = bedrock.create_model_import_job(
+    jobName="llama-support-import-01",
+    importedModelName="llama-support-v1",
+    roleArn="arn:aws:iam::111111111111:role/BedrockImportRole",
+    <span class="c"># Hugging Face layout: .safetensors weights, config.json and tokenizer files</span>
+    modelDataSource={"s3DataSource": {"s3Uri": "s3://models-111111111111/llama-support/"}},
+)</code></pre>
+			<ul>
+				<li>Regions: us-east-1, us-east-2, us-west-2 and eu-central-1 (GPT-OSS in us-east-1 only). Weights under 200 GB (100 GB for multimodal), context under 128K tokens, Transformers 4.51.3. No embedding models, batch inference or CloudFormation. 3 imported models per account and 1 import job at a time by default.</li>
+				<li><strong>Invoking:</strong> use the imported model ARN as <code>modelId</code>. Models imported since 11 November 2025 accept three body formats: Bedrock completion (<code>prompt</code>, <code>max_gen_len</code>), OpenAI completion (<code>prompt</code>, <code>max_tokens</code>) and OpenAI chat completion (<code>messages</code>; up to 3 images, structured outputs, logprobs, tool calling for GPT-OSS); AWS recommends the OpenAI formats. Converse works for most architectures but not GPT-OSS, Qwen2.5 and its vision variants, or Qwen3. Include a chat template in the tokenizer files, or chat requests aren't formatted.</li>
+				<li><strong>Cost:</strong> billed per <strong>Custom Model Unit</strong> (CMU) per minute, in 5-minute windows from the first successful call, per running copy ($0.05718 per CMU-minute for most architectures in the US, $0.1433 for OpenAI models), plus $1.95 per CMU per month storage. For example Llama 3.1 8B with 128K context uses 2 CMUs. After 5 minutes without calls the model scales to zero; the next call can get <code>ModelNotReadyException</code> while it starts (tens of seconds), so configure retries.</li>
+			</ul>
+
+			<h2 id="s9">Using, copying and sharing custom models</h2>
+			<ul>
+				<li><strong>On-demand deployment</strong> (pay per token, same price as the base Nova model): <code>bedrock.create_custom_model_deployment(modelDeploymentName="support-tone-prod", modelArn=CUSTOM_MODEL_ARN)</code>, then use the deployment ARN as <code>modelId</code>. Available in us-east-1 and us-west-2 for Nova models customized since 16 July 2025 and Llama 3.3 70B customized since 15 September 2025; 10 deployments per account.</li>
+				<li>Otherwise, buy <strong>Provisioned Throughput</strong> (model units; the quota starts at 0, so open a support case): see <a href="inference.html#s10">Provisioned Throughput and custom models</a>.</li>
+				<li><strong>Copy</strong> to another Region with <code>CreateModelCopyJob</code>, called in the destination Region. <strong>Share</strong> with another account in your organization through AWS RAM; the recipient must copy it before use, and only some model types are shareable.</li>
+				<li>Delete a distilled model's deployments and Provisioned Throughput before the model itself.</li>
+			</ul>
+
+			<h2 id="s10">Security, quotas and pricing</h2>
+			<span class="file">Service role trust policy for customization jobs (as in the customization IAM role page)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "bedrock.amazonaws.com"},
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {"aws:SourceAccount": "111111111111"},
+      "ArnEquals": {"aws:SourceArn": "arn:aws:bedrock:us-east-1:111111111111:model-customization-job/*"}
+    }
+  }]
+}</code></pre>
+			<ul>
+				<li>The role reads the training and validation buckets (<code>s3:GetObject</code>, <code>s3:ListBucket</code>) and writes the output bucket (<code>s3:PutObject</code>); distillation through an inference profile needs <code>bedrock:InvokeModel</code> on the profile and the model in each Region; RFT needs the Lambda permission; import jobs use <code>model-import-job/*</code> in the trust condition. With a VPC or a cross-Region teacher, the console can't create the role for you.</li>
+				<li><strong>KMS:</strong> a customer managed key gives Bedrock a grant to the model; revoking it makes the model unusable. SageMaker-trained Nova models must use the same key on import and in later training.</li>
+				<li><strong>Data use:</strong> your training data is used only for your job, isn't used to train base models or shared, and isn't kept after the job completes.</li>
+				<li><strong>Quotas:</strong> 100 custom models per account, 10 scheduled jobs, 20,000 training and validation records for Nova (10,000 for most others).</li>
+				<li><strong>Pricing:</strong> training is tokens in the dataset multiplied by epochs (so epochs multiply cost), plus $1.95 per custom model per month storage; distillation adds the teacher's inference; RFT on open-weight models is $80 per training hour. Inference is per token for on-demand deployments, or Provisioned Throughput hours.</li>
+			</ul>
+
+			<h2 id="s11">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> reinforcement fine-tuning for gpt-oss-20b and Qwen3 32B through the OpenAI-compatible API (17 February); Legacy and end of life for Llama 3.2 and 3.1 405B (end of life 7 July), Claude 3 Haiku (10 September), Nova Canvas (30 September), and Llama 3.1 and 3.3 Legacy (30 September).</li>
+				<li><strong>Late 2025:</strong> iterative customization (16 October); Custom Model Import for GPT-OSS and OpenAI-compatible request formats (November); Nova 2 Lite fine-tuning and Nova Forge (2 December); reinforcement fine-tuning for Nova 2 Lite (3 December).</li>
+				<li><strong>Mid 2025:</strong> distillation generally available (1 May); Qwen models in Custom Model Import (May to September); on-demand deployment of custom Nova models and SageMaker-trained Nova import (16 July); on-demand Llama 3.3 (15 September).</li>
+				<li><strong>2024 and earlier:</strong> fine-tuning for Titan, Cohere and Llama 2 and continued pre-training preview (November 2023); Claude 3 Haiku fine-tuning (July to November 2024); copy and share (August 2024); Custom Model Import generally available (21 October 2024); distillation preview (December 2024).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d1-task-1-2.html">AIP-C01 Task 1.2: select and configure FMs</a>, <a href="../../aws-aip/d2-task-2-2.html">AIP-C01 Task 2.2: model deployment strategies</a> and <a href="../../aws-aif/d3-task-3-3.html">AIF-C01 Task 3.3: training and fine-tuning</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="guardrails.html"><small>Previous</small>Guardrails</a>
+				<a class="next" href="build-tools-data.html"><small>Next</small>Prompts, Flows, Data Automation and Marketplace</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock model customization, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>

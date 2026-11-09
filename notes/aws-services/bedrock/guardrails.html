@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock Guardrails | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock Guardrails: content filters and prompt attacks, denied topics, word and sensitive information filters, contextual grounding, Classic and Standard tiers, creating and versioning a guardrail, Converse with guardContent and traces, InvokeModel tags, ApplyGuardrail, InvokeGuardrailChecks for agent loops, block, mask and detect, streaming, IAM, account and organization enforcement, cross-Region profiles, Automated Reasoning checks, quotas, pricing and monitoring.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Guardrails</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Safety &middot; Last checked 10 November 2026</span>
+		<h1>Guardrails</h1>
+		<p>Configurable safety checks on what goes into and comes out of a model: harmful content, prompt attacks, off-limits topics, banned words, personal data, ungrounded answers and rule violations. Use them inline with Bedrock models, standalone on any text, or enforced across every account in an organization.</p>
+		<div class="tags"><span class="tag code">Guardrails</span><span class="tag">Prompt attacks</span><span class="tag">PII</span><span class="tag">Grounding</span><span class="tag">Automated Reasoning</span><span class="tag">Enforcement</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">How a guardrail works</a></li>
+				<li><a href="#s2">The policies</a></li>
+				<li><a href="#s3">Classic and Standard tiers</a></li>
+				<li><a href="#s4">Creating and versioning</a></li>
+				<li><a href="#s5">Guarding model calls</a></li>
+				<li><a href="#s6">ApplyGuardrail and InvokeGuardrailChecks</a></li>
+				<li><a href="#s7">Block, mask, detect and streaming</a></li>
+				<li><a href="#s8">Enforcement and sharing</a></li>
+				<li><a href="#s9">Automated Reasoning checks</a></li>
+				<li><a href="#s10">Quotas, pricing and monitoring</a></li>
+				<li><a href="#s11">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">How a guardrail works</h2>
+			<p>A guardrail is a Regional resource holding up to seven policies. You edit a <strong>DRAFT</strong>, publish numbered <strong>versions</strong>, and reference an ID and version at inference time or call it standalone.</p>
+			<ol class="flow">
+				<li><b>Input</b>The user's input is evaluated by all enabled policies in parallel.</li>
+				<li><b>Blocked?</b>If an input policy intervenes, the configured blocked message is returned and the model isn't called (you pay only for the guardrail).</li>
+				<li><b>Model</b>Otherwise the model runs.</li>
+				<li><b>Output</b>The response is evaluated; it's replaced by the blocked message, masked, or returned unchanged.</li>
+			</ol>
+			<p>Guardrails work on <code>bedrock-runtime</code> (Converse, ConverseStream, InvokeModel and its streaming variant), with Knowledge Bases, Agents, Flows and the AgentCore Harness, and on any text through <code>ApplyGuardrail</code>.</p>
+			<div class="callout trap"><p>What guardrails <strong>don't</strong> check: retrieved Knowledge Base chunks (only the question and the generated answer), tool definitions, tool call arguments and tool results, and reasoning blocks. The <code>bedrock-mantle</code> endpoint has no Guardrails, and some models refuse a guardrail parameter (embedding and rerank models, Nova Sonic, OpenAI GPT-5.4 and 5.5, Marengo, Pegasus 1.5). For untrusted documents and tool output, check them yourself with <code>ApplyGuardrail</code> or <code>InvokeGuardrailChecks</code>.</p></div>
+
+			<h2 id="s2">The policies</h2>
+			<ul>
+				<li><strong>Content filters</strong> (<code>contentPolicyConfig</code>): <code>HATE</code>, <code>INSULTS</code>, <code>SEXUAL</code>, <code>VIOLENCE</code>, <code>MISCONDUCT</code> (crime, fraud, harm) and <code>PROMPT_ATTACK</code>, each with an input and output strength (<code>NONE</code>, <code>LOW</code>, <code>MEDIUM</code>, <code>HIGH</code>; <code>HIGH</code> blocks the most), action (<code>BLOCK</code> or <code>NONE</code>) and modalities (<code>TEXT</code>, <code>IMAGE</code>). Images are PNG or JPEG up to 4 MB, 20 per request.</li>
+				<li><strong>Prompt attacks</strong>: jailbreaks, prompt injection and (Standard tier) prompt leakage, evaluated on input. On InvokeModel they're checked <strong>only inside input tags</strong>.</li>
+				<li><strong>Denied topics</strong> (<code>topicPolicyConfig</code>): up to 30, each with a name, a definition (200 characters on Classic, 1,000 on Standard) and up to 5 example phrases. Write crisp definitions of what the topic <em>is</em>, not instructions or exceptions, and use word or PII filters for specific entities.</li>
+				<li><strong>Word filters</strong> (<code>wordPolicyConfig</code>, free): up to 10,000 words or phrases of up to three words, plus AWS's profanity list; case-insensitive whole-word matching.</li>
+				<li><strong>Sensitive information</strong> (<code>sensitiveInformationPolicyConfig</code>): 31 PII types (names, emails, phone numbers, addresses, card numbers, SSNs, AWS keys, bank and passport numbers and more) with <code>BLOCK</code>, <code>ANONYMIZE</code> (replaced by <code>{EMAIL}</code> and so on) or <code>NONE</code>, plus up to 30 regex patterns (free).</li>
+				<li><strong>Contextual grounding</strong> (<code>contextualGroundingPolicyConfig</code>): <code>GROUNDING</code> (is the answer supported by the source?) and <code>RELEVANCE</code> (does it answer the question?), each blocking below a threshold of 0 to 0.99; output only, with a source of up to 100,000 characters and responses up to 5,000.</li>
+				<li><strong>Automated Reasoning</strong> (<code>automatedReasoningPolicyConfig</code>): up to 2 versioned policies that check answers against formal rules (<a href="#s9">below</a>).</li>
+			</ul>
+
+			<h2 id="s3">Classic and Standard tiers</h2>
+			<p>Content filters, prompt attacks, denied topics and (since October 2026) contextual grounding come in two tiers, set with <code>tierConfig: {"tierName": "STANDARD"}</code> on each policy. Both cost the same.</p>
+			<div class="table-wrap">
+				<table class="stack labeled compare">
+					<thead><tr><th>Classic (default)</th><th>Standard</th></tr></thead>
+					<tbody>
+						<tr class="group"><th colspan="2">Languages</th></tr>
+						<tr><td data-label="Classic (default)">English, French and Spanish</td><td data-label="Standard">80+ languages listed in the docs</td></tr>
+						<tr class="group"><th colspan="2">Detection</th></tr>
+						<tr><td data-label="Classic (default)">Basic; strict grounding</td><td data-label="Standard">More robust to typos and variations; prompt leakage; harmful content and PII in code; grounding that handles conversational and reasoning answers</td></tr>
+						<tr class="group"><th colspan="2">Requirements</th></tr>
+						<tr><td data-label="Classic (default)">None</td><td data-label="Standard">A cross-Region guardrail profile (<code>crossRegionConfig</code>), so text may be processed in other Regions of the geography</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Scores differ between tiers, so retest thresholds when you switch (AWS suggests 0.7 for grounding and relevance on Standard as a starting point). Standard grounding is in 11 Regions only.</p>
+
+			<h2 id="s4">Creating and versioning</h2>
+			<span class="file">A Standard-tier guardrail for a support chatbot, then version 1 (Python, boto3; fields from the API reference)</span>
+<pre><code>import boto3
+
+bedrock = boto3.client("bedrock", region_name="us-east-1")
+
+resp = bedrock.create_guardrail(
+    name="support-bot-guardrail",
+    blockedInputMessaging="Sorry, I can't help with that request.",
+    blockedOutputsMessaging="Sorry, I can't share that answer.",
+    <span class="c"># Required for the Standard tier</span>
+    crossRegionConfig={"guardrailProfileIdentifier": "us.guardrail.v1:0"},
+    contentPolicyConfig={
+        "tierConfig": {"tierName": "STANDARD"},
+        "filtersConfig": [
+            {"type": "HATE", "inputStrength": "HIGH", "outputStrength": "HIGH"},
+            {"type": "VIOLENCE", "inputStrength": "HIGH", "outputStrength": "HIGH"},
+            <span class="c"># Detect only while tuning: report, don't block</span>
+            {"type": "MISCONDUCT", "inputStrength": "MEDIUM", "outputStrength": "MEDIUM",
+             "inputAction": "NONE", "outputAction": "NONE"},
+            {"type": "PROMPT_ATTACK", "inputStrength": "HIGH", "outputStrength": "NONE"},
+        ],
+    },
+    topicPolicyConfig={
+        "tierConfig": {"tierName": "STANDARD"},
+        "topicsConfig": [{
+            "name": "Investment Advice",
+            "type": "DENY",
+            "definition": "Guidance or recommendations about allocating money or assets to generate returns.",
+            "examples": ["Should I buy gold?", "Are stocks better than bonds?"],
+        }],
+    },
+    wordPolicyConfig={"managedWordListsConfig": [{"type": "PROFANITY"}]},
+    sensitiveInformationPolicyConfig={
+        "piiEntitiesConfig": [
+            {"type": "EMAIL", "action": "ANONYMIZE"},
+            {"type": "US_SOCIAL_SECURITY_NUMBER", "action": "BLOCK"},
+        ],
+        "regexesConfig": [{"name": "OrderId", "pattern": r"ORD-\d{8}", "action": "ANONYMIZE"}],
+    },
+    contextualGroundingPolicyConfig={
+        "tierConfig": {"tierName": "STANDARD"},
+        "filtersConfig": [{"type": "GROUNDING", "threshold": 0.7}, {"type": "RELEVANCE", "threshold": 0.7}],
+    },
+)
+guardrail_id = resp["guardrailId"]
+version = bedrock.create_guardrail_version(guardrailIdentifier=guardrail_id, description="v1")["version"]</code></pre>
+			<ul>
+				<li>A version is an immutable snapshot of the DRAFT (up to 20 per guardrail). Changes to DRAFT never reach production until you create a new version and switch the application to it.</li>
+				<li><code>UpdateGuardrail</code> <strong>replaces the whole configuration</strong>: resend every policy you want to keep, and resend <code>tierConfig</code>, or the tier silently resets to Classic.</li>
+				<li>Optional: a customer managed KMS key (<code>kmsKeyId</code>), per-direction <code>inputEnabled</code> and <code>outputEnabled</code> (a disabled direction isn't charged). Deleting a guardrail without a version deletes all its versions; guardrails used by enforcement can't be deleted.</li>
+			</ul>
+
+			<h2 id="s5">Guarding model calls</h2>
+			<span class="file">Converse with a guardrail on just the user's text, and reading the trace (Python, boto3)</span>
+<pre><code>rt = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+resp = rt.converse(
+    modelId="global.anthropic.claude-sonnet-5-5",
+    <span class="c"># Not evaluated: the system prompt has no guardContent block</span>
+    system=[{"text": "You are a banking assistant."}],
+    messages=[{"role": "user", "content": [
+        <span class="c"># Skipped, because a guardContent block is present</span>
+        {"text": "Answer briefly."},
+        {"guardContent": {"text": {"text": user_input}}},
+    ]}],
+    guardrailConfig={"guardrailIdentifier": guardrail_id, "guardrailVersion": "1", "trace": "enabled"},
+    inferenceConfig={"maxTokens": 512},
+)
+if resp["stopReason"] == "guardrail_intervened":
+    g = resp["trace"]["guardrail"]
+    for assessment in g.get("inputAssessment", {}).values():
+        for f in assessment.get("contentPolicy", {}).get("filters", []):
+            print("input", f["type"], f["confidence"], f["action"])
+        for t in assessment.get("topicPolicy", {}).get("topics", []):
+            print("input topic", t["name"], t["action"])
+    for assessments in g.get("outputAssessments", {}).values():
+        for a in assessments:
+            for p in a.get("sensitiveInformationPolicy", {}).get("piiEntities", []):
+                <span class="c"># ANONYMIZED or BLOCKED; p["match"] holds the raw value</span>
+                print("output PII", p["type"], p["action"])</code></pre>
+			<ul>
+				<li><strong>guardContent rules:</strong> with no guardContent block, all message content is evaluated; once any message has one, <strong>only</strong> the guardContent blocks are. The system prompt is evaluated only through its own guardContent block. Wrap just the latest user turn to save cost.</li>
+				<li><code>trace</code> is <code>enabled</code>, <code>enabled_full</code> (also lists what passed) or <code>disabled</code>. The trace's <code>appliedGuardrailDetails</code> shows whether a guardrail came from the request, the account or the organization.</li>
+				<li><strong>InvokeModel:</strong> pass <code>guardrailIdentifier</code>, <code>guardrailVersion</code> and <code>trace</code> as parameters (headers), add <code>"amazon-bedrock-guardrailConfig": {"tagSuffix": "..."}</code> to the body, and wrap the user's text in <code>&lt;amazon-bedrock-guardrails-guardContent_SUFFIX&gt;</code> tags. Use a new random suffix per request, so an attacker can't close the tag. The response adds <code>amazon-bedrock-guardrailAction</code>.</li>
+				<li>In Knowledge Bases, set <code>guardrailConfiguration</code> in <code>RetrieveAndGenerate</code>'s generation settings (<a href="knowledge-bases-custom.html#s7">customer-managed</a>) or <code>policyConfiguration</code> on <a href="knowledge-bases-managed.html#s6">agentic retrieval</a>; in the AgentCore Harness, use the model's <code>additionalParams.guardrailConfig</code>; AgentCore Policy can also use <a href="agentcore-gateway-identity-policy.html#s8">Guardrails conditions</a> on tool calls.</li>
+			</ul>
+
+			<h2 id="s6">ApplyGuardrail and InvokeGuardrailChecks</h2>
+			<div class="entry">
+				<h4>ApplyGuardrail: a guardrail on any text</h4>
+				<p><code>ApplyGuardrail</code> runs a guardrail without calling a model, so it works with any model (including non-Bedrock ones), on retrieved documents, tool output or a finished answer. Only <code>bedrock:ApplyGuardrail</code> is needed.</p>
+				<span class="file">Check user input before doing anything, and check a RAG answer for grounding (Python, boto3)</span>
+<pre><code><span class="c"># 1) Input check: cheaper than retrieving and generating first</span>
+r = rt.apply_guardrail(
+    guardrailIdentifier=guardrail_id,
+    guardrailVersion="1",
+    source="INPUT",
+    content=[{"text": {"text": user_input}}],
+)
+if r["action"] == "GUARDRAIL_INTERVENED":
+    <span class="c"># The blocked message, or the masked text if only masking applied</span>
+    reply = r["outputs"][0]["text"]
+
+<span class="c"># 2) Output grounding check: source and question are qualified, the answer is not</span>
+r = rt.apply_guardrail(
+    guardrailIdentifier=guardrail_id,
+    guardrailVersion="1",
+    source="OUTPUT",
+    content=[
+        {"text": {"text": retrieved_passages, "qualifiers": ["grounding_source"]}},
+        {"text": {"text": user_question, "qualifiers": ["query"]}},
+        {"text": {"text": model_answer}},
+    ],
+    <span class="c"># Also return scores that passed</span>
+    outputScope="FULL",
+)
+for a in r["assessments"]:
+    for f in a.get("contextualGroundingPolicy", {}).get("filters", []):
+        print(f["type"], f["score"], f["threshold"], f["action"])</code></pre>
+				<p>The response has <code>action</code> (<code>NONE</code> or <code>GUARDRAIL_INTERVENED</code>), <code>outputs</code>, <code>assessments</code> and <code>usage</code> in text units per policy.</p>
+			</div>
+			<div class="entry">
+				<h4>InvokeGuardrailChecks: scores for agent loops</h4>
+				<p><code>InvokeGuardrailChecks</code> (16 June 2026) needs no guardrail resource: you pick the checks per request (content filters, prompt attack, sensitive information), and it returns <strong>scores without blocking anything</strong>, so your code decides. It's meant for the points guardrails don't cover in agents: before the model, after the response, before running a tool, and on tool results.</p>
+				<span class="file">Scan a tool result for injection and secrets before the agent sees it (Python, boto3)</span>
+<pre><code>r = rt.invoke_guardrail_checks(
+    messages=[{"role": "user", "content": [{"text": tool_result_text}]}],
+    checks={
+        "promptAttack": {"categories": [{"category": "PROMPT_INJECTION"}, {"category": "JAILBREAK"}]},
+        "sensitiveInformation": {"entities": [{"type": "EMAIL"}, {"type": "AWS_SECRET_KEY"}]},
+    },
+)
+<span class="c"># Severity scores are 0, 0.2, 0.4 ... 1.0; the threshold is yours</span>
+if any(x["severityScore"] >= 0.6 for x in r["results"]["promptAttack"]["results"]):
+    tool_result_text = "[tool output withheld]"
+for e in r["results"]["sensitiveInformation"]["results"]:
+    <span class="c"># Character offsets for redaction in your code</span>
+    print(e["type"], e["beginOffset"], e["endOffset"])</code></pre>
+				<p>IAM <code>bedrock:InvokeGuardrailChecks</code> on <code>*</code>; 1,500 requests per minute; 7 Regions; cheaper per text unit than full guardrails (content filters $0.07, prompt attack $0.08, PII $0.10 per 1,000). No topics, words, grounding, regex or images.</p>
+			</div>
+
+			<h2 id="s7">Block, mask, detect and streaming</h2>
+			<ul>
+				<li><strong>Block</strong> returns your blocked message. <strong>Mask</strong> (<code>ANONYMIZE</code>, PII and regex only) replaces values with <code>{TYPE}</code>. <strong>Detect</strong> (action <code>NONE</code>, April 2025) changes nothing but reports what it found in the trace: use it to tune strengths before switching to block.</li>
+				<li>Since April 2025 inputs and outputs have separate actions and can be switched off individually.</li>
+				<li><strong>Streaming:</strong> <code>sync</code> mode (the default; <code>streamProcessingMode</code> in Converse's guardrail settings) holds chunks until they're checked, adding latency; <code>async</code> sends chunks immediately and checks in the background, so harmful content can reach the user before it's caught, and PII isn't masked. Relevance on streams is judged per chunk, so an off-topic answer may be flagged only after it has streamed.</li>
+			</ul>
+			<div class="callout trap"><p>A masked answer and a blocked answer both return <code>stopReason: guardrail_intervened</code>: only the trace (<code>ANONYMIZED</code> vs <code>BLOCKED</code>) tells them apart. The trace and model invocation logs contain the <strong>unmasked</strong> values by design, so treat them as sensitive (use CloudWatch Logs data protection on invocation logs).</p></div>
+
+			<h2 id="s8">Enforcement and sharing</h2>
+			<div class="entry">
+				<h4>IAM: require a guardrail on every call</h4>
+				<span class="file">Allow model calls only with guardrail version 1 (IAM policy, as in the Guardrails permissions guide)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowWithGuardrail",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": ["arn:aws:bedrock:us-east-1::foundation-model/*"],
+      "Condition": {"StringEquals": {"bedrock:GuardrailIdentifier": "arn:aws:bedrock:us-east-1:111111111111:guardrail/GUARDRAIL_ID:1"}}
+    },
+    {
+      "Sid": "DenyWithoutGuardrail",
+      "Effect": "Deny",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": ["arn:aws:bedrock:us-east-1::foundation-model/*"],
+      "Condition": {"StringNotEquals": {"bedrock:GuardrailIdentifier": "arn:aws:bedrock:us-east-1:111111111111:guardrail/GUARDRAIL_ID:1"}}
+    },
+    {
+      "Sid": "ApplyGuardrail",
+      "Effect": "Allow",
+      "Action": ["bedrock:ApplyGuardrail"],
+      "Resource": ["arn:aws:bedrock:us-east-1:111111111111:guardrail/GUARDRAIL_ID"]
+    }
+  ]
+}</code></pre>
+				<p>The value is the guardrail ARN with <code>:VERSION</code> (none means DRAFT; use <code>ArnLike ...:*</code> for any numbered version). Two limits: roles used for <code>RetrieveAndGenerate</code>, <code>InvokeAgent</code> and inline agents get AccessDenied under it (those make internal model calls without a guardrail), so use separate roles; and a caller can still skip <em>input</em> checks by tagging only harmless text, though output is always checked. Calls through inference profiles need profile statements too (<a href="inference.html#s7">inference profiles</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Account and organization enforcement</h4>
+				<ul>
+					<li><strong>Account level</strong> (<code>PutEnforcedGuardrailConfiguration</code>): a numbered guardrail version applied to every InvokeModel and Converse call in the account and Region, with <code>includedModels</code> (or <code>ALL</code>) and <code>excludedModels</code>, and <code>selectiveContentGuarding</code> for system prompts and messages: <code>COMPREHENSIVE</code> (default; evaluate everything, closing the tagging loophole) or <code>SELECTIVE</code> (only tagged content).</li>
+					<li><strong>Organization level</strong> (generally available 3 April 2026): an AWS Organizations policy of type <code>BEDROCK_POLICY</code> attached to the root, OUs or accounts names a versioned guardrail owned by the management account, per Region, with a resource policy letting member accounts call <code>bedrock:ApplyGuardrail</code> on it.</li>
+					<li>Request, account and organization guardrails all run, and the most restrictive result wins. Each is charged, to the calling account.</li>
+				</ul>
+				<span class="file">Enforce a guardrail on all models except embeddings in us-east-1 (AWS Organizations Bedrock policy, as in the Organizations guide)</span>
+<pre><code>{"bedrock": {"guardrail_inference": {"us-east-1": {"config_1": {
+  "identifier": {"@@assign": "arn:aws:bedrock:us-east-1:555555555555:guardrail/GUARDRAIL_ID:1"},
+  "selective_content_guarding": {"system": {"@@assign": "comprehensive"}, "messages": {"@@assign": "comprehensive"}},
+  "model_enforcement": {
+    "included_models": {"@@assign": ["ALL"]},
+    "excluded_models": {"@@assign": ["amazon.titan-embed-text-v2:0", "cohere.embed-english-v3"]}
+  }
+}}}}}</code></pre>
+			</div>
+			<div class="callout trap"><p>With an enforced guardrail, <strong>every caller needs <code>bedrock:ApplyGuardrail</code> on it</strong>, or all its Invoke and Converse calls fail with AccessDenied: test from every role before you turn it on. Enforced guardrails can't contain Automated Reasoning policies (runtime failures), must be numbered versions, are set per Region, and can't be deleted while enforced.</p></div>
+			<div class="entry">
+				<h4>Sharing and cross-Region profiles</h4>
+				<ul>
+					<li><strong>Resource-based policies</strong> on guardrails and guardrail profiles share them within your organization only (<code>aws:PrincipalOrgID</code> or OU paths; actions <code>ApplyGuardrail</code> and <code>GetGuardrail</code>). With cross-Region profiles, the policies on each destination Region's profile must be written through the <strong>source</strong> Region's endpoint, or they have no effect.</li>
+					<li><strong>Guardrail profiles</strong> (no extra cost): <code>us</code>, <code>us-gov</code>, <code>eu</code>, <code>uk</code>, <code>au</code>, <code>ca</code> and <code>apac</code> <code>.guardrail.v1:0</code>. Configuration stays in your Region, but text may be processed elsewhere in the geography; the UK and Australia profiles stay in one Region. IAM needs <code>ApplyGuardrail</code> on the profile ARN in each destination Region.</li>
+				</ul>
+			</div>
+
+			<h2 id="s9">Automated Reasoning checks</h2>
+			<p>Automated Reasoning (generally available August 2025) checks whether an answer follows <strong>formal rules</strong> extracted from your documents, such as an HR leave policy or eligibility criteria, using a logic solver; language models translate the text into the policy's variables. It's <strong>detect only</strong> and English only, with no streaming.</p>
+			<ol class="flow">
+				<li><b>Build</b><code>CreateAutomatedReasoningPolicy</code>, then a build workflow (<code>StartAutomatedReasoningPolicyBuildWorkflow</code> with <code>INGEST_CONTENT</code> and your PDF or text) generates rules (if-then logic) and variables; a fidelity report scores coverage.</li>
+				<li><b>Refine</b>Improve variable descriptions (the main lever for accuracy), resolve ambiguities and refine iteratively (June 2026).</li>
+				<li><b>Test</b>Test cases with expected results, plus generated scenarios.</li>
+				<li><b>Deploy</b><code>CreateAutomatedReasoningPolicyVersion</code>, then attach the <strong>versioned</strong> ARN to a guardrail (up to 2 policies) with a cross-Region profile.</li>
+				<li><b>Check</b>Call <code>ApplyGuardrail</code> with source <code>OUTPUT</code>: the question as a <code>query</code> block and the answer unqualified.</li>
+			</ol>
+			<ul>
+				<li><strong>Findings</strong>, worst first: <code>TRANSLATION_AMBIGUOUS</code>, <code>IMPOSSIBLE</code>, <code>INVALID</code> (contradicts a rule; the result names the rules), <code>SATISFIABLE</code> (could be true or false: missing conditions), <code>VALID</code>, plus <code>TOO_COMPLEX</code> and <code>NO_TRANSLATIONS</code> (nothing matched the policy's variables). <code>VALID</code> covers only the claims the policy's variables capture.</li>
+				<li>On Converse it runs only on guardContent blocks and is skipped silently otherwise: check that <code>automatedReasoningPolicyUnits</code> in usage is above 0.</li>
+				<li>It doesn't protect against prompt injection, and encoded text can make a whole submission go unevaluated.</li>
+				<li>Limits: 100 policies per account, 500 rules and 200 variables per policy. 7 Regions. $0.17 per 1,000 text units per policy, charged for every check. Customer managed KMS keys since October 2025.</li>
+			</ul>
+
+			<h2 id="s10">Quotas, pricing and monitoring</h2>
+			<ul>
+				<li><strong>Pricing</strong> per 1,000 text units (a text unit is up to 1,000 characters), only for enabled policies: content filters $0.15, denied topics $0.15, sensitive information $0.10, contextual grounding $0.10 (source plus question plus answer), images $0.00075 each; word filters and regex free. A blocked input costs only the guardrail; a blocked output also costs the model call. AWS's example: a chatbot with 1,000 queries an hour using content filters and topics costs about $0.90 an hour.</li>
+				<li><strong>Quotas:</strong> 100 guardrails per account, 20 versions each, 30 topics, 10,000 words, 30 regex patterns. <code>ApplyGuardrail</code> allows 100 requests per second in the large Regions and 25 elsewhere, and text-units-per-second limits per policy are often low outside the big Regions: check Service Quotas before scaling.</li>
+				<li><strong>Monitoring:</strong> CloudWatch namespace <code>AWS/Bedrock/Guardrails</code> with <code>Invocations</code>, <code>InvocationsIntervened</code>, <code>TextUnitCount</code> and latency, by policy type, input or output, and guardrail version. In CloudTrail, <code>ApplyGuardrail</code> is a data event (<code>AWS::Bedrock::Guardrail</code>, including evaluations made during model calls), off by default; watch it for AccessDenied after enabling enforcement.</li>
+				<li>Each enabled policy adds processing latency (<code>guardrailProcessingLatency</code> in the trace).</li>
+			</ul>
+
+			<h2 id="s11">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> organization and account enforcement generally available (3 April); <code>InvokeGuardrailChecks</code> and Automated Reasoning in Sydney (16 June); Guardrails in AgentCore Policy generally available (17 June); Automated Reasoning refinement workflows (23 June); Standard tier for contextual grounding (19 to 20 October).</li>
+				<li><strong>2025:</strong> IAM condition key <code>bedrock:GuardrailIdentifier</code> (18 March); image filters generally available (28 March); detect mode and per-direction actions (8 April); cross-Region guardrail profiles (May); Classic and Standard tiers (23 June); Automated Reasoning generally available (August); customer managed keys for Automated Reasoning (17 October); code-domain detection (19 November); sharing within an organization (21 November).</li>
+				<li><strong>2024:</strong> generally available (23 April); Knowledge Bases and Agents (May); Converse (June); contextual grounding and <code>ApplyGuardrail</code> (10 July); CloudWatch metrics (September); Flows (November); prices cut up to 85% (December); Automated Reasoning and image filter previews (December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d3-task-3-1.html">AIP-C01 Task 3.1: input and output safety controls</a>, <a href="../../aws-scs/d3-task-3-2.html#s7">SCS-C03 Task 3.2: Guardrails for generative AI</a> and <a href="../../aws-aif/d4-task-4-1.html">AIF-C01 Task 4.1: responsible AI</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="inference.html"><small>Previous</small>Inference APIs and options</a>
+				<a class="next" href="customization.html"><small>Next</small>Model customization</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock Guardrails, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
