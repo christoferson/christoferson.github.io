@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 4.2: Authorization Strategies | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 4.2 study guide: IAM policy evaluation order and same-account versus cross-account rules, KMS, Secrets Manager and other cross-account resource policies, trust policies, IAM paths, Roles Anywhere profiles, Amazon Verified Permissions and Cedar, ABAC with tags and session tags versus RBAC, permissions boundaries, session policies and condition operator traps, Access Analyzer validation, custom checks and policy generation, access denied messages, the policy simulator, and external, internal and unused access findings.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">Task 4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Identity and Access Management &middot; 20%</span>
+		<h1>Task 4.2: Design, implement, and troubleshoot authorization strategies</h1>
+		<p>Deciding what an authenticated caller can do: how AWS combines every policy type into one decision, granting access across accounts, attributes versus roles, keeping permissions to the minimum, reading an access denied message, and finding access nobody meant to grant.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">IAM policies</span><span class="tag">Verified Permissions</span><span class="tag">ABAC</span><span class="tag">Access Analyzer</span><span class="tag">Policy Simulator</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Designing and evaluating authorization</a></li>
+				<li><a href="#s2">ABAC and RBAC</a></li>
+				<li><a href="#s3">Least privilege policies</a></li>
+				<li><a href="#s4">Analyzing authorization failures</a></li>
+				<li><a href="#s5">Correcting unintended permissions</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.2</span>
+				<p><strong>Design, implement, and troubleshoot authorization strategies.</strong></p>
+			</div>
+			<p>Authorization questions are policy-reading questions: given an identity policy, a resource policy, an SCP, a boundary and a session policy, is the request allowed, and why not? The basic evaluation flow, policy types, permissions boundary delegation and SCPs and RCPs are in the <a href="../aws-saa/d1-task-1-1.html#s2">Solutions Architect guide</a>; this page covers the rules that decide specialty questions, the cross-account cases, and the tools that explain a denial. Organization-wide data perimeters are Task 6.1.</p>
+			<p><strong>Running example.</strong> The same company. Teams own resources in their workload accounts, the security tooling account (222222222222) reads data from every account, an analytics account (777777777777) reads the data platform's S3 buckets and secrets, the customer application needs per-customer authorization inside the app, and project teams change often, so the platform team wants tag-based access.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>4.2.1</td><td data-label="What you need to be able to do">Design and evaluate authorization for people, applications and systems, including cross-account and in-app</td></tr>
+						<tr><td>4.2.2</td><td data-label="What you need to be able to do">Choose between ABAC and RBAC and build tag-based access</td></tr>
+						<tr><td>4.2.3</td><td data-label="What you need to be able to do">Write and read least privilege policies with boundaries and session policies</td></tr>
+						<tr><td>4.2.4</td><td data-label="What you need to be able to do">Work out why a request was denied</td></tr>
+						<tr><td>4.2.5</td><td data-label="What you need to be able to do">Find and fix permissions nobody intended</td></tr>
+					</tbody>
+				</table>
+			</div>
+
+			<!-- Skill 4.2.1 -->
+			<h2 id="s1">Designing and evaluating authorization</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.1</span><span class="skill-text">Design and evaluate authorization controls for human, application, and system access (for example, Amazon Verified Permissions, IAM paths, IAM Roles Anywhere, resource policies for cross-account access, IAM role trust policies).</span></p>
+
+				<h3>How AWS reaches a decision</h3>
+				<ol class="flow">
+					<li><b>Explicit deny anywhere</b>An explicit Deny in an SCP, RCP, resource-based policy, identity-based policy, permissions boundary or session policy ends evaluation with Deny.</li>
+					<li><b>RCPs</b>Resource control policies on the resource's account must allow the action (the attached <code>RCPFullAWSAccess</code> allows everything until you add denies).</li>
+					<li><b>SCPs</b>Service control policies on the principal's account must allow it.</li>
+					<li><b>Resource-based policy</b>An Allow here can be enough on its own in the same account, depending on which principal it names.</li>
+					<li><b>Identity-based policy</b>Otherwise an identity policy must allow it.</li>
+					<li><b>Permissions boundary</b>If the principal has one, it must allow the action.</li>
+					<li><b>Session policy</b>If the session was created with one, it must allow the action.</li>
+				</ol>
+				<div class="entry">
+					<h4>Same account: which principal the resource policy names matters</h4>
+					<p>In one account, an Allow in either the identity policy or the resource policy is normally enough. But whether a resource policy grant escapes a <strong>permissions boundary</strong> or <strong>session policy</strong> depends on the principal it names:</p>
+					<ul>
+						<li><strong>An IAM user ARN</strong>: not limited by an implicit deny in the user's identity policy or boundary.</li>
+						<li><strong>A role session ARN</strong> (<code>arn:aws:sts::...:assumed-role/role/session</code>): not limited by identity policy, boundary or session policy.</li>
+						<li><strong>A role ARN</strong>: still limited by the role's boundary and session policy, whether in <code>Principal</code> or an <code>aws:PrincipalArn</code> condition, unless the policy uses <code>"Principal": "*"</code> with an <code>aws:PrincipalArn</code> condition.</li>
+					</ul>
+					<p>An explicit deny in a boundary always wins. Two resource policies are exceptions to "either is enough": <strong>role trust policies</strong> and <strong>KMS key policies</strong> must explicitly allow the principal.</p>
+				</div>
+				<div class="entry">
+					<h4>Cross-account: both sides must allow</h4>
+					<p>For a request across accounts, AWS evaluates the caller's account (identity policy, SCPs, boundaries) and the resource's account (resource policy, RCPs) separately, and both must return Allow. Naming another account in <code>Principal</code> (<code>"AWS": "arn:aws:iam::777777777777:root"</code> or just the account ID) delegates to that <strong>whole account</strong>, whose administrator then decides which of its principals get access; it doesn't mean only the root user. A specific role ARN in <code>Principal</code> is stored as the role's unique ID (<code>AROA...</code>), so deleting and recreating the role breaks the policy; an <code>aws:PrincipalArn</code> condition survives recreation.</p>
+				</div>
+
+				<h3>Cross-account resource policies</h3>
+				<div class="entry">
+					<h4>KMS keys</h4>
+					<p>A key policy grants nothing to the account automatically. The default key policy's "Enable IAM User Permissions" statement (the account root as principal) is what makes IAM policies work at all; without it, IAM allows for the key have no effect (IAM denies still do). Cross-account use needs a <strong>key policy statement</strong> naming the other account or role <strong>and</strong> an <strong>IAM policy</strong> there allowing the key's ARN. Only cryptographic operations, grants and describe calls work across accounts; management calls such as <code>ScheduleKeyDeletion</code> never do.</p>
+					<span class="file">Let the analytics account decrypt with the data platform key (two statements: the key policy in prod, the IAM policy in analytics)</span>
+<pre><code>[
+  {
+    "Sid": "AllowAnalyticsAccountToUseKey",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::777777777777:role/analytics-etl" },
+    "Action": ["kms:Decrypt", "kms:DescribeKey"],
+    "Resource": "*"
+  },
+  {
+    "Sid": "AllowUseOfProdDataKey",
+    "Effect": "Allow",
+    "Action": ["kms:Decrypt", "kms:DescribeKey"],
+    "Resource": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  }
+]</code></pre>
+					<p>Cryptographic operations accept the key ARN or an alias ARN from another account; grant operations need the key ARN. A bare key ID or alias name is always looked up in the caller's own account.</p>
+				</div>
+				<div class="entry">
+					<h4>Secrets, functions, queues and repositories</h4>
+					<ul>
+						<li><strong>Secrets Manager:</strong> a resource policy on the secret, an identity policy in the other account, and <strong>a customer managed KMS key</strong>, because the <code>aws/secretsmanager</code> key can't be used across accounts. Never grant <code>secretsmanager:PutResourcePolicy</code> to others; it lets them rewrite access. <code>BlockPublicPolicy</code> on <code>PutResourcePolicy</code> rejects public policies.</li>
+						<li><strong>Lambda:</strong> a function resource policy (<code>add-permission</code> or <code>put-resource-policy</code>); new function URLs need both <code>lambda:InvokeFunctionUrl</code> and <code>lambda:InvokeFunction</code>.</li>
+						<li><strong>SQS and SNS:</strong> queue and topic policies, with <code>aws:SourceArn</code> when another service sends.</li>
+						<li><strong>ECR:</strong> a repository policy for pull and push, plus <code>ecr:GetAuthorizationToken</code> in the caller's IAM policy.</li>
+						<li><strong>S3:</strong> a bucket policy (ACLs are disabled by default with bucket owner enforced), and for access points both the access point policy and the bucket policy (often delegating with <code>s3:DataAccessPointAccount</code>) must allow.</li>
+						<li><strong>AWS RAM</strong> shares supported resources with the organization or OUs without listing accounts, and shared resources appear in the consumer's console; the managed permission is the maximum, and the consumer's IAM policies still apply.</li>
+					</ul>
+					<p>Limit any resource policy to the organization with <code>aws:PrincipalOrgID</code> (or <code>aws:PrincipalOrgPaths</code> for OUs), paired with <code>aws:PrincipalIsAWSService</code> exceptions where AWS services write to the resource.</p>
+				</div>
+				<div class="entry">
+					<h4>Role trust policies for third parties</h4>
+					<p>A vendor assuming a role in your account should present an <strong>external ID</strong> that the vendor generates and keeps unique per customer, so another of its customers can't trick it into using your role (the confused deputy problem):</p>
+					<span class="file">Trust a monitoring vendor's account only with your external ID (IAM role trust policy, JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": {
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::999999999999:root" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "vendor-assigned-7f3c2a" } }
+  }
+}</code></pre>
+				</div>
+
+				<h3>IAM paths</h3>
+				<div class="entry">
+					<h4>Grouping roles and policies for delegation</h4>
+					<p>A <strong>path</strong> (for example <code>/team-a/</code>) puts users, roles and customer managed policies into named groups that ARNs can match with wildcards: <code>arn:aws:iam::111111111111:role/team-a/*</code>. Paths are set with the API, CLI or CloudFormation, not the console, and IAM enforces nothing by itself; their value is in policies. Team A's administrators can be allowed to create and attach only roles and policies under their path:</p>
+					<span class="file">Team A manages only its own roles and policies (identity policy JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageTeamRoles",
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRole", "iam:TagRole"],
+      "Resource": "arn:aws:iam::111111111111:role/team-a/*"
+    },
+    {
+      "Sid": "AttachOnlyTeamPolicies",
+      "Effect": "Allow",
+      "Action": "iam:AttachRolePolicy",
+      "Resource": "arn:aws:iam::111111111111:role/team-a/*",
+      "Condition": { "ArnLike": { "iam:PolicyARN": "arn:aws:iam::111111111111:policy/team-a/*" } }
+    }
+  ]
+}</code></pre>
+					<p>A role's path <strong>can't be changed</strong> after creation (only users and groups can move), and role names are unique across paths. Service-linked roles live under <code>/aws-service-role/</code> and Identity Center roles under <code>/aws-reserved/sso.amazonaws.com/</code>, which is how policies and SCPs exempt or target them.</p>
+				</div>
+
+				<h3>Systems outside AWS: Roles Anywhere profiles</h3>
+				<div class="entry">
+					<h4>Limiting what certificate holders get</h4>
+					<p>The trust policy (<a href="d4-task-4-1.html#s1">Task 4.1</a>) decides which certificates can assume a role; condition it on both the subject and the issuer, or any certificate from the CA or its subordinates qualifies. The <strong>profile</strong> then limits the session: which roles it covers, managed or inline session policies, and duration (up to 12 hours). <strong>Attribute mapping</strong> decides which certificate fields become principal tags for conditions:</p>
+					<span class="file">Map only the subject CN and OU into session tags (AWS CLI)</span>
+<pre><code>aws rolesanywhere put-attribute-mapping \
+  --profile-id a1b2c3d4-5678-90ab-cdef-EXAMPLE11111 \
+  --certificate-field x509Subject \
+  --mapping-rules specifier=CN specifier=OU</code></pre>
+					<p>Since May 2026, VPC endpoint policies apply to Roles Anywhere <code>CreateSession</code>, so a restrictive endpoint policy can block credential issuance.</p>
+				</div>
+
+				<h3>Authorization inside your application</h3>
+				<div class="entry">
+					<h4>Amazon Verified Permissions</h4>
+					<p>IAM authorizes calls to AWS. For decisions inside your own application (can this customer view this order?), <strong>Amazon Verified Permissions</strong> stores <strong>Cedar</strong> policies in a <strong>policy store</strong> with a schema, and the app asks it with <code>IsAuthorized</code> (or <code>IsAuthorizedWithToken</code>, passing a Cognito or OIDC token so the principal comes from the token). Forbid always overrides permit, and with no matching policy the answer is deny.</p>
+					<span class="file">Customers can read their own orders (Cedar policy)</span>
+<pre><code>permit (
+  principal in Shop::Role::"Customer",
+  action == Shop::Action::"GetOrder",
+  resource
+) when {
+  resource.owner == principal
+};</code></pre>
+					<ul>
+						<li><strong>Policy templates</strong> with <code>?principal</code> and <code>?resource</code> placeholders create template-linked policies, for example "share this order with this user"; changing the template changes every linked policy.</li>
+						<li><strong>Validation mode</strong> <code>STRICT</code> checks policies against the schema; with no schema, every policy fails, so define the schema first.</li>
+						<li><strong>API Gateway integration</strong> builds a Lambda authorizer that calls Verified Permissions for each request (caching decisions for 120 seconds by default).</li>
+						<li>Pricing fell to $5 per million single authorization requests in June 2025.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"Fine-grained permissions inside our SaaS app, managed outside the code" points to <strong>Verified Permissions</strong>. "Another account must read our encrypted secret" points to a <strong>secret resource policy plus a customer managed key</strong>. "Give a vendor access to our account" points to a <strong>role with an external ID</strong>.</p></div>
+			</div>
+
+			<!-- Skill 4.2.2 -->
+			<h2 id="s2">ABAC and RBAC</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.2</span><span class="skill-text">Design attribute-based access control (ABAC) and role-based access control (RBAC) strategies (for example, by configuring resource access based on tags or attributes).</span></p>
+
+				<h3>Choosing between them</h3>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>RBAC</th><th>ABAC</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="2">Permissions follow</th></tr>
+							<tr><td data-label="RBAC">A job function: a role or permission set per job (developer, auditor, DBA)</td><td data-label="ABAC">Attributes: tags on the principal match tags on the resource</td></tr>
+							<tr class="group"><th colspan="2">When something new appears</th></tr>
+							<tr><td data-label="RBAC">Update policies to list the new resources or create new roles</td><td data-label="ABAC">Tag the new resource or person; no policy change</td></tr>
+							<tr class="group"><th colspan="2">Watch out for</th></tr>
+							<tr><td data-label="RBAC">Role explosion as teams and projects multiply</td><td data-label="ABAC">Anyone who can change tags can change access; not every action supports tag conditions</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Most organizations combine them: Identity Center permission sets by job function (RBAC), with ABAC conditions inside them so one permission set serves every project.</p>
+
+				<h3>Building ABAC</h3>
+				<div class="entry">
+					<h4>The condition keys</h4>
+					<ul>
+						<li><code>aws:PrincipalTag/key</code>: a tag on the user or role, or a <strong>session tag</strong> passed at sign-in.</li>
+						<li><code>aws:ResourceTag/key</code>: a tag on the resource being accessed (only for resources that support tag-based authorization).</li>
+						<li><code>aws:RequestTag/key</code> and <code>aws:TagKeys</code>: tags in a create or tag request, used to require and restrict tags.</li>
+					</ul>
+					<p>Tag keys are case-insensitive in conditions, values case-sensitive. The decisive part of an ABAC design is protecting the tags themselves: deny changing the access tags on resources and principals, and require them at creation.</p>
+					<span class="file">Project teams manage only their project's secrets, must tag new ones, and can't remove access tags (identity policy JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SameProjectSameTeam",
+      "Effect": "Allow",
+      "Action": "secretsmanager:*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/access-project": "${aws:PrincipalTag/access-project}",
+          "aws:ResourceTag/access-team": "${aws:PrincipalTag/access-team}"
+        },
+        "StringEqualsIfExists": {
+          "aws:RequestTag/access-project": "${aws:PrincipalTag/access-project}",
+          "aws:RequestTag/access-team": "${aws:PrincipalTag/access-team}"
+        },
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["access-project", "access-team", "Name", "OwnedBy"] }
+      }
+    },
+    {
+      "Sid": "DenyRemovingAccessTags",
+      "Effect": "Deny",
+      "Action": "secretsmanager:UntagResource",
+      "Resource": "*",
+      "Condition": { "ForAnyValue:StringLike": { "aws:TagKeys": "access-*" } }
+    },
+    {
+      "Sid": "DenyPolicyManagement",
+      "Effect": "Deny",
+      "Action": "secretsmanager:*Policy",
+      "Resource": "*"
+    }
+  ]
+}</code></pre>
+					<p>For EC2, tagging at launch also authorizes <code>ec2:CreateTags</code>; allow it only during creation with the <code>ec2:CreateAction</code> condition (for example <code>"ec2:CreateAction": "RunInstances"</code>), and require tags with <code>aws:RequestTag</code> on the creating action.</p>
+				</div>
+				<div class="entry">
+					<h4>Attributes from the identity provider</h4>
+					<p>Session tags carry directory attributes (department, cost center, project) into AWS. With direct IAM SAML federation the IdP sends <code>https://aws.amazon.com/SAML/Attributes/PrincipalTag:CostCenter</code> (and the trust policy must allow <code>sts:TagSession</code>). With IAM Identity Center, turn on <strong>attributes for access control</strong>; the IdP sends <code>https://aws.amazon.com/SAML/Attributes/AccessControl:CostCenter</code>, or Identity Center maps its own user attributes, which take precedence. Either way, policies read them as <code>${aws:PrincipalTag/CostCenter}</code>. Up to 50 session tags; transitive tags survive role chaining; session tags override role tags with the same key.</p>
+				</div>
+				<div class="callout trap"><p>An ABAC policy is only as strong as the controls on tagging. If developers can run <code>iam:TagRole</code> on their own role or <code>ec2:CreateTags</code> on any instance, they can give themselves another project's access. Deny tagging of the access keys outside the creation path, and keep principal tags under central control (Identity Center attributes or SCIM).</p></div>
+			</div>
+
+			<!-- Skill 4.2.3 -->
+			<h2 id="s3">Least privilege policies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.3</span><span class="skill-text">Design, interpret, and implement IAM policies by following the principle of least privilege (for example, permission boundaries, session policies).</span></p>
+
+				<h3>Limits that only take away</h3>
+				<div class="entry">
+					<h4>Boundaries and session policies</h4>
+					<p>A <strong>permissions boundary</strong> (a managed policy set on a user or role) and a <strong>session policy</strong> (passed when a role session is created: one inline policy and up to 10 managed policy ARNs, 2,048 characters combined) grant nothing; effective permissions are the intersection with identity policies (and SCPs). Boundaries suit delegation: teams create roles only with the team boundary attached (the pattern is in the <a href="../aws-saa/d1-task-1-1.html#s2">Solutions Architect guide</a>). Session policies suit a broker or application that assumes one role for many users and narrows each session, for example to one customer's S3 prefix. Remember the resource policy rules above: a boundary doesn't cap what a resource policy grants directly to a user or session.</p>
+				</div>
+
+				<h3>Policy elements that grant more than they look</h3>
+				<div class="entry">
+					<h4>NotAction, NotPrincipal and conditions</h4>
+					<ul>
+						<li><strong><code>NotAction</code> with Allow</strong> allows every action in every service except those listed, including services launched later. Prefer explicit actions; use <code>NotAction</code> mainly in Deny statements.</li>
+						<li><strong><code>NotPrincipal</code></strong> works only with Deny, can't be used in identity, trust, SCP or RCP policies, always denies principals that have a permissions boundary, and AWS no longer recommends it. Use <code>"Principal": "*"</code> with an <code>aws:PrincipalArn</code> condition instead.</li>
+						<li><strong>Missing keys:</strong> a condition on a key absent from the request is false, but negated operators (<code>StringNotEquals</code>) are true. <code>...IfExists</code> treats a missing key as true, and a Deny with <code>StringNotEqualsIfExists</code> still denies when the key is absent.</li>
+						<li><strong><code>ForAllValues</code></strong> returns true when the key is missing or empty, so an Allow with it can allow requests with no tags at all; add <code>"Null": {"aws:TagKeys": "false"}</code>. Don't use set operators with single-valued keys such as <code>aws:PrincipalTag</code>.</li>
+						<li><strong>Policy variables</strong> need <code>"Version": "2012-10-17"</code>; without it <code>${aws:username}</code> is a literal string.</li>
+					</ul>
+					<span class="file">Deny the audit bucket to everyone except the auditor role, without NotPrincipal (S3 bucket policy statement, JSON)</span>
+<pre><code>{
+  "Sid": "OnlyAuditorRole",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:*",
+  "Resource": ["arn:aws:s3:::audit-evidence-444444444444", "arn:aws:s3:::audit-evidence-444444444444/*"],
+  "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::222222222222:role/auditor" } }
+}</code></pre>
+				</div>
+
+				<h3>Getting to least privilege</h3>
+				<div class="entry">
+					<h4>IAM Access Analyzer policy tools</h4>
+					<ul>
+						<li><strong>Policy generation</strong> (free) builds a policy from up to 90 days of the role's CloudTrail activity. It can't see <code>iam:PassRole</code> or data events such as S3 object reads, so review and add those.</li>
+						<li><strong>Policy validation</strong> (free) reports errors, security warnings (such as <code>PASS_ROLE_WITH_STAR_IN_RESOURCE</code>, <code>FORALLVALUES_WITH_SINGLE_VALUED_KEY</code>, <code>MISSING_GITHUB_REPO_CONDITION_KEY</code>), warnings and suggestions, in the console editor or with <code>validate-policy</code>.</li>
+						<li><strong>Custom policy checks</strong> ($2 per 1,000 calls) answer yes or no in a pipeline: does a new policy grant more than the old one (<code>check-no-new-access</code>), does a policy grant any of these sensitive actions (<code>check-access-not-granted</code>), does a resource policy allow public access (<code>check-no-public-access</code>)?</li>
+					</ul>
+					<span class="file">Fail the build if a policy change adds access, or if any policy allows deleting backups (AWS CLI in a pipeline)</span>
+<pre><code>aws accessanalyzer check-no-new-access \
+  --existing-policy-document file://deployed-policy.json \
+  --new-policy-document file://proposed-policy.json \
+  --policy-type IDENTITY_POLICY
+# {"result": "FAIL", "message": "The modified permissions grant new access compared to your existing policy.", ...}
+
+aws accessanalyzer check-access-not-granted \
+  --policy-document file://proposed-policy.json \
+  --access actions="backup:DeleteRecoveryPoint","backup:DeleteBackupVault" \
+  --policy-type IDENTITY_POLICY</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Quotas that shape designs</h4>
+					<p>Managed policies attached to a role now default to 20 (maximum 25; it was 10 until August 2026); users default to 10. A managed policy holds 6,144 characters; inline policies per role 10,240 in total. Customer managed policies keep 5 versions. Role session duration is 1 to 12 hours. Hitting these limits usually means the policies should be restructured, not the quota raised.</p>
+				</div>
+			</div>
+
+			<!-- Skill 4.2.4 -->
+			<h2 id="s4">Analyzing authorization failures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.4</span><span class="skill-text">Analyze authorization failures to determine causes or effects (for example, IAM Policy Simulator, IAM Access Analyzer).</span></p>
+
+				<h3>Reading the error</h3>
+				<div class="entry">
+					<h4>Access denied messages name the policy type</h4>
+					<p>Most services now say which policy type denied the request, and whether the deny was <strong>explicit</strong> (a Deny statement matched) or <strong>implicit</strong> (nothing allowed it). Since January 2026, explicit denies in SCPs, RCPs, identity policies, session policies and boundaries also include the <strong>ARN of the policy</strong>, within the same account or organization; inline policies show no ARN, and only one policy type is reported even if several denied.</p>
+					<span class="file">The message tells you where to look (examples of AccessDenied messages)</span>
+<pre><code>User: arn:aws:iam::111111111111:role/orders-api is not authorized to perform: secretsmanager:GetSecretValue
+on resource: arn:aws:secretsmanager:us-east-1:111111111111:secret:*
+with an explicit deny in a resource control policy: arn:aws:organizations::555555555555:policy/o-exampleorgid/resource_control_policy/p-examplepolicyid456
+
+User: arn:aws:iam::111111111111:role/orders-api is not authorized to perform: codedeploy:ListDeployments
+because no permissions boundary allows the codedeploy:ListDeployments action
+
+User: arn:aws:iam::111111111111:user/ops-break-glass is not authorized to perform: sts:AssumeRole
+because no role trust policy allows the sts:AssumeRole action</code></pre>
+					<ul>
+						<li>"No identity-based policy allows": add a permission to the caller.</li>
+						<li>"No permissions boundary allows" or "no session policy allows": the identity policy may be fine; the limit isn't.</li>
+						<li>"Explicit deny in a service control policy" or "resource control policy": an organization guardrail; changing local IAM won't help.</li>
+						<li>"No VPC endpoint policy allows": the endpoint policy on the path, which may belong to another account.</li>
+					</ul>
+					<p>S3 gives the same detail within the account or organization (phrased "with policy ARN:"), but a generic "Access Denied" across organizations and none for VPC endpoint denials. S3 Block Public Access denials say which setting blocked the request. EC2 returns an <strong>encoded</strong> authorization message; decode it with <code>aws sts decode-authorization-message --encoded-message ...</code> (needs <code>sts:DecodeAuthorizationMessage</code>) to see the matched statement and context.</p>
+				</div>
+
+				<h3>The IAM policy simulator</h3>
+				<div class="entry">
+					<h4>Testing a principal against actions and resources</h4>
+					<p>The policy simulator, now part of the IAM console (July 2026), evaluates a principal's identity policies, permissions boundary, <strong>SCPs</strong> and a resource policy you supply against actions, resources and context keys you set. It <strong>doesn't evaluate RCPs</strong>, doesn't show which SCP statement matched, and in the console fetches resource policies only for S3, SQS, SNS and Glacier. Context keys other than the principal's own must be supplied, or conditions on them won't match.</p>
+					<span class="file">Would the ETL role be allowed to read the object at the time of the job? (AWS CLI)</span>
+<pre><code>aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::777777777777:role/analytics-etl \
+  --action-names s3:GetObject \
+  --resource-arns arn:aws:s3:::shop-data-111111111111/orders/2026/11/09.parquet \
+  --context-entries "ContextKeyName=aws:SourceVpce,ContextKeyValues=vpce-0abc1234def567890,ContextKeyType=string"
+# EvalDecision: allowed | explicitDeny | implicitDeny, with MatchedStatements and MissingContextValues</code></pre>
+					<p>The output now has one result per action, with per-resource decisions in <code>ResourceSpecificResults</code>, and <code>--policy-exclusion-list</code> lets you test what happens without a given policy.</p>
+				</div>
+				<div class="entry">
+					<h4>Common causes by service</h4>
+					<ul>
+						<li><strong>KMS:</strong> the key policy lacks the account root statement (so IAM allows don't count), or, across accounts, either the key policy or the caller's IAM policy is missing. S3 SSE-KMS uploads need <code>kms:GenerateDataKey</code>, downloads <code>kms:Decrypt</code>.</li>
+						<li><strong>AssumeRole:</strong> the trust policy doesn't name the caller (or names a deleted and recreated role), the caller's own policy or boundary doesn't allow <code>sts:AssumeRole</code>, or a condition (external ID, MFA, source identity) isn't met.</li>
+						<li><strong>S3:</strong> bucket policy deny, Block Public Access, object owned by another account with ACLs, or a VPC endpoint policy.</li>
+						<li><strong>Cross-account generally:</strong> only one side allows. CloudTrail in the caller's account shows the error; the resource account may not log the denied attempt.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"The policy simulator says allowed but the call fails" points to something the simulator doesn't see: an <strong>RCP</strong>, a <strong>VPC endpoint policy</strong>, a missing <strong>context key</strong>, or a resource policy that wasn't supplied.</p></div>
+			</div>
+
+			<!-- Skill 4.2.5 -->
+			<h2 id="s5">Correcting unintended permissions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.5</span><span class="skill-text">Investigate and correct unintended permissions, authorizations, or privileges granted to a resource, service, or entity (for example, IAM Access Analyzer).</span></p>
+
+				<h3>IAM Access Analyzer findings</h3>
+				<div class="entry">
+					<h4>Three analyzer types</h4>
+					<ul>
+						<li><strong>External access</strong> (free, per Region): resources whose policies grant access outside the <strong>zone of trust</strong> (the account or the organization): S3 buckets, IAM role trust policies, KMS keys, Lambda functions and layers, SQS queues, Secrets Manager secrets, SNS topics, EBS and RDS snapshots, ECR repositories, EFS file systems, and DynamoDB tables and streams. Policies are re-analyzed within about 30 minutes of a change. <strong>Archive rules</strong> auto-archive findings for intended sharing (for example, the analytics account). <strong>Access previews</strong> show what a policy change would expose before you apply it.</li>
+						<li><strong>Internal access</strong> (June 2025, $9 per monitored resource per month): which principals <strong>inside</strong> the organization or account can reach chosen critical resources (S3 buckets, RDS snapshots, DynamoDB tables and streams).</li>
+						<li><strong>Unused access</strong> ($0.20 per role or user per month): unused roles, access keys, passwords and permissions over a tracking period you set (1 to 365 days), with recommended policies to remove the unused permissions.</li>
+					</ul>
+				</div>
+				<div class="callout trap"><p>An external access analyzer only covers the Region it's created in, so an organization needs one in every Region it uses (the delegated administrator in the security tooling account usually creates them all). A finding marked resolved means the access was removed; an archived finding means someone accepted it, which is worth reviewing periodically.</p></div>
+
+				<h3>Other sources of unintended privilege</h3>
+				<div class="entry">
+					<h4>Credentials and escalation paths</h4>
+					<p>The <strong>IAM credential report</strong> (at most every four hours) lists every user's password, MFA and access key status and last use, which finds old keys and users without MFA. Beyond that, look for permissions that let a principal give itself more. AWS doesn't publish one list, but these combinations follow directly from how IAM works:</p>
+					<ul>
+						<li><code>iam:PassRole</code> on any role plus <code>lambda:CreateFunction</code> or <code>ec2:RunInstances</code>: run code with a more powerful role.</li>
+						<li><code>iam:CreatePolicyVersion</code> or <code>iam:SetDefaultPolicyVersion</code> on a policy attached to yourself; <code>iam:AttachUserPolicy</code>, <code>iam:PutRolePolicy</code> or <code>iam:AddUserToGroup</code> on yourself.</li>
+						<li><code>iam:CreateAccessKey</code> or <code>iam:CreateLoginProfile</code> on other users; <code>iam:UpdateAssumeRolePolicy</code> on a privileged role.</li>
+						<li>KMS key administrators changing the key policy; <code>secretsmanager:PutResourcePolicy</code> on secrets; tag permissions in an ABAC design.</li>
+					</ul>
+					<p>Access Analyzer validation flags the wide <code>iam:PassRole</code> patterns; scope PassRole with <code>iam:PassedToService</code> and role paths (<a href="d3-task-3-2.html#s2">Task 3.2</a>), protect boundary policies from edits, and restrict IAM changes with SCPs.</p>
+				</div>
+				<div class="entry">
+					<h4>Correcting</h4>
+					<p>Fix the policy at its source (the bucket policy, the trust policy, the key policy) rather than adding denies elsewhere; replace wide grants with organization conditions (<code>aws:PrincipalOrgID</code>); remove unused roles and keys found by the unused access analyzer; and stop the same mistake returning with custom policy checks in the pipeline and preventive SCPs and RCPs. After the change, Access Analyzer marks the finding resolved, which is the confirmation.</p>
+				</div>
+				<div class="callout tip"><p>"Find every resource shared with accounts outside the organization" points to an <strong>external access analyzer</strong> with the organization as zone of trust. "Which of our own roles can read the customer database snapshots" points to an <strong>internal access analyzer</strong>. "Remove permissions roles haven't used in 90 days" points to an <strong>unused access analyzer</strong> or policy generation.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Evaluation: any explicit deny, then RCPs, SCPs, resource policy, identity policy, boundary, session policy. Same account: a resource policy naming a user or session ARN escapes boundaries; naming a role ARN doesn't. Trust policies and KMS key policies must always allow explicitly. Cross-account: both sides must allow.</li>
+				<li>An account in <code>Principal</code> delegates to the whole account; role ARNs are stored as unique IDs (recreating breaks them). KMS cross-account needs key policy plus IAM policy; Secrets Manager cross-account needs a customer managed key; external IDs for vendors.</li>
+				<li>Paths group roles and policies for delegation (<code>role/team-a/*</code>) and can't be changed on roles. Roles Anywhere profiles and attribute mapping limit certificate sessions. Verified Permissions with Cedar for in-app authorization (STRICT needs a schema).</li>
+				<li>ABAC with <code>aws:PrincipalTag</code>, <code>aws:ResourceTag</code>, <code>aws:RequestTag</code> and <code>aws:TagKeys</code>; protect the tags; session tags via <code>PrincipalTag:</code> (IAM SAML) or <code>AccessControl:</code> (Identity Center) attributes. RBAC by job function; combine both.</li>
+				<li>Least privilege: boundaries and session policies only reduce; beware <code>NotAction</code> allows, <code>NotPrincipal</code>, <code>ForAllValues</code> on empty sets and negated <code>IfExists</code> denies. Access Analyzer generation (no PassRole or data events), validation and custom checks in pipelines. Roles now take 20 managed policies by default.</li>
+				<li>Failures: AccessDenied names the policy type, explicit or implicit, and now the policy ARN; decode EC2 messages with STS; the simulator covers SCPs but not RCPs or VPC endpoint policies.</li>
+				<li>Unintended access: external (per Region, archive rules, access previews), internal (critical resources) and unused access analyzers; credential report; known escalation combinations around PassRole and policy editing.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-1.html"><small>Previous</small>Task 4.1: Authentication strategies</a>
+				<a class="next" href="d5-task-5-1.html"><small>Next</small>Task 5.1: Data in transit</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
