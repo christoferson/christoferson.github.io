@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 5.2: Controls for Data at Rest | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 5.2 study guide: choosing between KMS key types, CloudHSM and custom key stores, envelope encryption, S3 SSE-S3, SSE-KMS with bucket keys, DSSE-KMS, SSE-C blocked by default and client-side encryption, services that encrypt only at creation, integrity with Vault Lock, MFA delete, checksums, Lambda code signing and DataSync verification, S3, EFS, FSx and Data Lifecycle Manager lifecycle, and replication and backup with S3 replication, AWS Backup, EBS Snapshot Lock and Recycle Bin.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">Task 5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Data Protection &middot; 18%</span>
+		<h1>Task 5.2: Design and implement controls for data at rest</h1>
+		<p>Protecting stored data: choosing who holds the keys and where encryption happens, proving data hasn't changed, keeping it exactly as long as required and no longer, and replicating and backing it up so ransomware or a deleted account can't take it away.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">AWS KMS</span><span class="tag">CloudHSM</span><span class="tag">S3 encryption</span><span class="tag">AWS Backup</span><span class="tag">S3 Replication</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Choosing encryption at rest</a></li>
+				<li><a href="#s2">Protecting data integrity</a></li>
+				<li><a href="#s3">Lifecycle and retention</a></li>
+				<li><a href="#s4">Replication and backup</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.2</span>
+				<p><strong>Design and implement controls for data at rest.</strong></p>
+			</div>
+			<p>Most AWS storage is encrypted by default now, so exam questions are rarely "turn on encryption". They ask which key type meets a requirement (who can audit it, rotate it, share it across accounts), whether encryption can be added later, how to prove data wasn't altered, and how to keep backups out of an attacker's reach. Object Lock, Backup Vault Lock, air-gapped vaults and point-in-time restores are in <a href="d2-task-2-2.html#s4">Task 2.2</a>; key rotation, imported key material, multi-Region keys and secrets are Task 5.3.</p>
+			<p><strong>Running example.</strong> The same company. The S3 data platform holds customer data that compliance says must use keys the company controls and can audit; the payments team needs a single-tenant HSM for a legacy application; order records must be kept for 7 years unchanged; and every backup must survive the loss of the prod account.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>5.2.1</td><td data-label="What you need to be able to do">Choose the key service and encryption type for a requirement, and configure it</td></tr>
+						<tr><td>5.2.2</td><td data-label="What you need to be able to do">Protect integrity with locks, versioning, checksums, code signing and validation</td></tr>
+						<tr><td>5.2.3</td><td data-label="What you need to be able to do">Automate lifecycle and retention for S3, EFS, FSx and EBS</td></tr>
+						<tr><td>5.2.4</td><td data-label="What you need to be able to do">Design secure replication and backup, including against ransomware</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout retired"><p><strong>Status changes.</strong> S3 <strong>SSE-C</strong> is blocked by default for new buckets (and existing buckets in accounts that never used it) since April 2026. CloudHSM <code>hsm1.medium</code> reached end of support on 31 March 2026; clusters run on <code>hsm2m.medium</code>. The original <strong>Amazon Glacier</strong> vault service no longer accepts new customers; new designs use the S3 Glacier storage classes. KMS added post-quantum ML-DSA signing keys (June 2025), Ed25519 (November 2025) and ML-KEM keys (October 2026).</p></div>
+
+			<!-- Skill 5.2.1 -->
+			<h2 id="s1">Choosing encryption at rest</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.1</span><span class="skill-text">Design, implement, and configure data encryption at rest based on specific requirements (for example, by selecting the appropriate encryption key service such as AWS CloudHSM or AWS KMS or by selecting the appropriate encryption type such as client-side encryption or server-side encryption).</span></p>
+
+				<h3>Which kind of key</h3>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>AWS owned key</th><th>AWS managed key</th><th>Customer managed key</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Where it lives</th></tr>
+							<tr><td data-label="AWS owned key">In an AWS service account; you can't see it</td><td data-label="AWS managed key">In your account, alias <code>aws/&lt;service&gt;</code>; created by the service</td><td data-label="Customer managed key">In your account; created by you</td></tr>
+							<tr class="group"><th colspan="3">Control and audit</th></tr>
+							<tr><td data-label="AWS owned key">None; not in CloudTrail</td><td data-label="AWS managed key">View the policy and usage in CloudTrail; can't change the policy, rotation (yearly) or delete it</td><td data-label="Customer managed key">Your key policy and grants, rotation, disable, scheduled deletion, tags; full CloudTrail record</td></tr>
+							<tr class="group"><th colspan="3">Cross-account use</th></tr>
+							<tr><td data-label="AWS owned key">No</td><td data-label="AWS managed key">No: resources encrypted with it can't be shared with other accounts</td><td data-label="Customer managed key">Yes, through the key policy</td></tr>
+							<tr class="group"><th colspan="3">Cost</th></tr>
+							<tr><td data-label="AWS owned key">Free</td><td data-label="AWS managed key">No monthly fee; per-request fees</td><td data-label="Customer managed key">Monthly fee per key plus requests</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>AWS calls AWS managed keys a legacy type no longer created for new services, which use AWS owned keys. For the running example's "keys we control and can audit", the answer is a <strong>customer managed key</strong>; "share encrypted snapshots, replicate or copy backups to another account" also always needs one.</p>
+
+				<h3>KMS, CloudHSM or a custom key store</h3>
+				<div class="entry">
+					<h4>AWS KMS</h4>
+					<p>KMS keys are held in FIPS 140-3 Level 3 validated HSMs and never leave KMS unencrypted. A key's spec is fixed at creation: <code>SYMMETRIC_DEFAULT</code> (AES-256-GCM, the one storage services use), RSA and ECC for encryption, signing or key agreement, HMAC keys, and now post-quantum <strong>ML-DSA</strong> (signing) and <strong>ML-KEM</strong> (key establishment). <code>Encrypt</code> takes at most 4 KB, so data is encrypted with <strong>envelope encryption</strong>: <code>GenerateDataKey</code> returns a data key in plaintext and encrypted under the KMS key; encrypt locally with the plaintext key, discard it, and store the encrypted key with the data. Services do this for you; the AWS Encryption SDK does it in your code.</p>
+					<p>Limit a key to use through particular services with <code>kms:ViaService</code>, so a role can use the data key for EBS and RDS but not call <code>Decrypt</code> directly:</p>
+					<span class="file">The app role can use the key only through EC2 (EBS) and RDS (key policy statement, JSON)</span>
+<pre><code>{
+  "Sid": "UseOnlyThroughEbsAndRds",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::111111111111:role/orders-app" },
+  "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:CreateGrant", "kms:DescribeKey"],
+  "Resource": "*",
+  "Condition": { "StringEquals": { "kms:ViaService": ["ec2.us-east-1.amazonaws.com", "rds.us-east-1.amazonaws.com"] } }
+}</code></pre>
+				</div>
+				<div class="entry">
+					<h4>AWS CloudHSM</h4>
+					<p>CloudHSM gives <strong>single-tenant</strong> HSMs in your VPC (cluster of <code>hsm2m.medium</code> HSMs across AZs, in FIPS or non-FIPS mode chosen at creation). You create and manage the HSM users and keys yourself, outside IAM, and AWS can't see them. Applications use standard interfaces: PKCS #11, JCE, Windows CNG and OpenSSL. Choose it when a requirement says single-tenant or customer-exclusive HSM, or for uses KMS doesn't cover: SSL/TLS offload for web servers, Oracle TDE, a private CA's signing key, or applications that need PKCS #11. The payments team's legacy application in the running example is that case.</p>
+				</div>
+				<div class="entry">
+					<h4>Custom key stores</h4>
+					<p>A <strong>CloudHSM key store</strong> lets KMS keys live in your CloudHSM cluster (KMS integrations, your HSMs); an <strong>external key store</strong> keeps key material in an HSM outside AWS through a proxy (Task 5.3). Both support only symmetric encryption keys, have no SLA and limited throughput, and AWS advises using them only when regulation requires key material in a single-tenant or customer-controlled HSM, preferring a CloudHSM key store over an external one. Imported key material in a normal KMS key is often the simpler way to show control.</p>
+				</div>
+				<div class="callout tip"><p>"Keys must be in a single-tenant HSM that only we control" points to <strong>CloudHSM</strong> (or a CloudHSM key store if services need KMS integration). "Encrypt S3 and EBS with keys we can audit and disable" points to a <strong>customer managed KMS key</strong>. "Data larger than 4 KB with KMS" points to <strong>envelope encryption</strong>.</p></div>
+
+				<h3>Where encryption happens</h3>
+				<div class="entry">
+					<h4>Server-side options in S3</h4>
+					<ul>
+						<li><strong>SSE-S3</strong>: S3-managed keys; the default for every bucket since January 2023, at no cost.</li>
+						<li><strong>SSE-KMS</strong>: a KMS key (in the bucket's Region, symmetric). Uploads need <code>kms:GenerateDataKey</code>, downloads <code>kms:Decrypt</code>. <strong>S3 Bucket Keys</strong> cut KMS requests by up to 99% by deriving data keys from a short-lived bucket key; the encryption context becomes the bucket ARN, so key policy conditions on object ARNs stop matching.</li>
+						<li><strong>DSSE-KMS</strong>: two independent layers of AES-256, for standards that demand multi-layer encryption; no Bucket Keys.</li>
+						<li><strong>SSE-C</strong>: you send the key with each request and S3 never stores it. It's now <strong>blocked by default</strong>; requests that specify it get 403 until the bucket's <code>BlockedEncryptionTypes</code> is set to <code>NONE</code>.</li>
+					</ul>
+					<span class="file">Default SSE-KMS with the data platform key and a Bucket Key, and SSE-C kept blocked (AWS CLI)</span>
+<pre><code>aws s3api put-bucket-encryption --bucket shop-data-111111111111 \
+  --server-side-encryption-configuration '{
+    "Rules": [{
+      "ApplyServerSideEncryptionByDefault": {
+        "SSEAlgorithm": "aws:kms",
+        "KMSMasterKeyID": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+      },
+      "BucketKeyEnabled": true,
+      "BlockedEncryptionTypes": { "EncryptionType": ["SSE-C"] }
+    }]
+  }'</code></pre>
+					<span class="file">Refuse uploads that name any other KMS key (S3 bucket policy statement, JSON)</span>
+<pre><code>{
+  "Sid": "RequireDataPlatformKey",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::shop-data-111111111111/*",
+  "Condition": {
+    "StringNotEqualsIfExists": {
+      "s3:x-amz-server-side-encryption-aws-kms-key-id": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    }
+  }
+}</code></pre>
+					<p>Changing the default doesn't re-encrypt existing objects; copy them in place with S3 Batch Operations. Objects encrypted with <code>aws/s3</code> can't be shared with another account.</p>
+				</div>
+				<div class="entry">
+					<h4>Client-side encryption</h4>
+					<p>When data must be encrypted before it reaches AWS (so AWS never sees plaintext), encrypt in the application: the <strong>AWS Encryption SDK</strong> for any data (it can wrap each data key under several keys, such as KMS and an on-premises HSM), the <strong>Amazon S3 Encryption Client</strong> for S3 objects, and the <strong>AWS Database Encryption SDK</strong> (formerly the DynamoDB Encryption Client) to encrypt and sign individual DynamoDB attributes. The application then owns key handling; AWS services can't read, index or process the data.</p>
+				</div>
+				<div class="entry">
+					<h4>Services that decide at creation</h4>
+					<ul>
+						<li><strong>Encryption only at creation:</strong> RDS and Aurora (snapshot, copy the snapshot with encryption, restore), EFS (create a new encrypted file system and replicate), node-based ElastiCache (back up and restore into a new encrypted cluster). The KMS key of an RDS instance can't be changed either.</li>
+						<li><strong>Changeable later:</strong> DynamoDB (always encrypted; switch between AWS owned, AWS managed and customer managed keys any time), Redshift (modify encryption in place), OpenSearch (enable on existing domains, not disable; manual snapshots aren't covered).</li>
+						<li><strong>Message services:</strong> SQS (SSE-SQS by default or SSE-KMS, message body only), SNS and Kinesis (KMS, only data written after enabling). An SNS topic receiving CloudWatch alarm or EventBridge messages needs a customer managed key that allows those service principals.</li>
+						<li><strong>EFS, FSx and Lambda:</strong> enforce EFS encryption with the <code>elasticfilesystem:Encrypted</code> condition (SCP or IAM); FSx for Lustre is always encrypted; Lambda environment variables are encrypted at rest (use a customer managed key to control who can read them, and Secrets Manager for real secrets).</li>
+					</ul>
+				</div>
+				<div class="callout trap"><p>"Encrypt an existing unencrypted RDS database" can't be done by modifying it. The answer is <strong>snapshot, copy with encryption, restore</strong> (or blue/green). The same "at creation only" rule catches EFS and node-based ElastiCache.</p></div>
+			</div>
+
+			<!-- Skill 5.2.2 -->
+			<h2 id="s2">Protecting data integrity</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.2</span><span class="skill-text">Design and configure mechanisms to protect data integrity (for example, S3 Object Lock, S3 Glacier Vault Lock, versioning, digital code signing, file validation).</span></p>
+
+				<h3>Write once, read many</h3>
+				<div class="entry">
+					<h4>Object Lock, versioning and MFA delete</h4>
+					<p>For new designs, WORM storage on AWS is <strong>S3 Object Lock</strong> (compliance and governance modes, legal holds; <a href="d1-task-1-2.html#s3">Task 1.2</a>), with versioning underneath. <strong>Versioning</strong> alone keeps every version but lets anyone with <code>s3:DeleteObjectVersion</code> remove them; <strong>MFA delete</strong> adds a second factor for permanently deleting versions and changing the versioning state. MFA delete can only be enabled by the root user, only through the CLI or API, and can't be used on a bucket with lifecycle rules.</p>
+					<span class="file">Turn on versioning with MFA delete (AWS CLI, root user credentials)</span>
+<pre><code>aws s3api put-bucket-versioning --bucket audit-evidence-444444444444 \
+  --versioning-configuration Status=Enabled,MFADelete=Enabled \
+  --mfa "arn:aws:iam::444444444444:mfa/root-account-mfa-device 123456"</code></pre>
+					<p>Object Lock protects versions from deletion, but not from losing their KMS key: if the key is deleted, locked objects may become unreadable. Protect the key too (Task 5.3).</p>
+				</div>
+				<div class="entry">
+					<h4>Glacier Vault Lock</h4>
+					<p>The original Glacier vault service has <strong>Vault Lock</strong>: <code>initiate-vault-lock</code> attaches a lock policy in an <em>InProgress</em> state for 24 hours to test, and <code>complete-vault-lock</code> makes it permanent; after that the policy can't be changed or deleted. Typical lock policies deny <code>glacier:DeleteArchive</code> for archives younger than the retention period. The vault service no longer accepts new customers, so this applies to existing vaults; S3 Glacier storage classes with Object Lock replace it.</p>
+				</div>
+
+				<h3>Proving data hasn't changed</h3>
+				<div class="entry">
+					<h4>Checksums and validation</h4>
+					<ul>
+						<li><strong>S3 checksums:</strong> SDKs and the console send a checksum with every upload and S3 rejects mismatches (<code>BadDigest</code>); the default since December 2024 is CRC64NVME, with SHA-256, SHA-512 and others available. The S3 Batch Operations <strong>Compute checksum</strong> operation calculates checksums of stored objects, in any storage class, without downloading or restoring them, and writes a report: periodic proof that the archive is intact.</li>
+						<li><strong>CloudTrail log file validation</strong> proves logs weren't modified (<a href="d1-task-1-2.html#s2">Task 1.2</a>).</li>
+						<li><strong>DataSync</strong> always checks data in transit, and with <code>VerifyMode</code> <code>ONLY_FILES_TRANSFERRED</code> (recommended) or <code>POINT_IN_TIME_CONSISTENT</code> (all data, Basic mode only) also compares source and destination after the transfer.</li>
+						<li><strong>KMS signatures and MACs:</strong> asymmetric keys sign and verify (<code>aws kms sign</code>, now including ML-DSA), and HMAC keys generate and verify MACs, for application data such as exported files or tokens.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Code signing</h4>
+					<p><strong>AWS Signer</strong> signs code and images (Lambda packages, container images through Notation, IoT firmware). A Lambda <strong>code signing configuration</strong> lists the allowed signing profiles and what to do with code that fails: <code>Warn</code> (the default, which still deploys it and records a metric) or <code>Enforce</code> (block). Layers must be signed too, and checks happen at deployment, with no runtime cost. Require a code signing configuration on every function with an IAM condition:</p>
+					<span class="file">Functions can only be created with the company code signing configuration (identity policy statement, JSON)</span>
+<pre><code>{
+  "Sid": "RequireCodeSigning",
+  "Effect": "Deny",
+  "Action": "lambda:CreateFunction",
+  "Resource": "*",
+  "Condition": {
+    "StringNotEquals": {
+      "lambda:CodeSigningConfigArn": "arn:aws:lambda:us-east-1:111111111111:code-signing-config:csc-0d4518bd353a0a7c6"
+    }
+  }
+}</code></pre>
+				</div>
+				<div class="callout trap"><p>A code signing configuration left at the default <code>Warn</code> lets unsigned or tampered code deploy. Only <code>Enforce</code> blocks it, and it applies to new deployments, not code already running.</p></div>
+			</div>
+
+			<!-- Skill 5.2.3 -->
+			<h2 id="s3">Lifecycle and retention</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.3</span><span class="skill-text">Design automatic lifecycle management and retention solutions for data (for example, S3 Lifecycle policies, S3 Object Lock, Amazon EFS Lifecycle policies, Amazon FSx for Lustre backup policies).</span></p>
+
+				<h3>S3 Lifecycle</h3>
+				<div class="entry">
+					<h4>Keep exactly as long as required</h4>
+					<p>Lifecycle rules (up to 1,000 per bucket, filtered by prefix, tags and size) <strong>transition</strong> objects to cheaper classes and <strong>expire</strong> them. For versioned buckets, also expire noncurrent versions (otherwise "deleted" data stays forever), remove expired delete markers, and abort incomplete multipart uploads. For the 7-year order records: lock them with Object Lock for 7 years, move them to Glacier classes, and expire them after the retention ends.</p>
+					<span class="file">Order records: to Glacier Instant Retrieval at 90 days, Deep Archive at 1 year, deleted after 7 years (S3 lifecycle configuration, JSON)</span>
+<pre><code>{
+  "Rules": [
+    {
+      "ID": "orders-7-years",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "orders/" },
+      "Transitions": [
+        { "Days": 90, "StorageClass": "GLACIER_IR" },
+        { "Days": 365, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "Expiration": { "Days": 2557 },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}</code></pre>
+					<p>Applied with <code>aws s3api put-bucket-lifecycle-configuration --bucket shop-data-111111111111 --lifecycle-configuration file://lifecycle.json</code>.</p>
+					<ul>
+						<li><strong>Locks win:</strong> a lifecycle expiration can't delete an Object Lock-protected version; it only adds a delete marker, and the version is removed after its retention ends.</li>
+						<li><strong>Minimum durations</strong> (charged even if deleted early): 30 days for Standard-IA and One Zone-IA, 90 for Glacier Instant and Flexible Retrieval, 180 for Deep Archive. Objects under 128 KB aren't transitioned by default.</li>
+						<li>Lifecycle actions aren't in CloudTrail (they appear in server access logs), and billing changes when the rule is met even if the action runs later. For deletion deadlines that must be proven, check S3 Inventory's expiration date.</li>
+						<li><strong>Intelligent-Tiering</strong> moves objects between access tiers automatically when access patterns are unknown.</li>
+					</ul>
+				</div>
+
+				<h3>File systems and volumes</h3>
+				<div class="entry">
+					<h4>EFS lifecycle</h4>
+					<p>EFS moves files to Infrequent Access and Archive after a period without access, and back to Standard on first access:</p>
+					<span class="file">IA after 30 days, Archive after 90, back to Standard when read (AWS CLI)</span>
+<pre><code>aws efs put-lifecycle-configuration --file-system-id fs-0123456789abcdef0 \
+  --lifecycle-policies '[{"TransitionToIA": "AFTER_30_DAYS"}, {"TransitionToArchive": "AFTER_90_DAYS"}, {"TransitionToPrimaryStorageClass": "AFTER_1_ACCESS"}]'</code></pre>
+				</div>
+				<div class="entry">
+					<h4>FSx backups</h4>
+					<p>FSx for Lustre backs up <strong>persistent</strong> file systems that aren't linked to an S3 data repository (not scratch file systems): automatic daily backups kept 0 to 90 days (0 turns them off, the API default), plus user-initiated backups that never expire and survive deletion of the file system. FSx for Windows File Server has daily automatic backups on by default. For longer retention, cross-account copies and central policy, use AWS Backup.</p>
+				</div>
+				<div class="entry">
+					<h4>Amazon Data Lifecycle Manager</h4>
+					<p>DLM creates, copies and deletes <strong>EBS snapshots and EBS-backed AMIs</strong> by tag-based policy at no extra cost: up to four schedules, count or age retention, cross-Region copies (encrypted with a key you choose), cross-account sharing (only for unencrypted or customer-managed-key snapshots), fast snapshot restore and archiving. <strong>Default policies</strong> back up every volume or instance in a Region that has no recent backup, with 2 to 14 days of retention.</p>
+					<span class="file">Daily snapshots of tagged volumes, keep 7, copy encrypted to us-west-2 (DLM policy details, JSON)</span>
+<pre><code>{
+  "PolicyType": "EBS_SNAPSHOT_MANAGEMENT",
+  "ResourceTypes": ["VOLUME"],
+  "TargetTags": [{ "Key": "backup", "Value": "daily" }],
+  "Schedules": [{
+    "Name": "daily",
+    "CreateRule": { "Interval": 24, "IntervalUnit": "HOURS", "Times": ["03:00"] },
+    "RetainRule": { "Count": 7 },
+    "CopyTags": true,
+    "CrossRegionCopyRules": [{
+      "Target": "us-west-2",
+      "Encrypted": true,
+      "CmkArn": "arn:aws:kms:us-west-2:111111111111:key/abcd1234-ab12-cd34-ef56-abcdef123456",
+      "CopyTags": true,
+      "RetainRule": { "Interval": 7, "IntervalUnit": "DAYS" }
+    }]
+  }]
+}</code></pre>
+					<p>In AWS Backup, a rule that moves recovery points to cold storage must keep them at least 90 days after the move, and only some resource types (EFS, DynamoDB with advanced backup, EBS through snapshot archive and a few others) support cold storage.</p>
+				</div>
+			</div>
+
+			<!-- Skill 5.2.4 -->
+			<h2 id="s4">Replication and backup</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2.4</span><span class="skill-text">Design and configure secure replication and backup solutions (for example, Amazon Data Lifecycle Manager, AWS Backup, ransomware protection, AWS DataSync).</span></p>
+
+				<h3>S3 replication</h3>
+				<div class="entry">
+					<h4>Replicating encrypted and locked objects</h4>
+					<p>Cross-Region and same-Region replication copy new objects (versioning on both buckets, an IAM role S3 assumes). Objects encrypted with <strong>SSE-KMS or DSSE-KMS aren't replicated</strong> unless the rule opts in with <code>SseKmsEncryptedObjects</code> and names a key in the destination Region; the role needs <code>kms:Decrypt</code> on the source key and <code>kms:Encrypt</code> on the destination key. Across accounts, the keys must be customer managed.</p>
+					<span class="file">Replicate the data platform, including SSE-KMS objects, to the DR bucket in another account within 15 minutes (S3 replication configuration, JSON)</span>
+<pre><code>{
+  "Role": "arn:aws:iam::111111111111:role/s3-replication",
+  "Rules": [
+    {
+      "ID": "dr-copy",
+      "Status": "Enabled",
+      "Priority": 1,
+      "Filter": {},
+      "DeleteMarkerReplication": { "Status": "Disabled" },
+      "SourceSelectionCriteria": { "SseKmsEncryptedObjects": { "Status": "Enabled" } },
+      "Destination": {
+        "Bucket": "arn:aws:s3:::shop-data-dr-888888888888",
+        "Account": "888888888888",
+        "AccessControlTranslation": { "Owner": "Destination" },
+        "EncryptionConfiguration": { "ReplicaKmsKeyID": "arn:aws:kms:us-west-2:888888888888:key/5678efgh-56ef-78gh-90ij-5678efgh90ij" },
+        "ReplicationTime": { "Status": "Enabled", "Time": { "Minutes": 15 } },
+        "Metrics": { "Status": "Enabled", "EventThreshold": { "Minutes": 15 } }
+      }
+    }
+  ]
+}</code></pre>
+					<ul>
+						<li>Replication <strong>doesn't replicate deletes of specific versions</strong>, which protects the copy from malicious deletion; delete markers replicate only if enabled.</li>
+						<li>Existing objects, failed objects and replicas need <strong>S3 Batch Replication</strong>; Replication Time Control (15 minutes) doesn't cover it.</li>
+						<li>The <strong>owner override</strong> (<code>"Owner": "Destination"</code>) gives the destination account ownership of replicas; with bucket owner enforced on the destination, ownership is automatic.</li>
+						<li>Object Lock buckets can replicate to Object Lock destinations, and retention settings travel with the objects.</li>
+					</ul>
+				</div>
+
+				<h3>AWS Backup</h3>
+				<div class="entry">
+					<h4>Plans, copies and vault policies</h4>
+					<p>A <strong>backup plan</strong> schedules backups of selected resources into a vault, with lifecycle and <strong>copy actions</strong> to other Regions or accounts; Organizations <strong>backup policies</strong> deploy plans to every account. A <strong>vault access policy</strong> can deny deleting recovery points to everyone but a break-glass role, and AWS Backup <strong>Vault Lock</strong> makes retention immutable (<a href="d2-task-2-2.html#s4">Task 2.2</a>).</p>
+					<span class="file">Only the backup admin role can delete recovery points in the prod vault (backup vault access policy, JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyDeleteExceptBackupAdmin",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "backup:DeleteRecoveryPoint",
+      "Resource": "*",
+      "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::111111111111:role/backup-admin" } }
+    }
+  ]
+}</code></pre>
+					<p>A vault access policy only controls AWS Backup APIs; it doesn't stop someone deleting an EBS snapshot or RDS snapshot through EC2 or RDS, so add IAM and SCP denies (or EBS Snapshot Lock). <strong>Independent encryption</strong> (the vault's key, regardless of the source) applies only to fully managed resource types such as S3, EFS and DynamoDB with advanced backup; EBS, RDS, Aurora and FSx backups keep the source's key, so the source must be encrypted with a customer managed key for cross-account copies. AWS Backup Audit Manager frameworks report whether backups exist, are encrypted and are copied as required.</p>
+				</div>
+
+				<h3>Ransomware resilience</h3>
+				<ol class="flow">
+					<li><b>Back up everything by policy</b>Organizations backup policies so no account can skip it.</li>
+					<li><b>Copy out of the account</b>Copy actions to a vault in a separate backup account (or a logically air-gapped vault), so the prod account's credentials can't reach the copies.</li>
+					<li><b>Make retention immutable</b>Vault Lock in compliance mode, EBS Snapshot Lock, S3 Object Lock.</li>
+					<li><b>Keep the keys safe</b>Customer managed keys in the backup account, with deletion denied by SCP.</li>
+					<li><b>Prove you can restore clean</b>Malware scanning of recovery points and restore testing.</li>
+				</ol>
+				<div class="entry">
+					<h4>EBS Snapshot Lock and Recycle Bin</h4>
+					<p><strong>EBS Snapshot Lock</strong> (November 2023) locks snapshots for 1 to 36,500 days. Governance mode can be changed by authorized users; compliance mode allows changes only during an optional cooling-off period of up to 72 hours, after which the lock can only be extended. <strong>Recycle Bin</strong> keeps deleted snapshots, EBS-backed AMIs and (since November 2025) EBS volumes for a retention period, so an accidental or malicious deletion can be undone; a <strong>locked</strong> Region-level rule can't be changed or deleted without a 7 to 30 day unlock delay.</p>
+					<span class="file">Lock a snapshot in compliance mode after a 24-hour cooling-off, and keep deleted snapshots for 30 days (AWS CLI)</span>
+<pre><code>aws ec2 lock-snapshot --snapshot-id snap-0abcdef1234567890 \
+  --lock-mode compliance --cool-off-period 24 --lock-duration 365
+
+aws rbin create-rule --resource-type EBS_SNAPSHOT \
+  --retention-period RetentionPeriodValue=30,RetentionPeriodUnit=DAYS \
+  --description "Keep deleted snapshots for 30 days" \
+  --lock-configuration 'UnlockDelay={UnlockDelayUnit=DAYS,UnlockDelayValue=7}'</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Other replication paths</h4>
+					<ul>
+						<li><strong>RDS cross-Region automated backups</strong> replicate snapshots and logs for point-in-time restore in another Region, with a KMS key in the destination Region (<code>start-db-instance-automated-backups-replication</code>).</li>
+						<li><strong>DynamoDB export to S3</strong> (needs point-in-time recovery) copies tables to a bucket in another account or Region without consuming capacity.</li>
+						<li><strong>AWS DataSync</strong> moves data between on premises, other clouds and AWS storage with TLS in transit and post-transfer verification, writing into encrypted S3, EFS or FSx destinations through an IAM role.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"Backups must survive compromise of the production account" points to <strong>cross-account copies into a locked vault</strong> (or a logically air-gapped vault). "Replicate KMS-encrypted objects to another Region" points to <strong><code>SseKmsEncryptedObjects</code> plus a destination key</strong>. "Recover snapshots someone deleted" points to <strong>Recycle Bin</strong>.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Keys: AWS owned (invisible, free), AWS managed (<code>aws/</code>, auditable, no policy control, not cross-account), customer managed (full control, cross-account). KMS HSMs are FIPS 140-3 Level 3; 4 KB Encrypt limit means envelope encryption; <code>kms:ViaService</code> limits use to services.</li>
+				<li>CloudHSM for single-tenant HSMs you manage (PKCS #11, TLS offload, Oracle TDE); custom key stores only when regulation demands, symmetric keys only, no SLA.</li>
+				<li>S3: SSE-S3 default; SSE-KMS with Bucket Keys (encryption context becomes the bucket ARN); DSSE-KMS for dual layers; SSE-C blocked by default since April 2026; client-side with the Encryption SDK, S3 Encryption Client or Database Encryption SDK.</li>
+				<li>Encrypt at creation only: RDS and Aurora, EFS, node-based ElastiCache; DynamoDB keys switchable, Redshift and OpenSearch can be enabled later.</li>
+				<li>Integrity: Object Lock (keys still matter), versioning with MFA delete (root, CLI, no lifecycle), Glacier Vault Lock (24-hour test, then permanent; service closed to new customers), CRC64NVME checksums and Batch Compute checksum, DataSync verification, KMS signing and HMAC, Lambda code signing in <code>Enforce</code> mode.</li>
+				<li>Lifecycle: transitions and expiration including noncurrent versions and incomplete uploads; locks override expiration; minimum durations 30/90/180 days; EFS IA and Archive; FSx for Lustre backups for persistent file systems only; DLM for EBS snapshots and AMIs; Backup cold storage needs 90 more days.</li>
+				<li>Replication and backup: S3 replication needs opt-in for SSE-KMS objects and doesn't replicate version deletes; AWS Backup plans, copy actions, vault access policies (Backup APIs only), independent encryption for fully managed types; ransomware pattern of cross-account immutable copies; EBS Snapshot Lock and Recycle Bin with rule lock.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-1.html"><small>Previous</small>Task 5.1: Data in transit</a>
+				<a class="next" href="d5-task-5-3.html"><small>Next</small>Task 5.3: Secrets, credentials and key material</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
