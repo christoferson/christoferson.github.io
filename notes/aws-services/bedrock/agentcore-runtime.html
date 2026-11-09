@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock AgentCore Runtime | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock AgentCore Runtime: runtimes, versions, endpoints and sessions, microVMs and Instances, platform V1 and V2, building agents with the Python SDK, the HTTP, MCP, A2A and AG-UI service contracts, container and zip deployment, CreateAgentRuntime, invoking with boto3, HTTPS and WebSocket, shell commands, inbound and outbound auth, VPC and file systems, quotas, pricing and observability.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">AgentCore Runtime</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; AgentCore &middot; Last checked 9 November 2026</span>
+		<h1>AgentCore Runtime</h1>
+		<p>Serverless hosting for your own agent, MCP server, A2A agent or AG-UI backend, in any framework and with any model. Each session runs in its own isolated microVM (or EC2 instance), for up to 8 hours (or 14 days), billed by the second for CPU actually used.</p>
+		<div class="tags"><span class="tag code">AgentCore Runtime</span><span class="tag">MCP</span><span class="tag">A2A</span><span class="tag">Containers</span><span class="tag">boto3</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Concepts</a></li>
+				<li><a href="#s2">Compute types and platform versions</a></li>
+				<li><a href="#s3">Building an agent</a></li>
+				<li><a href="#s4">The service contract</a></li>
+				<li><a href="#s5">Deploying</a></li>
+				<li><a href="#s6">Invoking</a></li>
+				<li><a href="#s7">Authentication and the execution role</a></li>
+				<li><a href="#s8">Networking and storage</a></li>
+				<li><a href="#s9">MCP servers, A2A and AG-UI</a></li>
+				<li><a href="#s10">Quotas, pricing and observability</a></li>
+				<li><a href="#s11">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Concepts</h2>
+			<p>If you'd rather configure an agent than write one, use the <a href="agentcore.html">Harness</a>, which runs on Runtime. This page is for hosting your own code.</p>
+			<ul>
+				<li><strong>Agent runtime:</strong> your hosted agent or tool server (a container image or a code zip). Creating one also creates a <strong>workload identity</strong> for it in AgentCore Identity.</li>
+				<li><strong>Versions:</strong> immutable and numbered (1, 2, 3...). Creating makes version 1; <strong>every update</strong> (image, settings, network, auth) makes a new version.</li>
+				<li><strong>Endpoints:</strong> <code>DEFAULT</code> is created automatically and follows the latest version; named endpoints (for example <code>prod</code>) pin a version until you move them, with no downtime. Up to 10 per runtime.</li>
+				<li><strong>Sessions:</strong> a <code>runtimeSessionId</code> (at least 33 characters; use a UUID) maps to one dedicated microVM with its own CPU, memory and file system. A session is <strong>active</strong> while handling a request or reporting background work, <strong>idle</strong> otherwise, and <strong>stopped</strong> after the idle timeout (default 15 minutes), the maximum lifetime (default and maximum 8 hours), <code>StopRuntimeSession</code>, or failing health checks. Then the microVM is destroyed and its memory wiped.</li>
+				<li>Calling a stopped session's ID again starts a <strong>new, empty microVM</strong>. Only mounted storage survives; keep conversations in AgentCore Memory. Existing sessions keep the code they started with, so use a new session ID to test an update.</li>
+				<li>AgentCore doesn't map sessions to users: your backend decides which user owns which session.</li>
+			</ul>
+			<div class="callout trap"><p>Runtime and endpoint names allow <strong>letters, digits and underscores only</strong> (up to 48 characters), and versions are plain integers. An AWS versioning example uses <code>production-endpoint</code>, version <code>v2.1</code> and the wrong client: all three fail. Endpoints are managed with the <code>bedrock-agentcore-control</code> client.</p></div>
+
+			<h2 id="s2">Compute types and platform versions</h2>
+			<div class="table-wrap">
+				<table class="stack labeled compare">
+					<thead><tr><th>microVMs (default)</th><th>Instances</th></tr></thead>
+					<tbody>
+						<tr class="group"><th colspan="2">What runs your session</th></tr>
+						<tr><td data-label="microVMs (default)">A serverless microVM per session</td><td data-label="Instances">An AWS-managed EC2 instance in your account, from a capacity provider you define</td></tr>
+						<tr class="group"><th colspan="2">Limits</th></tr>
+						<tr><td data-label="microVMs (default)">ARM64 only, up to 2 vCPU and 8 GB, sessions up to 8 hours, no GPU</td><td data-label="Instances">x86_64 or ARM64, instance types you allow (including GPU families such as g5, g6 and inf2), sessions up to 14 days, VPC only</td></tr>
+						<tr class="group"><th colspan="2">Billing</th></tr>
+						<tr><td data-label="microVMs (default)">vCPU-seconds used and memory per second</td><td data-label="Instances">EC2 price (your Savings Plans and reservations apply) plus a management fee, plus EBS even while stopped</td></tr>
+						<tr class="group"><th colspan="2">Not available</th></tr>
+						<tr><td data-label="microVMs (default)">GPUs, multi-day sessions</td><td data-label="Instances">Custom port or path, session endpoints, session storage, EFS and S3 Files mounts</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Instances (generally available August 2026, 9 Regions) suit long-running or GPU workloads; up to 20 agents can share one instance session and a volume, without isolation from each other. The compute type can't be changed after creation, and you pass the capacity provider instead of a network configuration.</p>
+			<div class="entry">
+				<h4>Platform V1 and V2 (microVMs)</h4>
+				<p>Set <code>platformVersion="V2"</code> on create or update (V1 is the default). <strong>V2</strong> (generally available 18 September 2026, now in 10 Regions) prepares your environment once, snapshots it, and restores new sessions from the snapshot: AWS measured cold starts of about 2 seconds versus 5 to 30 seconds on V1 for 200 MB to 2 GB images. V2 also reclaims unused memory after 120 seconds, allows 250 connections per session, adds per-session IAM context keys and FUSE mounts, and costs more per unit (see <a href="#s10">pricing</a>).</p>
+				<ul>
+					<li>Creating or updating a V2 runtime takes <strong>minutes</strong>, and <code>/ping</code> must report healthy within 120 seconds of start-up or creation fails. Poll <code>GetAgentRuntime</code> until <code>READY</code>.</li>
+					<li>Do expensive set-up at module scope so it's in the snapshot, but generate <strong>random values, IDs, tokens and timestamps per request</strong>: restored copies share the snapshot's state (in Node.js, even crypto output can repeat, so read <code>/dev/urandom</code>).</li>
+					<li>AWS clients created at import time load credentials before the snapshot, so they lack the session context keys (<code>aws:AgentCoreRuntimeSourceSid</code>, <code>aws:AgentCoreRuntimeSourceArn</code>). If your IAM policies use those keys (for example a per-session S3 prefix), create the client in the handler from a new <code>boto3.Session()</code>.</li>
+				</ul>
+			</div>
+
+			<h2 id="s3">Building an agent</h2>
+			<div class="entry">
+				<h4>Python with the AgentCore SDK</h4>
+				<p>The <code>bedrock-agentcore</code> package (Python 3.10 or later) wraps your code in <code>BedrockAgentCoreApp</code>, a Starlette server that implements the contract: <code>POST /invocations</code>, <code>GET /ping</code> and a <code>/ws</code> WebSocket. Extras add framework support: <code>[strands-agents]</code>, <code>[a2a]</code>, <code>[ag-ui]</code>.</p>
+				<span class="file">main.py: a streaming Strands agent (Python; requirements: bedrock-agentcore[strands-agents], strands-agents, aws-opentelemetry-distro)</span>
+<pre><code>from bedrock_agentcore import BedrockAgentCoreApp
+from strands import Agent
+
+app = BedrockAgentCoreApp()
+<span class="c"># Created once per microVM; the default model is on Bedrock (execution role needs bedrock:InvokeModel*)</span>
+agent = Agent()
+
+
+@app.entrypoint
+async def invoke(payload, context):
+    <span class="c"># payload is the parsed JSON body; context.session_id is the runtime session</span>
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        yield {"error": "prompt must be a non-empty string"}
+        return
+    <span class="c"># Yielding makes the response a server-sent event stream</span>
+    async for event in agent.stream_async(prompt):
+        yield event
+
+
+if __name__ == "__main__":
+    app.run()</code></pre>
+				<ul>
+					<li>The SDK passes the request context only if the second parameter is named exactly <code>context</code>. <code>context.request_headers</code> holds only <code>Authorization</code> and <code>X-Amzn-Bedrock-AgentCore-Runtime-Custom-*</code> headers.</li>
+					<li>Return a dict for a JSON response, or yield (sync or async generator) to stream server-sent events.</li>
+					<li>Validate that the prompt is a string, as above: AWS warns that structured input can smuggle tool-use blocks into the model call.</li>
+					<li>Don't block inside the entrypoint, or <code>/ping</code> stops answering and the session is killed. For background work, use <code>app.add_async_task()</code> and <code>app.complete_async_task()</code> (or a custom <code>@app.ping</code>) so the session reports <code>HealthyBusy</code> and isn't treated as idle.</li>
+					<li><code>app.run()</code> listens on <code>0.0.0.0:8080</code> inside a container and on <code>127.0.0.1</code> elsewhere, so a local test with <code>curl http://localhost:8080/invocations</code> works.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Without the SDK, and Node.js</h4>
+				<p>Any HTTP server that follows the contract works, for example FastAPI on <code>0.0.0.0:8080</code> with <code>POST /invocations</code> and <code>GET /ping</code> returning <code>{"status": "Healthy"}</code>; your code then reads the session ID header itself. For Node.js, the TypeScript SDK (npm <code>bedrock-agentcore</code>, imported from <code>bedrock-agentcore/runtime</code>) provides the same app object, and zip deployment supports Node.js 22 (compile TypeScript to JavaScript first).</p>
+			</div>
+
+			<h2 id="s4">The service contract</h2>
+			<ul>
+				<li><strong>HTTP</strong> (agents): port 8080, <code>POST /invocations</code> (JSON or server-sent events), <code>GET /ping</code>, WebSocket <code>/ws</code>.</li>
+				<li><strong>MCP</strong> (tool servers): port 8000, <code>POST /mcp</code> (Streamable HTTP, JSON-RPC); a <code>GET /ping</code> is recommended.</li>
+				<li><strong>A2A</strong> (agent-to-agent): port 9000, <code>POST /</code> (JSON-RPC 2.0) and the agent card at <code>/.well-known/agent-card.json</code>.</li>
+				<li><strong>AG-UI</strong> (agent front ends): port 8080, <code>POST /invocations</code> streaming AG-UI events, and <code>/ws</code>.</li>
+				<li>Since October 2026 you can change the port (8000 to 12000) and path on microVMs. Containers must listen on <code>0.0.0.0</code>.</li>
+				<li><code>/ping</code> returns <code>{"status": "Healthy"}</code> or <code>{"status": "HealthyBusy"}</code>, with an optional <code>time_of_last_update</code>. Change that timestamp only when the status changes: refreshing it on every ping stops sessions from ever going idle, so they run to the 8-hour limit and exhaust your session quota.</li>
+				<li>Payloads up to 100 MB, streaming chunks up to 10 MB, synchronous requests up to 15 minutes, streams and WebSockets up to 60 minutes, background work up to the session's lifetime.</li>
+				<li>Errors: <code>424 RuntimeClientError</code> means your container returned an error or never became ready (check its logs); <code>409 RetryableConflictException</code> means the session is still starting or stopping (AWS SDKs retry it; raw HTTP clients must).</li>
+			</ul>
+
+			<h2 id="s5">Deploying</h2>
+			<div class="entry">
+				<h4>Container or zip</h4>
+				<ul>
+					<li><strong>Container:</strong> a <code>linux/arm64</code> image in Amazon ECR, up to 2 GB. You patch the image; AWS patches the host.</li>
+					<li><strong>Direct code (zip):</strong> a zip in S3, up to 250 MB zipped and 750 MB unzipped, with ARM64 wheels and files at the root. Runtimes <code>PYTHON_3_12</code>, <code>PYTHON_3_13</code>, <code>PYTHON_3_14</code> and <code>NODE_22</code>; Python 3.10 and 3.11 are past their update-block date (31 August 2026). AWS patches the language runtime for you.</li>
+				</ul>
+				<span class="file">Build and push an ARM64 image (shell)</span>
+<pre><code>aws ecr create-repository --repository-name support-agent --region us-west-2
+aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 111111111111.dkr.ecr.us-west-2.amazonaws.com
+docker buildx create --use
+docker buildx build --platform linux/arm64 -t 111111111111.dkr.ecr.us-west-2.amazonaws.com/support-agent:1.0.0 --push .</code></pre>
+				<p>An "exec format error" in the logs means the image or wheels were built for x86. Images with more than 53 layers and a non-numeric <code>USER</code> fail to mount: use <code>USER 1000</code> or fewer layers.</p>
+			</div>
+			<div class="entry">
+				<h4>CreateAgentRuntime</h4>
+				<span class="file">Create a V2 runtime, wait for it, and pin a prod endpoint (Python, boto3; shapes from the API reference)</span>
+<pre><code>import time
+
+import boto3
+
+ctl = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+
+r = ctl.create_agent_runtime(
+    agentRuntimeName="support_agent",
+    agentRuntimeArtifact={"containerConfiguration": {
+        "containerUri": "111111111111.dkr.ecr.us-west-2.amazonaws.com/support-agent:1.0.0",
+    }},
+    roleArn="arn:aws:iam::111111111111:role/AgentRuntimeRole",
+    networkConfiguration={"networkMode": "PUBLIC"},
+    <span class="c"># HTTP | MCP | A2A | AGUI</span>
+    protocolConfiguration={"serverProtocol": "HTTP"},
+    lifecycleConfiguration={"idleRuntimeSessionTimeout": 300, "maxLifetime": 3600},
+    environmentVariables={"LOG_LEVEL": "info"},
+    platformVersion="V2",
+)
+runtime_id, runtime_arn = r["agentRuntimeId"], r["agentRuntimeArn"]
+
+<span class="c"># V2 creation takes minutes</span>
+while (s := ctl.get_agent_runtime(agentRuntimeId=runtime_id))["status"] not in ("READY", "CREATE_FAILED"):
+    time.sleep(10)
+if s["status"] != "READY":
+    raise RuntimeError(s.get("failureReason"))
+
+ctl.create_agent_runtime_endpoint(agentRuntimeId=runtime_id, name="prod", agentRuntimeVersion="1")</code></pre>
+				<ul>
+					<li>For a zip, use <code>agentRuntimeArtifact={"codeConfiguration": {"code": {"s3": {"bucket": ..., "prefix": "agent/package.zip"}}, "runtime": "PYTHON_3_13", "entryPoint": ["opentelemetry-instrument", "main.py"]}}</code> (the <code>prefix</code> is the object key).</li>
+					<li>Other settings: <code>authorizerConfiguration</code> (JWT; omit for IAM), <code>requestHeaderConfiguration</code> (up to 20 extra headers passed to your code), <code>filesystemConfigurations</code>, <code>allowedPorts</code> (session endpoints), <code>capacityProviderConfiguration</code> (Instances) and up to 50 <code>environmentVariables</code> (4 KB in total; plain text, so no secrets).</li>
+					<li><code>UpdateAgentRuntime</code> must resend <code>agentRuntimeArtifact</code> and <code>roleArn</code> every time, and always makes a new version: DEFAULT moves, named endpoints don't until you call <code>UpdateAgentRuntimeEndpoint</code>.</li>
+				</ul>
+			</div>
+			<div class="callout trap"><p>Since 30 June 2026 invocations require <strong>MMDSv2</strong> (the token-protected version of the microVM metadata service that serves the role's credentials). Older runtimes fail with "This runtime is not MMDSv2-enabled" until you run <code>update_agent_runtime(..., metadataConfiguration={"requireMMDSV2": True})</code>; the field exists only on update.</p></div>
+			<div class="entry">
+				<h4>AgentCore CLI, CloudFormation and CDK</h4>
+				<ul>
+					<li><strong>CLI</strong> (npm <code>@aws/agentcore</code>): <code>agentcore create --name P --template agent-python-strands</code> (templates also for LangChain, TypeScript Strands and Vercel, A2A, AG-UI and FastMCP), <code>agentcore add runtime --name N --language python --protocol MCP</code>, <code>agentcore dev</code> to run locally, <code>agentcore deploy</code>, <code>agentcore invoke --runtime N --payload '{"prompt": "Hi"}'</code>, <code>agentcore logs runtime --name N</code>. Adding a Dockerfile switches the build from zip to container.</li>
+					<li><strong>CloudFormation:</strong> <code>AWS::BedrockAgentCore::Runtime</code> and <code>AWS::BedrockAgentCore::RuntimeEndpoint</code>. In CloudFormation <code>ProtocolConfiguration</code> is a plain string (<code>MCP</code>), not the API object.</li>
+					<li><strong>CDK:</strong> stable constructs in <code>aws-cdk-lib/aws-bedrockagentcore</code>: <code>Runtime</code> with <code>AgentRuntimeArtifact.fromAsset(dir)</code> or <code>fromCodeAsset(...)</code>, <code>runtime.addEndpoint(...)</code>, <code>RuntimeAuthorizerConfiguration.usingCognito(...)</code> and <code>grantInvoke</code>.</li>
+				</ul>
+			</div>
+
+			<h2 id="s6">Invoking</h2>
+			<div class="entry">
+				<h4>boto3</h4>
+				<span class="file">Call the agent and read either JSON or a stream (Python, boto3)</span>
+<pre><code>import json
+import uuid
+
+import boto3
+
+rt = boto3.client("bedrock-agentcore", region_name="us-west-2")
+<span class="c"># Reuse the same ID for follow-up turns in this session</span>
+session_id = str(uuid.uuid4())
+
+resp = rt.invoke_agent_runtime(
+    agentRuntimeArn=RUNTIME_ARN,
+    qualifier="prod",
+    runtimeSessionId=session_id,
+    contentType="application/json",
+    payload=json.dumps({"prompt": "Where is my order 1234?"}).encode(),
+)
+if "text/event-stream" in resp.get("contentType", ""):
+    for line in resp["response"].iter_lines(chunk_size=10):
+        if line and line.decode().startswith("data: "):
+            print(line.decode()[6:])
+else:
+    print(json.loads(resp["response"].read()))</code></pre>
+				<p>The response also carries <code>statusCode</code>, <code>runtimeSessionId</code> and MCP session fields. With the AWS CLI, the payload must be a file (<code>--payload fileb://payload.json</code>) and the body is written to an output file you name last. Passing an end-user ID (<code>runtimeUserId</code>) needs the extra action <code>bedrock-agentcore:InvokeAgentRuntimeForUser</code>; with IAM callers it's an unverified label, so AWS recommends JWT auth in production.</p>
+			</div>
+			<div class="entry">
+				<h4>HTTPS with a bearer token</h4>
+				<p>Runtimes using JWT auth can't be called with the AWS SDK. Call <code>POST https://bedrock-agentcore.REGION.amazonaws.com/runtimes/URL_ENCODED_ARN/invocations?qualifier=DEFAULT</code> with <code>Authorization: Bearer TOKEN</code>, <code>Content-Type: application/json</code> and the header <code>X-Amzn-Bedrock-AgentCore-Runtime-Session-Id</code>. Encode the ARN with <code>urllib.parse.quote(arn, safe="")</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>WebSocket, shell commands and stopping sessions</h4>
+				<ul>
+					<li><strong>Bidirectional streaming</strong> (voice, live UIs): connect to <code>wss://bedrock-agentcore.REGION.amazonaws.com/runtimes/ARN/ws</code> with SigV4 headers, a presigned URL or OAuth. It isn't a regular SDK call: use the SDK's <code>AgentCoreRuntimeClient(region=...).generate_ws_connection(runtime_arn=...)</code> with a WebSocket library. Frames up to 64 KB, connections up to 60 minutes.</li>
+					<li><strong>Shell commands</strong> into a running session: <code>invoke_agent_runtime_command(agentRuntimeArn=..., runtimeSessionId=..., body={"command": "ls /tmp", "timeout": 60})</code> streams stdout, stderr and an exit code; interactive shells use <code>agentcore runtime shell --id ID</code>. Commands run as root in the session's VM, so grant these actions narrowly. Runtimes created before 17 March 2026 (commands) or 5 June 2026 (interactive shells) must be redeployed to use them.</li>
+					<li><code>stop_runtime_session(agentRuntimeArn=..., runtimeSessionId=..., qualifier="DEFAULT")</code> ends a session immediately, which stops billing for it.</li>
+				</ul>
+			</div>
+
+			<h2 id="s7">Authentication and the execution role</h2>
+			<div class="entry">
+				<h4>Inbound</h4>
+				<p>Each runtime version uses one mode: <strong>IAM (SigV4)</strong>, the default, or <strong>JWT</strong> from your identity provider.</p>
+				<span class="file">Accept tokens from an Amazon Cognito user pool (authorizerConfiguration for create or update, JSON)</span>
+<pre><code>{
+  "customJWTAuthorizer": {
+    "discoveryUrl": "https://cognito-idp.us-west-2.amazonaws.com/USER_POOL_ID/.well-known/openid-configuration",
+    "allowedClients": ["APP_CLIENT_ID"]
+  }
+}</code></pre>
+				<ul>
+					<li>Cognito access tokens have <code>client_id</code> but no <code>aud</code>, so use <code>allowedClients</code>; other providers can use <code>allowedAudience</code>, <code>allowedScopes</code> or <code>customClaims</code>. The token's issuer must match the discovery document.</li>
+					<li>Your code receives the <code>Authorization</code> header only if you add it to <code>requestHeaderConfiguration</code>.</li>
+					<li><code>allowedWorkloadConfiguration</code> restricts a JWT runtime to calls through your AgentCore Gateway; for IAM runtimes, use a resource-based policy that denies every principal except the Gateway's role.</li>
+					<li><strong>Resource-based policies</strong> on the runtime and its endpoint allow cross-account calls; both must allow the caller, and the calls count against the owner's quotas.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Outbound with AgentCore Identity</h4>
+				<p>When a user calls with a JWT, Runtime exchanges it for a workload access token and hands it to your code. SDK decorators then fetch the user's OAuth token or an API key from the Identity token vault, so secrets never sit in your code or environment.</p>
+				<span class="file">Read the user's Google Drive on their behalf (Python, AgentCore SDK; the provider is created in Identity first)</span>
+<pre><code>from bedrock_agentcore.identity.auth import requires_access_token
+
+
+@requires_access_token(
+    provider_name="google-provider",
+    scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    auth_flow="USER_FEDERATION",
+    <span class="c"># First use: send this consent URL to the user</span>
+    on_auth_url=lambda url: print("Authorize at:", url),
+)
+async def list_drive_files(*, access_token: str):
+    ...</code></pre>
+				<p><code>auth_flow</code> is <code>USER_FEDERATION</code> (user consent), <code>M2M</code> (client credentials) or <code>ON_BEHALF_OF_TOKEN_EXCHANGE</code>; <code>@requires_api_key(provider_name=...)</code> does the same for API keys. Identity is free when used through Runtime or Gateway.</p>
+			</div>
+			<div class="entry">
+				<h4>The execution role</h4>
+				<span class="file">Trust policy with confused-deputy conditions (as in AWS's Runtime permissions page)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {"aws:SourceAccount": "111111111111"},
+      "ArnLike": {"aws:SourceArn": "arn:aws:bedrock-agentcore:us-west-2:111111111111:*"}
+    }
+  }]
+}</code></pre>
+				<p>The permissions policy needs ECR pull (<code>ecr:BatchGetImage</code>, <code>ecr:GetDownloadUrlForLayer</code>, <code>ecr:GetAuthorizationToken</code>) for containers, CloudWatch Logs on <code>/aws/bedrock-agentcore/runtimes/*</code>, X-Ray, <code>cloudwatch:PutMetricData</code> for the <code>bedrock-agentcore</code> namespace, and whatever your agent calls (for example <code>bedrock:InvokeModel</code>). Any code in the microVM can read these credentials, so scope the role to what the agent needs. Callers need <code>bedrock-agentcore:InvokeAgentRuntime</code> on both the runtime and the endpoint ARN.</p>
+			</div>
+
+			<h2 id="s8">Networking and storage</h2>
+			<ul>
+				<li><strong>VPC mode</strong> (<code>networkMode: VPC</code> with subnets and security groups): Runtime places network interfaces in your private subnets (supported Availability Zone IDs only). Public subnets give no internet access: use NAT, and add interface endpoints for <code>ecr.dkr</code>, <code>ecr.api</code> and <code>logs</code>, an S3 gateway endpoint, and the services your agent calls (such as <code>bedrock-runtime</code>). Runtimes created since May 2026 no longer get a hidden S3 path: your VPC governs all traffic.</li>
+				<li>IAM condition keys <code>bedrock-agentcore:subnets</code> and <code>bedrock-agentcore:securityGroups</code> let you require VPC mode on <code>CreateAgentRuntime</code>.</li>
+				<li>Inbound PrivateLink: interface endpoints <code>com.amazonaws.REGION.bedrock-agentcore</code> (data plane) and <code>bedrock-agentcore-control</code>.</li>
+				<li><strong>Session storage</strong> (preview, free during preview): a per-session mount (<code>sessionStorage</code>, up to 1 GB) that survives stop and resume of the same session ID; wiped after 14 days unused or on a version update.</li>
+				<li><strong>EFS and S3 Files access points</strong> (VPC only, up to 5 mounts in total): storage shared across sessions and agents; open TCP 2049 and grant the role the client mount and write actions.</li>
+			</ul>
+
+			<h2 id="s9">MCP servers, A2A and AG-UI</h2>
+			<div class="entry">
+				<h4>An MCP server</h4>
+				<p>Set <code>serverProtocol</code> to <code>MCP</code> and serve Streamable HTTP on <code>0.0.0.0:8000/mcp</code>. AWS's examples now use version 2 of the MCP Python SDK (<code>mcp&gt;=2.3,&lt;3</code>).</p>
+				<span class="file">main.py: a stateless MCP tool server (Python, MCP SDK v2, as in the Runtime MCP guide)</span>
+<pre><code>from mcp.server import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+mcp = MCPServer()
+
+
+@mcp.tool()
+def add_numbers(a: int, b: int) -> int:
+    """Add two numbers together"""
+    return a + b
+
+
+@mcp.custom_route("/ping", methods=["GET"])
+async def ping(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "Healthy"})
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, stateless_http=True)</code></pre>
+				<ul>
+					<li>Clients connect to <code>https://bedrock-agentcore.REGION.amazonaws.com/runtimes/URL_ENCODED_ARN/invocations?qualifier=DEFAULT</code> with a bearer token and <code>Accept: application/json, text/event-stream</code>; the MCP Inspector works for testing.</li>
+					<li>With MCP protocol versions up to 2025-11-25, most errors come back as HTTP 200 with a JSON-RPC error inside, so check the body (and retry code -32005, a session still starting). From 2026-07-28 the HTTP status reflects the error.</li>
+					<li>Stateful servers (<code>stateless_http=False</code>) are supported for elicitation, sampling and progress on older protocol versions. A runtime can also sit behind an AgentCore Gateway as a target.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>A2A and AG-UI</h4>
+				<p><strong>A2A:</strong> serve JSON-RPC on port 9000 with an agent card; with Strands, <code>serve_a2a(StrandsA2AExecutor(agent_factory=create_agent))</code> from <code>bedrock_agentcore.runtime</code> handles the port, ping and card. Callers fetch the card from <code>.../runtimes/ESCAPED_ARN/invocations/.well-known/agent-card.json</code>. <strong>AG-UI</strong> (March 2026): install <code>bedrock-agentcore[ag-ui]</code> and use <code>serve_ag_ui(agent)</code> to stream AG-UI events to a web front end.</p>
+			</div>
+
+			<h2 id="s10">Quotas, pricing and observability</h2>
+			<div class="entry">
+				<h4>Quotas</h4>
+				<p>Adjustable: 5,000 active sessions per account in us-east-1 and us-west-2 (2,500 elsewhere), 25 new sessions per second, 1,000 data-plane calls per second shared by all invoke, command, shell and stop actions, 1,000 runtimes, 1,000 versions and 10 endpoints per runtime. Fixed: 2 vCPU and 8 GB per microVM session, 2 GB images, 100 MB payloads, 4 KB of environment variables per runtime, control-plane rates of 50 changes, 150 gets and 25 lists per second.</p>
+			</div>
+			<div class="entry">
+				<h4>Pricing</h4>
+				<ul>
+					<li><strong>V1 microVMs:</strong> $0.0895 per vCPU-hour and $0.00945 per GB-hour. <strong>V2:</strong> $0.1276 per vCPU-hour and $0.0169 per GB-hour. Billed per second (1-second minimum, 128 MB memory minimum) from start to termination.</li>
+					<li>CPU isn't billed while the agent waits on I/O (most agent time is spent waiting for models and tools); memory is. Idle time until the timeout is billed too, so short idle timeouts and <code>StopRuntimeSession</code> save money.</li>
+					<li><strong>Instances:</strong> the EC2 price plus a management fee (12% in AWS's example, 7.8% for G-series), plus EBS.</li>
+					<li>AWS's worked example: a V2 support agent with 1 million 10-minute sessions a month at 90% I/O wait costs about $0.0067 per session.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Observability and audit</h4>
+				<ul>
+					<li>Turn on CloudWatch <strong>Transaction Search</strong> once per account and Region, and start your code with the AWS OpenTelemetry distribution (<code>opentelemetry-instrument</code>) to get agent spans.</li>
+					<li>Logs go to <code>/aws/bedrock-agentcore/runtimes/AGENT_ID-ENDPOINT_NAME/</code>; for runtimes created since July 2026, spans go to the same log group by default.</li>
+					<li>Metrics in <code>AWS/Bedrock-AgentCore</code>: Invocations, Latency, Throttles, SystemErrors, UserErrors, SessionCount, ActiveSessionCount, CPU and memory used, and on V2 OverheadLatency.</li>
+					<li>In CloudTrail, <code>InvokeAgentRuntime</code>, command and shell calls are <strong>data events</strong>, off by default: add an advanced event selector for <code>AWS::BedrockAgentCore::Runtime</code>.</li>
+				</ul>
+			</div>
+
+			<h2 id="s11">What's changed</h2>
+			<ul>
+				<li><strong>November 2026:</strong> V2 in 10 Regions, 250 connections per V2 session, OverheadLatency metric; Python SDK 1.25.4.</li>
+				<li><strong>October 2026:</strong> session endpoints and custom ports and paths; MCP protocol 2026-07-28; FUSE mounts and session context keys on V2; AgentCore CLI 1.0.</li>
+				<li><strong>September 2026:</strong> platform V2 generally available (18 September).</li>
+				<li><strong>August 2026:</strong> Instances compute type generally available (6 August); one shared 1,000-per-second data-plane quota; Python 3.10 and 3.11 zip runtimes blocked from updates (31 August).</li>
+				<li><strong>June to July 2026:</strong> interactive shells (5 June); MMDSv2 required (30 June); higher default quotas (1 July); per-agent span log groups; Runtime as a Gateway target.</li>
+				<li><strong>March to May 2026:</strong> stateful MCP, AG-UI, shell commands and session storage preview (March); Node.js zip deployment (28 April); VPC traffic fully under your control and EFS and S3 Files mounts (May); custom header passthrough.</li>
+				<li><strong>2025:</strong> preview (16 July); VPC, PrivateLink and CloudFormation (September); generally available with A2A (13 October); Python zip deployment (4 November); WebSocket streaming (2 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d2-task-2-1.html">AIP-C01 Task 2.1: agentic AI and tool integrations</a> and <a href="../../aws-dva/d2-task-2-3.html">DVA-C03 Task 2.3: security risks of AI services</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="agentcore.html"><small>Previous</small>AgentCore and Harness</a>
+				<span class="next"><small>Next</small>Gateway, Identity and Policy (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock AgentCore Runtime, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
