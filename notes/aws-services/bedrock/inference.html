@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock Inference APIs and Options | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock inference: Converse in depth with content blocks, reasoning and streaming, the client-side tool loop and server-side tools, structured outputs, prompt caching, inference profiles and their IAM rules, service tiers, batch inference, Provisioned Throughput and custom model deployment, prompt routing, CountTokens and embeddings, retries, timeouts and fallback, and cost attribution.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Inference APIs and options</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Inference &middot; Last checked 9 November 2026</span>
+		<h1>Inference APIs and options</h1>
+		<p>Everything between your application and the model in production: Converse in depth, reasoning, streaming, tools and structured outputs, prompt caching, inference profiles, service tiers, batch, Provisioned Throughput, retries and cost attribution. The <a href="index.html#s5">overview</a> covers the first calls, endpoints and model access.</p>
+		<div class="tags"><span class="tag code">Converse</span><span class="tag">Tool use</span><span class="tag">Prompt caching</span><span class="tag">Inference profiles</span><span class="tag">Batch</span><span class="tag">Service tiers</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Converse in depth</a></li>
+				<li><a href="#s2">Reasoning</a></li>
+				<li><a href="#s3">Streaming</a></li>
+				<li><a href="#s4">Tool use</a></li>
+				<li><a href="#s5">Structured outputs</a></li>
+				<li><a href="#s6">Prompt caching</a></li>
+				<li><a href="#s7">Inference profiles</a></li>
+				<li><a href="#s8">Service tiers</a></li>
+				<li><a href="#s9">Batch and async</a></li>
+				<li><a href="#s10">Provisioned Throughput and custom models</a></li>
+				<li><a href="#s11">Routing, token counting and embeddings</a></li>
+				<li><a href="#s12">Throttling, retries and fallback</a></li>
+				<li><a href="#s13">Cost attribution</a></li>
+				<li><a href="#s14">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Converse in depth</h2>
+			<div class="entry">
+				<h4>Messages and content blocks</h4>
+				<ul>
+					<li>Converse is stateless: send the whole conversation every time, appending each assistant message from <code>output.message</code> <strong>unchanged</strong> before the next user message.</li>
+					<li>Each content block holds exactly one of: <code>text</code>, <code>image</code> (png, jpeg, gif, webp; bytes, or an S3 location for Nova only), <code>document</code>, <code>video</code>, <code>audio</code>, <code>cachePoint</code>, <code>guardContent</code>, <code>reasoningContent</code>, <code>toolUse</code>, <code>toolResult</code>. Images and documents are allowed only in user messages; SDKs base64-encode bytes for you.</li>
+					<li><strong>Documents</strong> (pdf, csv, doc, docx, xls, xlsx, html, txt, md) need an explicit <code>format</code> (Bedrock doesn't infer it from the name), a text block in the same message, and a <code>name</code> of letters, digits, spaces, hyphens and brackets. Keep the name neutral: it reaches the model and can carry prompt injection. With citations enabled, only txt and pdf and no S3 source.</li>
+					<li><code>inferenceConfig</code> takes <code>maxTokens</code>, <code>temperature</code>, <code>topP</code> and <code>stopSequences</code>; model-specific settings (such as Claude's <code>top_k</code> or thinking) go in <code>additionalModelRequestFields</code>, and <code>additionalModelResponseFieldPaths</code> brings back native response fields. Some models restrict sampling settings (Claude Sonnet 4.5 and Haiku 4.5 accept temperature or top_p, not both, and AWS notes that Claude Sonnet 5 and 5.5 reject temperature): check the model card.</li>
+					<li><code>modelId</code> can be a model ID, an inference profile, an application profile, a Provisioned Throughput or custom deployment ARN, a prompt router or a Prompt management version.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Response and stop reasons</h4>
+				<p>The response holds <code>output.message</code>, <code>stopReason</code>, <code>usage</code> (with caching, <code>inputTokens</code> excludes cached tokens: total input is <code>inputTokens + cacheReadInputTokens + cacheWriteInputTokens</code>), <code>metrics.latencyMs</code>, the <code>serviceTier</code> that served it and any guardrail or router <code>trace</code>.</p>
+				<ul>
+					<li><code>end_turn</code>, <code>stop_sequence</code>: done. <code>tool_use</code>: run the tools and reply with results.</li>
+					<li><code>max_tokens</code>: the output (or JSON) is truncated: raise <code>maxTokens</code> or continue.</li>
+					<li><code>guardrail_intervened</code>, <code>content_filtered</code>: show a safe message and inspect the trace.</li>
+					<li><code>model_context_window_exceeded</code>: trim or summarize history. <code>malformed_tool_use</code>, <code>malformed_model_output</code>: retry once or reprompt.</li>
+				</ul>
+			</div>
+
+			<h2 id="s2">Reasoning</h2>
+			<p>Claude models think through <code>additionalModelRequestFields</code>. <strong>Adaptive thinking</strong> (Claude 4.6 and later) lets the model decide how much to think, steered by an <strong>effort</strong> level (<code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>) in a separate <code>output_config</code> object.</p>
+			<span class="file">Multi-turn Converse with adaptive thinking on Claude Sonnet 5.5 (Python, boto3)</span>
+<pre><code>import boto3
+
+brt = boto3.client("bedrock-runtime", region_name="us-east-1")
+MODEL = "global.anthropic.claude-sonnet-5-5"
+
+history = [{"role": "user", "content": [{"text": "Plan a three-step database migration."}]}]
+r = brt.converse(
+    modelId=MODEL,
+    system=[{"text": "You are a senior AWS engineer. Be concise."}],
+    messages=history,
+    <span class="c"># Covers thinking and the answer</span>
+    inferenceConfig={"maxTokens": 8000},
+    additionalModelRequestFields={
+        <span class="c"># Claude 5 returns empty thinking text unless display is "summarized"</span>
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        <span class="c"># Effort goes here, not inside "thinking"</span>
+        "output_config": {"effort": "medium"},
+    },
+)
+msg = r["output"]["message"]
+for block in msg["content"]:
+    if "reasoningContent" in block:
+        print("[thinking]", block["reasoningContent"].get("reasoningText", {}).get("text", ""))
+    elif "text" in block:
+        print(block["text"])
+<span class="c"># Append unchanged: the reasoning blocks carry signatures</span>
+history.append(msg)
+history.append({"role": "user", "content": [{"text": "Now add a rollback step."}]})</code></pre>
+			<ul>
+				<li><strong>Claude 5 and later think by default</strong> even if you send no thinking field, so thinking tokens are billed as output and count toward <code>maxTokens</code>. To turn it off use <code>{"type": "disabled"}</code> where allowed; Sonnet 5.5 rejects that and needs <code>{"type": "between_tools"}</code>; Opus 5.5 is adaptive only.</li>
+				<li>The older fixed budget (<code>{"type": "enabled", "budget_tokens": 4000}</code>) is required on Claude 4.5 and earlier, deprecated on 4.6, and returns 400 on Opus 4.7 and later and all Claude 5 models.</li>
+				<li>Pass reasoning blocks back <strong>complete and unmodified</strong>, in order: any change, or sending them to a different model, is an error (Claude 5.5 binds them to the model and conversation). Thinking can't be combined with sampling changes or forced tool use, and switching thinking modes invalidates the prompt cache.</li>
+			</ul>
+
+			<h2 id="s3">Streaming</h2>
+			<p><code>ConverseStream</code> sends <code>messageStart</code>; then per block <code>contentBlockStart</code> (only for tool use), <code>contentBlockDelta</code> (text, reasoning or partial tool input) and <code>contentBlockStop</code>; then <code>messageStop</code> with the stop reason and <code>metadata</code> with usage. Errors such as throttling can also arrive inside the stream.</p>
+			<span class="file">Rebuild text and tool calls from a stream (Python, boto3; our code on the documented event shapes)</span>
+<pre><code>import json
+
+
+def stream_turn(brt, model, messages, tool_config):
+    blocks, stop, usage = {}, None, None
+    resp = brt.converse_stream(modelId=model, messages=messages, toolConfig=tool_config,
+                               inferenceConfig={"maxTokens": 2048})
+    for ev in resp["stream"]:
+        if "contentBlockStart" in ev:
+            i = ev["contentBlockStart"]["contentBlockIndex"]
+            tu = ev["contentBlockStart"]["start"].get("toolUse")
+            if tu:
+                blocks[i] = {"toolUse": {"toolUseId": tu["toolUseId"], "name": tu["name"], "input": ""}}
+        elif "contentBlockDelta" in ev:
+            i = ev["contentBlockDelta"]["contentBlockIndex"]
+            d = ev["contentBlockDelta"]["delta"]
+            if "text" in d:
+                blocks.setdefault(i, {"text": ""})["text"] += d["text"]
+                print(d["text"], end="", flush=True)
+            elif "toolUse" in d:
+                <span class="c"># A partial JSON string: don't parse until the block stops</span>
+                blocks[i]["toolUse"]["input"] += d["toolUse"]["input"]
+        elif "contentBlockStop" in ev:
+            b = blocks.get(ev["contentBlockStop"]["contentBlockIndex"], {})
+            if "toolUse" in b:
+                b["toolUse"]["input"] = json.loads(b["toolUse"]["input"] or "{}")
+        elif "messageStop" in ev:
+            stop = ev["messageStop"]["stopReason"]
+        elif "metadata" in ev:
+            usage = ev["metadata"]["usage"]
+    return {"role": "assistant", "content": [blocks[k] for k in sorted(blocks)]}, stop, usage</code></pre>
+			<p>Some models accept tools only without streaming (Llama 3.1, 3.3 and 4, Mistral Large, Pixtral Large, Writer Palmyra): use <code>Converse</code> for them. Time to first token is measured only on streaming APIs, and the AWS CLI can't stream.</p>
+
+			<h2 id="s4">Tool use</h2>
+			<p>With <strong>client-side</strong> tools, the model asks and your code runs the tool. A tool is a <code>toolSpec</code> with a <code>name</code> (letters, digits, underscores, hyphens, up to 64), a <code>description</code> and an <code>inputSchema</code> (JSON Schema with a top-level object). <code>toolChoice</code> is <code>auto</code> (default), <code>any</code> (must call a tool) or <code>tool</code> (must call a named tool).</p>
+			<span class="file">A bounded tool loop that handles several tool calls per turn (Python, boto3)</span>
+<pre><code>TOOLS = {"get_order_status": lambda a: {"orderId": a["orderId"], "status": "SHIPPED"}}
+tool_config = {
+    "tools": [{"toolSpec": {
+        "name": "get_order_status",
+        "description": "Look up the shipping status of an order by its ID.",
+        "inputSchema": {"json": {
+            "type": "object",
+            "properties": {"orderId": {"type": "string"}},
+            "required": ["orderId"],
+            "additionalProperties": False,
+        }},
+        <span class="c"># Validate the model's tool input against the schema</span>
+        "strict": True,
+    }}],
+    "toolChoice": {"auto": {}},
+}
+
+
+def run(brt, model, messages, max_steps=8):
+    for _ in range(max_steps):
+        r = brt.converse(modelId=model, messages=messages, toolConfig=tool_config, inferenceConfig={"maxTokens": 1024})
+        msg = r["output"]["message"]
+        messages.append(msg)
+        if r["stopReason"] != "tool_use":
+            return msg
+        results = []
+        for block in msg["content"]:
+            if "toolUse" not in block:
+                continue
+            tu = block["toolUse"]
+            try:
+                out = TOOLS[tu["name"]](tu["input"])
+                results.append({"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"json": out}], "status": "success"}})
+            except Exception as e:
+                <span class="c"># Report the failure to the model instead of crashing</span>
+                results.append({"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"text": str(e)}], "status": "error"}})
+        <span class="c"># All results in one user turn</span>
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError("tool loop did not finish")</code></pre>
+			<ul>
+				<li>Keep sending the same <code>toolConfig</code> while the history contains tool calls, and bound the loop. Returning all results of a turn in one user message is the Anthropic convention; AWS's docs don't spell it out.</li>
+				<li><strong>Forced tool use</strong> (<code>any</code> or <code>tool</code>) depends on the exact model, never silently falls back to <code>auto</code>, isn't supported with thinking, and fails on Claude Opus 5.5, Fable 5.1 and Mythos 5.1. For structured data use structured outputs instead of the old forced-tool trick.</li>
+				<li>Tool definitions and results are billed as tokens, and Claude adds a hidden tool system prompt of a few hundred tokens.</li>
+				<li><strong>Server-side tools</strong> run inside Bedrock, but only on the Responses API on <code>bedrock-mantle</code>: your own tools behind a Lambda MCP connector (January 2026) or an AgentCore Gateway with IAM auth (February 2026; <code>require_approval</code> must be <code>never</code>), and the built-in <strong>web search</strong> for OpenAI GPT-5.4 and later in three US Regions. Web search also needs <code>bedrock-websearch:ExternalWebAccess</code> (not in the full-access policy): without it page fetches fail silently.</li>
+			</ul>
+
+			<h2 id="s5">Structured outputs</h2>
+			<p>Structured outputs (generally available 4 February 2026; all Claude models on both endpoints since October 2026) force the response to match a JSON Schema, by compiling the schema into a grammar.</p>
+			<span class="file">Classify a support ticket into a fixed JSON shape (Python, boto3; the schema is passed as a string)</span>
+<pre><code>import json
+
+schema = {
+    "type": "object",
+    "properties": {
+        "category": {"type": "string", "enum": ["billing", "technical", "other"]},
+        "urgent": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "required": ["category", "urgent", "summary"],
+    <span class="c"># Required on every object in the schema</span>
+    "additionalProperties": False,
+}
+r = brt.converse(
+    modelId="global.anthropic.claude-sonnet-5-5",
+    messages=[{"role": "user", "content": [{"text": "Ticket: card charged twice, need a refund today."}]}],
+    inferenceConfig={"maxTokens": 512},
+    outputConfig={"textFormat": {
+        "type": "json_schema",
+        "structure": {"jsonSchema": {"name": "ticket", "schema": json.dumps(schema)}},
+    }},
+)
+if r["stopReason"] == "end_turn":
+    text = next(b["text"] for b in r["output"]["message"]["content"] if "text" in b)
+    print(json.loads(text))</code></pre>
+			<ul>
+				<li>On Claude's InvokeModel body the field is <code>output_config.format</code> with the schema as an object (<code>output_format</code> is deprecated); open-weight models use <code>response_format</code>. <code>"strict": true</code> on a tool applies the same validation to tool inputs.</li>
+				<li>Supported: basic types, enums, <code>const</code>, <code>anyOf</code>, internal <code>$ref</code>, common string formats and simple patterns. Not supported: recursion, external refs, numeric and length bounds. At most 12 optional properties in total and 16 union-typed properties.</li>
+				<li>The first request with a new schema compiles it (up to about 90 seconds; cached for 24 hours), so set the client read timeout to at least 120 seconds. A low <code>maxTokens</code> gives truncated JSON. Works with batch and cross-Region inference, not with citations.</li>
+			</ul>
+
+			<h2 id="s6">Prompt caching</h2>
+			<p>A cache checkpoint stores the processed prefix of a prompt so later requests with the <strong>identical prefix</strong> read it at a discount and faster. The order is tools, then system, then messages: a change early in the prompt invalidates everything after it.</p>
+			<span class="file">Cache tools and a long system prompt for an hour, and the conversation for five minutes (Python, boto3)</span>
+<pre><code>r = brt.converse(
+    modelId="global.anthropic.claude-sonnet-5-5",
+    toolConfig={"tools": [*TOOL_SPECS, {"cachePoint": {"type": "default", "ttl": "1h"}}]},
+    system=[{"text": LONG_STABLE_INSTRUCTIONS}, {"cachePoint": {"type": "default", "ttl": "1h"}}],
+    messages=[{"role": "user", "content": [{"text": user_question}, {"cachePoint": {"type": "default"}}]}],
+    inferenceConfig={"maxTokens": 1024},
+)
+u = r["usage"]
+print(u["inputTokens"], u.get("cacheReadInputTokens", 0), u.get("cacheWriteInputTokens", 0))</code></pre>
+			<ul>
+				<li><strong>Minimum prefix per checkpoint:</strong> 512 tokens on the Claude 5 family, 1,024 on Opus 4.8, Sonnet 5 and Sonnet 4.6, 4,096 on Opus 4.5 to 4.7 and Haiku 4.5, 1,000 on Nova. Below it the request works but nothing is cached. Up to 4 checkpoints.</li>
+				<li><strong>Time to live:</strong> 5 minutes, reset on each hit; 1 hour (<code>"ttl": "1h"</code>) on supported models (sending it to others can fail), with 1-hour entries placed before 5-minute ones. OpenAI GPT-5.6 and later use 30 minutes; Nova and older OpenAI models also cache implicitly.</li>
+				<li>Claude can also cache automatically with one top-level <code>cache_control</code> (in Converse, inside <code>additionalModelRequestFields</code>) on recent models.</li>
+				<li><strong>Pricing:</strong> cache writes cost more than normal input and reads much less (for example on OpenAI and Kimi models, writes 1.25 times and reads 0.05 times the input price); the exact rates are on each model's pricing row. Cache reads don't count against tokens-per-minute; writes do.</li>
+				<li>The cache lives where the request was processed: cross-Region routing and parallel first requests can create extra writes. No caching in batch. Watch <code>CacheReadInputTokenCount</code> and <code>CacheWriteInputTokenCount</code> in CloudWatch.</li>
+			</ul>
+
+			<h2 id="s7">Inference profiles</h2>
+			<ul>
+				<li><strong>Geographic</strong> profiles (<code>us.</code>, <code>eu.</code>, <code>apac.</code>, <code>jp.</code>, <code>au.</code>, <code>in.</code>, <code>ca.</code>, <code>us-gov.</code>) route within a geography; <strong>Global</strong> (<code>global.</code>) routes to any commercial Region, about 10% cheaper. The destination Regions depend on the Region you call from and can include Regions you haven't enabled: check them with <code>GetInferenceProfile</code> from each source Region instead of trusting the prefix.</li>
+				<li>CloudTrail logs the call in the source Region with <code>additionalEventData.inferenceRegion</code>; quotas for cross-Region and global use are separate and usually higher. Profiles can't use Provisioned Throughput.</li>
+			</ul>
+			<span class="file">List Australian profiles and see where one routes (AWS CLI)</span>
+<pre><code>aws bedrock list-inference-profiles --region ap-southeast-2 --type-equals SYSTEM_DEFINED \
+  --query "inferenceProfileSummaries[?starts_with(inferenceProfileId, 'au.')].inferenceProfileId" --output text
+aws bedrock get-inference-profile --region ap-southeast-2 \
+  --inference-profile-identifier au.anthropic.claude-sonnet-5-5 --query 'models[].modelArn'</code></pre>
+			<div class="entry">
+				<h4>Application inference profiles</h4>
+				<span class="file">A tagged profile for one application, for cost tracking (Python, boto3)</span>
+<pre><code>bedrock = boto3.client("bedrock", region_name="us-east-1")
+aip = bedrock.create_inference_profile(
+    inferenceProfileName="support-bot-prod",
+    modelSource={"copyFrom": "arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.anthropic.claude-sonnet-5-5"},
+    tags=[{"key": "CostCenter", "value": "CC-1001"}, {"key": "App", "value": "support-bot"}],
+)
+<span class="c"># Use as modelId in Converse or InvokeModel</span>
+profile_arn = aip["inferenceProfileArn"]</code></pre>
+				<p>Copy from a foundation model (single Region) or a system profile (multi-Region). They're visible only through the API, rejected by the Responses and Chat Completions APIs, and their tags show in billing only after the payer account activates them as cost allocation tags (up to 24 hours, not retroactive). Up to 1,000 per Region.</p>
+			</div>
+			<div class="callout trap"><p>IAM for a profile needs the <strong>profile ARN and the foundation model ARN in every destination Region</strong> (use <code>bedrock:InferenceProfileArn</code> on the model statement to allow it only through the profile). Global profiles also need the Region-less model ARN <code>arn:aws:bedrock:::foundation-model/MODEL</code>, and SCPs that restrict <code>aws:RequestedRegion</code> must allow <code>unspecified</code>. A Region-deny SCP doesn't stop Global routing; to block Global, deny when <code>aws:RequestedRegion</code> equals <code>unspecified</code>.</p></div>
+
+			<h2 id="s8">Service tiers</h2>
+			<ul>
+				<li><strong>Standard</strong> (default), <strong>Priority</strong> (served first, up to about 25% faster output for most models, 75% more), <strong>Flex</strong> (lower priority under load, 50% less; for evaluations, labelling and background agents) and <strong>Reserved</strong> (guaranteed tokens per minute, at least 100,000 input and 10,000 output, for 1 or 3 months through your account team; overflow goes to Standard, and sizing must include cache-write tokens). OpenAI's newest models add <strong>Ultrafast</strong> at six times the Standard price.</li>
+				<li>Request it with <code>serviceTier={"type": "priority"}</code> on Converse, the boto3 <code>serviceTier</code> parameter (header <code>X-Amzn-Bedrock-Service-Tier</code>) on InvokeModel, or <code>service_tier</code> on the OpenAI-compatible APIs. The response says which tier served it; CloudWatch has <code>ServiceTier</code> and <code>ResolvedServiceTier</code> dimensions.</li>
+				<li>Priority, Standard and Flex share the model's on-demand quota. Restrict tiers with the IAM condition <code>bedrock:ServiceTier</code> (for example deny <code>priority</code>).</li>
+			</ul>
+			<div class="callout trap"><p>Tier support is per model, and the newest Claude models (the 5.5 family, Sonnet 5, Opus 5 and Opus 4.8) currently support <strong>only Standard</strong>; Claude 4.5 and 4.6 add Reserved; Priority and Flex are mainly on Nova and open-weight models. Check the model card's service tiers row before designing around one. How long Flex requests wait under load isn't documented.</p></div>
+
+			<h2 id="s9">Batch and async</h2>
+			<p><strong>Batch inference</strong> processes JSONL files from S3 at 50% of the on-demand price, usually within the timeout you set. Records use the model's InvokeModel body or, since February 2026, the Converse request format.</p>
+			<span class="file">Summarize a folder of tickets in a batch job (Python, boto3; one JSONL record shown in the comment)</span>
+<pre><code><span class="c"># Each line: {"recordId": "T-0001", "modelInput": {"messages": [{"role": "user", "content": [{"text": "Summarize: ..."}]}], "inferenceConfig": {"maxTokens": 512}}}</span>
+job = bedrock.create_model_invocation_job(
+    jobName="ticket-summaries-2026-11-09",
+    roleArn="arn:aws:iam::111111111111:role/BedrockBatchRole",
+    modelId="us.anthropic.claude-sonnet-4-6",
+    modelInvocationType="Converse",
+    inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://batch-in-111111111111/tickets/", "s3InputFormat": "JSONL"}},
+    outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://batch-out-111111111111/"}},
+    <span class="c"># 24 to 168 hours</span>
+    timeoutDurationInHours=72,
+)
+status = bedrock.get_model_invocation_job(jobIdentifier=job["jobArn"])["status"]</code></pre>
+			<ul>
+				<li>At least 100 and at most 100,000 records per job and per file, 1 GB per file and 5 GB per job (model-specific). Output files hold each record's input with its output or error, plus a manifest with counts and token totals; output order isn't guaranteed, and EventBridge reports job state changes.</li>
+				<li>On-demand traffic is served first and completion isn't guaranteed. No prompt caching, no Provisioned Throughput, and Converse-format jobs can't use tools. The newest Claude models (the 5.5 family and Sonnet 5) aren't batch-enabled: check the supported list.</li>
+				<li>The OpenAI-compatible Batch API is on <code>bedrock-runtime</code> at <code>/openai/v1/batches</code>, with the role and model passed as headers.</li>
+				<li><code>StartAsyncInvoke</code> runs long jobs that write to S3, such as Luma Ray2 video and segmented Nova Multimodal Embeddings or Marengo embeddings. Nova Reel and Nova Canvas reached end of life on 30 September 2026.</li>
+			</ul>
+
+			<h2 id="s10">Provisioned Throughput and custom models</h2>
+			<div class="table-wrap">
+				<table class="stack labeled compare">
+					<thead><tr><th>Reserved tier</th><th>Provisioned Throughput</th></tr></thead>
+					<tbody>
+						<tr class="group"><th colspan="2">What you buy</th></tr>
+						<tr><td data-label="Reserved tier">Input and output tokens per minute for a serverless model</td><td data-label="Provisioned Throughput">Model units (fixed throughput) for a model or a custom model</td></tr>
+						<tr class="group"><th colspan="2">Terms</th></tr>
+						<tr><td data-label="Reserved tier">1 or 3 months, monthly price, overflow to Standard</td><td data-label="Provisioned Throughput">Hourly with no commitment, 1 month or 6 months; no overflow; can't delete before the term ends</td></tr>
+						<tr class="group"><th colspan="2">Models</th></tr>
+						<tr><td data-label="Reserved tier">Some Claude 4.x models (see model cards)</td><td data-label="Provisioned Throughput">Nova, Titan, Cohere Embed, Llama and older Claude 3 variants, and custom models</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<ul>
+				<li><code>CreateProvisionedModelThroughput</code> takes <code>modelUnits</code> and <code>commitmentDuration</code> (<code>OneMonth</code>, <code>SixMonths</code>, or omit for none); use the returned ARN as <code>modelId</code>. Model unit quotas start at 0, so open a support case first. No new purchases for Legacy models.</li>
+				<li>A customized model needs Provisioned Throughput unless it supports <strong>on-demand custom model deployment</strong> (<code>CreateCustomModelDeployment</code>, July 2025): pay per token for custom Nova Lite, Nova 2 Lite, Nova Micro, Nova Pro or Llama 3.3 70B models customized since 16 July 2025, in us-east-1 or us-west-2.</li>
+			</ul>
+
+			<h2 id="s11">Routing, token counting and embeddings</h2>
+			<ul>
+				<li><strong>Intelligent prompt routing</strong>: a router ARN as <code>modelId</code> picks between two models of one family by predicted quality (configured routers set a fallback model and a <code>responseQualityDifference</code>); the trace shows which model answered. Now only Nova Lite and Pro and Llama 3.x (Legacy), English-optimized, $1 per 1,000 requests.</li>
+				<li><strong>Latency-optimized inference</strong> (<code>performanceConfig={"latency": "optimized"}</code>) is still in preview on a few older models and silently falls back to Standard when its quota runs out.</li>
+				<li><strong>CountTokens</strong> (free) returns the input tokens a request would be billed for: <code>brt.count_tokens(modelId=..., input={"converse": {"messages": [...], "system": [...]}})</code>. For Claude models available only through profiles on <code>bedrock-runtime</code> (such as Opus and Haiku 5.5), use <code>bedrock-mantle</code>'s <code>/anthropic/v1/messages/count_tokens</code>.</li>
+				<li><strong>Embeddings</strong> through InvokeModel, limited by requests per minute: Titan Text Embeddings V2 (<code>{"inputText": ..., "dimensions": 1024, "normalize": true}</code>), Cohere Embed v4 (texts or images, <code>input_type</code> required), Nova Multimodal Embeddings (text, image, audio or video).</li>
+				<li><strong>Speech</strong>: <code>InvokeModelWithBidirectionalStream</code> for Nova 2 Sonic, with interruptions and sessions up to 8 minutes.</li>
+			</ul>
+
+			<h2 id="s12">Throttling, retries and fallback</h2>
+			<ul>
+				<li><strong>429 ThrottlingException</strong> is your quota: lower <code>maxTokens</code>, spread load or raise quotas. <strong>503 ServiceUnavailable</strong> (and 529 overloaded on Anthropic-shaped APIs) is AWS capacity: retry, use Global profiles, fall back to other Regions or models. Never retry <code>ValidationException</code>; <code>ModelNotReadyException</code> is retried automatically; <code>ResourceNotFoundException</code> can mean an end-of-life model.</li>
+				<li>Each request reserves its input plus <code>maxTokens</code> when it starts, and output counts several times on newer models (15 times on Claude Opus 4.8; 10 times on Opus 5.5, Sonnet 5, Opus 5 and GPT-5.6; 5 times on older Claude). <strong>Omitting <code>maxTokens</code> reserves the model's maximum</strong>, so you're throttled far below your real usage. A per-account daily limit across models (700 million tokens by default) also applies.</li>
+				<li>botocore's <code>read_timeout</code> is <strong>60 seconds</strong> by default: long non-streaming generations time out and get retried, paying twice. Raise it or stream. Behind NAT gateways and VPC endpoints, idle connections drop after 350 seconds: enable <code>tcp_keepalive</code> and lower the OS keepalive time.</li>
+			</ul>
+			<span class="file">Bounded retries, long timeouts, and fallback across Regions and models (Python, boto3; our pattern on AWS's guidance)</span>
+<pre><code>import random
+import time
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+cfg = Config(retries={"total_max_attempts": 4, "mode": "standard"}, connect_timeout=10, read_timeout=300, tcp_keepalive=True)
+clients = {r: boto3.client("bedrock-runtime", region_name=r, config=cfg) for r in ("us-east-1", "us-west-2")}
+CHAIN = [
+    ("us-east-1", "global.anthropic.claude-sonnet-5-5"),
+    ("us-west-2", "us.anthropic.claude-sonnet-5-5"),
+    <span class="c"># A cheaper model as the last resort</span>
+    ("us-east-1", "global.anthropic.claude-haiku-5-5"),
+]
+RETRYABLE = {"ThrottlingException", "ServiceUnavailableException", "ModelNotReadyException",
+             "InternalServerException", "ModelTimeoutException", "ResourceNotFoundException"}
+
+
+def converse_with_fallback(**kw):
+    for attempt, (region, model) in enumerate(CHAIN):
+        try:
+            return clients[region].converse(modelId=model, **kw)
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in RETRYABLE:
+                raise
+            time.sleep(random.uniform(0, min(8, 2 ** attempt)))
+    raise RuntimeError("all fallbacks exhausted")</code></pre>
+			<p>Watch <code>InvocationThrottles</code>, <code>EstimatedTPMQuotaUsage</code>, <code>InvocationLatency</code> and <code>TimeToFirstToken</code> in <code>AWS/Bedrock</code>. Ramp traffic gradually, one dimension at a time, with a token-aware client-side limiter.</p>
+
+			<h2 id="s13">Cost attribution</h2>
+			<ul>
+				<li><strong>IAM principal attribution</strong> (April 2026; <code>bedrock-mantle</code> since August 2026): cost by caller identity, plus principal or session tags, in Cost Explorer and a new CUR 2.0 export with caller identity data, after the payer account activates the tags. Assume a role per user in gateways to bill by user.</li>
+				<li><strong>Application inference profiles</strong>: tags per application, model-specific (Converse and InvokeModel only).</li>
+				<li><strong>Projects</strong> (<code>bedrock-mantle</code>, February 2026): one project per application across models, with its own IAM; AWS now recommends them over many profiles.</li>
+				<li><strong><code>requestMetadata</code></strong> (up to 16 pairs; a body field on Converse, a header on InvokeModel since May 2026) appears only in model invocation logs, never on the bill, and isn't available on <code>bedrock-mantle</code>. Keep personal data out of it.</li>
+				<li>Billing is aggregated per usage type per day, with separate input, output, cache read and cache write usage types (forgetting the cache ones is the commonest reconciliation gap); per-request detail exists only in invocation logs.</li>
+			</ul>
+
+			<h2 id="s14">What's changed</h2>
+			<ul>
+				<li><strong>October 2026:</strong> structured outputs for all Claude models on both endpoints; batch completion documented as not guaranteed; Canada profile for Claude Haiku 5.5.</li>
+				<li><strong>September 2026:</strong> OpenAI-compatible guidance prefers <code>bedrock-runtime</code>; cross-model daily token quota (21 September); Ultrafast tier for GPT-6 models; Nova Reel and Canvas end of life (30 September).</li>
+				<li><strong>April to August 2026:</strong> IAM principal cost attribution (April; mantle in August); <code>requestMetadata</code> on InvokeModel (May); CloudWatch metrics for <code>bedrock-mantle</code> (June); web search on Responses (August).</li>
+				<li><strong>January to February 2026:</strong> 1-hour prompt cache (26 January); server-side custom tools (29 January); structured outputs generally available (4 February); tools through AgentCore Gateway (24 February); Projects (26 February); Converse-format batch (27 February).</li>
+				<li><strong>2025:</strong> prompt caching (7 April) and prompt routing (22 April) generally available; on-demand custom model deployment (16 July); CountTokens (22 August); OpenAI Batch API (27 August); Global profiles (3 September); Priority and Flex (18 November) and Reserved (26 November) tiers; OpenAI-compatible APIs (December).</li>
+				<li><strong>2024:</strong> Converse and tool use (30 May); batch at 50% off (21 August); cross-Region inference (27 August); application profiles (1 November); latency-optimized, prompt caching and routing previews (December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d2-task-2-4.html">AIP-C01 Task 2.4: FM API integrations</a>, <a href="../../aws-aip/d4-task-4-2.html">AIP-C01 Task 4.2: optimize application performance</a> and <a href="../../aws-aip/d2-task-2-2.html">AIP-C01 Task 2.2: model deployment strategies</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="knowledge-bases-custom.html"><small>Previous</small>Customer-managed Knowledge Bases</a>
+				<span class="next"><small>Next</small>Guardrails (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock inference, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock Customer-managed Knowledge Bases | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock customer-managed Knowledge Bases and RAG building blocks: when to choose them, vector stores (S3 Vectors, OpenSearch, Aurora pgvector, Neptune, Pinecone, Redis, MongoDB) and their setup, creating a knowledge base, S3 and custom data sources, chunking, parsing and Lambda transforms, multimodal, Retrieve with hybrid search, filters and reranking, RetrieveAndGenerate with prompts, guardrails and sessions, the Rerank API, structured data with Redshift, GraphRAG with Neptune Analytics, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Customer-managed Knowledge Bases</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Knowledge Bases &middot; Last checked 9 November 2026</span>
+		<h1>Customer-managed Knowledge Bases</h1>
+		<p>Retrieval-augmented generation on your own vector store, with full control of chunking, parsing and transformation, plus <code>RetrieveAndGenerate</code> with prompt templates and sessions, natural-language queries over Redshift, and GraphRAG on Neptune Analytics.</p>
+		<div class="tags"><span class="tag code">Knowledge Bases</span><span class="tag">Vector stores</span><span class="tag">Chunking</span><span class="tag">RetrieveAndGenerate</span><span class="tag">GraphRAG</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">When to choose customer-managed</a></li>
+				<li><a href="#s2">Vector stores</a></li>
+				<li><a href="#s3">Creating a knowledge base</a></li>
+				<li><a href="#s4">Data sources and ingestion</a></li>
+				<li><a href="#s5">Chunking, parsing and transforms</a></li>
+				<li><a href="#s6">Retrieve</a></li>
+				<li><a href="#s7">RetrieveAndGenerate</a></li>
+				<li><a href="#s8">Structured data and GraphRAG</a></li>
+				<li><a href="#s9">Security, quotas and pricing</a></li>
+				<li><a href="#s10">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">When to choose customer-managed</h2>
+			<p>AWS now recommends <a href="knowledge-bases-managed.html">Managed Knowledge Bases</a> for most new work, but the customer-managed types (<code>VECTOR</code>, <code>SQL</code> and <code>KENDRA</code>) aren't deprecated. Choose them when you need:</p>
+			<ul>
+				<li>Your own vector store that you can inspect, size and query directly.</li>
+				<li><strong>Structured data</strong> (natural language to SQL on Redshift) or <strong>GraphRAG</strong> (Neptune Analytics).</li>
+				<li>Semantic-only search, semantic or hierarchical chunking, model or Data Automation parsing, or a Lambda transformation step.</li>
+				<li><code>RetrieveAndGenerate</code> with your own prompt template, citations, query decomposition and sessions, <code>startsWith</code> and implicit filters, or Bedrock RAG <a href="evaluation.html#s5">evaluation jobs</a>.</li>
+				<li>A Region where Managed Knowledge Bases aren't offered.</li>
+			</ul>
+			<p>Choose Managed instead for SaaS connectors, document-level permissions, agentic retrieval, Gateway, Amazon Quick and cross-account access.</p>
+			<div class="callout retired"><p><strong>Status changes.</strong> Since 30 September 2026, new Confluence, SharePoint, Salesforce and web crawler connectors can't be created on customer-managed knowledge bases (existing ones keep working; they also require OpenSearch Serverless). New data sources are S3 or custom. The <strong>Kendra GenAI index</strong> type is for existing Kendra customers only: Kendra entered maintenance on 30 June 2026 and closed to new customers on 30 July 2026.</p></div>
+
+			<h2 id="s2">Vector stores</h2>
+			<p>You choose the store in <code>storageConfiguration</code>. The console can quick-create OpenSearch Serverless, Aurora PostgreSQL Serverless, Neptune Analytics or S3 Vectors for you; the API needs an existing store.</p>
+			<div class="entry">
+				<h4>Amazon S3 Vectors</h4>
+				<p>The cheapest option at scale (generally available December 2025): a vector bucket and index with up to 2 billion vectors per index, sub-second cold queries and about 100 ms warm. Float32 only and <strong>semantic search only</strong>. Each vector can carry at most <strong>1 KB of metadata and 35 keys</strong>, or ingestion fails, so avoid hierarchical chunking with large chunks. Mark <code>AMAZON_BEDROCK_TEXT</code> and <code>AMAZON_BEDROCK_METADATA</code> as non-filterable keys when you create the index; encryption can't be changed after the bucket exists.</p>
+			</div>
+			<div class="entry">
+				<h4>Amazon OpenSearch</h4>
+				<p><strong>Serverless</strong> collections (hybrid search, binary vectors, <code>startsWith</code> filters; private access through a network policy with source service <code>bedrock.amazonaws.com</code>) and <strong>managed clusters</strong> (since March 2025; the domain must have public access, version 2.13 or later, 2.16 for binary vectors). The index must use the <code>faiss</code> engine with HNSW; <code>nmslib</code> fails. Custom metadata used in filters needs a <code>keyword</code> type (or a keyword subfield), or filters fail with a "Rewrite first" error.</p>
+			</div>
+			<div class="entry">
+				<h4>Amazon Aurora PostgreSQL (pgvector)</h4>
+				<p>Same account, pgvector 0.5.0 or later, the RDS Data API enabled, credentials in Secrets Manager. You create the table and indexes yourself:</p>
+				<span class="file">Prepare Aurora for a knowledge base (SQL, from the Aurora user guide; use the embedding model's dimension for vector(n))</span>
+<pre><code>CREATE EXTENSION IF NOT EXISTS vector;
+CREATE SCHEMA bedrock_integration;
+CREATE ROLE bedrock_user WITH PASSWORD 'password' LOGIN;
+GRANT ALL ON SCHEMA bedrock_integration to bedrock_user;
+CREATE TABLE bedrock_integration.bedrock_kb (id uuid PRIMARY KEY, embedding vector(1024), chunks text, metadata json, custom_metadata jsonb);
+CREATE INDEX ON bedrock_integration.bedrock_kb USING hnsw (embedding vector_cosine_ops) WITH (ef_construction=256);
+CREATE INDEX ON bedrock_integration.bedrock_kb USING gin (to_tsvector('simple', chunks));
+CREATE INDEX ON bedrock_integration.bedrock_kb USING gin (custom_metadata);</code></pre>
+				<p>Use <code>to_tsvector('english', chunks)</code> for English hybrid search. With metadata filters on pgvector 0.8.0 or later, set <code>hnsw.iterative_scan = 'relaxed_order'</code> on the database, or filtered queries return too few results. The field mapping can't change after the knowledge base is created.</p>
+			</div>
+			<div class="entry">
+				<h4>Others</h4>
+				<p><strong>Neptune Analytics</strong> for GraphRAG (an empty graph whose vector index, created with the graph, matches the embedding dimension); <strong>Pinecone</strong> (endpoint and an API key secret), <strong>Redis Enterprise Cloud</strong> (TLS and certificates in the secret) and <strong>MongoDB Atlas</strong> (hybrid search needs a text search index; filter fields must be configured in the vector index). Third-party stores need <code>bedrock:AssociateThirdPartyKnowledgeBase</code> for their secret.</p>
+			</div>
+			<div class="callout trap"><p><strong>Hybrid search</strong> (keyword plus semantic) works only on OpenSearch Serverless, Aurora and MongoDB Atlas with a filterable text field; on every other store a <code>HYBRID</code> request silently runs as semantic. The embedding dimension and data type must match the index, and binary vectors work only on OpenSearch.</p></div>
+
+			<h2 id="s3">Creating a knowledge base</h2>
+			<span class="file">An S3 Vectors index and a knowledge base on it with Titan Text Embeddings V2 (Python, boto3)</span>
+<pre><code>import time
+
+import boto3
+
+region, account = "us-east-1", "111111111111"
+s3v = boto3.client("s3vectors", region_name=region)
+agent = boto3.client("bedrock-agent", region_name=region)
+
+s3v.create_vector_bucket(vectorBucketName="kb-vectors")
+s3v.create_index(
+    vectorBucketName="kb-vectors",
+    indexName="docs-index",
+    dimension=1024,
+    distanceMetric="cosine",
+    dataType="float32",
+    <span class="c"># Bedrock stores chunk text and its own metadata here; keep them non-filterable</span>
+    metadataConfiguration={"nonFilterableMetadataKeys": ["AMAZON_BEDROCK_TEXT", "AMAZON_BEDROCK_METADATA"]},
+)
+
+kb = agent.create_knowledge_base(
+    name="docs-kb",
+    roleArn=f"arn:aws:iam::{account}:role/BedrockKbServiceRole",
+    knowledgeBaseConfiguration={
+        "type": "VECTOR",
+        "vectorKnowledgeBaseConfiguration": {
+            "embeddingModelArn": f"arn:aws:bedrock:{region}::foundation-model/amazon.titan-embed-text-v2:0",
+            "embeddingModelConfiguration": {"bedrockEmbeddingModelConfiguration": {
+                "dimensions": 1024,
+                "embeddingDataType": "FLOAT32",
+            }},
+        },
+    },
+    storageConfiguration={
+        "type": "S3_VECTORS",
+        <span class="c"># indexArn alone, or vectorBucketArn plus indexName; never indexArn plus indexName</span>
+        "s3VectorsConfiguration": {"indexArn": f"arn:aws:s3vectors:{region}:{account}:bucket/kb-vectors/index/docs-index"},
+    },
+)["knowledgeBase"]
+kb_id = kb["knowledgeBaseId"]
+while agent.get_knowledge_base(knowledgeBaseId=kb_id)["knowledgeBase"]["status"] == "CREATING":
+    time.sleep(15)</code></pre>
+			<ul>
+				<li>Other stores: <code>"type": "OPENSEARCH_SERVERLESS"</code> with <code>opensearchServerlessConfiguration {collectionArn, vectorIndexName, fieldMapping {vectorField, textField, metadataField}}</code>; <code>"type": "RDS"</code> with <code>rdsConfiguration {resourceArn, credentialsSecretArn, databaseName, tableName, fieldMapping {primaryKeyField, vectorField, textField, metadataField, customMetadataField}}</code>; and similar objects for the rest.</li>
+				<li>Embedding models: Titan Text Embeddings V2 (1,024, 512 or 256 dimensions; the most Regions), Cohere Embed English and Multilingual v3, Cohere Embed v4, Nova Multimodal Embeddings.</li>
+				<li>For multimodal content, set <code>supplementalDataStorageConfiguration</code> (an S3 location for extracted media) at creation: it can't be added later.</li>
+				<li><strong>Service role:</strong> trusted by <code>bedrock.amazonaws.com</code> with <code>aws:SourceAccount</code> and <code>aws:SourceArn</code> conditions on <code>knowledge-base/*</code>, with <code>bedrock:InvokeModel</code> on the embedding model, <code>s3:ListBucket</code> and <code>s3:GetObject</code> on the source bucket, and the store's actions (<code>s3vectors:PutVectors</code>, <code>QueryVectors</code>, <code>GetVectors</code>, <code>DeleteVectors</code>, <code>GetIndex</code>; <code>aoss:APIAccessAll</code>; <code>rds-data:ExecuteStatement</code>; and so on).</li>
+			</ul>
+			<div class="callout trap"><p>AWS warns that <code>CreateDataSource</code> and <code>StartIngestionJob</code> don't pass a role, so there's no <code>iam:PassRole</code> check: anyone who manages data sources can ingest anything the knowledge base's role can read, and anyone with <code>bedrock:Retrieve</code> can read everything synced (customer-managed KBs have no document permissions). Scope the role to specific buckets and prefixes, and treat data source actions as privileged.</p></div>
+
+			<h2 id="s4">Data sources and ingestion</h2>
+			<ul>
+				<li><strong>S3:</strong> <code>{"type": "S3", "s3Configuration": {"bucketArn": ..., "inclusionPrefixes": ["policies/"]}}</code> (a general-purpose bucket in the same Region, exactly one prefix, cross-account with <code>bucketOwnerAccountId</code>).</li>
+				<li><strong>Custom:</strong> <code>{"type": "CUSTOM"}</code>, with documents pushed by <code>IngestKnowledgeBaseDocuments</code> (up to 25 per call, 6 MB). Direct ingestion also works on S3 sources but doesn't write to the bucket, so the next sync overwrites it unless you mirror the change; never run it during a sync.</li>
+				<li><strong>Metadata:</strong> next to each S3 file, <code>FILE.EXT.metadata.json</code> (up to 10 KB), for example <code>{"metadataAttributes": {"department": {"value": {"type": "STRING", "stringValue": "finance"}, "includeForEmbedding": true}}}</code>. <code>includeForEmbedding</code> adds the attribute to the embedded text. CSV files can map columns to content and metadata with a record-based structure file.</li>
+				<li><code>dataDeletionPolicy</code>: <code>DELETE</code> removes the vectors when the data source or knowledge base is deleted (the store itself stays); <code>RETAIN</code> keeps them. Set it explicitly.</li>
+				<li><strong>Sync:</strong> <code>StartIngestionJob</code> is incremental (only one job at a time per knowledge base, five per account, and 0.1 starts per second); text files up to 50 MB, up to 100 GB per job. Formats: TXT, Markdown, HTML, Word, CSV, Excel and PDF, plus images, audio and video with multimodal parsing.</li>
+				<li><strong>Multimodal:</strong> Nova Multimodal Embeddings embeds images, audio and video directly (text or image queries, visual similarity) but can't search speech; Data Automation parsing converts media to text (transcripts, scene summaries, OCR) and supports full <code>RetrieveAndGenerate</code>.</li>
+			</ul>
+
+			<h2 id="s5">Chunking, parsing and transforms</h2>
+			<p>All set in <code>vectorIngestionConfiguration</code> on the data source. <strong>The chunking strategy and parser type can't be changed later</strong>: create a new data source to change them.</p>
+			<ul>
+				<li><strong>Default</strong> (omit it): about 300 tokens, respecting sentences.</li>
+				<li><code>FIXED_SIZE</code>: <code>maxTokens</code> (1 to 8,192) and <code>overlapPercentage</code> (1 to 99).</li>
+				<li><code>HIERARCHICAL</code>: exactly two <code>levelConfigurations</code> (parent, then child <code>maxTokens</code>) and <code>overlapTokens</code>. Search matches small child chunks and returns their parents, so you get precise matching with broader context (and possibly fewer results).</li>
+				<li><code>SEMANTIC</code>: <code>maxTokens</code>, <code>bufferSize</code> (0 or 1 neighbouring sentences) and <code>breakpointPercentileThreshold</code> (50 to 99); splits where meaning changes, using a model (extra cost).</li>
+				<li><code>NONE</code>: one chunk per file, for pre-split content or a Lambda that does its own chunking.</li>
+				<li><strong>Parsing:</strong> the default parser extracts text only; <code>BEDROCK_FOUNDATION_MODEL</code> uses a vision model (Claude, Nova or Llama 4) with your parsing prompt to transcribe tables and describe figures; <code>BEDROCK_DATA_AUTOMATION</code> costs $0.010 per page. Both process every PDF (including text-only ones), fall back to the default parser silently on failure, and handle up to 1,000 files per data source.</li>
+				<li><strong>Lambda transformation</strong> (<code>customTransformationConfiguration</code>, step <code>POST_CHUNKING</code>, with an intermediate S3 location): your function reads and rewrites batches of chunks, to chunk your own way (with <code>NONE</code>) or to add chunk-level metadata, which overrides file-level metadata.</li>
+			</ul>
+			<span class="file">An S3 source with semantic chunking and model parsing that keeps vectors if the source is deleted (Python, boto3)</span>
+<pre><code>ds = agent.create_data_source(
+    knowledgeBaseId=kb_id,
+    name="policies-s3",
+    dataDeletionPolicy="RETAIN",
+    dataSourceConfiguration={"type": "S3", "s3Configuration": {
+        "bucketArn": "arn:aws:s3:::policies-111111111111",
+        "inclusionPrefixes": ["published/"],
+    }},
+    <span class="c"># Customer managed key for transient data during sync</span>
+    serverSideEncryptionConfiguration={"kmsKeyArn": "arn:aws:kms:us-east-1:111111111111:key/KEY_ID"},
+    vectorIngestionConfiguration={
+        "chunkingConfiguration": {
+            "chunkingStrategy": "SEMANTIC",
+            "semanticChunkingConfiguration": {"maxTokens": 512, "bufferSize": 1, "breakpointPercentileThreshold": 95},
+        },
+        "parsingConfiguration": {
+            "parsingStrategy": "BEDROCK_FOUNDATION_MODEL",
+            "bedrockFoundationModelConfiguration": {
+                "modelArn": "arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "parsingModality": "MULTIMODAL",
+                "parsingPrompt": {"parsingPromptText": "Transcribe all text, render tables as markdown, and describe figures."},
+            },
+        },
+    },
+)["dataSource"]
+agent.start_ingestion_job(knowledgeBaseId=kb_id, dataSourceId=ds["dataSourceId"])</code></pre>
+
+			<h2 id="s6">Retrieve</h2>
+			<span class="file">Hybrid search with a metadata filter, then Cohere reranking (Python, boto3)</span>
+<pre><code>rt = boto3.client("bedrock-agent-runtime", region_name="us-east-1")
+
+r = rt.retrieve(
+    knowledgeBaseId=kb_id,
+    retrievalQuery={"text": "What is the refund window for annual plans?"},
+    retrievalConfiguration={"vectorSearchConfiguration": {
+        <span class="c"># Candidates before reranking (1-100)</span>
+        "numberOfResults": 20,
+        <span class="c"># OpenSearch Serverless, Aurora and MongoDB only</span>
+        "overrideSearchType": "HYBRID",
+        <span class="c"># andAll and orAll need at least two conditions</span>
+        "filter": {"andAll": [
+            {"equals": {"key": "doc_type", "value": "policy"}},
+            {"greaterThanOrEquals": {"key": "year", "value": 2025}},
+        ]},
+        "rerankingConfiguration": {
+            "type": "BEDROCK_RERANKING_MODEL",
+            "bedrockRerankingConfiguration": {
+                "numberOfRerankedResults": 5,
+                "modelConfiguration": {"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0"},
+            },
+        },
+    }},
+)
+for res in r["retrievalResults"]:
+    print(round(res["score"], 3), res["location"].get("s3Location", {}).get("uri"), res["content"]["text"][:80])</code></pre>
+			<ul>
+				<li>Filter operators: <code>equals</code>, <code>notEquals</code>, the numeric comparisons, <code>in</code>, <code>notIn</code>, <code>listContains</code>, <code>stringContains</code> and <code>startsWith</code> (OpenSearch Serverless only; neither of the last two on S3 Vectors), combined with <code>andAll</code> and <code>orAll</code>.</li>
+				<li><strong>Implicit filters</strong> (<code>implicitFilterConfiguration</code> with up to 25 described attributes and a Claude model) let a model turn "policies from 2025 for finance" into a filter automatically.</li>
+				<li><strong>Rerank API</strong> on its own: <code>rt.rerank(queries=[...], sources=[...], rerankingConfiguration={...})</code> reorders any text list (Amazon Rerank 1.0 or Cohere Rerank 3.5, $2.00 per 1,000 queries of up to 100 documents; Amazon Rerank isn't in us-east-1).</li>
+				<li><code>numberOfResults</code> is a maximum: hierarchical chunking, table context merging and reranking can return fewer. Guardrails on Retrieve check the query, never the retrieved chunks.</li>
+			</ul>
+
+			<h2 id="s7">RetrieveAndGenerate</h2>
+			<span class="file">Answer with citations, a custom prompt, a guardrail, query decomposition and a session (Python, boto3)</span>
+<pre><code>MODEL = "arn:aws:bedrock:us-east-1:111111111111:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+<span class="c"># $search_results$ is required; without $output_format_instructions$ you lose citations</span>
+TEMPLATE = """Answer using only the search results below. If the answer isn't there, say you don't know.
+$search_results$
+$output_format_instructions$"""
+
+
+def ask(question, session_id=None):
+    req = {
+        "input": {"text": question},
+        "retrieveAndGenerateConfiguration": {
+            "type": "KNOWLEDGE_BASE",
+            "knowledgeBaseConfiguration": {
+                "knowledgeBaseId": kb_id,
+                "modelArn": MODEL,
+                "retrievalConfiguration": {"vectorSearchConfiguration": {"numberOfResults": 8}},
+                "orchestrationConfiguration": {"queryTransformationConfiguration": {"type": "QUERY_DECOMPOSITION"}},
+                "generationConfiguration": {
+                    "promptTemplate": {"textPromptTemplate": TEMPLATE},
+                    "guardrailConfiguration": {"guardrailId": "GUARDRAIL_ID", "guardrailVersion": "1"},
+                    "inferenceConfig": {"textInferenceConfig": {"temperature": 0.2, "maxTokens": 800}},
+                },
+            },
+        },
+    }
+    <span class="c"># Reuse the ID Bedrock returned; you can't make one up</span>
+    if session_id:
+        req["sessionId"] = session_id
+    r = rt.retrieve_and_generate(**req)
+    <span class="c"># Citations are at the top level of the response</span>
+    for c in r["citations"]:
+        span = c["generatedResponsePart"]["textResponsePart"]["span"]
+        sources = [ref["location"].get("s3Location", {}).get("uri") for ref in c["retrievedReferences"]]
+        print(span, sources)
+    return r["output"]["text"], r["sessionId"]
+
+
+answer, sid = ask("Who approves travel over 5,000 dollars?")
+follow_up, _ = ask("And for international trips?", sid)</code></pre>
+			<ul>
+				<li><code>RetrieveAndGenerateStream</code> streams <code>output</code> text and <code>citation</code> events. <code>sessionConfiguration.kmsKeyArn</code> encrypts session data with your key.</li>
+				<li><strong>Query decomposition</strong> splits a complex question into sub-queries before retrieval. Placeholders: <code>$query$</code>, <code>$search_results$</code>, <code>$output_format_instructions$</code> and <code>$current_time$</code>.</li>
+				<li><code>"type": "EXTERNAL_SOURCES"</code> answers from a single document you pass (S3 or bytes up to 10 MB) without a knowledge base.</li>
+			</ul>
+
+			<h2 id="s8">Structured data and GraphRAG</h2>
+			<div class="entry">
+				<h4>Structured data (type SQL)</h4>
+				<p>A <code>SQL</code> knowledge base turns questions into SQL against Amazon Redshift (provisioned or Serverless, with IAM, user or secret authentication) over Redshift databases or Glue Data Catalog tables. Give it table and column descriptions and up to 10 curated example queries in <code>queryGenerationConfiguration</code>; a sync ingests the schema metadata. <code>Retrieve</code> returns rows, <code>RetrieveAndGenerate</code> answers from them (only 10 results reach the model), and <code>GenerateQuery</code> returns just the SQL (2 per second, English questions).</p>
+				<span class="file">Get the SQL for a question without running it (Python, boto3)</span>
+<pre><code>sql = rt.generate_query(
+    queryGenerationInput={"type": "TEXT", "text": "Top 5 customers by revenue in 2026"},
+    transformationConfiguration={
+        "mode": "TEXT_TO_SQL",
+        "textToSqlConfiguration": {
+            "type": "KNOWLEDGE_BASE",
+            "knowledgeBaseConfiguration": {"knowledgeBaseArn": "arn:aws:bedrock:us-east-1:111111111111:knowledge-base/SQL_KB_ID"},
+        },
+    },
+)
+print(sql["queries"][0]["sql"])</code></pre>
+				<p>Grant the role's database user <strong>SELECT only</strong> (create the <code>"IAMR:ROLE_NAME"</code> user and grants before the first sync), and treat generated SQL as untrusted: AWS calls arbitrary text-to-SQL a security risk. Since 10 May 2026 these knowledge bases use cross-Region inference automatically; in Seoul, Mumbai, Singapore and S&atilde;o Paulo requests may leave the local geography. SQL generation is charged per request, plus Redshift.</p>
+			</div>
+			<div class="entry">
+				<h4>GraphRAG with Neptune Analytics</h4>
+				<p>A <code>VECTOR</code> knowledge base on <code>NEPTUNE_ANALYTICS</code> storage, with an S3 data source whose <code>contextEnrichmentConfiguration</code> (<code>BEDROCK_FOUNDATION_MODEL</code>, method <code>CHUNK_ENTITY_EXTRACTION</code>, a model such as Claude Haiku 4.5 or Nova) extracts entities and relationships into a graph during ingestion. Queries start with vector search, then follow the graph to related chunks across documents, which helps multi-hop questions. Up to 1,000 files per data source by default (10,000 on request), no graph autoscaling, 7 Regions; the graph isn't deleted with the knowledge base and keeps billing until you delete it.</p>
+			</div>
+
+			<h2 id="s9">Security, quotas and pricing</h2>
+			<ul>
+				<li><strong>Encryption:</strong> your KMS key for transient sync data (on the data source), for sessions, and on the vector store itself; S3 and Secrets Manager keys need <code>kms:Decrypt</code> for the role.</li>
+				<li><strong>Network:</strong> interface endpoints for <code>bedrock-agent</code> and <code>bedrock-agent-runtime</code>; private OpenSearch Serverless collections; MongoDB Atlas PrivateLink; Aurora through the Data API.</li>
+				<li><strong>Audit and logs:</strong> <code>Retrieve</code> and <code>RetrieveAndGenerate</code> are CloudTrail data events (off by default). Ingestion logs (per-document status and chunk counts) go to CloudWatch Logs, S3 or Firehose through log delivery, except for SQL and Kendra types.</li>
+				<li><strong>Quotas</strong> (not adjustable): 100 knowledge bases per account, 5 data sources each, <code>Retrieve</code> and <code>RetrieveAndGenerate</code> 20 per second, queries up to 1,000 characters. Far lower than Managed KBs.</li>
+				<li><strong>Pricing:</strong> no Knowledge Bases fee. You pay embedding tokens at ingestion and query, the vector store, generation tokens (including decomposition), semantic chunking and parsing model tokens or Data Automation pages, rerank queries, and SQL generation requests.</li>
+			</ul>
+
+			<h2 id="s10">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> Managed Knowledge Bases recommended in the docs (from March) and generally available (17 June); structured data uses cross-Region inference automatically (10 May); Kendra maintenance (30 June) and closure to new customers (30 July); no new SaaS connectors on customer-managed KBs (30 September); S3 Vectors in more Regions, cheaper queries, 10,000 results per query and metadata pre-filtering.</li>
+				<li><strong>2025:</strong> Data Automation generally available (3 March); GraphRAG generally available (7 March); OpenSearch managed clusters (27 March); hybrid search on Aurora and MongoDB (10 April); S3 Vectors preview (15 July) and general availability (2 December); multimodal retrieval with Nova Multimodal Embeddings (30 November).</li>
+				<li><strong>2024:</strong> hybrid search on OpenSearch (March); multiple data sources (April); MongoDB Atlas (May); semantic and hierarchical chunking, model parsing, Lambda transforms and query decomposition (10 July); binary vectors (November); Rerank, streaming, implicit filters and direct ingestion (1 December); structured data and GraphRAG preview (4 December).</li>
+				<li><strong>2023:</strong> preview (September) and general availability (28 November); Aurora (21 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d1-task-1-5.html">AIP-C01 Task 1.5: retrieval mechanisms</a>, <a href="../../aws-aip/d1-task-1-3.html">AIP-C01 Task 1.3: data validation and processing</a> and <a href="../../aws-aif/d3-task-3-1.html">AIF-C01 Task 3.1: design considerations</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="knowledge-bases-managed.html"><small>Previous</small>Managed Knowledge Bases</a>
+				<a class="next" href="inference.html"><small>Next</small>Inference APIs and options</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock customer-managed Knowledge Bases, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
