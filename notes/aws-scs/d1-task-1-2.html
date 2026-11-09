@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 1.2: Design and Implement Logging Solutions | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 1.2 study guide: choosing log sources and storage, organization CloudTrail trails with event selectors, integrity validation and KMS, centralizing CloudWatch Logs in a logging account, the CloudWatch agent, log archive buckets and Security Lake, Logs Insights, Athena and Security Hub CSPM insights, normalizing logs with Lambda, Firehose, transformers and OpenSearch, and network logs from VPC and transit gateway flow logs, Resolver query logs, Network Firewall and WAF.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">Task 1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Detection &middot; 16%</span>
+		<h1>Task 1.2: Design and implement logging solutions</h1>
+		<p>Deciding which logs to collect and where to keep them, turning them on across every account, protecting them from tampering, and making them searchable, normalized and correlated when an investigation needs them.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">CloudTrail</span><span class="tag">CloudWatch Logs</span><span class="tag">Security Lake</span><span class="tag">Athena</span><span class="tag">VPC Flow Logs</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Choosing log sources and storage</a></li>
+				<li><a href="#s2">Configuring logging</a></li>
+				<li><a href="#s3">Log storage and data lakes</a></li>
+				<li><a href="#s4">Analyzing logs</a></li>
+				<li><a href="#s5">Normalizing, parsing and correlating</a></li>
+				<li><a href="#s6">Network log sources</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.2</span>
+				<p><strong>Design and implement logging solutions.</strong></p>
+			</div>
+			<p>Task 1.1 was about findings: conclusions that detectors such as GuardDuty reach. This task is about the raw evidence underneath them. Questions give a requirement (keep API activity for seven years, prove logs weren't altered, let a third-party SIEM read everything, find which host made a DNS query) and ask for the source, the configuration and the store that meet it. Most correct answers share three habits: log at the organization level so new accounts are covered, deliver to a separate <strong>log archive account</strong> that workload administrators can't touch, and encrypt and lock what's stored there.</p>
+			<p><strong>Running example.</strong> The same company as in <a href="d1-task-1-1.html">Task 1.1</a>: AWS Organizations with a management account (555555555555), a security tooling account (222222222222), a log archive account (444444444444) and workload accounts (prod is 111111111111). It runs a web application behind CloudFront, AWS WAF and an Application Load Balancer, containers on EKS and ECS on Fargate, a data platform on S3, and a generative AI assistant on Amazon Bedrock, in us-east-1 with us-west-2 for disaster recovery. VPCs in each account connect through a transit gateway in a shared network account.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>1.2.1</td><td data-label="What you need to be able to do">Match a requirement to the log source that records it and the store that keeps it</td></tr>
+						<tr><td>1.2.2</td><td data-label="What you need to be able to do">Configure organization trails, a central logging account and the CloudWatch agent</td></tr>
+						<tr><td>1.2.3</td><td data-label="What you need to be able to do">Build tamper-resistant log storage and a Security Lake data lake, and connect third-party tools</td></tr>
+						<tr><td>1.2.4</td><td data-label="What you need to be able to do">Query logs with CloudWatch Logs Insights and Athena, and group findings with insights</td></tr>
+						<tr><td>1.2.5</td><td data-label="What you need to be able to do">Normalize, parse and correlate logs with Lambda, Firehose, CloudWatch, OpenSearch and Grafana</td></tr>
+						<tr><td>1.2.6</td><td data-label="What you need to be able to do">Pick and configure network log sources for a network design and a threat</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout retired"><p><strong>CloudTrail Lake is closed to new customers</strong> from 31 May 2026. Existing customers can keep using it, but it only gets critical bug fixes and security updates, and AWS points to Amazon CloudWatch for similar capabilities (event data can be imported with <code>aws logs create-import-task</code>). CloudTrail trails and Insights are unaffected. For new designs, store and query CloudTrail with S3 and Athena, CloudWatch Logs or Security Lake, as this page does.</p></div>
+
+			<!-- Skill 1.2.1 -->
+			<h2 id="s1">Choosing log sources and storage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.1</span><span class="skill-text">Identify sources for log ingestion and storage based on requirements.</span></p>
+
+				<h3>What each source records</h3>
+				<div class="entry">
+					<h4>CloudTrail event types</h4>
+					<p>CloudTrail records who called which AWS API, from where and with what result. It has four kinds of event, and only the first is logged by default:</p>
+					<ul>
+						<li><strong>Management events:</strong> control-plane calls such as <code>AttachRolePolicy</code>, <code>CreateSubnet</code> or <code>StopLogging</code>, plus sign-in events such as <code>ConsoleLogin</code>. The first copy delivered to S3 is free.</li>
+						<li><strong>Data events:</strong> high-volume calls on resources: S3 object reads and writes, Lambda invocations, DynamoDB item activity and many more. They're charged ($0.10 per 100,000 events) and must be selected.</li>
+						<li><strong>Network activity events:</strong> API calls made through <strong>your VPC endpoints</strong>, recorded for the endpoint owner, including calls the endpoint policy denied (<code>VpceAccessDenied</code>). Generally available since February 2025 for more than 70 services. Use them to spot credentials from outside the organization trying to use your endpoints.</li>
+						<li><strong>Insights events:</strong> unusual API call rates or error rates compared with a learned baseline, for management events and (on trails only) data events.</li>
+					</ul>
+					<p>The console's <strong>Event history</strong> shows only the last 90 days of management events, per account and per Region. Anything longer, or across accounts, needs a trail.</p>
+				</div>
+				<div class="entry">
+					<h4>Service and application logs</h4>
+					<p>Beyond CloudTrail, each layer of the running example has its own log: <strong>CloudFront</strong> and <strong>ALB access logs</strong> (every request), <strong>WAF logs</strong> (every request the web ACL evaluated, with the rule that matched), <strong>EKS control plane audit logs</strong>, <strong>VPC Flow Logs</strong> and <strong>transit gateway flow logs</strong> (IP traffic), <strong>Route 53 Resolver query logs</strong> (DNS lookups from VPCs), <strong>Network Firewall</strong> logs, and application and OS logs collected by the <strong>CloudWatch agent</strong>. Network sources are compared in <a href="#s6">Skill 1.2.6</a>.</p>
+				</div>
+				<div class="callout trap"><p>For S3 object access, AWS recommends <strong>CloudTrail data events</strong> over S3 server access logs: they arrive in about five minutes, support integrity validation and can be filtered by prefix. Server access logs are best effort and can be hours late, but they're the only one of the two that records requests that failed <strong>authentication</strong> (bad credentials) and lifecycle actions. CloudTrail does record authorization failures (<code>AccessDenied</code>) and anonymous requests.</p></div>
+
+				<h3>Where to keep logs</h3>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>S3 log archive bucket</th><th>CloudWatch Logs</th><th>Amazon Security Lake</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Best for</th></tr>
+							<tr><td data-label="S3 log archive bucket">Cheap long-term retention and legal evidence</td><td data-label="CloudWatch Logs">Near real-time search, metric filters, alarms and subscriptions</td><td data-label="Amazon Security Lake">Normalized security data shared with analytics tools and SIEMs</td></tr>
+							<tr class="group"><th colspan="3">Format</th></tr>
+							<tr><td data-label="S3 log archive bucket">As delivered (CloudTrail JSON, flow log text or Parquet)</td><td data-label="CloudWatch Logs">Log events in log groups; optional transformation</td><td data-label="Amazon Security Lake">OCSF in Apache Parquet, one table per source</td></tr>
+							<tr class="group"><th colspan="3">Tamper resistance</th></tr>
+							<tr><td data-label="S3 log archive bucket">Object Lock, bucket policy, separate account</td><td data-label="CloudWatch Logs">IAM, KMS key per log group, separate account</td><td data-label="Amazon Security Lake">Lake Formation permissions; doesn't support Object Lock</td></tr>
+							<tr class="group"><th colspan="3">Query with</th></tr>
+							<tr><td data-label="S3 log archive bucket">Athena</td><td data-label="CloudWatch Logs">Logs Insights (QL, PPL or SQL)</td><td data-label="Amazon Security Lake">Athena, OpenSearch, subscribers' tools</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The three combine. In the running example, the organization trail writes to an S3 bucket in the log archive account for seven-year retention, also delivers to CloudWatch Logs for alarms, and Security Lake collects CloudTrail, VPC Flow Logs, Resolver logs, WAF logs and Security Hub CSPM findings for the security team's analytics.</p>
+				<div class="callout tip"><p>CloudWatch Logs has two main log classes. <strong>Standard</strong> supports everything. <strong>Essentials</strong> (the renamed Infrequent Access class) costs half as much to ingest but has no subscription filters, metric filters, Live Tail or anomaly detection; it still supports Logs Insights, KMS and masking. A log group's class can't be changed later, so logs that feed alarms or a SIEM must be Standard.</p></div>
+			</div>
+
+			<!-- Skill 1.2.2 -->
+			<h2 id="s2">Configuring logging</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.2</span><span class="skill-text">Configure logging for AWS services and applications (for example, by configuring an AWS CloudTrail trail for an organization, by creating a dedicated Amazon CloudWatch logging account, by configuring the Amazon CloudWatch Logs agent).</span></p>
+
+				<h3>An organization trail</h3>
+				<div class="entry">
+					<h4>Who creates it, and what members can do</h4>
+					<p>An <strong>organization trail</strong> logs every account in the organization, including accounts that join later. It needs all features enabled in Organizations and trusted access for <code>cloudtrail.amazonaws.com</code>. It can be created by the management account or by a CloudTrail <strong>delegated administrator</strong> (up to three per organization); the management account still owns it. Member accounts can see the trail but can't stop, change or delete it, which is the point: a compromised workload administrator can't turn off the evidence.</p>
+					<span class="file">Create and start an organization trail (AWS CLI, management account or CloudTrail delegated administrator)</span>
+<pre><code># Console-created organization trails are always multi-Region; on the CLI you must say so.
+# Log file validation is off by default; turn it on.
+aws cloudtrail create-trail \
+  --name org-trail \
+  --s3-bucket-name org-cloudtrail-444444444444 \
+  --is-organization-trail \
+  --is-multi-region-trail \
+  --enable-log-file-validation \
+  --kms-key-id arn:aws:kms:us-east-1:444444444444:key/1234abcd-12ab-34cd-56ef-1234567890ab
+
+# A new trail doesn't log until you start it
+aws cloudtrail start-logging --name org-trail</code></pre>
+				</div>
+				<div class="entry">
+					<h4>The bucket policy in the log archive account</h4>
+					<p>The bucket lives in the log archive account, and its policy lets the CloudTrail service write under <code>AWSLogs/&lt;organization ID&gt;/</code> (one folder per member account below it). The <code>aws:SourceArn</code> condition must use the <strong>management account ID</strong> in the trail ARN, even if a delegated administrator created the trail. AWS's sample policy also keeps a statement for <code>AWSLogs/&lt;management account ID&gt;/</code> in case the trail is converted back to an account trail.</p>
+					<span class="file">Organization trail bucket policy (S3 bucket policy JSON, log archive account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AWSCloudTrailAclCheck20150319",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:GetBucketAcl",
+      "Resource": "arn:aws:s3:::org-cloudtrail-444444444444",
+      "Condition": { "StringEquals": { "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail" } }
+    },
+    {
+      "Sid": "AWSCloudTrailWrite20150319",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::org-cloudtrail-444444444444/AWSLogs/555555555555/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail"
+        }
+      }
+    },
+    {
+      "Sid": "AWSCloudTrailOrganizationWrite20150319",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Encrypting with KMS</h4>
+					<p>By default, log files are encrypted with SSE-S3. With <code>--kms-key-id</code>, CloudTrail uses SSE-KMS for the log files and, since May 2025, the digest files too. The key policy needs three things: <code>kms:GenerateDataKey*</code> for CloudTrail, <code>kms:DescribeKey</code> for CloudTrail, and <code>kms:Decrypt</code> for whoever reads the logs. Reading a log then needs permission on both the bucket and the key, which keeps logs private even from someone with broad S3 access.</p>
+					<span class="file">Let CloudTrail encrypt with the key (one statement of the KMS key policy)</span>
+<pre><code>{
+  "Sid": "AllowCloudTrailEncryptLogs",
+  "Effect": "Allow",
+  "Principal": { "Service": "cloudtrail.amazonaws.com" },
+  "Action": "kms:GenerateDataKey*",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": { "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail" },
+    "StringLike": { "kms:EncryptionContext:aws:cloudtrail:arn": "arn:aws:cloudtrail:*:555555555555:trail/*" }
+  }
+}</code></pre>
+					<p>The readers' statement allows <code>kms:Decrypt</code> with the condition <code>"Null": { "kms:EncryptionContext:aws:cloudtrail:arn": "false" }</code>, so the permission only works on CloudTrail logs. If the key is disabled or its policy is wrong, CloudTrail can't deliver logs at all.</p>
+				</div>
+
+				<h3>Choosing events with advanced event selectors</h3>
+				<div class="entry">
+					<h4>Data events for one bucket, KMS noise out</h4>
+					<p><strong>Advanced event selectors</strong> filter on fields such as <code>eventCategory</code>, <code>resources.type</code>, <code>resources.ARN</code>, <code>eventName</code>, <code>eventSource</code>, <code>readOnly</code> and <code>userIdentity.arn</code>, with operators Equals, NotEquals, StartsWith, NotStartsWith, EndsWith and NotEndsWith; there are no wildcards. Setting advanced selectors replaces any basic ones. KMS <code>Encrypt</code>, <code>Decrypt</code> and <code>GenerateDataKey</code> calls are over 99% of KMS events, so excluding <code>kms.amazonaws.com</code> from management events cuts volume sharply, at the cost of losing those records.</p>
+					<span class="file">All management events except KMS, plus data events on the customer-data bucket (AWS CLI)</span>
+<pre><code># For S3 objects, StartsWith with a trailing "/" is required to match every object ARN.
+# Leaving out readOnly logs both read and write events.
+aws cloudtrail put-event-selectors \
+  --trail-name org-trail \
+  --advanced-event-selectors '[
+    {
+      "Name": "Management events except KMS",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["Management"] },
+        { "Field": "eventSource", "NotEquals": ["kms.amazonaws.com"] }
+      ]
+    },
+    {
+      "Name": "S3 data events on customer data",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["Data"] },
+        { "Field": "resources.type", "Equals": ["AWS::S3::Object"] },
+        { "Field": "resources.ARN", "StartsWith": ["arn:aws:s3:::customer-data-111111111111/"] }
+      ]
+    }
+  ]'</code></pre>
+					<p>Network activity events use <code>eventCategory</code> <code>NetworkActivity</code> and one selector per <code>eventSource</code>, optionally filtered to <code>errorCode</code> <code>VpceAccessDenied</code> to keep only calls the endpoint policy blocked.</p>
+				</div>
+				<div class="callout trap"><p>Don't log S3 data events for the bucket the trail writes to: every delivery creates more events about itself. Deliver to a bucket in the log archive account and exclude it (or simply don't select it).</p></div>
+
+				<h3>Proving logs weren't changed</h3>
+				<div class="entry">
+					<h4>Log file integrity validation</h4>
+					<p>With validation on, CloudTrail delivers a <strong>digest file</strong> every hour to a <code>CloudTrail-Digest</code> folder in the same bucket. It lists the SHA-256 hash of every log file delivered in that hour, is signed with a per-Region private key, and contains the previous digest's signature, so the digests form a chain. Turning validation on only produces digests; you validate with the CLI, which detects modified, deleted or moved log and digest files.</p>
+					<span class="file">Check a day of organization trail logs for one member account (AWS CLI)</span>
+<pre><code># Region-specific; --account-id is required for organization trails.
+# Files must still be in their original S3 location to be validated.
+aws cloudtrail validate-logs \
+  --trail-arn arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail \
+  --account-id 111111111111 \
+  --start-time 2026-11-01T00:00:00Z \
+  --end-time 2026-11-02T00:00:00Z \
+  --region us-east-1 \
+  --verbose</code></pre>
+				</div>
+				<div class="callout tip"><p>"Prove to auditors that CloudTrail logs haven't been modified or deleted" points to <strong>log file integrity validation</strong> plus <code>validate-logs</code>. "Make sure nobody can delete them, not even an administrator" points to <strong>S3 Object Lock in compliance mode</strong> (<a href="#s3">Skill 1.2.3</a>).</p></div>
+
+				<h3>A dedicated CloudWatch logging account</h3>
+				<div class="entry">
+					<h4>Log centralization rules (since September 2025)</h4>
+					<p>The simplest way to get every account's CloudWatch Logs into the log archive account is <strong>cross-account cross-Region log centralization</strong>. The management account or a delegated administrator creates a <strong>centralization rule</strong> that selects source accounts or OUs, source Regions and log groups, and copies new log events to a destination account and Region, with an optional backup Region. Destination log group names can include <code>${source.accountId}</code> and <code>${source.region}</code> so accounts don't merge into one group. Only data ingested after the rule is created is copied. The first copy is free; each extra copy, including the backup Region, costs $0.05 per GB.</p>
+				</div>
+				<div class="entry">
+					<h4>Cross-account subscriptions</h4>
+					<p>The older pattern, still used when logs must stream to Kinesis Data Streams or Firehose for a SIEM, is a <strong>subscription</strong>. In the log archive account you create a <strong>destination</strong> in front of a stream, with a destination policy that lets the organization subscribe. Each sending account then adds a subscription filter that points at the destination. A log group can have up to five subscription filters, and each account can also have one <strong>account-level</strong> subscription filter per Region that covers every log group.</p>
+					<span class="file">Accept subscriptions from the whole organization (destination access policy, log archive account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "logs:PutSubscriptionFilter",
+      "Resource": "arn:aws:logs:us-east-1:444444444444:destination:org-security-logs",
+      "Condition": { "StringEquals": { "aws:PrincipalOrgID": ["o-exampleorgid"] } }
+    }
+  ]
+}</code></pre>
+					<span class="file">Send every log group in a workload account, except the noisy ones (AWS CLI, account-level filter)</span>
+<pre><code># NOT IN is the only operator the selection criteria support.
+# Exclude log groups on the delivery path to avoid a loop.
+aws logs put-account-policy \
+  --policy-name org-security-feed \
+  --policy-type SUBSCRIPTION_FILTER_POLICY \
+  --scope ALL \
+  --selection-criteria 'LogGroupName NOT IN ["/aws/lambda/log-forwarder", "/app/debug"]' \
+  --policy-document '{"DestinationArn": "arn:aws:logs:us-east-1:444444444444:destination:org-security-logs", "RoleArn": "arn:aws:iam::111111111111:role/CWLtoSubscriptionRole", "FilterPattern": "", "Distribution": "Random"}'</code></pre>
+					<p>When the destination policy names the organization rather than individual accounts, each sender needs a role trusted by <code>logs.amazonaws.com</code>, passed as <code>RoleArn</code>. Subscriptions only work on Standard log groups.</p>
+				</div>
+				<div class="entry">
+					<h4>Turning logging on everywhere: telemetry enablement rules</h4>
+					<p>Centralizing only helps if the logs exist. CloudWatch <strong>telemetry enablement rules</strong> (2025) turn on logging for resource types across the organization, an OU or an account: VPC Flow Logs, Route 53 Resolver query logs, WAF logs, EKS control plane logs, ALB and NLB logs, CloudFront, S3 server access logs and others, including resources created later. OU and account rules can collect more than the organization rule but not less. An AWS Config rule with automatic remediation is the older way to achieve the same thing.</p>
+				</div>
+
+				<h3>Protecting what's in CloudWatch Logs</h3>
+				<div class="entry">
+					<h4>KMS keys and masking</h4>
+					<p>Log groups are always encrypted; for your own key, associate a customer managed key (CLI or API only for existing log groups). The key policy must allow the <strong>Regional</strong> service principal, for example <code>logs.us-east-1.amazonaws.com</code>, scoped with the <code>kms:EncryptionContext:aws:logs:arn</code> condition. Disabling the key later makes the data it encrypted unreadable.</p>
+					<p>A <strong>data protection policy</strong> finds sensitive data (credentials, financial data, personal data, IP addresses and up to 10 custom identifiers) as it's ingested, masks it everywhere it leaves (console, Logs Insights, metric and subscription filters) and can report findings. Only principals with <code>logs:Unmask</code> see the original. It applies to a log group or the whole account, and only to data ingested after it's set.</p>
+					<span class="file">Mask email addresses and AWS secret keys in the app's log group (data protection policy JSON)</span>
+<pre><code>{
+  "Name": "app-data-protection",
+  "Version": "2021-06-01",
+  "Statement": [
+    {
+      "Sid": "audit",
+      "DataIdentifier": [
+        "arn:aws:dataprotection::aws:data-identifier/EmailAddress",
+        "arn:aws:dataprotection::aws:data-identifier/AwsSecretKey"
+      ],
+      "Operation": { "Audit": { "FindingsDestination": {} } }
+    },
+    {
+      "Sid": "mask",
+      "DataIdentifier": [
+        "arn:aws:dataprotection::aws:data-identifier/EmailAddress",
+        "arn:aws:dataprotection::aws:data-identifier/AwsSecretKey"
+      ],
+      "Operation": { "Deidentify": { "MaskConfig": {} } }
+    }
+  ]
+}</code></pre>
+					<p>The policy always has exactly these two statements, with the same identifiers in both: one that audits and one that masks. It's applied with <code>aws logs put-data-protection-policy --log-group-identifier ... --policy-document file://policy.json</code>.</p>
+				</div>
+
+				<h3>The CloudWatch agent</h3>
+				<div class="entry">
+					<h4>Collecting OS and application logs</h4>
+					<p>The agent ships log files and Windows event logs from EC2 and on-premises servers. Installing it, metrics and the wizard are covered in the <a href="../aws-soa/d1-task-1-1.html#s2">CloudOps guide's agent section</a>; the security points are below. The <code>logs</code> section lists files with <code>file_path</code>, <code>log_group_name</code>, <code>log_stream_name</code> and optionally <code>retention_in_days</code> and <code>log_group_class</code>; Windows channels such as <code>Security</code> go under <code>windows_events</code>.</p>
+					<span class="file">Collect the Linux auth log and Windows logon events (CloudWatch agent configuration, logs section)</span>
+<pre><code>{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/secure",
+            "log_group_name": "/prod/os/secure",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 365
+          }
+        ]
+      },
+      "windows_events": {
+        "collect_list": [
+          {
+            "event_name": "Security",
+            "event_ids": [4624, 4625, 4672],
+            "log_group_name": "/prod/windows/security",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  }
+}</code></pre>
+					<p>Store the configuration in Parameter Store with a name starting <code>AmazonCloudWatch-</code>, because the managed policies only allow those parameters: <code>CloudWatchAgentServerPolicy</code> on every instance can read them, <code>CloudWatchAgentAdminPolicy</code> (which can also write them) belongs only on the instance used to create the configuration. Each instance then loads it with <code>amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-linux</code>, or the fleet is configured with the <code>AmazonCloudWatch-ManageAgent</code> Run Command document. To send logs to another account, set <code>credentials.role_arn</code> in the configuration to a role in that account.</p>
+				</div>
+				<div class="callout trap"><p>Setting <code>retention_in_days</code> on a log group that already exists deletes every event older than that many days. The agent also needs <code>logs:PutRetentionPolicy</code> to set it.</p></div>
+			</div>
+
+			<!-- Skill 1.2.3 -->
+			<h2 id="s3">Log storage and data lakes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.3</span><span class="skill-text">Implement log storage and log data lakes (for example, Security Lake) and integrate with third-party security tools.</span></p>
+
+				<h3>A tamper-resistant log archive</h3>
+				<div class="entry">
+					<h4>The log archive bucket</h4>
+					<p>The bucket in the log archive account combines several controls. <strong>S3 Object Lock</strong> (which requires versioning) stores objects as write once, read many: in <strong>compliance mode</strong> no user, including the root user, can delete or overwrite a locked version or shorten its retention until it expires. In <strong>governance mode</strong> users with <code>s3:BypassGovernanceRetention</code> can, which is useful for testing. A <strong>legal hold</strong> has no end date and is removed by anyone with <code>s3:PutObjectLegalHold</code>. A bucket default retention applies to every new object. Add to that:</p>
+					<ul>
+						<li><strong>SSE-KMS with an S3 Bucket Key</strong>, which cuts KMS request costs for high-volume logs.</li>
+						<li>A bucket policy that <strong>denies non-TLS requests</strong> with <code>aws:SecureTransport</code> <code>false</code>, and that only lets the logging services write.</li>
+						<li><strong>Lifecycle rules</strong> to move older logs to S3 Glacier storage classes and expire them when retention ends.</li>
+						<li>Access for workload administrators limited to nothing: they don't need to read the archive, and SCPs can stop anyone outside the security team changing the bucket.</li>
+					</ul>
+				</div>
+				<div class="callout trap"><p>An object locked in compliance mode can only be deleted early by closing the AWS account. Test retention settings in governance mode first; a 10-year compliance-mode default on the wrong bucket can't be undone.</p></div>
+
+				<h3>Amazon Security Lake</h3>
+				<div class="entry">
+					<h4>Storage and retention</h4>
+					<p>Security Lake's sources and delegated administrator are covered in <a href="d1-task-1-1.html#s3">Task 1.1</a>. It stores data in an S3 bucket per Region in the account where it runs (the log archive account in the running example), as OCSF in Apache Parquet and, for version 2 sources, Apache Iceberg tables. Retention and storage class transitions are set per Region <strong>in Security Lake</strong>, not with S3 lifecycle rules on its bucket, which can remove its metadata. Contributing Regions can replicate into a <strong>rollup Region</strong> so one place holds everything.</p>
+					<span class="file">Keep a year of data, moving it to One Zone-IA after 30 days (AWS CLI, Security Lake administrator)</span>
+<pre><code>aws securitylake update-data-lake \
+  --configurations '[{"region": "us-east-1",
+                      "encryptionConfiguration": {"kmsKeyId": "S3_MANAGED_KEY"},
+                      "lifecycleConfiguration": {"expiration": {"days": 365},
+                                                 "transitions": [{"days": 30, "storageClass": "ONEZONE_IA"}]}}]' \
+  --meta-store-manager-role-arn arn:aws:iam::444444444444:role/service-role/AmazonSecurityLakeMetaStoreManager</code></pre>
+				</div>
+				<div class="callout trap"><p><strong>Security Lake doesn't support S3 Object Lock</strong>; enabling it with a default retention on the lake's bucket interrupts delivery. If logs must be immutable, keep the original CloudTrail delivery in a locked log archive bucket and use Security Lake as the analysis copy.</p></div>
+				<div class="entry">
+					<h4>Subscribers and third-party tools</h4>
+					<p>Other tools reach Security Lake data as <strong>subscribers</strong>, each identified by an AWS account ID and external ID and limited to the sources you choose (up to 10):</p>
+					<ul>
+						<li><strong>Data access</strong>: the subscriber reads the S3 objects directly and is told about new ones through an SQS queue or an HTTPS endpoint. This suits a SIEM that ingests everything.</li>
+						<li><strong>Query access</strong>: Lake Formation shares the tables with the subscriber's account through AWS RAM (the invitation must be accepted within 12 hours), and the subscriber queries them with Athena or similar engines, paying for its own queries. This suits an analytics team that queries in place.</li>
+					</ul>
+					<p>A subscriber only sees data in the Region where it's created, so point it at the rollup Region. Third-party tools can also write <em>into</em> the lake as <strong>custom sources</strong> (up to 50), as long as they deliver OCSF in Parquet under the partition layout Security Lake expects.</p>
+				</div>
+				<div class="callout tip"><p>"Give a partner SIEM all security logs from every account and Region without building pipelines" points to a <strong>Security Lake subscriber with data access</strong> in the rollup Region. "Our analysts want to run SQL on the lake from their own account" points to a <strong>query access subscriber</strong>.</p></div>
+			</div>
+
+			<!-- Skill 1.2.4 -->
+			<h2 id="s4">Analyzing logs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.4</span><span class="skill-text">Use AWS services to analyze logs (for example, CloudWatch Logs Insights, Amazon Athena, Security Hub findings).</span></p>
+
+				<h3>CloudWatch Logs Insights</h3>
+				<div class="entry">
+					<h4>Interactive queries over log groups</h4>
+					<p>Logs Insights queries one or more log groups, charged per GB scanned. It has three languages: <strong>Logs Insights QL</strong> (pipe-separated commands such as <code>fields</code>, <code>filter</code>, <code>stats</code>, <code>sort</code>, <code>limit</code> and <code>parse</code>), <strong>OpenSearch PPL</strong> and <strong>OpenSearch SQL</strong>, which can join log groups. Fields in CloudTrail, VPC Flow Logs, Route 53 and JSON logs are discovered automatically. From a CloudWatch cross-account observability monitoring account, one query can cover log groups in linked accounts.</p>
+					<span class="file">Who is getting denied, and for what (Logs Insights QL, CloudTrail log group)</span>
+<pre><code>filter errorCode = "AccessDenied" or errorCode like /UnauthorizedOperation/
+| stats count(*) as denied by userIdentity.arn, eventSource, eventName
+| sort denied desc
+| limit 20</code></pre>
+					<span class="file">Top sources of rejected traffic (Logs Insights QL, VPC Flow Logs log group)</span>
+<pre><code>filter action = "REJECT"
+| stats count(*) as rejects by srcAddr
+| sort rejects desc
+| limit 20</code></pre>
+				</div>
+
+				<h3>Amazon Athena</h3>
+				<div class="entry">
+					<h4>SQL over the log archive</h4>
+					<p>Athena queries logs where they sit in S3, charged per TB scanned ($5 per TB in AWS's examples). For CloudTrail, AWS's table definition uses the CloudTrail input format and <strong>partition projection</strong> on the date folders, so new days are queryable without adding partitions and a query with a date filter reads only those days. The JSON SerDe lets you declare just the columns you need.</p>
+					<span class="file">CloudTrail table for one account and Region with partition projection (Athena SQL, shortened column list)</span>
+<pre><code>CREATE EXTERNAL TABLE cloudtrail_prod_use1 (
+  eventversion STRING,
+  useridentity STRUCT&lt;type: STRING, principalid: STRING, arn: STRING, accountid: STRING,
+                      invokedby: STRING, accesskeyid: STRING, username: STRING&gt;,
+  eventtime STRING,
+  eventsource STRING,
+  eventname STRING,
+  awsregion STRING,
+  sourceipaddress STRING,
+  useragent STRING,
+  errorcode STRING,
+  errormessage STRING,
+  requestparameters STRING,
+  responseelements STRING,
+  eventid STRING,
+  readonly STRING,
+  recipientaccountid STRING
+)
+PARTITIONED BY (`timestamp` STRING)
+ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'
+STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/111111111111/CloudTrail/us-east-1'
+TBLPROPERTIES (
+  'projection.enabled' = 'true',
+  'projection.timestamp.type' = 'date',
+  'projection.timestamp.format' = 'yyyy/MM/dd',
+  'projection.timestamp.range' = '2024/01/01,NOW',
+  'projection.timestamp.interval' = '1',
+  'projection.timestamp.interval.unit' = 'DAYS',
+  'storage.location.template' = 's3://org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/111111111111/CloudTrail/us-east-1/${timestamp}'
+);
+
+-- What did one access key do last week?
+SELECT eventtime, eventsource, eventname, sourceipaddress, errorcode
+FROM cloudtrail_prod_use1
+WHERE "timestamp" BETWEEN '2026/11/01' AND '2026/11/07'
+  AND useridentity.accesskeyid = 'AKIAIOSFODNN7EXAMPLE'
+ORDER BY eventtime;</code></pre>
+					<p>Security Lake tables are already in the Glue Data Catalog, named by Region and source, for example <code>amazon_security_lake_glue_db_us_east_1.amazon_security_lake_table_us_east_1_vpc_flow_2_0</code>. Version 2 tables are partitioned on <code>time_dt</code>, and OCSF uses the same field names across sources (<code>src_endpoint.ip</code>, <code>actor.user</code>), which makes one query pattern work on many sources. The caller needs Lake Formation SELECT on the tables.</p>
+					<span class="file">Everything one IP did in the VPC (Athena SQL, Security Lake version 2 table)</span>
+<pre><code>SELECT time_dt, accountid, src_endpoint.ip, dst_endpoint.ip, dst_endpoint.port
+FROM "amazon_security_lake_glue_db_us_east_1"."amazon_security_lake_table_us_east_1_vpc_flow_2_0"
+WHERE time_dt &gt; TIMESTAMP '2026-11-01'
+  AND src_endpoint.ip = '198.51.100.7'
+ORDER BY time_dt DESC
+LIMIT 50;</code></pre>
+				</div>
+
+				<h3>Security Hub CSPM findings</h3>
+				<div class="entry">
+					<h4>Insights</h4>
+					<p>An <strong>insight</strong> groups findings by one attribute (<code>GroupByAttribute</code>) after filters, to answer "which resources have the most critical findings" or "which principals show suspicious access key activity". Security Hub CSPM includes managed insights such as "AWS resources with the most findings" and "S3 buckets with public write or read permissions", which can't be edited but can be copied into custom insights. With cross-Region aggregation, insights in the home Region cover linked Regions too.</p>
+					<span class="file">Roles with critical findings, grouped by role (AWS CLI, Security Hub CSPM administrator)</span>
+<pre><code>aws securityhub create-insight \
+  --name "Critical role findings" \
+  --group-by-attribute "ResourceId" \
+  --filters '{"ResourceType": [{"Comparison": "EQUALS", "Value": "AwsIamRole"}],
+              "SeverityLabel": [{"Comparison": "EQUALS", "Value": "CRITICAL"}]}'</code></pre>
+					<p>Filters on the same attribute are combined with OR, on different attributes with AND. For analysis beyond grouping, Security Hub CSPM findings can be sent to Security Lake (the <code>SH_FINDINGS</code> source) or, through a telemetry rule, to a CloudWatch log group, and queried with Athena or Logs Insights.</p>
+				</div>
+			</div>
+
+			<!-- Skill 1.2.5 -->
+			<h2 id="s5">Normalizing, parsing and correlating</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.5</span><span class="skill-text">Use AWS services to normalize, parse, and correlate logs (for example, Amazon OpenSearch Service, AWS Lambda, Amazon Managed Grafana).</span></p>
+				<p>Every source has its own format: CloudTrail JSON, space-separated flow log records, WAF JSON, syslog text. Correlating them, for example joining a GuardDuty finding to the flow logs and DNS queries of the same instance, is far easier once they share field names. <strong>OCSF</strong> is the common schema AWS uses for that.</p>
+
+				<h3>Inside CloudWatch</h3>
+				<div class="entry">
+					<h4>Log transformers and pipelines</h4>
+					<p>A <strong>log transformer</strong> on a log group (or the whole account) parses events as they're ingested, with processors such as <code>parseJSON</code>, <code>grok</code>, <code>csv</code> and <code>parseKeyValue</code>, built-in parsers for WAF, VPC, CloudFront and Route 53 logs, and <code>parseToOCSF</code>, which converts CloudTrail, Route 53 Resolver, VPC Flow, EKS audit and WAF logs to OCSF 1.1 or 1.5. The original event is kept alongside the transformed one, metric and subscription filters see the transformed version, and transformers only work on Standard log groups.</p>
+					<span class="file">Convert CloudTrail events to OCSF on arrival (transformer processor configuration)</span>
+<pre><code>[
+  {
+    "parseToOCSF": {
+      "eventSource": "CloudTrail",
+      "ocsfVersion": "V1.5"
+    }
+  }
+]</code></pre>
+					<p><strong>CloudWatch pipelines</strong> (December 2025) are a managed collector that ingests from S3, CloudWatch Logs and third-party sources, applies processors including OCSF conversion, and routes to log groups. Unlike a transformer, a pipeline doesn't keep the raw event. CloudWatch Logs can also expose log data as Apache Iceberg tables in S3 Tables for Athena, at no extra charge.</p>
+				</div>
+
+				<h3>Lambda and Amazon Data Firehose</h3>
+				<div class="entry">
+					<h4>Custom parsing and enrichment</h4>
+					<p>When the logic is your own (look up the instance's owner tag, drop health check noise, add geo data), a <strong>Lambda function</strong> does it, either as a CloudWatch Logs subscription target or as a Firehose transformation. A subscription delivers a batch of events base64-encoded and gzip-compressed in <code>awslogs.data</code>:</p>
+					<span class="file">Unpack a CloudWatch Logs subscription batch (Lambda handler, Python)</span>
+<pre><code>import base64, gzip, json
+
+def handler(event, context):
+    # The batch arrives base64-encoded and gzip-compressed
+    batch = json.loads(gzip.decompress(base64.b64decode(event["awslogs"]["data"])))
+    if batch["messageType"] == "CONTROL_MESSAGE":   # test message sent when the filter is created
+        return
+    for log_event in batch["logEvents"]:
+        record = json.loads(log_event["message"])    # CloudTrail events are JSON
+        # enrich, normalize and forward here
+        print(batch["owner"], batch["logGroup"], record.get("eventName"))</code></pre>
+					<p><strong>Amazon Data Firehose</strong> (formerly Kinesis Data Firehose) buffers records, can decompress CloudWatch Logs batches, transform them with Lambda (each record returned as <code>Ok</code>, <code>Dropped</code> or <code>ProcessingFailed</code>) and deliver to S3, OpenSearch, Splunk and other destinations. <strong>Dynamic partitioning</strong> writes S3 prefixes from fields in the data, for example by account and date; it can only be turned on when the stream is created and can't be turned off.</p>
+				</div>
+				<div class="callout trap"><p>Firehose can't deliver CloudWatch Logs subscription data to an <strong>OpenSearch</strong> destination, because CloudWatch packs several log events into one Firehose record. Use the CloudWatch Logs subscription to OpenSearch (which uses a Lambda function), or Firehose to S3 and OpenSearch Ingestion from there.</p></div>
+
+				<h3>OpenSearch Service and Managed Grafana</h3>
+				<div class="entry">
+					<h4>Amazon OpenSearch Service</h4>
+					<p>OpenSearch is the choice for full-text search and correlation across large volumes. Three features matter here:</p>
+					<ul>
+						<li><strong>Security Analytics</strong> (managed domains, OpenSearch 2.5 or later): detectors run open-source <strong>Sigma</strong> rules, mapped to MITRE ATT&amp;CK, against log types such as CloudTrail, VPC Flow Logs and DNS, and raise findings and alerts.</li>
+						<li><strong>OpenSearch Ingestion</strong> pipelines can read Security Lake as a subscriber (S3 data access with SQS notifications) using a ready-made Security Lake blueprint, and index the OCSF data.</li>
+						<li><strong>Direct query</strong> analyzes CloudWatch Logs, S3 and Security Lake in place, without ingestion pipelines, using PPL or SQL.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Amazon Managed Grafana</h4>
+					<p>Managed Grafana workspaces visualize data where it lives, with data sources for CloudWatch, Athena (and so S3 and Security Lake), OpenSearch and others, and sign-in through IAM Identity Center or a SAML identity provider. It doesn't store logs; it's the shared dashboard that puts CloudTrail error rates, WAF blocks and GuardDuty finding counts side by side. Grafana version 8 workspaces are no longer supported (from October 2026); current workspaces run versions 10, 12 or 13.</p>
+				</div>
+				<div class="callout tip"><p>"Normalize logs from many AWS and third-party sources into one schema" points to <strong>OCSF</strong>: Security Lake, a <code>parseToOCSF</code> transformer or a CloudWatch pipeline. "Detect threats in logs with Sigma rules" points to <strong>OpenSearch Security Analytics</strong>. "Dashboard over several data sources, no data copied" points to <strong>Managed Grafana</strong>.</p></div>
+			</div>
+
+			<!-- Skill 1.2.6 -->
+			<h2 id="s6">Network log sources</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2.6</span><span class="skill-text">Determine and configure appropriate log sources based on network design, threats, and attacks (for example, VPC Flow Logs, transit gateway flow logs, Amazon Route 53 Resolver logs).</span></p>
+				<p>Pick the source by the question being asked. "Which IP talked to which, and was it allowed?" is flow logs. "Which domain did this host look up?" is Resolver query logs. "What HTTP request was blocked, by which rule?" is WAF or ALB logs. "Which stateful firewall rule fired?" is Network Firewall alert logs. Capturing packet payloads (Traffic Mirroring) is out of scope for this exam.</p>
+
+				<h3>VPC Flow Logs</h3>
+				<div class="entry">
+					<h4>What they record, and what they don't</h4>
+					<p>Flow logs capture IP traffic metadata for a VPC, subnet or network interface (including those of load balancers, NAT gateways and RDS), for ACCEPT, REJECT or ALL traffic, to CloudWatch Logs, S3 or Firehose. Records are aggregated over up to 10 minutes (or 1 minute; Nitro instances always 1 minute) and arrive in minutes, not in real time. The default format is version 2 (addresses, ports, protocol, packets, bytes, start, end, action, status). A custom format adds fields such as:</p>
+					<ul>
+						<li><code>pkt-srcaddr</code> and <code>pkt-dstaddr</code>: the original addresses behind a NAT gateway or for EKS pods, where <code>srcaddr</code> shows the network interface's address.</li>
+						<li><code>tcp-flags</code> (SYN 2, SYN-ACK 18, FIN 1, RST 4), useful for spotting scans that never complete a handshake.</li>
+						<li><code>flow-direction</code>, <code>traffic-path</code> (how egress left: internet gateway, peering, VPN and so on) and <code>pkt-src-aws-service</code>.</li>
+						<li>Newer fields: <code>ecs-*</code> task and service fields, <code>reject-reason</code> (for example, blocked by VPC Block Public Access), <code>encryption-status</code>, and instance and interface tags.</li>
+					</ul>
+					<span class="file">Flow logs for the prod VPC with the fields an investigation needs, to the log archive (AWS CLI)</span>
+<pre><code># A flow log's format can't be changed later; delete it and create a new one instead.
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids vpc-0abc1234def567890 \
+  --traffic-type ALL \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::org-flow-logs-444444444444/prod/ \
+  --log-format '${version} ${account-id} ${vpc-id} ${subnet-id} ${instance-id} ${interface-id} ${srcaddr} ${dstaddr} ${pkt-srcaddr} ${pkt-dstaddr} ${srcport} ${dstport} ${protocol} ${tcp-flags} ${packets} ${bytes} ${start} ${end} ${action} ${flow-direction} ${traffic-path} ${log-status}'</code></pre>
+					<p>For an S3 destination, the bucket policy lets <code>delivery.logs.amazonaws.com</code> write, with <code>aws:SourceAccount</code> and <code>aws:SourceArn</code> conditions; Parquet output with hourly partitions makes Athena queries much cheaper. For CloudWatch Logs, flow logs use a role trusted by <code>vpc-flow-logs.amazonaws.com</code>.</p>
+				</div>
+				<div class="callout trap"><p>Flow logs <strong>don't record</strong> traffic to the Amazon DNS server (traffic to your own DNS server is recorded), instance metadata at 169.254.169.254, Amazon Time Sync at 169.254.169.123, DHCP, ARP, Windows license activation, or traffic to the VPC router's reserved address. "Find which instance queried a malicious domain" can't be answered from flow logs; it needs Resolver query logs.</p></div>
+
+				<h3>Transit gateway flow logs</h3>
+				<div class="entry">
+					<h4>Traffic between VPCs and on premises</h4>
+					<p>In the running example, traffic between accounts' VPCs crosses the transit gateway. <strong>Transit gateway flow logs</strong>, created on the transit gateway or one attachment by its owner, record those flows with source and destination VPC, account, subnet and attachment IDs. There's no ACCEPT or REJECT field, because a transit gateway has no security groups; dropped traffic shows in counters such as <code>packets-lost-no-route</code>, <code>packets-lost-blackhole</code>, <code>packets-lost-mtu-exceeded</code> and <code>packets-lost-ttl-expired</code>. Use them to see east-west movement between accounts that no single VPC's flow logs show end to end.</p>
+				</div>
+
+				<h3>DNS logs</h3>
+				<div class="entry">
+					<h4>Route 53 Resolver query logs</h4>
+					<p>Resolver query logs record DNS queries from resources in associated VPCs, queries arriving through inbound Resolver endpoints from on premises, and queries sent through outbound endpoints: the name, type, response code, answers, source IP and the instance ID. Queries that match <strong>Route 53 Resolver DNS Firewall</strong> rules also carry <code>firewall_rule_action</code> and the rule group and domain list IDs, so DNS Firewall needs no separate log. Only queries the Resolver actually answers are logged; answers served from a cache aren't. Destinations are CloudWatch Logs, S3 or Firehose in the same Region, and a configuration can be associated with VPCs directly or through a Route 53 Profile.</p>
+					<p>These logs reveal DNS-based threats: instances resolving known command-and-control domains, DNS tunnelling (long, random-looking subdomains), and lookups of domains a DNS Firewall rule blocked. GuardDuty reads the same DNS data on its own, but the query logs are what an investigator searches.</p>
+				</div>
+				<div class="entry">
+					<h4>Public DNS query logs</h4>
+					<p>For a <strong>public hosted zone</strong>, Route 53 public DNS query logging records the queries resolvers on the internet send to Route 53, by edge location. The log group must be in <strong>us-east-1</strong>, and because resolvers cache answers, the log can show as few as one query in several thousand.</p>
+				</div>
+
+				<h3>Firewall, load balancer and CDN logs</h3>
+				<div class="entry">
+					<h4>AWS Network Firewall</h4>
+					<p>Network Firewall has three log types: <strong>flow</strong> logs for traffic sent to the stateful engine, <strong>alert</strong> logs for traffic matching stateful rules with drop, alert or reject actions, and <strong>TLS</strong> logs for TLS inspection errors. Each type goes to S3, CloudWatch Logs or Firehose. Traffic handled only by stateless rules isn't logged, so a "pass" in a stateless rule leaves no record.</p>
+				</div>
+				<div class="entry">
+					<h4>AWS WAF, ALB and CloudFront</h4>
+					<ul>
+						<li><strong>WAF logs</strong> go to a CloudWatch log group, S3 bucket or Firehose stream whose name starts with <code>aws-waf-logs-</code>. Sensitive fields such as headers can be redacted (shown as <code>xxx</code>) and log filters can keep only blocked requests. The WAF console now calls web ACLs "protection packs (web ACLs)".</li>
+						<li><strong>ALB access logs</strong> go to an S3 bucket in the same Region, which can only use <strong>SSE-S3</strong>, not SSE-KMS. The bucket policy allows the service principal <code>logdelivery.elasticloadbalancing.amazonaws.com</code> (Regions available before August 2022 also accept the older per-Region ELB account). ALBs also have connection logs, which record TLS details for mutual TLS clients.</li>
+						<li><strong>CloudFront standard logs</strong> (version 2) are configured through the CloudWatch Logs delivery APIs in us-east-1 and go to CloudWatch Logs, Firehose or S3, with a choice of fields and formats. <strong>Real-time logs</strong> arrive within seconds but only to Kinesis Data Streams.</li>
+					</ul>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>VPC Flow Logs</th><th>Resolver query logs</th><th>WAF logs</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Answers</th></tr>
+							<tr><td data-label="VPC Flow Logs">Who talked to whom, on which port, accepted or rejected</td><td data-label="Resolver query logs">Which host looked up which domain, and what it got back</td><td data-label="WAF logs">Which HTTP request matched which rule, and the action taken</td></tr>
+							<tr class="group"><th colspan="3">Typical threat</th></tr>
+							<tr><td data-label="VPC Flow Logs">Port scans, data exfiltration volume, unexpected egress</td><td data-label="Resolver query logs">Command-and-control domains, DNS tunnelling</td><td data-label="WAF logs">SQL injection, bots, credential stuffing</td></tr>
+							<tr class="group"><th colspan="3">Doesn't show</th></tr>
+							<tr><td data-label="VPC Flow Logs">Payloads, DNS names, Amazon DNS traffic</td><td data-label="Resolver query logs">Cached answers, traffic after the lookup</td><td data-label="WAF logs">Traffic that never reaches CloudFront, the ALB or API Gateway</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout tip"><p>"See which domains instances resolve and block known malicious ones" points to <strong>Route 53 Resolver DNS Firewall</strong> with Resolver query logging. "See traffic between VPCs in different accounts through the transit gateway" points to <strong>transit gateway flow logs</strong>.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>CloudTrail: management events by default; data events and network activity events (VPC endpoint calls, <code>VpceAccessDenied</code>) cost extra; Event history is 90 days per account. CloudTrail Lake is closed to new customers from 31 May 2026.</li>
+				<li>Organization trail from the management account or a delegated administrator (up to 3); members can't change it. Bucket policy path <code>AWSLogs/o-.../</code> with <code>aws:SourceArn</code> using the management account ID. CLI trails need <code>--is-multi-region-trail</code>, validation and <code>start-logging</code>.</li>
+				<li>Advanced event selectors: no wildcards, StartsWith with a trailing slash for S3, exclude <code>kms.amazonaws.com</code> to cut volume. Integrity validation: hourly signed, chained digests checked with <code>validate-logs</code>.</li>
+				<li>Central logging account: centralization rules (first copy free), or a destination with an organization policy plus subscription filters (5 per log group, 1 account-level per Region, Standard class only). Log group KMS keys need the Regional <code>logs.&lt;region&gt;.amazonaws.com</code> principal; masking needs <code>logs:Unmask</code> to reverse.</li>
+				<li>Agent: configuration in Parameter Store under <code>AmazonCloudWatch-</code>; ServerPolicy reads, AdminPolicy writes; <code>retention_in_days</code> on an existing group deletes older events.</li>
+				<li>Storage: log archive bucket with Object Lock (compliance mode can't be undone), SSE-KMS with Bucket Keys, TLS-only policy, lifecycle. Security Lake: OCSF Parquet, retention set in Security Lake, no Object Lock, rollup Regions, data or query subscribers, custom sources.</li>
+				<li>Analysis: Logs Insights (QL, PPL, SQL; cross-account from a monitoring account), Athena with partition projection and Security Lake tables, Security Hub CSPM insights grouped by one attribute.</li>
+				<li>Normalize: OCSF through Security Lake, <code>parseToOCSF</code> transformers or CloudWatch pipelines; Lambda for custom enrichment; Firehose with dynamic partitioning (not to OpenSearch from CloudWatch Logs); OpenSearch Security Analytics with Sigma rules; Grafana for dashboards.</li>
+				<li>Network: flow logs (no Amazon DNS or metadata traffic, can't edit, <code>pkt-srcaddr</code> behind NAT), transit gateway flow logs (no ACCEPT/REJECT, packets-lost counters), Resolver query logs with DNS Firewall fields, public DNS logs in us-east-1, WAF destinations named <code>aws-waf-logs-</code>, ALB logs SSE-S3 only.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-1.html"><small>Previous</small>Task 1.1: Monitoring and alerting</a>
+				<a class="next" href="d1-task-1-3.html"><small>Next</small>Task 1.3: Troubleshoot monitoring, logging and alerting</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
