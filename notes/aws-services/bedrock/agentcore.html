@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock AgentCore and Harness | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock AgentCore and the AgentCore Harness: the 13 components and how they fit together, choosing Harness or Runtime, configuring a harness (model, tools, skills, memory, truncation, limits, environment), the execution role, creating and invoking with boto3, stream events and inline function round trips, the AgentCore CLI, versions and endpoints, lifecycle hooks, security, quotas, pricing and migrating from Agents Classic.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">AgentCore and Harness</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; AgentCore &middot; Last checked 9 November 2026</span>
+		<h1>AgentCore and the Harness</h1>
+		<p>How the AgentCore platform fits together, and how to build an agent with the Harness: a managed agent loop you configure instead of code. Model, tools, skills, memory and limits as settings; one isolated microVM per session; versions and endpoints for safe releases.</p>
+		<div class="tags"><span class="tag code">AgentCore</span><span class="tag">Harness</span><span class="tag">Agents</span><span class="tag">MCP</span><span class="tag">boto3</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">The AgentCore platform</a></li>
+				<li><a href="#s2">Harness or Runtime</a></li>
+				<li><a href="#s3">How the Harness works</a></li>
+				<li><a href="#s4">Configuring a harness</a></li>
+				<li><a href="#s5">Permissions</a></li>
+				<li><a href="#s6">Creating and invoking</a></li>
+				<li><a href="#s7">The AgentCore CLI</a></li>
+				<li><a href="#s8">Versions and endpoints</a></li>
+				<li><a href="#s9">Lifecycle hooks</a></li>
+				<li><a href="#s10">Security, logs, quotas and cost</a></li>
+				<li><a href="#s11">Moving from Agents Classic</a></li>
+				<li><a href="#s12">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">The AgentCore platform</h2>
+			<p><strong>Amazon Bedrock AgentCore</strong> is AWS's platform for building, running and operating agents with any framework and any model, inside or outside Bedrock. It's a set of services you can use together or one at a time, all billed by consumption. It became generally available in October 2025 and is now in 21 commercial Regions plus AWS GovCloud (US-West), though not every component is in every Region.</p>
+			<div class="entry">
+				<h4>The 13 components</h4>
+				<ul>
+					<li><strong>Harness:</strong> a managed agent loop; you declare model, prompt, tools, skills, memory and limits, and AgentCore runs the loop.</li>
+					<li><strong>Runtime:</strong> serverless hosting for your own agent or tool code (any framework), with per-session isolation and sessions up to 8 hours.</li>
+					<li><strong>Memory:</strong> short-term conversation events and long-term records (facts, preferences, summaries) extracted by strategies.</li>
+					<li><strong>Gateway:</strong> turns Lambda functions, OpenAPI and Smithy APIs and MCP servers into one governed MCP tool endpoint.</li>
+					<li><strong>Identity:</strong> agent identities, inbound JWT or IAM authentication, and a token vault for the OAuth tokens and API keys agents use outbound.</li>
+					<li><strong>Code Interpreter</strong> and <strong>Browser:</strong> sandboxed code execution and a managed cloud Chrome for agents.</li>
+					<li><strong>Observability:</strong> OpenTelemetry traces, logs and metrics in CloudWatch.</li>
+					<li><strong>Evaluations</strong> and <strong>Optimization:</strong> scoring agent quality from traces, then recommending prompt and tool changes and A/B testing them.</li>
+					<li><strong>Policy:</strong> deterministic authorization of every tool call that goes through a Gateway.</li>
+					<li><strong>Registry:</strong> a governed catalog of agents, MCP servers and skills.</li>
+					<li><strong>Payments:</strong> agent micropayments through x402 and the Machine Payments Protocol.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>How the pieces fit in one request</h4>
+				<ol class="flow">
+					<li><b>Call</b>Your application calls <code>InvokeHarness</code> (or <code>InvokeAgentRuntime</code> for code), signed with IAM or carrying a user's JWT that Identity validates.</li>
+					<li><b>Session</b>AgentCore starts or resumes the session's own microVM, keyed by the session ID you send.</li>
+					<li><b>Memory</b>The loop loads recent turns and relevant long-term records for the user (the actor).</li>
+					<li><b>Model</b>The loop calls the model: Bedrock through the execution role, or OpenAI, Gemini or LiteLLM with a key from the Identity token vault.</li>
+					<li><b>Tools</b>Tool calls go to the Gateway (where Policy authorizes each one), to MCP servers, Browser or Code Interpreter, to built-in shell and file tools, or back to your code.</li>
+					<li><b>Observe</b>Traces and logs flow to CloudWatch automatically; Evaluations score them and Optimization suggests changes you release as new versions.</li>
+				</ol>
+			</div>
+
+			<h2 id="s2">Harness or Runtime</h2>
+			<p>Both run on the same isolated session infrastructure. The difference is who owns the agent loop.</p>
+			<div class="table-wrap">
+				<table class="stack labeled compare">
+					<thead><tr><th>Harness</th><th>Runtime</th></tr></thead>
+					<tbody>
+						<tr class="group"><th colspan="2">What you provide</th></tr>
+						<tr><td data-label="Harness">Configuration (API, CLI <code>harness.yaml</code> or console); no code</td><td data-label="Runtime">Your code in any framework (Strands, LangGraph, CrewAI, OpenAI Agents SDK and others) as an ARM64 container or zip</td></tr>
+						<tr class="group"><th colspan="2">The loop</th></tr>
+						<tr><td data-label="Harness">AWS-managed, built on Strands Agents; built-in shell and file tools</td><td data-label="Runtime">Yours: you call models, Memory, Gateway and tools through the SDK</td></tr>
+						<tr class="group"><th colspan="2">Can't do</th></tr>
+						<tr><td data-label="Harness">Choose the framework, voice or bidirectional streaming, graph workflows, per-stage prompts, custom orchestrators, routing multi-agent systems</td><td data-label="Runtime">Nothing structural; you build what the Harness gives you for free</td></tr>
+						<tr class="group"><th colspan="2">Shared</th></tr>
+						<tr><td colspan="2">Session isolation, VPC, IAM and OAuth inbound, file system mounts, environment variables, shell commands into the session, versions and endpoints, Runtime quotas</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>AWS's guidance is to start with the Harness unless you have a reason to own the loop (an existing codebase or advanced orchestration). If you outgrow it, <code>agentcore export harness</code> generates equivalent Strands Python for Runtime, though it drops Gateway, Browser and Code Interpreter tools, AWS skills and managed memory, which you then wire up in code.</p>
+			<div class="callout note"><p><strong>Not the same thing:</strong> <strong>Bedrock Managed Agents, powered by OpenAI</strong> (preview since September 2026, three US Regions, <code>bedrock-mantle</code> only) is an OpenAI-managed loop for OpenAI models. The Harness is AWS-managed and works with any provider.</p></div>
+
+			<h2 id="s3">How the Harness works</h2>
+			<ul>
+				<li>Each <strong>session</strong> (your <code>runtimeSessionId</code>, 33 to 100 characters) gets its own Firecracker microVM with a file system and a shell. Reusing the ID continues the conversation in the same VM; a new ID starts fresh.</li>
+				<li>Sessions end after the idle timeout (default 15 minutes) or maximum lifetime (default and maximum 8 hours). Anything you need beyond that goes in Memory, session storage or a mounted file system.</li>
+				<li>Every harness has two <strong>built-in tools</strong>, <code>shell</code> and <code>file_operations</code>, so the agent can run commands and edit files in its VM. Their definitions add about 900 input tokens to every model call.</li>
+				<li>The Harness is generally available since 17 June 2026 in 15 commercial Regions and GovCloud (US-West). It isn't in AgentCore's newer Regions (N. California, Milan, Spain, Malaysia, Hyderabad, Thailand).</li>
+			</ul>
+
+			<h2 id="s4">Configuring a harness</h2>
+			<p>The configuration is the same whether you use the <code>CreateHarness</code> API or the CLI's <code>harness.yaml</code> (which uses the API's field names). This file shows most settings:</p>
+			<span class="file">app/assistant/harness.yaml (AgentCore CLI project; fields as in the CLI documentation)</span>
+<pre><code>name: assistant
+model:
+  bedrockModelConfig:
+    modelId: global.anthropic.claude-sonnet-5-5
+    apiFormat: converse_stream
+    <span class="c"># per model call</span>
+    maxTokens: 4096
+tools:
+  - name: research
+    type: remote_mcp
+    config:
+      remoteMcp:
+        url: https://mcp.example.com/mcp
+  - name: company_tools
+    type: agentcore_gateway
+    config:
+      agentCoreGateway:
+        gatewayArn: arn:aws:bedrock-agentcore:us-west-2:111111111111:gateway/GATEWAY_ID
+        outboundAuth:
+          awsIam: {}
+allowedTools: ["@builtin", "@research/search", "@company_tools"]
+skills:
+  - awsSkills:
+      paths: [core-skills/aws-cdk]
+memory:
+  managedMemoryConfiguration:
+    strategies: [SEMANTIC, SUMMARIZATION]
+    eventExpiryDuration: 30
+truncation:
+  strategy: sliding_window
+  config:
+    slidingWindow:
+      messagesCount: 40
+maxIterations: 15
+timeoutSeconds: 300
+environmentVariables:
+  LOG_LEVEL: info
+environment:
+  agentCoreRuntimeEnvironment:
+    lifecycleConfiguration:
+      idleRuntimeSessionTimeout: 900
+      maxLifetime: 28800
+    filesystemConfigurations:
+      - sessionStorage:
+          mountPath: /mnt/session
+tags:
+  team: support</code></pre>
+
+			<div class="entry">
+				<h4>Model</h4>
+				<p>Set exactly one provider object. If you omit the model, the API uses <code>global.anthropic.claude-sonnet-4-6</code>; the CLI scaffolds <code>global.anthropic.claude-sonnet-5-5</code>.</p>
+				<ul>
+					<li><code>bedrockModelConfig</code>: <code>modelId</code>, <code>apiFormat</code> (<code>converse_stream</code>, the default, on <code>bedrock-runtime</code>; or <code>responses</code> / <code>chat_completions</code> on <code>bedrock-mantle</code> for models served there, such as OpenAI's), <code>maxTokens</code> per model call, <code>temperature</code>, <code>topP</code>, and <code>additionalParams</code> passed through unchanged (for example a <code>guardrailConfig</code>).</li>
+					<li><code>openAiModelConfig</code>, <code>geminiModelConfig</code>, <code>liteLlmModelConfig</code>: the model ID plus <code>apiKeyArn</code>, the ARN of an <strong>Identity API key credential provider</strong> (not a Secrets Manager ARN); OpenAI and LiteLLM also accept <code>apiBase</code> for compatible endpoints.</li>
+					<li>Claude Sonnet 5 and 5.5 reject <code>temperature</code>: leave it unset for them.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Tools and allowedTools</h4>
+				<p>Each tool has a <code>type</code>, an optional <code>name</code>, and a <code>config</code> key matching the type:</p>
+				<ul>
+					<li><code>remote_mcp</code> (<code>remoteMcp</code>): an MCP server <code>url</code> and optional <code>headers</code>; a header value can be <code>${arn:...apikeycredentialprovider/NAME}</code>, which the harness swaps for the stored key at call time.</li>
+					<li><code>agentcore_gateway</code> (<code>agentCoreGateway</code>): <code>gatewayArn</code> and <code>outboundAuth</code> (<code>awsIam</code>, the default, signs with the execution role; or <code>oauth</code> with a credential provider; or <code>none</code>).</li>
+					<li><code>agentcore_browser</code> and <code>agentcore_code_interpreter</code>: the AWS-managed tools by default, or your custom ones by ARN.</li>
+					<li><code>inline_function</code> (<code>inlineFunction</code>): a <code>description</code> and JSON <code>inputSchema</code>. The harness doesn't run it: it pauses and hands the call to your application (see <a href="#s6">inline functions</a>). Use it for approvals and anything that must run in your own code.</li>
+				</ul>
+				<p><code>allowedTools</code> narrows what the model sees with patterns: <code>*</code>, <code>@builtin</code>, <code>@builtin/shell</code>, <code>@git</code> (every tool from the entry named <code>git</code>), <code>@git/read_*</code>. Omitted means all tools. It's a prompt filter, not a security control: it saves tokens but doesn't stop <code>InvokeAgentRuntimeCommand</code>, which IAM governs.</p>
+			</div>
+			<div class="entry">
+				<h4>Skills</h4>
+				<p>Skills are folders with a <code>SKILL.md</code> (YAML front matter with <code>name</code> and <code>description</code>) plus optional scripts and references. Only about 100 tokens of metadata go into the prompt; the agent loads the full skill when it needs it. Sources: <code>awsSkills</code> (AWS's curated catalog, optionally narrowed by <code>paths</code>), <code>git</code> (URL, subfolder, optional token from Identity; 60-second clone limit), <code>s3</code> (a prefix, up to 1 GB per skill) or <code>path</code> (already in the VM). Skills are fetched once per session; a fetch failure fails the invocation.</p>
+			</div>
+			<div class="entry">
+				<h4>Memory and truncation</h4>
+				<ul>
+					<li><code>managedMemoryConfiguration</code> (the <strong>default if you omit memory</strong>, and billed): AgentCore creates a memory with 1 to 4 strategies (<code>SEMANTIC</code> and <code>SUMMARIZATION</code> by default, also <code>USER_PREFERENCE</code> and <code>EPISODIC</code>), an event expiry in days (default 30) and an optional KMS key set at creation.</li>
+					<li><code>agentCoreMemoryConfiguration</code>: use an existing memory by ARN, with optional <code>actorId</code> and retrieval settings per namespace.</li>
+					<li><code>disabled: {}</code>: no memory. Managed memory is deleted with the harness unless you pass <code>deleteManagedMemory=false</code>.</li>
+					<li><code>truncation</code> keeps the prompt inside the context window: <code>sliding_window</code> (default; keep the last N messages), <code>summarization</code> (summarize older turns, keep recent ones) or <code>none</code>. It trims the prompt only, never Memory.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Limits and environment</h4>
+				<ul>
+					<li><code>maxIterations</code> (default 75 model calls per invocation), <code>timeoutSeconds</code> (default 3,600) and <code>maxTokens</code> stop runaway loops; all three can be overridden per call. AWS's pages describe <code>maxTokens</code> both as per iteration and as a total per invocation, so test the behaviour before relying on it as a cost cap.</li>
+					<li><code>environment.agentCoreRuntimeEnvironment</code> holds the session lifecycle (<code>idleRuntimeSessionTimeout</code>, <code>maxLifetime</code>, 60 to 28,800 seconds), the network (<code>PUBLIC</code> or <code>VPC</code> with subnets and security groups) and up to 5 file system mounts under <code>/mnt</code>: per-session storage (1 GB, kept across stop and resume of the same session ID), EFS access points and S3 Files access points (VPC only, up to 2 each).</li>
+					<li><code>environmentArtifact.containerConfiguration.containerUri</code> swaps the managed base image (Python and bash) for your own <code>linux/arm64</code> image, which must include bash, sh and core utilities (plus <code>tar</code> and a writable <code>/tmp</code> for fetched skills). The harness overrides its entry point.</li>
+					<li><code>environmentVariables</code> (up to 50) are plain text: never put secrets there; use the Identity token vault.</li>
+				</ul>
+			</div>
+			<div class="callout trap"><p><code>harnessName</code> (up to 40 characters, which in the CLI includes the project and target prefix) and endpoint names allow <strong>letters, digits and underscores only</strong>. Some AWS examples use hyphens (<code>production-endpoint</code>) and fail validation. And <code>UpdateHarness</code> <strong>replaces lists wholesale</strong> (tools, hooks, mounts, environment variables): send the full list, not just the new item.</p></div>
+
+			<h2 id="s5">Permissions</h2>
+			<div class="entry">
+				<h4>The execution role</h4>
+				<p>The harness assumes an <strong>execution role</strong> for everything it does: calling models, writing logs and traces, using Memory, Browser, Code Interpreter and Gateway, and fetching keys from the token vault. The CLI creates it for you; with the API you create it yourself.</p>
+				<span class="file">Trust policy (as on the harness security page)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}</code></pre>
+				<span class="file">Core of the permissions policy (abridged from AWS's sample; add statements only for the features you configure)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockModelInvocation",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": ["arn:aws:bedrock:*::foundation-model/*", "arn:aws:bedrock:us-west-2:111111111111:inference-profile/*"]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+      "Resource": "arn:aws:logs:us-west-2:111111111111:log-group:/aws/bedrock-agentcore/runtimes/*"
+    },
+    {
+      "Sid": "Tracing",
+      "Effect": "Allow",
+      "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}}
+    }
+  ]
+}</code></pre>
+				<p>AWS's full sample adds statements for the workload identity, the managed Browser and Code Interpreter, managed memory (<code>memory/harness_*</code>), and pulling the managed image. Add <code>bedrock:ApplyGuardrail</code> for guardrails, <code>bedrock-agentcore:InvokeGateway</code> for Gateway tools, <code>s3:GetObject</code> and <code>s3:ListBucket</code> for S3 skills, <code>lambda:InvokeFunction</code> (or <code>sns:Publish</code>, <code>events:PutEvents</code>) for hooks, and <code>bedrock-agentcore:GetResourceApiKey</code> plus <code>secretsmanager:GetSecretValue</code> on the vault secret for third-party model keys.</p>
+			</div>
+			<div class="entry">
+				<h4>Caller permissions</h4>
+				<p>Every harness action also needs the matching <strong>Runtime</strong> action, because a harness is built on a managed Runtime: invoking needs <code>bedrock-agentcore:InvokeHarness</code> and <code>InvokeAgentRuntime</code>; creating needs <code>CreateHarness</code>, <code>CreateAgentRuntime</code> and <code>CreateMemory</code>; invoking a named endpoint needs both the harness ARN and the endpoint ARN in the policy's resources.</p>
+			</div>
+
+			<h2 id="s6">Creating and invoking</h2>
+			<div class="entry">
+				<h4>End to end in Python</h4>
+				<p>Harness code uses boto3: the control-plane client <code>bedrock-agentcore-control</code> creates and manages harnesses; the data-plane client <code>bedrock-agentcore</code> invokes them. (The AgentCore Python SDK has no harness module, and the AWS CLI has no <code>invoke-harness</code> command because the response is an event stream.)</p>
+				<span class="file">Create a harness with an approval step, wait until ready, chat with streaming, then pin production (Python, boto3; field names from the API reference)</span>
+<pre><code>import json
+import time
+import uuid
+
+import boto3
+
+REGION = "us-west-2"
+ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
+dp = boto3.client("bedrock-agentcore", region_name=REGION)
+
+<span class="c"># An inline function: the harness pauses and your code decides</span>
+approve_tool = {
+    "type": "inline_function",
+    "name": "approve_purchase",
+    "config": {"inlineFunction": {
+        "description": "Ask a human to approve a purchase.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"item": {"type": "string"}, "amount": {"type": "number"}},
+            "required": ["item", "amount"],
+        },
+    }},
+}
+
+h = ctl.create_harness(
+    harnessName="shopping_agent",
+    executionRoleArn="arn:aws:iam::111111111111:role/HarnessExecutionRole",
+    model={"bedrockModelConfig": {"modelId": "global.anthropic.claude-sonnet-5-5", "maxTokens": 4096}},
+    systemPrompt=[{"text": "You help staff buy equipment. Always request approval before buying."}],
+    tools=[{"type": "agentcore_browser", "name": "browser"}, approve_tool],
+    <span class="c"># Managed memory is created (and billed) unless you disable it</span>
+    memory={"disabled": {}},
+    truncation={"strategy": "sliding_window", "config": {"slidingWindow": {"messagesCount": 30}}},
+    maxIterations=25,
+    timeoutSeconds=900,
+    environment={"agentCoreRuntimeEnvironment": {
+        "lifecycleConfiguration": {"idleRuntimeSessionTimeout": 300, "maxLifetime": 3600},
+    }},
+    tags={"team": "procurement"},
+)["harness"]
+harness_id, harness_arn = h["harnessId"], h["arn"]
+
+<span class="c"># Wait for READY (CREATING, CREATE_FAILED, READY, ...)</span>
+while (st := ctl.get_harness(harnessId=harness_id)["harness"])["status"] not in ("READY", "CREATE_FAILED"):
+    time.sleep(5)
+if st["status"] != "READY":
+    raise RuntimeError(st.get("failureReason"))
+
+
+def run(messages, session_id):
+    """Stream one invocation; return (toolUseId, input) if the harness waits for approval."""
+    r = dp.invoke_harness(harnessArn=harness_arn, runtimeSessionId=session_id, messages=messages)
+    tool_id, idx, tool_input, last_stop = None, None, "", None
+    for ev in r["stream"]:
+        if "contentBlockStart" in ev:
+            tu = ev["contentBlockStart"]["start"].get("toolUse")
+            if tu and tu["name"] == "approve_purchase":
+                tool_id, idx = tu["toolUseId"], ev["contentBlockStart"]["contentBlockIndex"]
+        elif "contentBlockDelta" in ev:
+            d = ev["contentBlockDelta"]
+            if "text" in d["delta"]:
+                print(d["delta"]["text"], end="", flush=True)
+            elif "toolUse" in d["delta"] and d["contentBlockIndex"] == idx:
+                tool_input += d["delta"]["toolUse"]["input"]
+        elif "messageStop" in ev:
+            last_stop = ev["messageStop"]["stopReason"]
+        elif "metadata" in ev:
+            print("\n[usage]", ev["metadata"]["usage"])
+        elif "runtimeClientError" in ev:
+            raise RuntimeError(ev["runtimeClientError"])
+    if last_stop == "tool_use" and tool_id:
+        return tool_id, json.loads(tool_input or "{}")
+    return None
+
+
+<span class="c"># At least 33 characters; reuse it to continue the same conversation</span>
+session = f"shop-{uuid.uuid4()}"
+pending = run([{"role": "user", "content": [{"text": "Find a USB-C dock under $150 and buy it."}]}], session)
+while pending:
+    tool_use_id, args = pending
+    ok = input(f"\nApprove {args}? [y/n] ") == "y"
+    <span class="c"># Same session; send only the tool result</span>
+    pending = run([{"role": "user", "content": [{"toolResult": {
+        "toolUseId": tool_use_id,
+        "content": [{"text": "approved" if ok else "rejected by the user"}],
+        "status": "success",
+    }}]}], session)
+
+<span class="c"># Pin a production endpoint to the tested version; callers pass qualifier="prod"</span>
+ctl.create_harness_endpoint(harnessId=harness_id, endpointName="prod",
+                            targetVersion=st["harnessVersion"], description="Production")</code></pre>
+				<p>Not executed here: it was assembled from the API reference and the getting-started guide. The ARN is in <code>harness.arn</code> of the create response; the ID looks like <code>shopping_agent-AbCdEf1234</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>The request</h4>
+				<ul>
+					<li><code>harnessArn</code> (the full ARN) and optional <code>qualifier</code> (endpoint name; omitted means DEFAULT, the latest version).</li>
+					<li><code>runtimeSessionId</code> (required, 33 to 100 characters; a UUID is 36), an optional end-user ID for user-scoped credentials, and W3C trace headers.</li>
+					<li><code>messages</code> (user and assistant turns of text, tool results and reasoning; the last message can't be a tool use), <code>actorId</code> for Memory, and per-call overrides of <code>model</code>, <code>systemPrompt</code>, <code>tools</code>, <code>skills</code> (appended), <code>allowedTools</code> and the three limits. Memory, hooks and environment can't be overridden per call.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Stream events and stop reasons</h4>
+				<p>One invocation streams several assistant turns and tool results: <code>messageStart</code>, then per content block <code>contentBlockStart</code> (tool calls and results), <code>contentBlockDelta</code> (text, partial tool input JSON, tool results, reasoning) and <code>contentBlockStop</code>, then <code>messageStop</code> with a <code>stopReason</code>, plus <code>metadata</code> (token usage, latency), <code>hookEvent</code> and error events. Read until the stream closes.</p>
+				<ul>
+					<li><code>end_turn</code>: finished. <code>tool_result</code>: tool results were streamed and more output may follow.</li>
+					<li><code>tool_use</code> on the <strong>last</strong> <code>messageStop</code>: the harness is waiting for your inline function result.</li>
+					<li><code>max_iterations_exceeded</code>, <code>timeout_exceeded</code>, <code>max_output_tokens_exceeded</code>: a harness limit stopped it. <code>max_tokens</code>: one model call hit its limit. <code>model_context_window_exceeded</code>: add or tighten truncation.</li>
+					<li><code>hook_stopped</code>: a lifecycle hook denied the run. Others: <code>content_filtered</code>, <code>malformed_model_output</code>, <code>malformed_tool_use</code>, <code>interrupted</code>, <code>partial_turn</code>, <code>stop_sequence</code>.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Inline functions</h4>
+				<ol class="flow">
+					<li><b>Capture</b>While streaming, note the <code>toolUseId</code> from <code>contentBlockStart</code> and join the <code>toolUse.input</code> fragments for that block.</li>
+					<li><b>Check</b>Only if the final <code>messageStop</code> is <code>tool_use</code> is the harness waiting for you.</li>
+					<li><b>Run</b>Do the work in your application (ask a human, call an internal system).</li>
+					<li><b>Return</b>Invoke again with the same session ID and only a user message holding the <code>toolResult</code>. Don't resend the assistant's tool use; if several inline calls came together, return all results in one request.</li>
+				</ol>
+				<p>The AgentCore CLI can show an inline call but can't return its result; use the SDK.</p>
+			</div>
+
+			<h2 id="s7">The AgentCore CLI</h2>
+			<p>The <strong>AgentCore CLI</strong> (npm package <code>@aws/agentcore</code>, Node.js 20.12 or later; version 1.0 since October 2026) scaffolds projects, deploys them with CDK, and runs, tests and observes them. It replaces the older Python starter toolkit, whose <code>agentcore</code> command can shadow it if both are installed.</p>
+			<span class="file">From nothing to a deployed, versioned harness (shell)</span>
+<pre><code>npm install -g @aws/agentcore
+agentcore create --name ResearchProject --template empty
+cd ResearchProject
+
+agentcore add harness --name researcher \
+  --model '{"provider":"bedrock","modelId":"global.anthropic.claude-sonnet-5-5"}' \
+  --system-prompt "You are a research assistant. Cite sources." \
+  --tools '[{"type":"agentcore_browser","name":"browser"}]' \
+  --memory '{"mode":"managed","strategies":["SEMANTIC","SUMMARIZATION"],"eventExpiryDuration":30}' \
+  --max-iterations 30 --timeout-seconds 900
+
+<span class="c"># CDK deploy: creates the role, the harness and managed memory</span>
+agentcore deploy
+
+SESSION="$(uuidgen)"
+agentcore invoke --harness researcher --session-id "$SESSION" --prompt "Compare three EU Regions for latency to Lisbon."
+agentcore logs harness --name researcher --since 1h --level error
+agentcore traces harness list --name researcher --since 2h
+
+<span class="c"># Pin prod to version 1, then call it</span>
+agentcore harness endpoint create --id HARNESS_ID --name prod --target-version 1
+agentcore invoke --harness researcher --qualifier prod --prompt "Hello"
+
+<span class="c"># Score real sessions, or move to code when configuration isn't enough</span>
+agentcore eval ondemand evaluate --agent HARNESS_ID --evaluators Builtin.Helpfulness --session-ids "$SESSION"
+agentcore export harness --name researcher</code></pre>
+			<ul>
+				<li>A project keeps <code>agentcore/agentcore.json</code>, <code>aws-targets.json</code>, <code>.env.local</code> (local secrets; never commit), a CDK app, and <code>app/NAME/harness.yaml</code> with <code>system-prompt.md</code>. Edit the YAML, then <code>agentcore deploy</code>.</li>
+				<li>API keys for other providers: <code>agentcore add credentials api-key --name NAME --api-key -</code> (from stdin); deploy creates the Identity provider and grants the role. Inline secrets on the command line are rejected.</li>
+				<li><code>agentcore dev --mode browser</code> deploys and opens a local inspector against the cloud harness; it doesn't run the harness locally, so it costs money.</li>
+				<li>The CLI-created role doesn't include VPC image-pull permissions: add them in <code>agentcore/cdk/lib/cdk-stack.ts</code>.</li>
+			</ul>
+
+			<h2 id="s8">Versions and endpoints</h2>
+			<ul>
+				<li>Creating a harness makes version 1; <strong>every update creates a new immutable version</strong> holding the whole configuration.</li>
+				<li>The <strong>DEFAULT</strong> endpoint always follows the latest version. <strong>Named endpoints</strong> (<code>CreateHarnessEndpoint</code> with <code>targetVersion</code>) stay pinned until you move them; each shows a <code>liveVersion</code> and, while updating, the <code>targetVersion</code>.</li>
+				<li>A release pattern: let DEFAULT track the latest for development, keep <code>stage</code> and <code>prod</code> pinned, promote by moving stage and then prod with <code>UpdateHarnessEndpoint</code>, and <strong>roll back</strong> instantly by pointing prod at the previous version.</li>
+				<li>Limits: 10 endpoints and 1,000 versions per harness (Runtime quotas). Logs, traces and online evaluations can be filtered by endpoint.</li>
+			</ul>
+
+			<h2 id="s9">Lifecycle hooks</h2>
+			<p>Hooks (September 2026) run your checks at four points: <code>beforeInvocation</code>, <code>beforeToolCall</code>, <code>afterToolCall</code> and <code>afterInvocation</code>, up to 20 per harness. A <strong>Lambda</strong> target can allow or deny (synchronous); <strong>SNS</strong> and <strong>EventBridge</strong> targets only notify. A deny before invocation stops the run (<code>hook_stopped</code>), before a tool call skips that tool, after a tool call keeps the result but stops the run, and after invocation is only reported.</p>
+			<span class="file">Configure a hook that blocks shell commands touching credentials (UpdateHarness, boto3)</span>
+<pre><code>ctl.update_harness(
+    harnessId=harness_id,
+    hooks=[{"beforeToolCall": {
+        "name": "guard_shell",
+        "target": {"lambda": {
+            "arn": "arn:aws:lambda:us-west-2:111111111111:function:harness-guard",
+            "timeoutSeconds": 10,
+            "failureMode": "deny",
+        }},
+    }}],
+)</code></pre>
+			<span class="file">The Lambda function: return allow or deny with a reason (Python)</span>
+<pre><code>def handler(event, context):
+    <span class="c"># event: hookEventId, name, event, harnessArn, sessionId, context</span>
+    ctx = event.get("context", {})
+    if event["event"] == "before_tool_call" and ctx.get("toolName") == "shell":
+        command = str(ctx.get("toolInput", ""))
+        if ".aws/credentials" in command or "env" in command.split():
+            return {"decision": "deny", "reason": "Reading credentials is not allowed."}
+    return {"decision": "allow"}</code></pre>
+			<ul>
+				<li>The context differs by event: messages before invocation, tool name, type, input and ID around tool calls, stop reason and usage after invocation; it's capped at 64 KiB with a <code>truncated</code> marker.</li>
+				<li><code>failureMode</code> (<code>deny</code> by default) decides what happens if the Lambda errors or times out. Several Lambda hooks on one event run in parallel, and any deny wins.</li>
+				<li>For long hooks, raise the boto3 read timeout above the hook timeout. An allow on an inline function isn't proof the client did the action.</li>
+			</ul>
+
+			<h2 id="s10">Security, logs, quotas and cost</h2>
+			<div class="entry">
+				<h4>Security</h4>
+				<ul>
+					<li>Each session is isolated in its own microVM. Commands sent with <code>InvokeAgentRuntimeCommand</code> run as root inside it, so grant that action (and the interactive shell action) narrowly.</li>
+					<li>Anyone who can invoke the harness reaches all its tools, and per-call overrides let callers change the model, <code>apiBase</code>, <code>additionalParams</code> and skills. If you pass user input through, <strong>strip or allowlist those fields</strong>: they can redirect inference, headers and instructions.</li>
+					<li>With IAM (SigV4) callers there's no per-user identity downstream; use a <strong>custom JWT authorizer</strong> when tools need user-scoped OAuth or on-behalf-of tokens. The end-user ID and <code>actorId</code> aren't authentication.</li>
+					<li>Keep provider keys in the Identity token vault; the agent never sees them. Apply Guardrails through <code>additionalParams.guardrailConfig</code> (with <code>converse_stream</code> only) and govern tool calls with Policy on the Gateway.</li>
+					<li>VPC mode needs interface endpoints for ECR (<code>ecr.api</code>, <code>ecr.dkr</code>), an S3 gateway endpoint and <code>bedrock-runtime</code>, plus ECR pull permissions on <code>harness-*</code> repositories; otherwise sessions fail with image pull timeouts. Git skills, remote MCP and public images need NAT.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Observability</h4>
+				<p>Traces, logs and metrics are emitted for every model call, tool call, memory operation and command, with no extra setup; turn on CloudWatch <strong>Transaction Search</strong> once per account (<code>agentcore deploy</code> does it). Logs go to the managed Runtime's log group under <code>/aws/bedrock-agentcore/runtimes/</code>. In CloudTrail a harness appears as a Runtime resource: management events are <code>CreateHarness</code> and friends, but invocations are logged as <code>InvokeAgentRuntime</code> data events, not <code>InvokeHarness</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas</h4>
+				<p>The Harness has no quotas of its own; Runtime's apply: 5,000 active sessions per account in us-east-1 and us-west-2 (2,500 elsewhere, adjustable), 25 new sessions per second, 1,000 data-plane calls per second shared across invoke actions, 2 vCPU and 8 GB per session, 60-minute streaming responses, and 8-hour sessions. Cross-account calls count against the owner's quotas.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>There's <strong>no separate harness charge</strong>. You pay for the Runtime underneath (vCPU-seconds actually used, not while waiting on I/O, plus peak memory per second for the session's life), model tokens (the prompt includes the system prompt, history, retrieved memory, skill metadata and every allowed tool's definition), Memory if enabled, Browser and Code Interpreter sessions, Gateway calls, and CloudWatch. Shorter idle timeouts, <code>allowedTools</code>, tighter truncation and disabling unused memory all cut cost. Harness tags propagate to the managed Runtime and memory for cost allocation.</p>
+			</div>
+			<div class="callout trap"><p>A Step Functions <code>InvokeHarness</code> task stops after 15 minutes, but the harness keeps running (and billing) until its own <code>timeoutSeconds</code>. Set the harness timeout to match the workflow.</p></div>
+
+			<h2 id="s11">Moving from Agents Classic</h2>
+			<p><strong>Bedrock Agents</strong> is now <strong>Agents Classic</strong>: closed to new customers since 30 July 2026 (accounts without recent use get a 403 on <code>CreateAgent</code> and <code>InvokeInlineAgent</code>), in maintenance mode with its model catalog frozen, and no end-of-life date. AWS's migration guide recommends the Harness and maps the concepts:</p>
+			<ul>
+				<li><strong>Action groups</strong> become Gateway targets exposed as MCP tools (or <code>@tool</code> functions on Runtime).</li>
+				<li><strong>Knowledge bases</strong> become a Gateway-fronted Managed Knowledge Base or a retrieval tool; the knowledge bases themselves don't change.</li>
+				<li><strong>Return of control</strong> and user input become inline functions; the code interpreter becomes <code>agentcore_code_interpreter</code>; session memory becomes AgentCore Memory.</li>
+				<li><strong>Guardrails</strong> move to the model's <code>guardrailConfig</code> or to Policy on the Gateway; the trace view becomes AgentCore Observability.</li>
+				<li><strong>Per-stage prompt overrides</strong>, custom orchestrators and supervisor-style multi-agent setups need Runtime code. Agent versions and aliases correspond naturally to harness versions and endpoints.</li>
+			</ul>
+			<p>The AWS agent toolkit's <code>amazon-bedrock</code> skill can drive the migration from a coding assistant, and <code>agentcore add runtime --agent-id ID --agent-alias-id ALIAS --framework strands</code> imports a Classic agent as Runtime code. Use the CLI 1.0 flags shown on this page: the manual steps on AWS's migration page use older flags.</p>
+
+			<h2 id="s12">What's changed</h2>
+			<ul>
+				<li><strong>November 2026:</strong> AgentCore CLI 1.0.2; Web Answer connector (us-east-1).</li>
+				<li><strong>October 2026:</strong> AgentCore CLI 1.0 (28 October; <code>agentcore migrate</code> for older projects, evaluation commands under <code>agentcore eval</code>); Gateway model fallback; short-term memory moved to consumption pricing (6 October); the Registry's preview namespace was retired (30 October).</li>
+				<li><strong>September 2026:</strong> Harness lifecycle hooks, interactive shells and custom OpenAI-compatible endpoints (<code>apiBase</code>); Runtime platform V2 (18 September); Bedrock Managed Agents (OpenAI) public preview (29 September).</li>
+				<li><strong>August 2026:</strong> Harness, Memory and Policy in GovCloud (US-West) (7 August); Payments (18 August) and Agent Registry (31 August) generally available.</li>
+				<li><strong>July 2026:</strong> Agents Classic closed to new customers (30 July).</li>
+				<li><strong>June 2026:</strong> <strong>Harness generally available</strong> (17 June) with managed memory by default, LiteLLM and Bedrock Mantle providers, the AWS skills catalog, versions and endpoints, and export to Strands; Step Functions integration; Web Search.</li>
+				<li><strong>April to May 2026:</strong> Harness public preview in four Regions (22 April); file system mounts (May).</li>
+				<li><strong>October 2025 to March 2026:</strong> AgentCore generally available (13 October 2025); Policy (3 March 2026) and Evaluations (31 March 2026) generally available; AgentCore CLI generally available (March 2026).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d2-task-2-1.html">AIP-C01 Task 2.1: agentic AI and tool integrations</a>, <a href="../../aws-aip/d4-task-4-3.html">AIP-C01 Task 4.3: monitoring</a>, <a href="../../aws-aif/d5-task-5-1.html">AIF-C01 Task 5.1: securing AI systems</a> and <a href="../../aws-dva/d2-task-2-3.html">DVA-C03 Task 2.3: security risks of AI services</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="index.html"><small>Previous</small>Bedrock overview</a>
+				<span class="next"><small>Next</small>AgentCore Runtime (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock AgentCore, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
