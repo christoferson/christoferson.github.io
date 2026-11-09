@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 1.3: Troubleshoot Monitoring, Logging and Alerting | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 1.3 study guide: why Lambda, API Gateway and CloudFront logs go missing, load balancer and Route 53 health checks that fail, CloudWatch agent problems, CloudTrail, flow log and vended log delivery errors, EventBridge rules and alarms that don't fire, encrypted SNS targets, Security Hub CSPM WARNING findings, and the tools to diagnose them.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">Task 1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Detection &middot; 16%</span>
+		<h1>Task 1.3: Troubleshoot security monitoring, logging, and alerting solutions</h1>
+		<p>Working out why a log is empty, a health check fails or an alert never arrived, and fixing it: usually a missing permission, a setting in the wrong Region or account, a key policy, or a log class that doesn't support the feature.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Lambda</span><span class="tag">API Gateway</span><span class="tag">CloudFront</span><span class="tag">CloudWatch agent</span><span class="tag">EventBridge</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Analyzing logging and health check setups</a></li>
+				<li><a href="#s2">Remediating missing logs and silent alerts</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.3</span>
+				<p><strong>Troubleshoot security monitoring, logging, and alerting solutions.</strong></p>
+			</div>
+			<p>Troubleshooting questions describe a symptom: "the log group is empty", "the alarm stays in INSUFFICIENT_DATA", "the Lambda function is never invoked by the rule". The answer is almost always one of a short list of causes, and checking them in the same order each time finds it quickly. <a href="d1-task-1-1.html">Task 1.1</a> and <a href="d1-task-1-2.html">Task 1.2</a> showed how these pieces are set up; this page is about why they stop working.</p>
+			<p><strong>Running example.</strong> The same company: AWS Organizations with security tooling (222222222222), log archive (444444444444) and workload accounts (prod is 111111111111); a web application behind CloudFront, AWS WAF and an Application Load Balancer, a REST API on API Gateway backed by Lambda, containers on EKS and ECS, EC2 instances running the CloudWatch agent, and an S3 data platform, in us-east-1 with us-west-2 for disaster recovery.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>1.3.1</td><td data-label="What you need to be able to do">Check how Lambda, API Gateway, CloudFront logging and health checks are configured and permitted, and spot what's wrong</td></tr>
+						<tr><td>1.3.2</td><td data-label="What you need to be able to do">Fix agent configurations, missing logs, and alerts and findings that never arrive</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<h3>A checking order that works</h3>
+			<ol class="flow">
+				<li><b>Is it turned on?</b>Logging level, trail logging, flow log status, the right log class, the feature enabled in this Region.</li>
+				<li><b>Is the writer allowed?</b>The execution role, service role or service principal can write, and the bucket, log group or key policy lets it.</li>
+				<li><b>Is it going where you're looking?</b>The right account, Region (us-east-1 for global services) and log group name.</li>
+				<li><b>Does the consumer match it?</b>Metric filter and event pattern syntax, the alarm's missing data setting, target permissions.</li>
+				<li><b>Has it had time?</b>Many logs are delivered in minutes to hours, and filters only see new events.</li>
+			</ol>
+
+			<!-- Skill 1.3.1 -->
+			<h2 id="s1">Analyzing logging and health check setups</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3.1</span><span class="skill-text">Analyze the functionality, permissions, and configuration of resources (for example, Lambda function logging, Amazon API Gateway logging, health checks, Amazon CloudFront logging).</span></p>
+
+				<h3>Lambda function logging</h3>
+				<div class="entry">
+					<h4>Permissions and log groups</h4>
+					<p>Lambda writes to <code>/aws/lambda/&lt;function name&gt;</code> using the function's <strong>execution role</strong>, which needs <code>logs:CreateLogGroup</code>, <code>logs:CreateLogStream</code> and <code>logs:PutLogEvents</code>; the managed policy <code>AWSLambdaBasicExecutionRole</code> has exactly those. The console adds them when it creates a role, the CLI and infrastructure as code don't, so a function deployed from a pipeline with a hand-written role often has no logs. After fixing the role, make a trivial configuration change: running execution environments keep their old credentials until they're replaced.</p>
+					<p>A function can write to a <strong>custom log group</strong> (several functions can share one), set with <code>--logging-config LogGroup=...</code>; the role must allow writing to it. A custom name starting with <code>aws/</code> silently receives nothing. If the log group uses a customer managed KMS key, the key policy must allow the Regional <code>logs.&lt;region&gt;.amazonaws.com</code> principal (<a href="d1-task-1-2.html#s2">Task 1.2</a>).</p>
+				</div>
+				<div class="entry">
+					<h4>Advanced logging controls</h4>
+					<p>With <strong>JSON</strong> log format, Lambda can filter by <strong>application log level</strong> (TRACE to FATAL) and <strong>system log level</strong> (DEBUG, INFO, WARN). Level filtering only works with JSON; both levels default to INFO, and a level set in the function's code wins over the configuration. If security events are logged at INFO but the level is set to ERROR, they're dropped before they reach CloudWatch.</p>
+					<span class="file">JSON logs, application events from INFO up, system events from WARN up (AWS CLI)</span>
+<pre><code>aws lambda update-function-configuration \
+  --function-name orders-api \
+  --logging-config LogFormat=JSON,ApplicationLogLevel=INFO,SystemLogLevel=WARN,LogGroup=/prod/lambda/orders</code></pre>
+					<p>Logs can also be missing with correct permissions when CloudWatch Logs throttles the account's API quotas, or when one stream exceeds about 2 MB per second. Attaching a function to your VPC doesn't change the Lambda-managed environment that captures its basic logs, and AWS doesn't list a NAT gateway or endpoint as a requirement for them; extensions such as Lambda Insights, which send from inside the function, do need a route or the <code>com.amazonaws.&lt;region&gt;.logs</code> endpoint.</p>
+				</div>
+				<div class="callout trap"><p>Lambda can deliver logs straight to S3 or Firehose through a log group of class <strong>DELIVERY</strong>, which keeps events for only 2 days and doesn't support Logs Insights. An <strong>Essentials</strong> log group (formerly Infrequent Access) has no metric filters, subscription filters or Live Tail. Either class explains "the metric filter on the function's logs never matches", and a log group's class can't be changed after creation.</p></div>
+
+				<h3>API Gateway logging</h3>
+				<div class="entry">
+					<h4>Execution logs and access logs</h4>
+					<p>REST and WebSocket APIs have two independent log types. <strong>Execution logs</strong> are API Gateway's own trace (authorizer results, integration requests, errors) in <code>API-Gateway-Execution-Logs_{rest-api-id}/{stage}</code>, turned on per stage with <code>loggingLevel</code> <code>ERROR</code> or <code>INFO</code>. <strong>Access logs</strong> are one line per request in a format you define with <code>$context</code> variables, sent to a log group or to a Firehose stream whose name starts with <code>amazon-apigateway-</code>. HTTP APIs have access logs only, to CloudWatch Logs only.</p>
+					<p>For REST and WebSocket APIs, API Gateway writes to CloudWatch Logs with a role set on the <strong>account</strong>, in <strong>each Region</strong>. Without it, enabling logging on a stage fails. The role trusts <code>apigateway.amazonaws.com</code> and has the <code>AmazonAPIGatewayPushToCloudWatchLogs</code> managed policy; AWS STS must be enabled in the Region.</p>
+					<span class="file">Set the API Gateway logging role for this Region (AWS CLI, once per Region per account)</span>
+<pre><code>aws apigateway update-account \
+  --region us-west-2 \
+  --patch-operations op='replace',path='/cloudwatchRoleArn',value='arn:aws:iam::111111111111:role/APIGatewayToCloudWatchLogs'</code></pre>
+					<p>For security investigations, an access log format that captures caller identity, authorizer and WAF results is worth more than execution logs. The format must include <code>$context.requestId</code> or <code>$context.extendedRequestId</code>; the extended ID can't be overridden by clients.</p>
+					<span class="file">Security-focused access log format (stage access log format, JSON)</span>
+<pre><code>{
+  "requestId": "$context.extendedRequestId",
+  "sourceIp": "$context.identity.sourceIp",
+  "userArn": "$context.identity.userArn",
+  "principalId": "$context.authorizer.principalId",
+  "authorizerError": "$context.authorizer.error",
+  "wafStatus": "$context.waf.status",
+  "webAclArn": "$context.webaclArn",
+  "status": "$context.status",
+  "errorMessage": "$context.error.message",
+  "tlsVersion": "$context.tlsVersion"
+}</code></pre>
+				</div>
+				<div class="callout trap"><p><code>dataTraceEnabled</code> logs full request and response bodies, which can put tokens and personal data into logs; AWS recommends not enabling it for production. Standard execution log events are also cut at 1 KB. REST execution logs can now be delivered through CloudWatch vended logs to a log group of your choice, S3 or Firehose, with events up to 1 MB; but once such a delivery exists, the old <code>API-Gateway-Execution-Logs_...</code> group stops receiving events, so alarms and metric filters on it go quiet.</p></div>
+
+				<h3>Health checks</h3>
+				<div class="entry">
+					<h4>Load balancer target health</h4>
+					<p><code>aws elbv2 describe-target-health</code> (or the target group's resource map) shows each target's state and a <strong>reason code</strong>. The common ones:</p>
+					<ul>
+						<li><code>Target.Timeout</code>: no response in time, usually a security group or network ACL blocking the health check port. The target's security group must allow the health check port from the load balancer's security group, and network ACLs must allow the return traffic on ephemeral ports.</li>
+						<li><code>Target.ResponseCodeMismatch</code>: the path answered, but not with the expected code (default 200), for example a redirect to a login page, or a virtual host rejecting the health check's <code>Host</code> header, which is the target's private IP.</li>
+						<li><code>Target.FailedHealthChecks</code>, <code>Elb.InitialHealthChecking</code>, <code>Target.NotRegistered</code>, <code>Target.NotInUse</code> (no listener rule uses the group, or the Availability Zone isn't enabled), <code>Target.HealthCheckDisabled</code>.</li>
+					</ul>
+					<p>ALB <strong>health check logs</strong> (off by default, delivered to S3 every 5 minutes) record every check with a reason such as <code>TimedOut</code>, <code>ConnectionReset</code> or <code>ResponseCodeMismatch</code>. Both ALB and NLB fail open: when every target is unhealthy, traffic goes to all of them. An NLB HTTPS health check fails against targets that only support TLS 1.3.</p>
+				</div>
+				<div class="entry">
+					<h4>Route 53 health checks</h4>
+					<p>Route 53 health checkers come from the internet, so a failing endpoint check is usually a firewall or security group that doesn't allow them. Allow the <code>ROUTE53_HEALTHCHECKS</code> ranges from <code>ip-ranges.json</code>, or reference the AWS-managed prefix list <code>com.amazonaws.&lt;region&gt;.route53-healthchecks</code> in the security group. Other causes:</p>
+					<ul>
+						<li>The endpoint IP is private: Route 53 can't check private, local or non-routable addresses. Use a CloudWatch alarm-based health check on a metric from inside the VPC instead.</li>
+						<li>A string match fails because the string isn't in the first 5,120 bytes of the body.</li>
+						<li>HTTPS checks don't validate certificates, so an expired certificate doesn't fail the check. Monitor certificate expiry separately (Task 5.1).</li>
+					</ul>
+					<span class="file">Allow Route 53 health checkers to reach the web tier, then see why a check failed (AWS CLI)</span>
+<pre><code># Find the managed prefix list for health checkers
+aws ec2 describe-managed-prefix-lists \
+  --filters Name=prefix-list-name,Values=com.amazonaws.us-east-1.route53-healthchecks
+
+# Allow HTTPS from it on the web tier's security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0abc1234def567890 \
+  --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,PrefixListIds=[{PrefixListId=pl-0123456789abcdef0}]'
+
+# What each checker saw last (not available for calculated health checks)
+aws route53 get-health-check-last-failure-reason --health-check-id 01234567-89ab-cdef-0123-456789abcdef</code></pre>
+				</div>
+
+				<h3>CloudFront logging</h3>
+				<div class="entry">
+					<h4>Legacy, version 2 and real-time logs</h4>
+					<ul>
+						<li><strong>Legacy standard logs</strong> (S3 only) need <strong>ACLs enabled</strong> on the bucket: CloudFront grants the <code>awslogsdelivery</code> account FULL_CONTROL. New buckets have ACLs disabled (Object Ownership "bucket owner enforced") by default, which stops delivery, and buckets in opt-in Regions aren't supported. With SSE-KMS, only a customer managed key works, with a key policy for <code>delivery.logs.amazonaws.com</code>.</li>
+						<li><strong>Standard logs version 2</strong> (since November 2024) use the CloudWatch Logs delivery APIs, which must be called in <strong>us-east-1</strong>, with a Firehose destination also in us-east-1. A distribution can have only one delivery source, and the output format can't be changed after the destination is created.</li>
+						<li><strong>Real-time logs</strong> go to Kinesis Data Streams through a role trusted by <code>cloudfront.amazonaws.com</code> with <code>kinesis:PutRecord</code>, <code>kinesis:PutRecords</code> and the Describe actions, plus <code>kms:GenerateDataKey</code> if the stream is encrypted. Missing records usually mean too few shards.</li>
+					</ul>
+					<p>Standard logs are delivered up to several times an hour and can be up to 24 hours late; AWS says delivery becomes reliable about four hours after logging is enabled. "No logs ten minutes after enabling" isn't a fault.</p>
+				</div>
+				<div class="callout tip"><p>"CloudFront access logs stopped after the bucket was recreated" or "...in a new account" points to <strong>bucket ACLs</strong>: enable ACLs (Object Ownership "bucket owner preferred") or move to standard logging v2.</p></div>
+			</div>
+
+			<!-- Skill 1.3.2 -->
+			<h2 id="s2">Remediating missing logs and silent alerts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3.2</span><span class="skill-text">Remediate misconfiguration of resources (for example, by troubleshooting CloudWatch Agent configurations, troubleshooting missing logs).</span></p>
+
+				<h3>The CloudWatch agent</h3>
+				<div class="entry">
+					<h4>Where to look</h4>
+					<p>Start with the agent's status and its own logs. If it won't start, the configuration didn't validate; if it runs but nothing arrives, the agent log shows the API errors.</p>
+					<span class="file">Check the agent on a Linux instance (shell)</span>
+<pre><code># Running? Which version?
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -m ec2 -a status
+
+# Why it won't start
+sudo cat /opt/aws/amazon-cloudwatch-agent/logs/configuration-validation.log
+
+# Why data isn't arriving (AccessDenied, endpoint, credential errors)
+sudo tail -n 50 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+
+# Editing the JSON does nothing until the agent loads it again
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-linux</code></pre>
+					<p>On Windows, the logs are under <code>%ProgramData%\Amazon\AmazonCloudWatchAgent\Logs</code>. For a fleet, the <code>AWSSupport-TroubleshootCloudWatchAgent</code> runbook checks the instance profile, permissions, agent status and endpoint connectivity.</p>
+				</div>
+				<div class="entry">
+					<h4>The usual causes</h4>
+					<ul>
+						<li><strong>Permissions:</strong> the instance profile lacks <code>CloudWatchAgentServerPolicy</code>, or the configuration parameter isn't named <code>AmazonCloudWatch-*</code>, so <code>ssm:GetParameter</code> is denied.</li>
+						<li><strong>Credentials on premises:</strong> the agent uses the <code>AmazonCloudWatchAgent</code> profile referenced in <code>common-config.toml</code>, started with <code>-m onPremise</code>. Environment variables aren't visible when the agent runs as a systemd service.</li>
+						<li><strong>No route to the endpoint:</strong> instances in private subnets need a NAT gateway or the <code>com.amazonaws.&lt;region&gt;.logs</code> interface endpoint (and <code>monitoring</code> for metrics, plus SSM endpoints for Parameter Store). Live Tail uses a separate <code>stream-logs</code> endpoint.</li>
+						<li><strong>Containers:</strong> with IMDSv2, the instance metadata hop limit must be 2, or the agent can't get credentials or tags (the log says to increase the hop limit).</li>
+						<li><strong>Files:</strong> a <code>file_path</code> glob ships only the newest matching file; the user the agent runs as (root, or <code>run_as_user</code>) must be able to read the file; and conflicting <code>retention_in_days</code> values for one log group stop the agent.</li>
+					</ul>
+				</div>
+
+				<h3>Missing logs, source by source</h3>
+				<div class="entry">
+					<h4>CloudTrail</h4>
+					<p><code>aws cloudtrail get-trail-status</code> answers most questions: <code>IsLogging</code> (a trail that was stopped), <code>LatestDeliveryError</code> (S3 delivery, almost always the bucket policy or KMS key policy), <code>LatestDigestDeliveryError</code>, <code>LatestNotificationError</code> (SNS topic policy) and <code>LatestCloudWatchLogsDeliveryError</code>. Status is per Region, and member accounts must pass the organization trail's full ARN. CloudTrail keeps retrying a misconfigured bucket for 30 days, and you're charged for it.</p>
+					<span class="file">A trail whose bucket policy was changed (get-trail-status output, abridged)</span>
+<pre><code>{
+  "IsLogging": true,
+  "LatestDeliveryError": "AccessDenied",
+  "LatestDeliveryTime": "2026-11-08T14:05:12Z",
+  "LatestDigestDeliveryError": "AccessDenied",
+  "LatestCloudWatchLogsDeliveryTime": "2026-11-09T09:41:57Z"
+}</code></pre>
+					<p>Here the trail is logging and CloudWatch Logs delivery still works, but S3 delivery has failed since yesterday, so the bucket policy or its KMS key is the place to look. For CloudTrail to CloudWatch Logs, the log group must be in the trail's own account, and the role trusted by <code>cloudtrail.amazonaws.com</code> must allow <code>logs:CreateLogStream</code> and <code>logs:PutLogEvents</code> on streams named <code>&lt;account&gt;_CloudTrail_&lt;region&gt;*</code> (plus <code>&lt;org ID&gt;_*</code> for an organization trail). CloudTrail doesn't send events over 256 KB to CloudWatch Logs or EventBridge.</p>
+				</div>
+				<div class="entry">
+					<h4>VPC Flow Logs</h4>
+					<p><code>aws ec2 describe-flow-logs</code> shows the status and <code>DeliverLogsErrorMessage</code>. <strong>Access error</strong> means the role's trust (<code>vpc-flow-logs.amazonaws.com</code>) or permissions are wrong. A new flow log with no records may just need 10 minutes, and its log group appears only once traffic is recorded. For S3, an "undeliverable" destination means the bucket's default SSE-KMS key is given as a key ID rather than an ARN, and a bucket policy that grew past 20 KB (one statement per flow log) should use <code>arn:aws:s3:::bucket/*</code>. In records, <code>NODATA</code> means no traffic in the interval, not a fault; <code>SKIPDATA</code> means records were skipped.</p>
+				</div>
+				<div class="entry">
+					<h4>Logs that need a specific bucket or log group</h4>
+					<ul>
+						<li><strong>ALB access logs:</strong> bucket in the same Region, SSE-S3 only (SSE-KMS isn't supported), policy for <code>logdelivery.elasticloadbalancing.amazonaws.com</code>, and no <code>AWSLogs</code> in the prefix.</li>
+						<li><strong>S3 server access logs:</strong> destination bucket in the same Region and account, SSE-S3, no Object Lock default retention, no Requester Pays, and a bucket policy for <code>logging.s3.amazonaws.com</code>. Delivery takes hours.</li>
+						<li><strong>WAF logs:</strong> the destination's name must start with <code>aws-waf-logs-</code>, in the same Region and account as the web ACL.</li>
+						<li><strong>Route 53 public DNS query logs:</strong> the log group must be in us-east-1.</li>
+					</ul>
+					<p>Services that deliver vended logs to CloudWatch Logs (Route 53, WAF, flow logs and others) need a <strong>resource policy</strong> allowing <code>delivery.logs.amazonaws.com</code>. An account can have only 10 resource policies per Region; when that's reached, new deliveries can't add permissions. Newer deliveries put the policy on the log group itself, and log groups named under <code>/aws/vendedlogs/</code> can share one account-level policy.</p>
+				</div>
+
+				<h3>Alerts that don't arrive</h3>
+				<div class="entry">
+					<h4>EventBridge rules</h4>
+					<p>If the rule's <code>TriggeredRules</code> metric is zero, the pattern doesn't match or the rule is in the wrong Region; if <code>FailedInvocations</code> rises, the target refused the event. Checks, in order:</p>
+					<ul>
+						<li><strong>Region:</strong> API events for global services such as IAM appear only in <strong>us-east-1</strong> (so do AWS Health global events, Task 1.1).</li>
+						<li><strong>Pattern:</strong> exact strings and ARNs; CloudTrail API events have an empty <code>resources</code> field, so match on <code>detail</code> instead. Test with <code>aws events test-event-pattern</code> or the console sandbox.</li>
+						<li><strong>Lambda target:</strong> the function's resource policy must allow <code>events.amazonaws.com</code> from the rule's ARN, without a <code>SourceAccount</code> field.</li>
+						<li><strong>SNS or SQS target encrypted with KMS:</strong> it must use a <strong>customer managed key</strong>; the AWS managed key for SNS can't be granted to EventBridge or CloudWatch alarms.</li>
+					</ul>
+					<span class="file">Let EventBridge invoke the responder function (AWS CLI)</span>
+<pre><code>aws lambda add-permission \
+  --function-name quarantine-responder \
+  --statement-id allow-guardduty-rule \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:us-east-1:222222222222:rule/guardduty-high</code></pre>
+					<span class="file">Let EventBridge and CloudWatch alarms publish to an encrypted topic (one statement of the KMS key policy)</span>
+<pre><code>{
+  "Sid": "AllowEventSourcesToUseTheKey",
+  "Effect": "Allow",
+  "Principal": { "Service": ["events.amazonaws.com", "cloudwatch.amazonaws.com"] },
+  "Action": ["kms:GenerateDataKey*", "kms:Decrypt"],
+  "Resource": "*"
+}</code></pre>
+					<p>The topic policy must also allow <code>sns:Publish</code> from those principals. AWS notes that <code>aws:SourceAccount</code>, <code>aws:SourceArn</code> and <code>aws:SourceOrgID</code> conditions in the key policy aren't supported for EventBridge publishing to encrypted topics, so don't add them there.</p>
+				</div>
+				<div class="entry">
+					<h4>Alarms and metric filters</h4>
+					<p>A metric filter only counts events ingested <strong>after</strong> it was created, so testing it against yesterday's root sign-in shows nothing. Without a default value, a filter on a rare event publishes no data points at all, and the alarm sits in <strong>INSUFFICIENT_DATA</strong>, because the default missing data treatment is <code>missing</code>. For a count of bad events, treat missing data as <code>notBreaching</code> (or set the filter's <code>defaultValue</code> to 0).</p>
+					<span class="file">An alarm on a rare event that stays OK between occurrences (AWS CLI)</span>
+<pre><code>aws cloudwatch put-metric-alarm \
+  --alarm-name root-usage \
+  --namespace LogMetrics --metric-name RootUsageCount \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:us-east-1:222222222222:security-alerts</code></pre>
+					<p>The other end matters too: an email subscription stays "pending confirmation" until someone clicks the link, and unconfirmed subscriptions are deleted after 48 hours.</p>
+				</div>
+
+				<h3>Findings that don't appear</h3>
+				<div class="entry">
+					<h4>Security Hub CSPM, Config and GuardDuty</h4>
+					<ul>
+						<li><strong>Security Hub CSPM controls show WARNING</strong> (control status Unknown) rather than FAILED when AWS Config isn't recording the resource type the control checks, and <strong>Config.1</strong> fails. Fix the recorder: <code>aws configservice describe-configuration-recorder-status</code> shows <code>recording</code>, <code>lastStatus</code> and <code>lastErrorCode</code>. When both Security Hub CSPM and the new Security Hub are enabled, CSPM creates its own service-linked recorder, and this problem goes away.</li>
+						<li><strong>No data</strong> on a control means it's new, unavailable in the Region, or all its findings are suppressed.</li>
+						<li><strong>GuardDuty findings missing for one Region</strong>: the delegated administrator and member enablement are per Region; auto-enable <code>NEW</code> misses accounts that opted into a Region after joining, so use <code>ALL</code>.</li>
+						<li><strong>Findings missing from Security Hub CSPM or EventBridge but present in GuardDuty or Macie</strong>: a suppression rule archived them, or (for Macie) only policy findings are published by default (Task 1.1).</li>
+					</ul>
+				</div>
+
+				<h3>Diagnostic tools</h3>
+				<div class="entry">
+					<h4>Find the blocking permission or network path</h4>
+					<ul>
+						<li><strong>IAM policy simulator</strong>: test whether a role can call an action, with identity policies and SCPs taken into account.</li>
+						<li><strong>IAM Access Analyzer policy validation</strong>: catch errors and security warnings in a bucket, key or trust policy before applying it.</li>
+						<li><strong>Reachability Analyzer</strong>: show which security group, network ACL or route blocks the path from a load balancer to a target.</li>
+						<li><strong>CloudWatch Logs Live Tail</strong>: watch events arrive in a log group in real time while you test (Standard class only).</li>
+						<li><strong>CloudTrail Event history</strong>: find the failed management call (for example <code>PutBucketPolicy</code> or <code>StopLogging</code>) that started the problem.</li>
+					</ul>
+					<span class="file">Can the flow logs role write to CloudWatch Logs? (AWS CLI)</span>
+<pre><code>aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::111111111111:role/FlowLogsToCloudWatch \
+  --action-names logs:CreateLogStream logs:PutLogEvents \
+  --resource-arns arn:aws:logs:us-east-1:111111111111:log-group:/aws/vpc/prod:*
+# EvalDecision: allowed, explicitDeny or implicitDeny for each action</code></pre>
+				</div>
+				<div class="callout tip"><p>"Logs stopped arriving after a change nobody remembers" points to <strong>CloudTrail</strong> (who changed the bucket policy, key policy or role) and <strong>AWS Config</strong> (what the resource looked like before). Then fix the configuration and prevent it with an SCP or Config rule.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Check in order: turned on, writer allowed, right account, Region and name, consumer matching, time to arrive.</li>
+				<li>Lambda: execution role with the three logs actions (the CLI doesn't add them), no <code>aws/</code> prefix on custom log groups, log levels need JSON, DELIVERY and Essentials log groups lack metric and subscription filters.</li>
+				<li>API Gateway: CloudWatch role set on the account in every Region; execution logs (<code>loggingLevel</code>, 1 KB events) vs access logs (<code>$context</code> format, Firehose names <code>amazon-apigateway-</code>); HTTP APIs have access logs only; avoid <code>dataTraceEnabled</code> in production.</li>
+				<li>Health checks: <code>Target.Timeout</code> is usually a security group; ALB and NLB fail open; Route 53 needs its checker ranges or prefix list allowed, can't check private IPs, and doesn't validate HTTPS certificates.</li>
+				<li>CloudFront: legacy logs need bucket ACLs (no opt-in Region buckets, customer managed KMS key only); v2 is configured in us-east-1; logs can lag hours.</li>
+				<li>Agent: status, <code>configuration-validation.log</code> and <code>amazon-cloudwatch-agent.log</code>; <code>fetch-config</code> after edits; <code>AmazonCloudWatch-</code> parameter names; logs endpoint in private subnets; IMDSv2 hop limit 2 in containers.</li>
+				<li>Delivery: <code>get-trail-status</code> errors, flow log Access error and key-ID-not-ARN, ALB logs SSE-S3 only, S3 access logs same account and Region, <code>aws-waf-logs-</code> names, 10 resource policies per Region.</li>
+				<li>Alerts: global events only in us-east-1, Lambda resource policy for <code>events.amazonaws.com</code>, customer managed KMS keys for encrypted SNS and SQS targets, metric filters not retroactive, <code>notBreaching</code> for rare-event alarms. Security Hub CSPM WARNING means Config isn't recording.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-2.html"><small>Previous</small>Task 1.2: Design and implement logging solutions</a>
+				<a class="next" href="d2-task-2-1.html"><small>Next</small>Task 2.1: Design and test an incident response plan</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
