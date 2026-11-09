@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 5.3: Secrets, Credentials and Key Material | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 5.3 study guide: Secrets Manager rotation types, steps, strategies and schedules, RDS-managed master passwords, retrieving secrets in Lambda, ECS, EKS and CloudFormation, Parameter Store, importing and rotating key material, external key stores, imported versus AWS-generated key material, masking with CloudWatch Logs, SNS, Glue and Lake Formation, multi-Region KMS keys, rotation and deletion, AWS Private CA modes, CRLs and sharing, and ACM certificates across Regions.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">Task 5.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Data Protection &middot; 18%</span>
+		<h1>Task 5.3: Design and implement controls to protect confidential data, credentials, secrets, and cryptographic key materials</h1>
+		<p>Looking after the most sensitive things you hold: secrets that rotate themselves, key material you bring or keep outside AWS, sensitive values hidden from people who don't need them, and keys and certificates managed consistently in one Region or many.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Secrets Manager</span><span class="tag">AWS KMS</span><span class="tag">Imported key material</span><span class="tag">External key stores</span><span class="tag">AWS Private CA</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Managing and rotating secrets</a></li>
+				<li><a href="#s2">Imported key material and external key stores</a></li>
+				<li><a href="#s3">Imported versus AWS-generated key material</a></li>
+				<li><a href="#s4">Masking sensitive data</a></li>
+				<li><a href="#s5">Keys and certificates across Regions</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.3</span>
+				<p><strong>Design and implement controls to protect confidential data, credentials, secrets, and cryptographic key materials.</strong></p>
+			</div>
+			<p>This task is about the things that unlock everything else. Questions test whether rotation actually happens without breaking applications, what changes when you bring your own key material, what's lost when a key or its material is deleted, and how keys and certificates behave across Regions and accounts. Key types and choosing between KMS and CloudHSM are in <a href="d5-task-5-2.html#s1">Task 5.2</a>.</p>
+			<p><strong>Running example.</strong> The same company. Aurora and RDS databases, a Snowflake account and third-party API keys hold credentials; compliance requires one key to use material generated in the company's own HSM; a regulator in one market requires key material to stay outside AWS; logs and notifications must not expose customer personal data; and the platform runs in us-east-1 and us-west-2 with internal TLS everywhere.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>5.3.1</td><td data-label="What you need to be able to do">Design secret storage and rotation with Secrets Manager</td></tr>
+						<tr><td>5.3.2</td><td data-label="What you need to be able to do">Import, rotate and manage key material, and configure external key stores</td></tr>
+						<tr><td>5.3.3</td><td data-label="What you need to be able to do">Explain how imported key material differs from AWS-generated material</td></tr>
+						<tr><td>5.3.4</td><td data-label="What you need to be able to do">Mask sensitive data in logs, messages and data sets</td></tr>
+						<tr><td>5.3.5</td><td data-label="What you need to be able to do">Manage KMS keys and certificates in one or more Regions, including AWS Private CA</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout retired"><p><strong>Status changes.</strong> <strong>Amazon SNS message data protection</strong> closed to new customers on 30 April 2026; AWS recommends Lambda with Bedrock Guardrails for masking message content. The Secrets Manager Agent has been renamed the <strong>AWS Workload Credentials Provider</strong>. Imported key material can now be <strong>rotated on demand</strong> (single-Region keys from June 2025, multi-Region from November 2025), Secrets Manager added <strong>managed external secrets</strong> (November 2025), and AWS Private CA supports post-quantum ML-DSA CAs (November 2025).</p></div>
+
+			<!-- Skill 5.3.1 -->
+			<h2 id="s1">Managing and rotating secrets</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3.1</span><span class="skill-text">Design management and rotation of credentials and secrets (for example, AWS Secrets Manager).</span></p>
+
+				<h3>Rotation in Secrets Manager</h3>
+				<div class="entry">
+					<h4>Three ways secrets rotate</h4>
+					<ul>
+						<li><strong>Managed rotation</strong>: the owning service rotates its own secret with no Lambda function, for RDS, Aurora, DocumentDB and Redshift master users and ECS Service Connect certificates. <strong>RDS-managed master passwords</strong> (<code>--manage-master-user-password</code>) rotate every 7 days by default; deleting the database deletes the secret, the KMS key can't be changed later, and they don't work with Blue/Green deployments or RDS Custom.</li>
+						<li><strong>Managed external secrets</strong> (November 2025): partner SaaS credentials such as Salesforce and Snowflake, rotated by Secrets Manager with no Lambda in your account.</li>
+						<li><strong>Lambda rotation</strong> for everything else, from AWS templates or your own function.</li>
+					</ul>
+				</div>
+				<ol class="flow">
+					<li><b>createSecret</b>Generate a new value and store it as a new version labelled <code>AWSPENDING</code>.</li>
+					<li><b>setSecret</b>Change the credential in the database or service to the pending value.</li>
+					<li><b>testSecret</b>Sign in with the pending value to prove it works.</li>
+					<li><b>finishSecret</b>Move <code>AWSCURRENT</code> to the new version; the old one becomes <code>AWSPREVIOUS</code>, the last known good value.</li>
+				</ol>
+				<div class="entry">
+					<h4>Strategies and schedules</h4>
+					<p>The <strong>single user</strong> strategy changes one user's password; it's the simplest and fits most cases, but there's a short window where clients holding the old password fail, so use retries. The <strong>alternating users</strong> strategy keeps two users in the secret and switches between them, so the old credential keeps working until the next rotation; it needs a separate superuser secret to create and change the clone user, and RDS Proxy doesn't support it.</p>
+					<p>Schedules are <code>rate()</code> or <code>cron()</code> expressions in UTC, as often as every 4 hours, with a rotation window (<code>Duration</code>). Turning rotation on <strong>rotates immediately</strong> by default; with <code>--no-rotate-immediately</code>, only the testSecret step runs to validate the setup.</p>
+					<span class="file">Rotate the third-party API key on the 1st and 15th of each month at 04:00 UTC, within a 2-hour window (AWS CLI)</span>
+<pre><code>aws secretsmanager rotate-secret \
+  --secret-id prod/partner-api-key \
+  --rotation-lambda-arn arn:aws:lambda:us-east-1:111111111111:function:rotate-partner-key \
+  --rotation-rules '{"ScheduleExpression": "cron(0 4 1,15 * ? *)", "Duration": "2h"}'
+
+# The rotation function must allow Secrets Manager to invoke it
+aws lambda add-permission --function-name rotate-partner-key \
+  --statement-id SecretsManager --action lambda:InvokeFunction \
+  --principal secretsmanager.amazonaws.com --source-account 111111111111</code></pre>
+					<p>A rotation function in a VPC needs a route or a Secrets Manager VPC endpoint to call the API. Security Hub CSPM controls check that rotation is on (SecretsManager.1), succeeding (SecretsManager.2), recent (SecretsManager.4, 90 days by default), and that unused secrets are removed (SecretsManager.3).</p>
+				</div>
+
+				<h3>Getting secrets into applications</h3>
+				<div class="entry">
+					<h4>Retrieval patterns and their catches</h4>
+					<ul>
+						<li><strong>Caching:</strong> the <strong>AWS Workload Credentials Provider</strong> (formerly the Secrets Manager Agent) serves secrets on <code>localhost:2773</code> with a 5-minute cache and an SSRF token header, on EC2, ECS, EKS and Lambda; the Parameters and Secrets Lambda extension does the same for functions. Caches don't notice rotation; use the provider's <code>refreshNow</code> option or handle authentication failures by fetching again.</li>
+						<li><strong>ECS:</strong> the <code>secrets</code> section of a task definition injects values at container start using the <strong>task execution role</strong>; running tasks keep the old value after rotation until they're replaced.</li>
+						<li><strong>EKS:</strong> the Secrets Store CSI Driver with the AWS provider mounts secrets as files, authenticated with Pod Identity or IRSA.</li>
+						<li><strong>CloudFormation:</strong> <code>{{resolve:secretsmanager:prod/db:SecretString:password}}</code> resolves at deployment, and isn't re-read when only the secret changes.</li>
+					</ul>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>Secrets Manager</th><th>Parameter Store SecureString</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="2">Rotation</th></tr>
+							<tr><td data-label="Secrets Manager">Built in: managed or Lambda</td><td data-label="Parameter Store SecureString">None; build it yourself</td></tr>
+							<tr class="group"><th colspan="2">Size and cost</th></tr>
+							<tr><td data-label="Secrets Manager">64 KB; $0.40 per secret per month plus API calls</td><td data-label="Parameter Store SecureString">4 KB standard (free) or 8 KB advanced ($0.05 per parameter per month)</td></tr>
+							<tr class="group"><th colspan="2">Across Regions and accounts</th></tr>
+							<tr><td data-label="Secrets Manager">Replica secrets in other Regions; resource policies for other accounts</td><td data-label="Parameter Store SecureString">Advanced tier only, shared through RAM, with a customer managed key</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="entry">
+					<h4>Replication, deletion and other credentials</h4>
+					<p><strong>Replica secrets</strong> copy a secret to other Regions (each can use a key in its Region); rotation happens in the primary and propagates. For disaster recovery, promote a replica with <code>stop-replication-to-replica</code> from the replica's Region. A deleted secret waits 7 to 30 days (default 30) before it's gone, and a primary with replicas can't be deleted until they're removed. Beyond Secrets Manager: rotate IAM user access keys (create the second key, switch, deactivate, delete; the <code>access-keys-rotated</code> Config rule flags keys older than 90 days), and prefer <strong>RDS IAM database authentication</strong> (15-minute tokens, MySQL, MariaDB and PostgreSQL) where an application can use it instead of a stored password.</p>
+				</div>
+				<div class="callout trap"><p>"Rotation broke the application" usually means the app cached the password (ECS environment variable, CloudFormation reference, agent cache) or the single user strategy was used for a workload that can't retry. The fixes are re-fetching on authentication failure, replacing tasks after rotation, or the <strong>alternating users</strong> strategy.</p></div>
+			</div>
+
+			<!-- Skill 5.3.2 -->
+			<h2 id="s2">Imported key material and external key stores</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3.2</span><span class="skill-text">Manage and use imported key material (for example, by managing and rotating imported key material, by managing and configuring external key stores).</span></p>
+
+				<h3>Bringing your own key material</h3>
+				<div class="entry">
+					<h4>The import</h4>
+					<p>A KMS key created with <code>--origin EXTERNAL</code> has no material and sits in <code>PendingImport</code>. You download a wrapping public key and import token (valid 24 hours), wrap your material with it, and import. Symmetric, asymmetric (except ML-DSA and ML-KEM) and HMAC keys can be imported, but not into custom key stores.</p>
+					<span class="file">Create the key, get import parameters, import material that expires in a year (AWS CLI)</span>
+<pre><code>aws kms create-key --origin EXTERNAL --description "Customer data key, material from corporate HSM"
+
+aws kms get-parameters-for-import --key-id 1234abcd-12ab-34cd-56ef-1234567890ab \
+  --wrapping-algorithm RSAES_OAEP_SHA_256 --wrapping-key-spec RSA_4096
+
+# Wrap the material with the downloaded public key in your HSM, then:
+aws kms import-key-material --key-id 1234abcd-12ab-34cd-56ef-1234567890ab \
+  --encrypted-key-material fileb://EncryptedKeyMaterial.bin \
+  --import-token fileb://ImportToken.bin \
+  --expiration-model KEY_MATERIAL_EXPIRES \
+  --valid-to 2027-11-01T00:00:00Z</code></pre>
+					<ul>
+						<li><strong>Wrapping:</strong> RSA_4096 is the recommended wrapping key; RSA private keys must be wrapped with <code>RSA_AES_KEY_WRAP_SHA_256</code>; PKCS #1 v1.5 wrapping is no longer supported.</li>
+						<li><strong>Expiry:</strong> the default expiration model is <code>KEY_MATERIAL_EXPIRES</code>, at most 365 days ahead. When it expires, KMS deletes the material and the key returns to <code>PendingImport</code>; re-import the same material to use it again. Alarm on approaching expiry.</li>
+						<li><strong>Deleting material:</strong> <code>delete-imported-key-material</code> takes effect immediately and is reversible by re-importing, a fast kill switch that scheduled key deletion (7 to 30 days, irreversible) isn't. Without <code>--key-material-id</code> it deletes the current material.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Rotating imported material</h4>
+					<p>Imported keys still can't rotate automatically, but symmetric ones can now rotate <strong>on demand</strong>: import new material as <code>NEW_KEY_MATERIAL</code> (it waits as <code>PENDING_ROTATION</code>), then rotate. Old material stays associated so existing ciphertext still decrypts, which also means you must keep every version: if any of the key's material is lost, the key becomes unusable.</p>
+					<span class="file">Rotate to new imported material (AWS CLI)</span>
+<pre><code>aws kms import-key-material --key-id 1234abcd-12ab-34cd-56ef-1234567890ab \
+  --encrypted-key-material fileb://NewEncryptedKeyMaterial.bin \
+  --import-token fileb://NewImportToken.bin \
+  --expiration-model KEY_MATERIAL_DOES_NOT_EXPIRE \
+  --import-type NEW_KEY_MATERIAL \
+  --key-material-description "2026 Q4 rotation"
+
+aws kms rotate-key-on-demand --key-id 1234abcd-12ab-34cd-56ef-1234567890ab</code></pre>
+					<p>For a <strong>multi-Region</strong> imported key, import the new material into the primary, import the same material into each replica (as <code>EXISTING_KEY_MATERIAL</code>; until then the state is <code>PENDING_MULTI_REGION_IMPORT_AND_ROTATION</code>), then rotate on the primary. Replicas of imported keys start in <code>PendingImport</code> because you must import the same material into each one.</p>
+				</div>
+
+				<h3>External key stores</h3>
+				<div class="entry">
+					<h4>Key material that never enters AWS</h4>
+					<p>An <strong>external key store</strong> (XKS) backs KMS keys with keys in your own key manager outside AWS. KMS sends requests to an <strong>XKS proxy</strong> you run (built to AWS's open specification), reached over a public endpoint or, better, a <strong>VPC endpoint service</strong> (a PrivateLink service in front of an NLB in at least two AZs). KMS authenticates to the proxy with a SigV4 <strong>proxy authentication credential</strong> you create (not IAM keys), and data is <strong>double encrypted</strong>: first with KMS material for that key, then by your external key, so neither side can decrypt alone.</p>
+					<span class="file">Create an external key store reached through PrivateLink, then a key in it (AWS CLI)</span>
+<pre><code>aws kms create-custom-key-store \
+  --custom-key-store-name market-x-xks \
+  --custom-key-store-type EXTERNAL_KEY_STORE \
+  --xks-proxy-connectivity VPC_ENDPOINT_SERVICE \
+  --xks-proxy-vpc-endpoint-service-name com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0 \
+  --xks-proxy-uri-endpoint https://xks.internal.example.com \
+  --xks-proxy-uri-path /kms/xks/v1 \
+  --xks-proxy-authentication-credential AccessKeyId=EXAMPLEXKSACCESSID,RawSecretAccessKey=EXAMPLEXKSSECRET
+
+aws kms connect-custom-key-store --custom-key-store-id cks-1234567890abcdef0
+aws kms create-key --origin EXTERNAL_KEY_STORE --custom-key-store-id cks-1234567890abcdef0 --xks-key-id bb8562717f809024</code></pre>
+					<p>The trade-offs are significant: <strong>you</strong> own availability, latency and durability (no SLA; requests time out at 250 ms; 1,800 requests per second per store, not adjustable), and keys are symmetric only, with no automatic rotation, multi-Region or imported material. Revoking access at the external manager "crypto-shreds" everything encrypted under those keys. AWS says external key stores are not recommended unless there's an explicit requirement to keep material outside AWS, and to prefer a CloudHSM key store if a custom key store is needed. Suitable only for low-volume uses such as EBS and RDS encryption.</p>
+				</div>
+				<div class="callout tip"><p>"Material must be generated in our HSM, but we want normal KMS integrations and availability" points to <strong>imported key material</strong>. "Material must never leave our premises, and we must be able to cut AWS off" points to an <strong>external key store</strong>. "Single-tenant HSM in AWS behind KMS" points to a <strong>CloudHSM key store</strong>.</p></div>
+			</div>
+
+			<!-- Skill 5.3.3 -->
+			<h2 id="s3">Imported versus AWS-generated key material</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3.3</span><span class="skill-text">Describe the differences between imported key material and AWS generated key material.</span></p>
+				<p>A key's <strong>origin</strong> is fixed at creation: <code>AWS_KMS</code> (generated by KMS), <code>EXTERNAL</code> (imported), <code>AWS_CLOUDHSM</code> (CloudHSM key store) or <code>EXTERNAL_KEY_STORE</code>. The condition key <code>kms:KeyOrigin</code> can restrict which origins people may create.</p>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>AWS-generated (AWS_KMS)</th><th>Imported (EXTERNAL)</th><th>External key store</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Who generates and holds the material</th></tr>
+							<tr><td data-label="AWS-generated (AWS_KMS)">KMS, in its HSMs</td><td data-label="Imported (EXTERNAL)">You generate it; KMS holds a copy in its HSMs</td><td data-label="External key store">Your key manager outside AWS (plus a KMS layer)</td></tr>
+							<tr class="group"><th colspan="3">Rotation</th></tr>
+							<tr><td data-label="AWS-generated (AWS_KMS)">Automatic every 90 to 2,560 days (default 365) and on demand, up to 25 times</td><td data-label="Imported (EXTERNAL)">On demand only, after importing new material</td><td data-label="External key store">In your external manager; no KMS rotation</td></tr>
+							<tr class="group"><th colspan="3">Expiry and fast revocation</th></tr>
+							<tr><td data-label="AWS-generated (AWS_KMS)">No expiry; disable the key</td><td data-label="Imported (EXTERNAL)">Optional expiry; delete material instantly and re-import later</td><td data-label="External key store">Disconnect the store or disable the external key</td></tr>
+							<tr class="group"><th colspan="3">Durability and availability</th></tr>
+							<tr><td data-label="AWS-generated (AWS_KMS)">AWS keeps durable copies; 99.999% SLA</td><td data-label="Imported (EXTERNAL)">You must keep the original copy; same 99.999% SLA</td><td data-label="External key store">Entirely yours; no SLA</td></tr>
+							<tr class="group"><th colspan="3">Key types and multi-Region</th></tr>
+							<tr><td data-label="AWS-generated (AWS_KMS)">All types; multi-Region, copied by KMS</td><td data-label="Imported (EXTERNAL)">Symmetric, asymmetric (not ML-DSA or ML-KEM), HMAC; multi-Region, you import into each Region</td><td data-label="External key store">Symmetric only; single-Region</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<div class="callout trap"><p>A deleted symmetric KMS key <strong>can't be recreated</strong>, even if you still hold the imported material: KMS binds unique metadata into every ciphertext. Asymmetric and HMAC material can be imported into a new key, but it gets a new key ID, policy and aliases. Deleting imported material is reversible; deleting the key isn't.</p></div>
+			</div>
+
+			<!-- Skill 5.3.4 -->
+			<h2 id="s4">Masking sensitive data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3.4</span><span class="skill-text">Mask sensitive data (for example, CloudWatch Logs data protection policies, Amazon SNS message data protection).</span></p>
+
+				<h3>Masking in logs and messages</h3>
+				<div class="entry">
+					<h4>CloudWatch Logs data protection</h4>
+					<p>A data protection policy on a log group or the account masks managed and custom data identifiers as data is ingested, everywhere it's read; only principals with <code>logs:Unmask</code> see the original. The policy shape and limits are in <a href="d1-task-1-2.html#s2">Task 1.2</a>. It works in the Standard and Essentials log classes and applies only to data ingested after it's set.</p>
+				</div>
+				<div class="entry">
+					<h4>SNS message data protection, and its replacement</h4>
+					<p>SNS message data protection let a topic policy audit, mask, redact or deny messages containing sensitive data, inbound (on publish) or outbound (on delivery). It's <strong>closed to new customers</strong> since 30 April 2026 (existing users keep it, with security fixes only), so recognize the shape but design new masking with AWS's recommended pattern: publish to an intake topic, have a Lambda function check and redact content with <strong>Bedrock Guardrails</strong> sensitive information filters (<a href="d3-task-3-2.html#s7">Task 3.2</a>), and publish the clean message to the delivery topic.</p>
+					<span class="file">The existing-customer shape: mask card numbers for subscribers, block publishes carrying AWS secret keys (SNS data protection policy, JSON)</span>
+<pre><code>{
+  "Name": "orders-topic-protection",
+  "Version": "2021-06-01",
+  "Statement": [
+    {
+      "Sid": "MaskCardsOnDelivery",
+      "DataDirection": "Outbound",
+      "Principal": ["*"],
+      "DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/CreditCardNumber"],
+      "Operation": { "Deidentify": { "MaskConfig": { "MaskWithCharacter": "#" } } }
+    },
+    {
+      "Sid": "DenySecretsOnPublish",
+      "DataDirection": "Inbound",
+      "Principal": ["*"],
+      "DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/AwsSecretKey"],
+      "Operation": { "Deny": {} }
+    }
+  ]
+}</code></pre>
+				</div>
+
+				<h3>Masking data sets</h3>
+				<div class="entry">
+					<h4>Analytics and data lakes</h4>
+					<ul>
+						<li><strong>AWS Glue sensitive data detection</strong> scans columns or cells in ETL jobs and can redact, partially redact or replace values with a SHA-256 hash before data lands in the lake.</li>
+						<li><strong>Lake Formation data filters</strong> hide columns and rows (together, individual cells) from users querying through Athena and other engines, without copying data.</li>
+						<li><strong>Amazon Comprehend</strong> detects and redacts PII in text, for example support tickets.</li>
+						<li><strong>Amazon Macie</strong> finds sensitive data in S3 but doesn't mask it; use it to decide what the masking must cover.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"Developers need the application logs, but not the customers' emails in them" points to a <strong>CloudWatch Logs data protection policy</strong>. "Analysts may query the table but not see card numbers" points to <strong>Lake Formation data filters</strong> or Glue redaction. "Mask PII in messages for a new SNS design" points to <strong>Lambda with Bedrock Guardrails</strong>, not message data protection.</p></div>
+			</div>
+
+			<!-- Skill 5.3.5 -->
+			<h2 id="s5">Keys and certificates across Regions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3.5</span><span class="skill-text">Create and manage encryption keys and certificates across a single AWS Region or multiple Regions (for example, AWS KMS customer managed AWS KMS keys, AWS Private Certificate Authority).</span></p>
+
+				<h3>KMS keys in one or many Regions</h3>
+				<div class="entry">
+					<h4>Single-Region or multi-Region keys</h4>
+					<p>AWS's advice is that single-Region keys fit most needs: one key per Region, data re-encrypted when it moves. A <strong>multi-Region key</strong> (ID starting <code>mrk-</code>) shares its key ID and material with replicas in other Regions, so ciphertext from one Region decrypts in another without a cross-Region call. That suits client-side encryption of data replicated between Regions (DynamoDB global tables, S3 objects encrypted by the application) and disaster recovery. Most AWS services still treat it as a Regional key.</p>
+					<ul>
+						<li><strong>Shared</strong> (from the primary): key ID, material, key spec and usage, origin, rotation. <strong>Independent</strong>: key policy, grants, aliases, tags, description, enabled state. A replica created without a policy gets the default key policy, not a copy of the primary's.</li>
+						<li>You can't convert a single-Region key to multi-Region or back. Rotation is configured on the primary only. Each primary and replica is billed as a key.</li>
+					</ul>
+					<span class="file">Replicate the client-side encryption key to the DR Region, and move the primary there if needed (AWS CLI)</span>
+<pre><code>aws kms replicate-key \
+  --key-id arn:aws:kms:us-east-1:111111111111:key/mrk-1234abcd12ab34cd56ef1234567890ab \
+  --replica-region us-west-2 \
+  --policy file://dr-key-policy.json
+
+aws kms update-primary-region \
+  --key-id arn:aws:kms:us-east-1:111111111111:key/mrk-1234abcd12ab34cd56ef1234567890ab \
+  --primary-region us-west-2</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Rotation, policies and deletion</h4>
+					<p>Automatic rotation (<code>enable-key-rotation --rotation-period-in-days 180</code>, anywhere from 90 to 2,560 days) and on-demand rotation (<code>rotate-key-on-demand</code>, up to 25 times per key) create new material and keep the old for decryption; they don't re-encrypt data, and they don't help if a data key was exposed. Asymmetric, HMAC and custom key store keys rotate only by creating a new key and moving the alias.</p>
+					<p>Separate <strong>key administrators</strong> (manage the key, can't use it) from <strong>key users</strong> (use it, can't manage it); note that the console's default administrator permissions include <code>ScheduleKeyDeletion</code> unless you untick it. Deletion waits 7 to 30 days in <code>PendingDeletion</code>; during that time, an alarm on attempts to use the key (from CloudTrail) catches anything still depending on it, and disabling the key first is the safer test. A common guardrail is an SCP that denies scheduling deletion except for a break-glass role:</p>
+					<span class="file">Only the key custodian role can schedule key deletion, anywhere in the organization (SCP statement, JSON)</span>
+<pre><code>{
+  "Sid": "ProtectKmsKeysFromDeletion",
+  "Effect": "Deny",
+  "Action": ["kms:ScheduleKeyDeletion", "kms:DeleteImportedKeyMaterial"],
+  "Resource": "*",
+  "Condition": {
+    "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/key-custodian" }
+  }
+}</code></pre>
+					<p>Security Hub CSPM controls KMS.3 (keys not scheduled for deletion, Critical), KMS.4 (rotation enabled) and KMS.5 (no public key policy) watch for mistakes. The newer <code>GetKeyLastUsage</code> API shows when a key was last used, but AWS advises disabling the key and watching CloudTrail before deleting rather than relying on it alone.</p>
+				</div>
+
+				<h3>AWS Private CA</h3>
+				<div class="entry">
+					<h4>Internal certificates</h4>
+					<p><strong>AWS Private CA</strong> runs private root and subordinate CAs whose keys are held in HSMs (FIPS 140-2 Level 3 by default), with RSA, ECDSA and, since November 2025, ML-DSA keys. Two modes:</p>
+					<ul>
+						<li><strong>General purpose</strong> ($400 per CA per month): certificates of any validity, usually with revocation.</li>
+						<li><strong>Short-lived certificate</strong> ($50 per CA per month): certificates valid at most 7 days, where expiry replaces revocation. A short-lived CA must be the last CA in its chain, and ACM can't issue from it.</li>
+					</ul>
+					<p>Best practice is a root CA used only to sign subordinate CAs, and subordinates (one per Region or purpose) that issue certificates; <strong>templates</strong> such as <code>SubordinateCACertificate_PathLen0/V1</code> limit what each can sign. CAs are Regional and can be shared with other accounts through <strong>AWS RAM</strong>.</p>
+				</div>
+				<div class="entry">
+					<h4>Revocation and issuance</h4>
+					<p>CRLs and OCSP are both <strong>off by default</strong>. CRLs are written to an S3 bucket (with Block Public Access on, set the object ACL to <code>BUCKET_OWNER_FULL_CONTROL</code> and serve it through a custom CNAME), and partitioned CRLs allow far more certificates per CA. Certificates come two ways:</p>
+					<ul>
+						<li><strong>Through ACM</strong> (<code>aws acm request-certificate --certificate-authority-arn ...</code>): managed private certificates that attach to load balancers and other integrated services and renew automatically.</li>
+						<li><strong>With <code>IssueCertificate</code></strong> from your own CSR: unmanaged certificates, not visible in or renewed by ACM; you track expiry.</li>
+					</ul>
+					<span class="file">Issue a one-year certificate for an internal service from a CSR (AWS CLI)</span>
+<pre><code>aws acm-pca issue-certificate \
+  --certificate-authority-arn arn:aws:acm-pca:us-east-1:111111111111:certificate-authority/11223344-1234-1122-2233-112233445566 \
+  --csr fileb://orders-api.csr \
+  --signing-algorithm SHA256WITHRSA \
+  --template-arn arn:aws:acm-pca:::template/EndEntityServerAuthCertificate/V1 \
+  --validity Value=365,Type=DAYS</code></pre>
+				</div>
+
+				<h3>Certificates across Regions</h3>
+				<div class="entry">
+					<h4>ACM is Regional</h4>
+					<p>ACM certificates exist in one Region and renew independently in each; a certificate for CloudFront must be in <strong>us-east-1</strong>. Imported certificates are never renewed by ACM. Watch expiry with the <code>DaysToExpiry</code> CloudWatch metric, the Config rule <code>acm-certificate-expiration-check</code> (Security Hub CSPM ACM.1) and the ACM EventBridge event, which starts 30 days ahead for public certificates and 45 for private and imported ones:</p>
+					<span class="file">Alert on certificates nearing expiry in every account (EventBridge event pattern)</span>
+<pre><code>{
+  "source": ["aws.acm"],
+  "detail-type": ["ACM Certificate Approaching Expiration"]
+}</code></pre>
+				</div>
+				<div class="callout trap"><p>A private certificate issued with <code>IssueCertificate</code> doesn't renew, and an ACM private certificate in an account using a <strong>shared</strong> CA renews only if that account still has ACM's service-linked role and permission on the CA. Expired internal certificates are a common outage; issue through ACM where the service supports it, or use short-lived certificates with automated reissue.</p></div>
+				<div class="callout tip"><p>"Decrypt in us-west-2 data that the application encrypted in us-east-1, without calling us-east-1" points to a <strong>multi-Region key</strong>. "Internal TLS certificates that renew themselves on load balancers" points to <strong>ACM private certificates from Private CA</strong>. "Certificates for containers that live a few days" points to <strong>short-lived certificate mode</strong>.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Secrets Manager rotation: managed (RDS, Aurora, DocumentDB, Redshift, external SaaS secrets) or Lambda; createSecret, setSecret, testSecret, finishSecret with AWSPENDING, AWSCURRENT, AWSPREVIOUS; single user or alternating users (needs superuser secret, not with RDS Proxy); every 4 hours at most often; rotates immediately when turned on.</li>
+				<li>RDS-managed master passwords rotate every 7 days; caches, ECS environment variables and CloudFormation references don't pick up rotation by themselves. Parameter Store has no rotation and 4 or 8 KB limits; replica secrets for other Regions; 7 to 30 day deletion window.</li>
+				<li>Imported material: <code>--origin EXTERNAL</code>, 24-hour import token, RSA_4096 wrapping, expiry up to 365 days (default expires), instant reversible deletion, on-demand rotation with <code>NEW_KEY_MATERIAL</code>, you keep every version; multi-Region imports into each replica.</li>
+				<li>External key stores: XKS proxy over PrivateLink, SigV4 proxy credential, double encryption, no SLA, 250 ms and 1,800 requests per second, symmetric single-Region only; not recommended unless required.</li>
+				<li>Origins differ in rotation (automatic 90 to 2,560 days only for AWS_KMS), expiry, durability (you for imported) and SLA (none for custom key stores). Deleted symmetric keys can never be recreated.</li>
+				<li>Masking: CloudWatch Logs data protection with <code>logs:Unmask</code>; SNS message data protection closed to new customers (use Lambda and Bedrock Guardrails); Glue redaction and hashing, Lake Formation filters, Comprehend; Macie finds but doesn't mask.</li>
+				<li>Multi-Region keys share material and ID but not policies; can't convert; rotation on the primary. Separate key admins from users, deny deletion by SCP, watch KMS.3 to KMS.5.</li>
+				<li>Private CA: general purpose or short-lived (7 days, last in chain, not via ACM), root and subordinates with path-length templates, CRL and OCSP off by default, RAM sharing; ACM-managed private certificates renew, <code>IssueCertificate</code> ones don't; ACM is Regional, CloudFront certificates in us-east-1.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-2.html"><small>Previous</small>Task 5.2: Data at rest</a>
+				<a class="next" href="d6-task-6-1.html"><small>Next</small>Task 6.1: Account strategy</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
