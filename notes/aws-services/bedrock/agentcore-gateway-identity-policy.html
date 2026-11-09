@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>AgentCore Gateway, Identity and Policy | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock AgentCore Gateway, Identity and Policy: MCP, HTTP and inference targets, tool naming, inbound and outbound auth, creating a gateway and Lambda target with boto3, calling it from Strands, semantic search, sessions, rate limits and interceptors, workload identities, credential providers, OAuth flows and SDK decorators, Cedar and Dogwood policies with enforce and log-only modes, AWS Agent Registry, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Gateway, Identity and Policy</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; AgentCore &middot; Last checked 9 November 2026</span>
+		<h1>Gateway, Identity and Policy</h1>
+		<p>How agents reach tools safely: Gateway turns your APIs, Lambda functions and MCP servers into one governed MCP endpoint; Identity authenticates users and holds the OAuth tokens and API keys agents use downstream; Policy decides, outside the agent's code, which tool calls are allowed.</p>
+		<div class="tags"><span class="tag code">AgentCore Gateway</span><span class="tag">AgentCore Identity</span><span class="tag">AgentCore Policy</span><span class="tag">MCP</span><span class="tag">OAuth</span><span class="tag">Cedar</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">How the three fit together</a></li>
+				<li><a href="#s2">Gateway concepts</a></li>
+				<li><a href="#s3">Creating a gateway and a target</a></li>
+				<li><a href="#s4">Calling a gateway</a></li>
+				<li><a href="#s5">Gateway features</a></li>
+				<li><a href="#s6">Running a gateway</a></li>
+				<li><a href="#s7">AgentCore Identity</a></li>
+				<li><a href="#s8">AgentCore Policy</a></li>
+				<li><a href="#s9">AWS Agent Registry</a></li>
+				<li><a href="#s10">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">How the three fit together</h2>
+			<ol class="flow">
+				<li><b>Inbound</b>A user signs in to your app; the agent (on <a href="agentcore-runtime.html">Runtime</a>, the <a href="agentcore.html">Harness</a> or anywhere) calls the gateway with the user's JWT or with IAM credentials. The gateway's authorizer checks it.</li>
+				<li><b>Discover</b>The agent lists tools (or searches them) through one MCP endpoint that combines every target.</li>
+				<li><b>Authorize</b>For each tool call, the Policy engine attached to the gateway evaluates the caller, the tool and its arguments, and denies unless a policy permits.</li>
+				<li><b>Outbound</b>The gateway calls the target with its IAM role, or with an OAuth token or API key that Identity fetches from its token vault for this user.</li>
+				<li><b>Record</b>Metrics, logs, traces and CloudTrail data events show what happened.</li>
+			</ol>
+
+			<h2 id="s2">Gateway concepts</h2>
+			<div class="entry">
+				<h4>Three kinds of target</h4>
+				<ul>
+					<li><strong>MCP targets</strong> are combined into one virtual MCP server with a single tool list: <strong>Lambda</strong> functions (you supply tool schemas), <strong>OpenAPI</strong> 3.0 or 3.1 specs (each <code>operationId</code> becomes a tool), <strong>Smithy</strong> models, <strong>API Gateway REST API stages</strong> (same account and Region), remote <strong>MCP servers</strong> (tools, prompts and resources are synchronized), and built-in <strong>connectors</strong>: Managed Knowledge Bases, Web Search, Web Answer (us-east-1 only) and Step Functions.</li>
+					<li><strong>HTTP targets</strong> pass requests through unchanged, routed by path (<code>/TARGET/...</code>): an AgentCore Runtime agent, an A2A agent, an external MCP server or any HTTPS endpoint. No tool aggregation or search.</li>
+					<li><strong>Inference targets</strong> make the gateway an LLM proxy at <code>/inference</code>, routing by model to Bedrock, OpenAI, Anthropic or compatible providers, with model fallback (October 2026). Callers then need only <code>bedrock-agentcore:InvokeGateway</code>, not Bedrock permissions.</li>
+				</ul>
+				<p>Tools are named <code>TARGET___TOOL</code> with <strong>three underscores</strong> (for example <code>Orders___get_order</code>). Your Lambda receives the full name and must strip the prefix, and policies use the full name.</p>
+			</div>
+			<div class="entry">
+				<h4>Inbound and outbound auth</h4>
+				<ul>
+					<li><strong>Inbound</strong> (<code>authorizerType</code>): <code>CUSTOM_JWT</code> (tokens from your IdP, configured like Runtime's JWT authorizer), <code>AWS_IAM</code> (SigV4), <code>AUTHENTICATE_ONLY</code> (checks the SigV4 signature but authorizes nothing) or <code>NONE</code> (development only).</li>
+					<li><strong>Outbound</strong> (one <code>credentialProviderConfigurations</code> entry per target): <code>GATEWAY_IAM_ROLE</code> (the gateway's role; the only option for Lambda and connectors), <code>OAUTH</code> (client credentials, authorization code for user consent, or token exchange), <code>API_KEY</code> (header or query parameter), <code>CALLER_IAM_CREDENTIALS</code> (forward the caller's IAM identity) and <code>JWT_PASSTHROUGH</code> (HTTP targets).</li>
+				</ul>
+			</div>
+			<div class="callout trap"><p>The gateway's IAM role is shared by every target that uses <code>GATEWAY_IAM_ROLE</code>, so it's the ceiling of what any caller can do through that gateway. Use separate gateways for separate trust boundaries. And <code>NONE</code> or <code>AUTHENTICATE_ONLY</code> gateways make no authorization decision: without a Policy engine, anyone who can reach them can call every tool.</p></div>
+
+			<h2 id="s3">Creating a gateway and a target</h2>
+			<span class="file">A JWT-protected MCP gateway with semantic search and a Lambda target (Python, boto3; field names from the API reference)</span>
+<pre><code>import time
+
+import boto3
+
+ctl = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+
+gw = ctl.create_gateway(
+    <span class="c"># Letters, digits and single hyphens, up to 48 characters</span>
+    name="orders-gateway",
+    roleArn="arn:aws:iam::111111111111:role/OrdersGatewayRole",
+    <span class="c"># MCP only; omit protocolType to allow HTTP targets too</span>
+    protocolType="MCP",
+    authorizerType="CUSTOM_JWT",
+    authorizerConfiguration={"customJWTAuthorizer": {
+        "discoveryUrl": "https://cognito-idp.us-west-2.amazonaws.com/USER_POOL_ID/.well-known/openid-configuration",
+        <span class="c"># Cognito access tokens have client_id but no aud</span>
+        "allowedClients": ["APP_CLIENT_ID"],
+    }},
+    protocolConfiguration={"mcp": {
+        "supportedVersions": ["2025-11-25"],
+        "searchType": "SEMANTIC",
+        "instructions": "Order tools for the support agent.",
+    }},
+)
+gateway_id, gateway_url = gw["gatewayId"], gw["gatewayUrl"]
+while ctl.get_gateway(gatewayIdentifier=gateway_id)["status"] != "READY":
+    time.sleep(5)
+
+ctl.create_gateway_target(
+    gatewayIdentifier=gateway_id,
+    <span class="c"># Tools become Orders___get_order</span>
+    name="Orders",
+    targetConfiguration={"mcp": {"lambda": {
+        "lambdaArn": "arn:aws:lambda:us-west-2:111111111111:function:orders-tools",
+        "toolSchema": {"inlinePayload": [{
+            "name": "get_order",
+            "description": "Look up one order by its ID",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"orderId": {"type": "string"}},
+                "required": ["orderId"],
+            },
+        }]},
+    }}},
+    <span class="c"># Exactly one entry; Lambda targets accept only the gateway role</span>
+    credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+)</code></pre>
+			<span class="file">The Lambda function behind the target (Python)</span>
+<pre><code>def lambda_handler(event, context):
+    <span class="c"># The event is the tool's arguments; the tool name arrives in the client context</span>
+    full_name = context.client_context.custom["bedrockAgentCoreToolName"]
+    tool = full_name.split("___", 1)[1]
+    if tool == "get_order":
+        return {"orderId": event["orderId"], "status": "SHIPPED"}
+    return {"error": f"unknown tool {tool}"}</code></pre>
+			<ul>
+				<li>The client context also carries the gateway ID, target ID, MCP message ID and request ID. The gateway role needs <code>lambda:InvokeFunction</code> on the function; its trust policy should add <code>aws:SourceAccount</code> and <code>aws:SourceArn</code> conditions for your gateway.</li>
+				<li>For an <strong>MCP server</strong> target use <code>{"mcp": {"mcpServer": {"endpoint": "https://..."}}}</code> with OAuth or an API key; tools are synchronized on create and update (or call <code>SynchronizeGatewayTargets</code>). For <strong>OpenAPI</strong>, pass the spec inline or from S3; only JSON bodies, no <code>oneOf</code>/<code>anyOf</code>/<code>allOf</code>, and the gateway blocks private IP addresses.</li>
+				<li><code>UpdateGateway</code> is a full replacement: resend the name, role, authorizer type and configuration. While developing, <code>exceptionLevel="DEBUG"</code> returns detailed errors.</li>
+			</ul>
+
+			<h2 id="s4">Calling a gateway</h2>
+			<p>The MCP endpoint is the <code>gatewayUrl</code>: <code>https://GATEWAY_ID.gateway.bedrock-agentcore.REGION.amazonaws.com/mcp</code> (DNS can take a minute after creation). Clients send <code>Accept: application/json, text/event-stream</code> and, for JWT gateways, a bearer token.</p>
+			<span class="file">A Strands agent using the gateway's tools (Python; tool listing is paginated)</span>
+<pre><code>from mcp.client.streamable_http import streamablehttp_client
+from strands import Agent
+from strands.models import BedrockModel
+from strands.tools.mcp.mcp_client import MCPClient
+
+GATEWAY_URL = "https://GATEWAY_ID.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp"
+TOKEN = get_user_access_token()
+
+mcp = MCPClient(lambda: streamablehttp_client(GATEWAY_URL, headers={"Authorization": f"Bearer {TOKEN}"}))
+with mcp:
+    tools, page = [], None
+    while True:
+        batch = mcp.list_tools_sync(pagination_token=page)
+        tools.extend(batch)
+        page = batch.pagination_token
+        if page is None:
+            break
+    agent = Agent(model=BedrockModel(model_id="global.anthropic.claude-sonnet-5-5"), tools=tools)
+    agent("Where is order 12345?")</code></pre>
+			<ul>
+				<li><strong>IAM gateways:</strong> swap the transport for SigV4 signing from the <code>mcp-proxy-for-aws</code> package: <code>aws_iam_streamablehttp_client(endpoint=GATEWAY_URL, aws_region="us-west-2", aws_service="bedrock-agentcore")</code>. The caller needs <code>bedrock-agentcore:InvokeGateway</code>.</li>
+				<li>The Harness uses a gateway as an <code>agentcore_gateway</code> tool; LangGraph, Claude Code and other MCP clients connect the same way, and the Bedrock Responses API can run gateway tools server-side.</li>
+				<li>Unauthorized JWT calls get 401 with a <code>WWW-Authenticate</code> header pointing to the protected-resource metadata, so OAuth-aware clients can discover how to sign in.</li>
+			</ul>
+
+			<h2 id="s5">Gateway features</h2>
+			<ul>
+				<li><strong>Semantic tool search</strong> (<code>searchType: SEMANTIC</code>): adds a built-in tool, <code>x_amz_bedrock_agentcore_search</code>, listed first, that takes <code>{"query": "..."}</code> and returns only matching tools. Agents with hundreds of tools then send far fewer tool definitions to the model. Searches cost extra and are limited to 25 per minute.</li>
+				<li><strong>MCP versions:</strong> 2025-03-26, 2025-06-18, 2025-11-25 and 2026-07-28; the gateway accepts only those in <code>supportedVersions</code>. 2026-07-28 is stateless: every request carries <code>Mcp-Method</code> and <code>Mcp-Name</code> headers and <code>_meta</code> fields, and user prompts (elicitation) and sampling become multi-round-trip requests.</li>
+				<li><strong>Sessions and streaming</strong> (May 2026, for earlier MCP versions): sessions last 15 minutes to 8 hours from the first initialize (default 1 hour) and are bound to the caller; streaming (<code>enableResponseStreaming</code>, and the client must send <code>Accept: text/event-stream</code>) passes progress, log, elicitation and sampling messages through. <strong>MCP Tasks</strong> (October 2026, 2026-07-28 only) handle tools that run longer than the 15-minute call limit.</li>
+				<li><strong>Rate limits</strong> (August 2026): per tool, target, model, JWT claim or IAM principal, up to 50 per gateway; they fail open, so they're for fairness and cost, not security. <strong>Gateway rules</strong> split traffic two ways for A/B tests and route requests.</li>
+				<li><strong>Interceptors:</strong> up to one request and one response Lambda that can inspect or rewrite traffic (headers only if <code>passRequestHeaders</code> is true). They can be retried, so make them idempotent.</li>
+				<li>Also: customer managed KMS keys, AWS WAF web ACLs, VPC egress to private targets through VPC Lattice, private certificate authorities for targets, and custom domains through CloudFront.</li>
+			</ul>
+
+			<h2 id="s6">Running a gateway</h2>
+			<ul>
+				<li><strong>Quotas:</strong> 1,000 gateways per account, 100 targets per gateway, 1,000 tools per target, 200 tool calls or lists per second per gateway and per account, 5,000 concurrent connections, 6 MB payloads, 15-minute calls; inline schemas up to 1 MB, S3 schemas 10 MB.</li>
+				<li><strong>Pricing:</strong> $0.005 per 1,000 calls (list, call, ping), $0.025 per 1,000 searches, $0.02 per 100 tools indexed per month, $0.006 per GB of VPC egress; Web Search $7 and Web Answer $10 per 1,000.</li>
+				<li><strong>Observability:</strong> metrics in <code>AWS/Bedrock-AgentCore</code> (invocations, throttles, errors, latency, target time); application logs need a log delivery you create (default group under <code>/aws/vendedlogs/bedrock-agentcore/gateway/</code>). Policy decisions aren't in those logs: a denied call leaves no request record there, so enable gateway tracing.</li>
+				<li><strong>CloudTrail:</strong> <code>InvokeGateway</code> is a data event (<code>AWS::BedrockAgentCore::Gateway</code>), off by default. It records the JWT's claims, including <code>sub</code>, so keep personal data out of <code>sub</code>.</li>
+				<li><strong>Access control:</strong> resource-based policies (<code>bedrock-agentcore:InvokeGateway</code>, exact ARN; JWT gateways need <code>Principal: "*"</code> with conditions such as <code>aws:SourceVpce</code>), PrivateLink (<code>com.amazonaws.REGION.bedrock-agentcore.gateway</code>), and SCP condition keys such as <code>bedrock-agentcore:GatewayAuthorizerType</code> to forbid <code>NONE</code> gateways.</li>
+			</ul>
+
+			<h2 id="s7">AgentCore Identity</h2>
+			<div class="entry">
+				<h4>The model</h4>
+				<ul>
+					<li><strong>Workload identities</strong> represent agents. Runtime and Gateway create one automatically; for agents hosted elsewhere, call <code>CreateWorkloadIdentity</code>. They live in one directory per account and Region.</li>
+					<li>The <strong>token vault</strong> stores OAuth access and refresh tokens and API keys, bound to the workload identity <strong>and</strong> the user, encrypted with an AWS-owned or customer managed KMS key.</li>
+					<li><strong>Credential providers</strong> describe how to get credentials: OAuth2 providers (25 built-in vendors such as Google, GitHub, Slack, Salesforce, Microsoft, Atlassian, Okta, Auth0 and Cognito, or <code>CustomOauth2</code>), API key providers, and payment providers.</li>
+					<li>A <strong>workload access token</strong> is the AWS-signed token an agent presents to Identity. When a user calls with a JWT, Runtime and Gateway validate it and exchange it for a workload access token tied to that user (<code>GetWorkloadAccessTokenForJWT</code>), and your code receives it automatically.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Creating a credential provider</h4>
+				<span class="file">Register Google as an OAuth provider (AWS CLI)</span>
+<pre><code>aws bedrock-agentcore-control create-oauth2-credential-provider \
+  --name google-provider \
+  --credential-provider-vendor GoogleOauth2 \
+  --oauth2-provider-config-input '{"googleOauth2ProviderConfig": {"clientId": "CLIENT_ID", "clientSecret": "CLIENT_SECRET"}}'</code></pre>
+				<p>The response includes a <code>callbackUrl</code>: register it as the redirect URI in your Google OAuth app. To keep the client secret out of shell history and in a secret you manage, pass <code>"clientSecretSource": "EXTERNAL"</code> with <code>"clientSecretConfig": {"secretId": ..., "jsonKey": ...}</code> instead (June 2026). Custom providers also support private-key JWT client authentication with a key held in KMS. API keys use <code>create-api-key-credential-provider</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>The flows</h4>
+				<ul>
+					<li><strong>Machine to machine</strong> (<code>M2M</code>, OAuth client credentials): the agent acts as itself.</li>
+					<li><strong>User federation</strong> (<code>USER_FEDERATION</code>, three-legged OAuth): the first call returns an <code>authorizationUrl</code>; the user consents; the provider redirects to AgentCore and then to your return URL; your app confirms the user and calls <code>CompleteResourceTokenAuth</code> within 10 minutes; later calls get the stored token. The return URL must be listed in the workload identity's <code>allowedResourceOauth2ReturnUrls</code>.</li>
+					<li><strong>On-behalf-of token exchange</strong> (<code>ON_BEHALF_OF_TOKEN_EXCHANGE</code>, April 2026): exchanges the user's inbound token for a downstream token (RFC 8693, or the JWT authorization grant used by Microsoft), with no consent screen. AWS recommends it over passing the user's JWT through.</li>
+					<li>The <strong>consent portal</strong> (September 2026) is an AWS-hosted page per gateway where users connect their accounts, useful for IDE agents that can't show consent links.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>SDK decorators</h4>
+				<span class="file">Tools that get credentials from the token vault (Python, AgentCore SDK)</span>
+<pre><code>from bedrock_agentcore.identity.auth import requires_access_token, requires_api_key
+from strands import tool
+
+
+@tool
+@requires_access_token(
+    provider_name="google-provider",
+    scopes=["https://www.googleapis.com/auth/drive.metadata.readonly"],
+    auth_flow="USER_FEDERATION",
+    <span class="c"># In production, send this link to the user's UI</span>
+    on_auth_url=lambda url: print("Authorize here:", url),
+    <span class="c"># Must be in the workload identity's allowedResourceOauth2ReturnUrls</span>
+    callback_url="https://app.example.com/oauth/callback",
+    <span class="c"># Google: ask for a refresh token</span>
+    custom_parameters={"access_type": "offline"},
+)
+async def list_drive_files(*, access_token: str) -> str:
+    ...
+
+
+@tool
+@requires_api_key(provider_name="weather-api-key")
+def weather(city: str, *, api_key: str) -> str:
+    ...</code></pre>
+				<span class="file">Your OAuth callback endpoint: bind the consent to the signed-in user (Python, AgentCore SDK)</span>
+<pre><code>from bedrock_agentcore.services.identity import IdentityClient, UserIdIdentifier
+
+
+def oauth_callback(session_id: str, signed_in_user_id: str):
+    <span class="c"># signed_in_user_id comes from YOUR app's session, after you verify it</span>
+    IdentityClient("us-west-2").complete_resource_token_auth(
+        session_uri=session_id,
+        user_identifier=UserIdIdentifier(user_id=signed_in_user_id),
+    )</code></pre>
+				<p>The decorator polls for up to 10 minutes after the consent link is issued. Run outside Runtime (for example on a laptop), the SDK quietly creates a workload identity and a random user ID and saves them in <code>.agentcore.json</code>, so tokens you authorize locally belong to that made-up user.</p>
+			</div>
+			<div class="callout trap"><p><code>GetWorkloadAccessTokenForUserId</code> (and the Runtime user-ID header) accepts any string as the user: whoever can call it can act as any user. Prefer the JWT-based exchange, deny the user-ID actions where you don't need them, and prefix user IDs per identity provider.</p></div>
+			<div class="entry">
+				<h4>Quotas and pricing</h4>
+				<p>11,000 workload identities, 50 OAuth2 and 50 API key providers per Region, 200 token requests per second. Identity is free through Runtime or Gateway; elsewhere $0.010 per 1,000 successful token or key requests.</p>
+			</div>
+
+			<h2 id="s8">AgentCore Policy</h2>
+			<div class="entry">
+				<h4>The model</h4>
+				<p>A <strong>policy engine</strong> holds policies and is attached to one or more gateways (one engine per gateway). It intercepts every tool call, <strong>denies by default</strong>, and a forbid always wins over a permit. Policies are written in <strong>Cedar</strong> or <strong>Dogwood</strong>, an open-source superset of Cedar that AWS now recommends, which adds time- and session-based conditions and Guardrails checks. Policy has been generally available since 3 March 2026.</p>
+				<ul>
+					<li><strong>Principal:</strong> <code>AgentCore::OAuthUser</code> (JWT callers; claims become tags you test with <code>principal.hasTag("role")</code> and <code>principal.getTag("role")</code>) or <code>AgentCore::IamEntity</code> (IAM callers; <code>principal.id</code> is the caller's ARN).</li>
+					<li><strong>Action:</strong> <code>AgentCore::Action::"TARGET___TOOL"</code>; <code>action in AgentCore::Action::"TARGET"</code> covers a whole target. No wildcards.</li>
+					<li><strong>Resource:</strong> <code>AgentCore::Gateway::"GATEWAY_ARN"</code>, which must be a specific gateway, so policies are written after the gateway exists.</li>
+					<li><strong>Context:</strong> <code>context.input</code> (tool arguments), <code>context.output</code> (results), <code>context.system.now</code> (the time).</li>
+				</ul>
+			</div>
+			<span class="file">Refunds under $1,000 for support staff only; never return high-sensitivity results (Cedar, also valid Dogwood)</span>
+<pre><code>permit (
+  principal is AgentCore::OAuthUser,
+  action == AgentCore::Action::"Orders___process_refund",
+  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-west-2:111111111111:gateway/GATEWAY_ID"
+)
+when {
+  principal.hasTag("role") && principal.getTag("role") == "support" &&
+  context.input.amount &lt; 1000
+};
+
+forbid (
+  principal,
+  action == AgentCore::Action::"Reports___view_results",
+  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-west-2:111111111111:gateway/GATEWAY_ID"
+)
+when { context.input.sensitivity == "high" };</code></pre>
+			<span class="file">Pay out only if this claim was approved earlier in the same session (Dogwood temporal policy, from AWS's examples)</span>
+<pre><code>permit (
+  principal,
+  action == AgentCore::Action::"Insurance___disburse_payment",
+  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-west-2:111111111111:gateway/GATEWAY_ID"
+)
+when temporal {
+  formerly within 1h AgentCore::Action::"Insurance___approve_claim"::response{
+    eventResource: resource,
+    input.claimId: context.input.claimId,
+    output.approved: true
+  }
+};</code></pre>
+			<ul>
+				<li><strong>Temporal policies</strong> (August 2026) use <code>formerly within</code>, <code>since within</code>, counts and sums over earlier calls in a <strong>policy session</strong> you identify with the header <code>x-amzn-bedrock-agentcore-policy-session-id</code> on every request (the gateway never creates one). Windows up to 24 hours, 20 temporal policies per engine; adding or changing one ends open sessions with a 409.</li>
+				<li><strong>Guardrails in policies</strong> (June 2026): <code>when guardrails { ... }</code> blocks score tool inputs with Bedrock Guardrails content filters, prompt-attack and sensitive-information checks, and a <code>suppressOutput</code> effect withholds a tool's response. The gateway role then needs <code>bedrock:InvokeGuardrailChecks</code>.</li>
+			</ul>
+			<div class="entry">
+				<h4>Creating and attaching</h4>
+				<span class="file">Create an engine, attach it in log-only mode, then add a policy (Python, boto3)</span>
+<pre><code>import boto3
+
+ctl = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+GW_ARN = "arn:aws:bedrock-agentcore:us-west-2:111111111111:gateway/GATEWAY_ID"
+
+eng = ctl.create_policy_engine(name="orders_policies", description="Tool rules for orders-gateway")
+engine_id, engine_arn = eng["policyEngineId"], eng["policyEngineArn"]
+<span class="c"># Poll get_policy_engine until it's ready, then attach (full update of the gateway)</span>
+ctl.update_gateway(
+    gatewayIdentifier="GATEWAY_ID",
+    name="orders-gateway",
+    roleArn="arn:aws:iam::111111111111:role/OrdersGatewayRole",
+    protocolType="MCP",
+    authorizerType="CUSTOM_JWT",
+    authorizerConfiguration={"customJWTAuthorizer": {
+        "discoveryUrl": "https://cognito-idp.us-west-2.amazonaws.com/USER_POOL_ID/.well-known/openid-configuration",
+        "allowedClients": ["APP_CLIENT_ID"],
+    }},
+    <span class="c"># Observe decisions first; switch to ENFORCE when they look right</span>
+    policyEngineConfiguration={"arn": engine_arn, "mode": "LOG_ONLY"},
+)
+
+ctl.create_policy(
+    policyEngineId=engine_id,
+    name="RefundLimit",
+    definition={"cedar": {"statement": (
+        'permit(principal, action == AgentCore::Action::"Orders___process_refund", '
+        f'resource == AgentCore::Gateway::"{GW_ARN}") when {{ context.input.amount &lt; 1000 }};'
+    )}},
+    validationMode="FAIL_ON_ANY_FINDINGS",
+)</code></pre>
+				<ul>
+					<li>Use <code>definition={"policy": {"statement": ...}}</code> for Dogwood. Creation is asynchronous: poll for active or <code>CREATE_FAILED</code> with reasons.</li>
+					<li>Validation uses automated reasoning to flag policies that are overly permissive, overly restrictive or can never match. It can't interpret guardrail conditions, so a lone guardrail <code>forbid</code> looks unconditional and fails: write a permit with the inverse threshold, or use <code>IGNORE_ALL_FINDINGS</code>.</li>
+					<li>Two log-only switches: the gateway's <code>mode</code> (<code>LOG_ONLY</code> or <code>ENFORCE</code>, for the whole engine) and each policy's <code>enforcementMode</code> (<code>ACTIVE</code> or <code>LOG_ONLY</code>, to shadow-test one policy).</li>
+					<li><strong>Natural-language authoring:</strong> <code>StartPolicyGeneration</code> turns a description such as "support staff can refund up to $1,000" into Dogwood for the gateway's tools; review the result before creating it.</li>
+					<li>The gateway role needs <code>bedrock-agentcore:GetPolicyEngine</code>, <code>AuthorizeAction</code> and <code>PartiallyAuthorizeActions</code>, or every call is denied. Tool listing shows a tool if any context could permit it; the call itself is still checked.</li>
+				</ul>
+			</div>
+			<div class="callout trap"><p>Attaching an engine in <code>ENFORCE</code> mode before any permit exists <strong>denies every tool call</strong>. Start in <code>LOG_ONLY</code>, check the <code>AllowDecisions</code> and <code>DenyDecisions</code> metrics and the decision spans, then enforce. Anyone allowed to call <code>UpdateGateway</code> can switch the mode or detach the engine: constrain it with the <code>bedrock-agentcore:PolicyEngineMode</code> condition key.</p></div>
+			<div class="entry">
+				<h4>Quotas and pricing</h4>
+				<p>1,000 engines per Region and 1,000 policies per engine (fixed), 10 KB per policy, 400 KB schema per engine. $0.000025 per authorization request; guardrail checks at Guardrails rates. Decisions appear as metrics and trace spans (allow or deny, reason, determining policies), not in gateway logs.</p>
+			</div>
+
+			<h2 id="s9">AWS Agent Registry</h2>
+			<p>A private, governed catalog of agents (A2A agent cards), MCP servers, skills and custom resources, generally available since 31 August 2026 in 9 Regions. Records go from draft through approval to discoverable; editing an approved record creates a new draft while the approved version stays live. Search with <code>SearchDiscoverableRegistryRecords</code> (semantic plus keyword, with filters) or through the registry's own MCP endpoint, and share registries with AWS RAM. It moved to its own namespace (<code>agent-registry</code> service, endpoints under <code>api.aws</code>, IAM prefix <code>agent-registry:</code>, boto3 clients <code>agent-registry</code> and <code>agent-registry-control</code>); the preview namespace stopped working on 30 October 2026, so older samples using <code>search_registry_records</code> no longer work. A monthly free tier (5,000 records, 1 million searches) covers most teams.</p>
+
+			<h2 id="s10">What's changed</h2>
+			<ul>
+				<li><strong>November 2026:</strong> Web Answer connector (us-east-1).</li>
+				<li><strong>October 2026:</strong> MCP 2026-07-28 and MCP Tasks on Gateway; private CAs for targets; Step Functions connector; InvokeModel on inference targets with model fallback; Registry's old namespace retired (30 October).</li>
+				<li><strong>September 2026:</strong> Identity consent portal (1 September).</li>
+				<li><strong>August 2026:</strong> Dogwood temporal policies and configurable Gateway rate limits (6 August); Policy in GovCloud (US-West); Registry generally available (31 August).</li>
+				<li><strong>July 2026:</strong> HTTP passthrough, Runtime and inference targets; Identity private-key JWT.</li>
+				<li><strong>June 2026:</strong> Guardrails in policies generally available (17 June); bring-your-own Secrets Manager secrets for Identity; Web Search connector.</li>
+				<li><strong>April to May 2026:</strong> user-consent OAuth for MCP targets; on-behalf-of token exchange (30 April); Registry preview (9 April); Gateway sessions, streaming, elicitation and sampling (May).</li>
+				<li><strong>December 2025 to March 2026:</strong> Policy preview (2 December 2025) and general availability (3 March 2026); API Gateway stages as targets; custom JWT claims.</li>
+				<li><strong>2025:</strong> Gateway and Identity in preview (16 July) and generally available with MCP server targets (13 October).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d2-task-2-1.html">AIP-C01 Task 2.1: agentic AI and tool integrations</a>, <a href="../../aws-aif/d5-task-5-1.html">AIF-C01 Task 5.1: securing AI systems</a> and <a href="../../aws-dva/d2-task-2-3.html">DVA-C03 Task 2.3: security risks of AI services</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="agentcore-runtime.html"><small>Previous</small>AgentCore Runtime</a>
+				<span class="next"><small>Next</small>Memory and built-in tools (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock AgentCore Gateway, Identity and Policy, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
