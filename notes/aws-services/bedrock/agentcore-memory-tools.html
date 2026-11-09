@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>AgentCore Memory and Built-in Tools | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock AgentCore Memory and built-in tools: short-term events and long-term records, strategies and namespaces, CreateMemory, CreateEvent and RetrieveMemoryRecords with boto3, the Strands session manager, metadata filtering, record TTL and ingestion, separating users, pricing, Code Interpreter sessions, Browser with Playwright, live view and OS actions, Web Search and Web Answer, and AgentCore Payments.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Memory and built-in tools</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; AgentCore &middot; Last checked 9 November 2026</span>
+		<h1>Memory and built-in tools</h1>
+		<p>AgentCore Memory gives agents short-term conversation history and long-term knowledge about each user, extracted automatically. The built-in tools give them a sandbox to run code, a managed cloud browser, and web search, plus Payments for paid resources.</p>
+		<div class="tags"><span class="tag code">AgentCore Memory</span><span class="tag">Code Interpreter</span><span class="tag">Browser</span><span class="tag">Web Search</span><span class="tag">Payments</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Memory concepts</a></li>
+				<li><a href="#s2">Strategies and namespaces</a></li>
+				<li><a href="#s3">Using Memory with boto3</a></li>
+				<li><a href="#s4">Memory in agent frameworks</a></li>
+				<li><a href="#s5">More Memory features</a></li>
+				<li><a href="#s6">Separating users, quotas and cost</a></li>
+				<li><a href="#s7">Code Interpreter</a></li>
+				<li><a href="#s8">Browser</a></li>
+				<li><a href="#s9">Web Search and Web Answer</a></li>
+				<li><a href="#s10">Payments</a></li>
+				<li><a href="#s11">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Memory concepts</h2>
+			<ul>
+				<li>A <strong>memory</strong> is a resource holding two kinds of data. Its name allows letters, digits and underscores only.</li>
+				<li><strong>Short-term memory</strong> is <strong>events</strong>: immutable, timestamped records you write with <code>CreateEvent</code>, filed under an <strong>actor</strong> (<code>actorId</code>: a user, an agent, or both, such as <code>agent-support/customer-456</code>) and a <strong>session</strong> (<code>sessionId</code>). Use them to reload a conversation. They expire after the memory's <code>eventExpiryDuration</code> (3 to 365 days in the API; the quotas page says a minimum of 7), applied to each event when it's written.</li>
+				<li><strong>Long-term memory</strong> is <strong>records</strong> that <strong>strategies</strong> extract from events in the background: facts, preferences, summaries and episodes. They're stored under <strong>namespaces</strong> and found by semantic search with <code>RetrieveMemoryRecords</code>.</li>
+				<li>An event's payload is a list of up to 100 items: <code>conversational</code> messages (roles <code>USER</code>, <code>ASSISTANT</code>, <code>TOOL</code>, <code>OTHER</code>), <code>json</code> data (up to 100 KB, August 2026), or <code>blob</code> data. Blobs are never extracted to long-term memory.</li>
+				<li><strong>Branches</strong> (<code>branch {name, rootEventId}</code>) record alternative paths, for example when a user edits an earlier message. <code>extractionMode: "SKIP"</code> keeps an event short-term only.</li>
+				<li>AgentCore never invents actors or sessions: your application decides which user an <code>actorId</code> belongs to.</li>
+			</ul>
+			<div class="callout trap"><p>Long-term extraction is <strong>asynchronous</strong> (seconds to minutes), so something the user just said isn't retrievable as a record on the next turn: use the session's events for the current conversation and records for later ones. Strategies also process only events written <strong>after</strong> the strategy became active; there's no backfill.</p></div>
+			<p>AWS's rule of thumb for memory versus retrieval-augmented generation: long-term memory answers "who is this user and what happened before"; a knowledge base answers "what do trusted sources say now". Most assistants need both.</p>
+
+			<h2 id="s2">Strategies and namespaces</h2>
+			<div class="entry">
+				<h4>Built-in strategies</h4>
+				<ul>
+					<li><strong>Semantic</strong> (<code>semanticMemoryStrategy</code>): facts about people, things and events.</li>
+					<li><strong>User preference</strong> (<code>userPreferenceMemoryStrategy</code>): choices, likes and styles. Semantic and preference strategies read only <code>USER</code> and <code>ASSISTANT</code> messages.</li>
+					<li><strong>Summary</strong> (<code>summaryMemoryStrategy</code>): summaries of each session, so its namespace must include <code>{sessionId}</code>. Besides summary chunks it keeps one full-session recap record (<code>FULL_SESSION</code>), updated as the session continues.</li>
+					<li><strong>Episodic</strong> (<code>episodicMemoryStrategy</code>, December 2025): records each completed episode (situation, intent, outcome and lessons) and writes <strong>reflections</strong> across episodes. Include tool results in events for it to work well. A reflection namespace broader than the actor (such as <code>/strategy/{memoryStrategyId}/</code>) shares lessons across all users, which is a privacy decision.</li>
+				</ul>
+				<p>Up to 6 strategies per memory. <strong>Built-in with overrides</strong> lets you append instructions to the extraction prompt and choose the Bedrock model, which runs in your account through <code>memoryExecutionRoleArn</code> (cheaper record storage, but you pay the model tokens and use your Bedrock quotas). <strong>Self-managed</strong> strategies deliver batches of events to your S3 bucket and SNS topic, and your own pipeline writes records back with <code>BatchCreateMemoryRecords</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>Namespaces</h4>
+				<p>A namespace is a path like <code>/users/{actorId}/preferences/</code>, with one leading and one trailing slash. Built-in variables are <code>{actorId}</code>, <code>{sessionId}</code> and <code>{memoryStrategyId}</code>. Each strategy takes exactly one template in <code>namespaceTemplates</code> (the older <code>namespaces</code> field is deprecated). Since August 2026 you can declare up to 5 custom variables (<code>namespaceKeys</code>, lowercase) and pass their values on each event in <code>extractionConfig.namespaceVariables</code>, for example a tenant or project. If a value is missing, the event is stored but extraction for that strategy is silently skipped; only the <code>NamespaceResolutionFailure</code> metric tells you.</p>
+			</div>
+
+			<h2 id="s3">Using Memory with boto3</h2>
+			<span class="file">Create a memory, write a turn, reload the session and search long-term records (Python, boto3; field names from the API reference)</span>
+<pre><code>import time
+from datetime import datetime, timezone
+
+import boto3
+
+ctl = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+dp = boto3.client("bedrock-agentcore", region_name="us-west-2")
+
+mem = ctl.create_memory(
+    <span class="c"># Letters, digits and underscores only</span>
+    name="SupportAgentMemory",
+    <span class="c"># Days to keep raw events</span>
+    eventExpiryDuration=30,
+    memoryStrategies=[
+        {"userPreferenceMemoryStrategy": {
+            "name": "Preferences",
+            "namespaceTemplates": ["/users/{actorId}/preferences/"],
+        }},
+        {"summaryMemoryStrategy": {
+            "name": "SessionSummary",
+            "namespaceTemplates": ["/summaries/{actorId}/{sessionId}/"],
+        }},
+    ],
+)["memory"]
+while (status := ctl.get_memory(memoryId=mem["id"])["memory"]["status"]) not in ("ACTIVE", "FAILED"):
+    time.sleep(10)
+
+<span class="c"># Short-term: one event per turn</span>
+dp.create_event(
+    memoryId=mem["id"],
+    actorId="user-123",
+    sessionId="session-0001",
+    eventTimestamp=datetime.now(timezone.utc),
+    payload=[
+        {"conversational": {"role": "USER", "content": {"text": "I prefer aisle seats."}}},
+        {"conversational": {"role": "ASSISTANT", "content": {"text": "Noted: aisle seats."}}},
+    ],
+)
+
+<span class="c"># Reload this session's recent events</span>
+events = dp.list_events(memoryId=mem["id"], actorId="user-123", sessionId="session-0001", maxResults=20)["events"]
+
+<span class="c"># Later: search this user's long-term records (exact namespace, or namespacePath for a subtree)</span>
+hits = dp.retrieve_memory_records(
+    memoryId=mem["id"],
+    namespace="/users/user-123/preferences/",
+    searchCriteria={"searchQuery": "seat preference", "topK": 5},
+)["memoryRecordSummaries"]
+for h in hits:
+    print(round(h["score"], 3), h["content"]["text"])</code></pre>
+			<ul>
+				<li><code>ListEvents</code> doesn't guarantee newest first: sort by <code>eventTimestamp</code> if order matters.</li>
+				<li><code>ListMemoryRecords</code> lists records without a query; <code>GetMemoryRecord</code> and <code>DeleteMemoryRecord</code> handle one record; batch create, update and delete take up to 100 (check <code>failedRecords</code> even on success).</li>
+				<li>The AgentCore CLI creates memories too (<code>agentcore add memory --name X --strategies SEMANTIC,SUMMARIZATION</code>) and inspects them (<code>agentcore memory record list --namespace-path /</code>), but can't change strategies on an existing memory.</li>
+			</ul>
+
+			<h2 id="s4">Memory in agent frameworks</h2>
+			<p>The <code>bedrock-agentcore</code> SDK's recommended interface is <code>MemorySessionManager</code> (sessions with <code>add_turns</code> and <code>search_long_term_memories</code>); the older <code>MemoryClient</code> is labelled legacy. For Strands, a session manager restores history and injects relevant long-term records into the prompt automatically.</p>
+			<span class="file">A Strands agent with short-term history and long-term retrieval (Python, AgentCore SDK)</span>
+<pre><code>from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
+from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+from strands import Agent
+
+config = AgentCoreMemoryConfig(
+    memory_id="MEMORY_ID",
+    <span class="c"># Your backend maps the signed-in user to this</span>
+    actor_id="user-123",
+    session_id="session-0001",
+    <span class="c"># Keys are the strategies' namespace templates</span>
+    retrieval_config={
+        "/users/{actorId}/preferences/": RetrievalConfig(top_k=5, relevance_score=0.5),
+        "/summaries/{actorId}/{sessionId}/": RetrievalConfig(top_k=3),
+    },
+    <span class="c"># Buffer writes; the with block flushes them on exit</span>
+    batch_size=10,
+)
+with AgentCoreMemorySessionManager(config, region_name="us-west-2") as session_manager:
+    agent = Agent(system_prompt="You are a travel assistant.", session_manager=session_manager)
+    agent("Book me a flight to Lisbon next Friday.")</code></pre>
+			<p>With <code>batch_size</code> above 1, always use the <code>with</code> block or call <code>close()</code>: buffered messages are lost otherwise. For LangGraph, the <code>langgraph-checkpoint-aws</code> package provides <code>AgentCoreMemorySaver</code> (checkpoints as events) and <code>AgentCoreMemoryStore</code> (long-term records). The <a href="agentcore.html">Harness</a> manages a memory for you by default.</p>
+
+			<h2 id="s5">More Memory features</h2>
+			<ul>
+				<li><strong>Direct ingestion</strong> (<code>IngestData</code>, August 2026): send content straight to long-term extraction without storing it as an event, for example importing a CRM profile. Up to 100 KB per request, 10 requests per second per account.</li>
+				<li><strong>Metadata filtering</strong> (April 2026): declare up to 10 <code>indexedKeys</code> (string, string list or number; they can never be removed), give strategies a metadata schema the model fills in or, for up to 3 keys, copies exactly from event metadata, then filter retrievals with operators such as <code>EQUALS_TO</code>, <code>CONTAINS</code> and <code>AFTER</code>. AWS's advice: use namespaces for <em>who</em>, metadata for what, when and how urgent; never metadata alone for tenant isolation.</li>
+				<li><strong>Record expiry</strong> (October 2026): <code>recordExpirySpecification</code> with at least 31 days, for new records only; deletion can lag by a few days, so use <code>DeleteMemoryRecord</code> when removal must be immediate. It needs the separate permission <code>UpdateMemoryRecordExpirySpecification</code>. By default records never expire.</li>
+				<li><strong>Streaming</strong> (March 2026): push record created, updated and deleted events (full content or metadata only) to a Kinesis data stream, for example to replicate long-term memory to another Region.</li>
+				<li><strong>Failed extraction:</strong> <code>ListMemoryExtractionJobs</code> shows failures (often throttling, or model access for override strategies) and <code>StartMemoryExtractionJob</code> retries them.</li>
+				<li><strong>Sharing and encryption:</strong> resource-based policies allow cross-account access (June 2026; callers pass the full memory ARN); a customer managed KMS key encrypts content, but event metadata isn't encrypted with it, so keep sensitive data out of metadata.</li>
+			</ul>
+
+			<h2 id="s6">Separating users, quotas and cost</h2>
+			<div class="callout trap"><p>Memory only sees the calling IAM principal. If one backend role reads and writes memory for every user, a bug in <code>actorId</code> or a namespace shows one user another's memories. Constrain access with the condition keys <code>bedrock-agentcore:actorId</code>, <code>sessionId</code>, <code>namespace</code> and <code>namespacePath</code> (per-user IAM sessions), or put Memory behind a Gateway with its Memory connector and a Cedar policy that requires <code>actorId</code> to equal the JWT's <code>sub</code>, plus a resource policy that blocks direct access. Namespaces in IAM conditions must keep their slashes (<code>/users/alice/*</code>).</p></div>
+			<ul>
+				<li><strong>Quotas:</strong> 150 memories per Region (adjustable), 6 strategies per memory; <code>CreateEvent</code> up to 100 messages, 100 KB per message, 200 per second per account and 5 per second per actor and session; <code>RetrieveMemoryRecords</code> 30 per second; long-term extraction 150,000 tokens per minute per account for built-in strategies.</li>
+				<li><strong>Short-term pricing</strong> (since 6 October 2026): $1.00 per GB ingested, $0.20 per GB retrieved, $0.10 per GB-month stored. Each event is billed as at least 12 KB and at most 64 KB for ingestion and retrieval, so several messages in one event cost less than many tiny events.</li>
+				<li><strong>Long-term pricing:</strong> $0.75 per 1,000 records per month (built-in), $0.25 with overrides or self-managed (plus your model costs), and $0.50 per 1,000 retrieval calls, which usually dominate.</li>
+				<li><strong>Metrics:</strong> latency, invocations, errors and throttles, plus <code>TokenCount</code>, <code>FailedExtraction</code> and <code>NamespaceResolutionFailure</code>.</li>
+			</ul>
+
+			<h2 id="s7">Code Interpreter</h2>
+			<p><strong>Code Interpreter</strong> runs code the agent writes in an isolated microVM per session (2 vCPU, 8 GB), in Python, JavaScript or TypeScript (runtimes <code>python</code>, <code>nodejs</code> or <code>deno</code>, the default for JavaScript and TypeScript). Variables and files persist for the session. Python comes with pandas, numpy, matplotlib, scikit-learn, torch, requests and many more; install others with a command.</p>
+			<ul>
+				<li><strong>AWS-managed</strong> <code>aws.codeinterpreter.v1</code> needs no set-up. A <strong>custom</strong> interpreter (<code>CreateCodeInterpreter</code>) chooses the network: <code>SANDBOX</code> (limited access, but still reaches Amazon S3), <code>PUBLIC</code> or <code>VPC</code>, plus an execution role for AWS calls, root certificates and EFS or S3 Files mounts.</li>
+				<li>Tools you invoke: <code>executeCode</code>, <code>executeCommand</code>, <code>writeFiles</code>, <code>readFiles</code>, <code>listFiles</code>, <code>removeFiles</code>, and <code>startCommandExecution</code> with <code>getTask</code> and <code>stopTask</code> for long commands. Inline uploads up to 100 MB; up to 5 GB through S3.</li>
+				<li>Sessions default to 15 minutes and can run up to 8 hours; they bill until stopped or timed out.</li>
+			</ul>
+			<span class="file">Upload a file and run pandas on it; the session always stops (Python, AgentCore SDK)</span>
+<pre><code>from bedrock_agentcore.tools.code_interpreter_client import code_session
+
+with code_session("us-west-2") as ci:
+    ci.invoke("writeFiles", {"content": [{"path": "data.csv", "text": "a,b\n1,2\n3,4\n"}]})
+    out = ci.invoke("executeCode", {
+        "language": "python",
+        "code": "import pandas as pd\nprint(pd.read_csv('data.csv').sum())",
+    })
+    for event in out["stream"]:
+        print(event["result"])</code></pre>
+			<p>Without the SDK: <code>start_code_interpreter_session</code>, <code>invoke_code_interpreter(name="executeCode", arguments={...})</code> (results arrive as a stream of content blocks with stdout, stderr and exit code) and <code>stop_code_interpreter_session</code> on the <code>bedrock-agentcore</code> client. In Strands, add <code>AgentCoreCodeInterpreter(region="us-west-2").code_interpreter</code> from <code>strands_tools.code_interpreter</code> as a tool. Pricing is the Runtime V1 rate: $0.0895 per vCPU-hour and $0.00945 per GB-hour, no CPU charge while waiting; AWS's example of a 2-minute run costs about $0.0036. Up to 1,000 concurrent sessions per account.</p>
+
+			<h2 id="s8">Browser</h2>
+			<p><strong>Browser</strong> is a managed Chrome in its own microVM per session (1 vCPU, 4 GB), driven over the Chrome DevTools Protocol by Playwright, browser-use, Nova Act or the Strands browser tool. Use <code>aws.browser.v1</code>, or create a custom browser for VPC networking, session recording to S3, Web Bot Auth signing (preview) and enterprise policies.</p>
+			<span class="file">Drive the browser with Playwright and print a live-view link (Python, AgentCore SDK)</span>
+<pre><code>import asyncio
+
+from bedrock_agentcore.tools.browser_client import browser_session
+from playwright.async_api import async_playwright
+
+
+async def main():
+    with browser_session("us-west-2", viewport={"width": 1280, "height": 800}) as client:
+        <span class="c"># A SigV4-signed WebSocket URL and headers for the automation stream</span>
+        ws_url, headers = client.generate_ws_headers()
+        print("Live view:", client.generate_live_view_url(expires=300))
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(ws_url, headers=headers)
+            page = browser.contexts[0].pages[0]
+            await page.goto("https://example.com")
+            print(await page.title())
+            await browser.close()
+    <span class="c"># Leaving the with block stops the session and its billing</span>
+
+
+asyncio.run(main())</code></pre>
+			<ul>
+				<li><strong>Live view</strong> lets a person watch (the presigned link lasts up to 5 minutes); <strong>take control</strong> (<code>take_control()</code>, or <code>UpdateBrowserStream</code> disabling automation) hands the session to a human, for example to type a password the agent should never see.</li>
+				<li><strong>OS-level actions</strong> (<code>InvokeBrowser</code>, April 2026): mouse clicks, drags and scrolls, key presses and shortcuts, and full-screen PNG screenshots, for native dialogs and menus that CDP can't reach.</li>
+				<li><strong>Profiles</strong> (February 2026) save cookies and local storage after a login for later sessions; <strong>proxies</strong> (HTTP and HTTPS, up to 5 per session) route traffic but aren't a network control; <strong>extensions</strong> (up to 10, 10 MB each), Chrome <strong>enterprise policies</strong> and custom <strong>root certificates</strong> (March 2026) customize the browser.</li>
+				<li>Set <code>sessionTimeoutSeconds</code> explicitly (up to 8 hours): AWS's pages disagree on the default. Same pricing as Code Interpreter; AWS's example 10-minute session at 80% I/O wait costs about $0.012.</li>
+			</ul>
+
+			<h2 id="s9">Web Search and Web Answer</h2>
+			<p>Both are used only as <a href="agentcore-gateway-identity-policy.html#s2">Gateway connectors</a>: agents call them as MCP tools through a gateway, and the gateway role needs <code>bedrock-agentcore:InvokeWebSearch</code> or <code>InvokeWebAnswer</code>. Queries stay within AWS, backed by an Amazon web index.</p>
+			<ul>
+				<li><strong>Web Search</strong> (June 2026; 7 Regions including GovCloud): a query up to 200 characters, 1 to 25 results, domain include and exclude lists (up to 100 each, also fixed at the target level where the agent can't widen them) and published-date filters. Results arrive as a JSON string in <code>content[0].text</code> with text, URL, title and date: parse it. $7 per 1,000 queries; 10 per second. The SDK's <code>WebSearchClient</code> wraps the gateway call.</li>
+				<li><strong>Web Answer</strong> (5 November 2026; us-east-1 only, geographic cross-Region inference): one call runs a search agent and returns a finished markdown answer with citations. $10 per 1,000 calls. Use it when you want a cited answer to a sub-question without filling your own context with search results.</li>
+				<li>Both require you to show the source citations to end users and forbid bulk copying of results.</li>
+			</ul>
+
+			<h2 id="s10">Payments</h2>
+			<p><strong>AgentCore Payments</strong> (generally available 18 August 2026) lets agents pay for paid APIs, MCP servers and content with stablecoin micropayments over HTTP 402 protocols (x402, and the Machine Payments Protocol). You create a payment manager and a connector to a wallet provider (Coinbase CDP, which needs an AWS Marketplace subscription, or Stripe Privy); each user gets a wallet they fund; and each <strong>payment session</strong> has a spending limit (<code>maxSpendAmount</code>) and an expiry of 15 to 480 minutes enforced by AWS. When an agent hits a 402, the SDK plugin calls <code>ProcessPayment</code> within the session's budget and retries. AgentCore charges nothing; the wallet provider charges per operation. Keep the roles that set budgets separate from those that spend.</p>
+
+			<h2 id="s11">What's changed</h2>
+			<ul>
+				<li><strong>November 2026:</strong> Web Answer connector (us-east-1).</li>
+				<li><strong>October 2026:</strong> short-term memory moved to consumption pricing (6 October); record expiry; Web Search in more Regions and connector 1.3.0.</li>
+				<li><strong>August 2026:</strong> JSON payloads, <code>IngestData</code> and custom namespace variables; Memory in GovCloud (US-West); Payments generally available (18 August); Web Search date and domain filters.</li>
+				<li><strong>June 2026:</strong> strictly consistent metadata (15 June); Web Search (16 June); Harness managed memory by default (17 June); Memory cross-account access (23 June).</li>
+				<li><strong>March to May 2026:</strong> Memory resource policies and record streaming; Code Interpreter Node.js runtime; Browser enterprise policies and root certificates (March); metadata filtering and Browser OS actions (April); Payments preview (7 May).</li>
+				<li><strong>December 2025 to February 2026:</strong> episodic memory (2 December); Browser extensions, profiles and proxies (January to February).</li>
+				<li><strong>2025:</strong> preview (16 July); generally available (13 October); Web Bot Auth preview (30 October).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d2-task-2-1.html">AIP-C01 Task 2.1: agentic AI and tool integrations</a> and <a href="../../aws-aif/d2-task-2-3.html">AIF-C01 Task 2.3: AWS infrastructure for generative AI</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="agentcore-gateway-identity-policy.html"><small>Previous</small>Gateway, Identity and Policy</a>
+				<span class="next"><small>Next</small>Observability, Evaluations and Optimization (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock AgentCore Memory and built-in tools, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
