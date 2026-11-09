@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>AgentCore Observability, Evaluations and Optimization | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock AgentCore Observability, Evaluations and Optimization: enabling CloudWatch Transaction Search, OpenTelemetry for agents on and off Runtime, where logs, spans and metrics land, built-in and custom evaluators, online, on-demand and batch evaluation, ground truth, recommendations, configuration bundles, A/B tests through Gateway, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Observability, Evaluations and Optimization</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; AgentCore &middot; Last checked 9 November 2026</span>
+		<h1>Observability, Evaluations and Optimization</h1>
+		<p>Running agents in production: trace every model and tool call in CloudWatch, score real sessions with LLM judges and code, then turn the scores into better prompts and tool descriptions, proven with an A/B test before you ship them.</p>
+		<div class="tags"><span class="tag code">AgentCore Observability</span><span class="tag">AgentCore Evaluations</span><span class="tag">Optimization</span><span class="tag">OpenTelemetry</span><span class="tag">CloudWatch</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">One data path, three layers</a></li>
+				<li><a href="#s2">Turning on observability</a></li>
+				<li><a href="#s3">Where the data lands</a></li>
+				<li><a href="#s4">Evaluators</a></li>
+				<li><a href="#s5">Online evaluation</a></li>
+				<li><a href="#s6">On-demand and batch evaluation</a></li>
+				<li><a href="#s7">Optimization</a></li>
+				<li><a href="#s8">Quotas, pricing and Regions</a></li>
+				<li><a href="#s9">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">One data path, three layers</h2>
+			<ol class="flow">
+				<li><b>Observe</b>Your agent emits OpenTelemetry spans and logs (through the AWS Distro for OpenTelemetry, ADOT) into CloudWatch, which shows sessions, traces and metrics.</li>
+				<li><b>Evaluate</b>Evaluators (LLM judges, Lambda functions or programmatic matchers) read those spans from CloudWatch and write scores back as logs and metrics.</li>
+				<li><b>Optimize</b>Recommendations read the traces and scores and propose a better system prompt or tool descriptions; you store them as versioned configuration bundles and prove them with an A/B test through Gateway.</li>
+			</ol>
+			<p>This works for agents on <a href="agentcore-runtime.html">Runtime</a> or the <a href="agentcore.html">Harness</a> and for agents hosted elsewhere (ECS, EKS, Lambda, outside AWS) that export ADOT telemetry to CloudWatch. For scoring models, prompts and Knowledge Bases on a fixed dataset, see <a href="evaluation.html">Model and RAG evaluation</a>.</p>
+
+			<h2 id="s2">Turning on observability</h2>
+			<div class="entry">
+				<h4>Step 1: CloudWatch Transaction Search (once per account and Region)</h4>
+				<p>Without it there are no AgentCore spans, and evaluations and A/B tests return nothing. <code>agentcore deploy</code> turns it on for you (opt out with <code>agentcore config transactionSearch false</code>); otherwise run:</p>
+				<span class="file">Let X-Ray write spans to CloudWatch Logs, then switch the destination (AWS CLI, as in the AgentCore and CloudWatch guides)</span>
+<pre><code>aws logs put-resource-policy --policy-name TransactionSearchXRayAccess --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "TransactionSearchXRayAccess",
+    "Effect": "Allow",
+    "Principal": {"Service": "xray.amazonaws.com"},
+    "Action": "logs:PutLogEvents",
+    "Resource": [
+      "arn:aws:logs:us-west-2:111111111111:log-group:aws/spans:*",
+      "arn:aws:logs:us-west-2:111111111111:log-group:/aws/application-signals/data:*"
+    ],
+    "Condition": {
+      "ArnLike": {"aws:SourceArn": "arn:aws:xray:us-west-2:111111111111:*"},
+      "StringEquals": {"aws:SourceAccount": "111111111111"}
+    }
+  }]
+}'
+
+aws xray update-trace-segment-destination --destination CloudWatchLogs
+
+<span class="c"># Optional: index 1% of spans as trace summaries (free); all spans are still stored</span>
+aws xray update-indexing-rule --name "Default" --rule '{"Probabilistic": {"DesiredSamplingPercentage": 1}}'</code></pre>
+				<p>Spans take about 10 minutes to become searchable after enabling. To encrypt <code>aws/spans</code> with your KMS key when the log group already exists, enable without a key and then associate the key with the log group.</p>
+			</div>
+			<div class="entry">
+				<h4>Step 2: agents on Runtime or the Harness</h4>
+				<p>The Harness emits traces, logs and metrics automatically. Agents deployed to Runtime with the CLI are instrumented for you; in your own container add <code>aws-opentelemetry-distro&gt;=0.18.0</code> and start with <code>opentelemetry-instrument python main.py</code>, with a framework that emits OpenTelemetry (Strands does natively). The session header you send on invoke becomes <code>session.id</code> on every span. To send telemetry to another platform (Langfuse, Datadog and others), set <code>DISABLE_ADOT_OBSERVABILITY=true</code> and your own OTLP endpoint.</p>
+			</div>
+			<div class="entry">
+				<h4>Step 3: agents hosted elsewhere</h4>
+				<span class="file">Environment for an agent on ECS, EKS or a server (as in the AgentCore observability configuration page; create the log group first)</span>
+<pre><code>AGENT_OBSERVABILITY_ENABLED=true
+OTEL_PYTHON_DISTRO=aws_distro
+OTEL_PYTHON_CONFIGURATOR=aws_configurator
+OTEL_RESOURCE_ATTRIBUTES=service.name=orders-agent,aws.log.group.names=/aws/bedrock-agentcore/runtimes/orders-agent
+OTEL_EXPORTER_OTLP_LOGS_HEADERS=x-aws-log-group=/aws/bedrock-agentcore/runtimes/orders-agent,x-aws-log-stream=runtime-logs,x-aws-metric-namespace=bedrock-agentcore
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_TRACES_EXPORTER=otlp
+<span class="c"># Keep model inputs and outputs and tool I/O on spans (needed for evaluations)</span>
+AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT=true</code></pre>
+				<p>Then run <code>opentelemetry-instrument python agent.py</code> (on Lambda, use the OpenTelemetry Lambda layer with <code>AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument</code>). Outside Runtime there's no session header, so set the session yourself:</p>
+				<span class="file">Tag every span of a conversation with its session ID (Python, OpenTelemetry)</span>
+<pre><code>from opentelemetry import baggage, context
+
+token = context.attach(baggage.set_baggage("session.id", session_id))
+try:
+    result = agent(prompt)
+finally:
+    context.detach(token)</code></pre>
+				<p>LangChain and LangGraph are instrumented through <code>opentelemetry-instrumentation-langchain</code> or OpenInference; other frameworks through OpenInference, OpenLLMetry, OpenLit or Traceloop. Add your own spans with <code>trace.get_tracer(...).start_as_current_span(...)</code> and business attributes, which become searchable.</p>
+			</div>
+			<div class="entry">
+				<h4>Other components</h4>
+				<p>Runtime creates its log group automatically. For Memory, Gateway and the built-in tools, enable log delivery (application logs to CloudWatch Logs, S3 or Firehose; default groups under <code>/aws/vendedlogs/bedrock-agentcore/</code>) and tracing per resource, in the console or with CloudWatch Logs delivery APIs. Runtime application logs include the request payload but not the response.</p>
+			</div>
+
+			<h2 id="s3">Where the data lands</h2>
+			<ul>
+				<li><strong>Agent log group:</strong> <code>/aws/bedrock-agentcore/runtimes/AGENT_ID-ENDPOINT</code>, with stdout and stderr, OpenTelemetry log records (AWS's pages name the stream <code>runtime-logs</code> or <code>otel-rt-logs</code>), and, for agents created since 20 July 2026, a <code>spans</code> stream. Older agents send spans to the shared <code>aws/spans</code> group unless you set <code>UNIFIED_TRACES_DESTINATION_ENABLED=true</code> (needs ADOT 0.18.0 or later and <code>logs:PutResourcePolicy</code> on the execution role).</li>
+				<li><strong>Consoles:</strong> the AgentCore observability page and CloudWatch GenAI Observability show agents, sessions, traces (with trajectory diagrams and timelines) and spans, plus Memory, Gateway, tools and Identity. <code>agentcore dev</code> opens a local inspector.</li>
+				<li><strong>Metrics</strong> (namespace <code>AWS/Bedrock-AgentCore</code>, on by default): Runtime Invocations, Latency, Throttles, SystemErrors, UserErrors, SessionCount, ActiveSessionCount, CPU and memory used, and OverheadLatency on V2; Gateway latency, target execution time and errors per tool; Memory extraction tokens and failures; Identity token fetches; Policy allow and deny decisions. Your agent's own metrics go to <code>bedrock-agentcore</code>, evaluation scores to <code>Bedrock-AgentCore/Evaluations</code>.</li>
+				<li><strong>Cross-account</strong> (April 2026): link source accounts to a monitoring account with CloudWatch cross-account observability to see agents, traces and evaluation results in one place, within a Region.</li>
+				<li><strong>Cost:</strong> CloudWatch rates. AWS's example: about 10 million spans a month (200,000 invocations) cost about $6.50 in ingestion. Filter or redact spans with span processors to control cost and personal data.</li>
+			</ul>
+			<span class="file">Alarm on gateway errors (AWS CLI)</span>
+<pre><code>aws cloudwatch put-metric-alarm --alarm-name orders-gateway-errors \
+  --namespace AWS/Bedrock-AgentCore --metric-name SystemErrors --statistic Sum \
+  --dimensions Name=Resource,Value=GATEWAY_ARN --period 300 --evaluation-periods 1 \
+  --threshold 5 --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:us-west-2:111111111111:agent-alerts</code></pre>
+
+			<h2 id="s4">Evaluators</h2>
+			<p>AgentCore Evaluations (generally available 31 March 2026) scores agents at three levels: <strong>session</strong> (a whole conversation), <strong>trace</strong> (one request and response) and <strong>tool call</strong>.</p>
+			<div class="entry">
+				<h4>Built-in evaluators</h4>
+				<ul>
+					<li><strong>Session:</strong> <code>Builtin.GoalSuccessRate</code> (yes or no; optional assertions as ground truth), and programmatic trajectory matchers <code>Builtin.TrajectoryExactOrderMatch</code>, <code>TrajectoryInOrderMatch</code> and <code>TrajectoryAnyOrderMatch</code>, which compare the tools called with an expected list and use no model.</li>
+					<li><strong>Trace:</strong> <code>Builtin.Correctness</code> (optional expected response), <code>Faithfulness</code>, <code>Helpfulness</code>, <code>ResponseRelevance</code>, <code>Coherence</code>, <code>Conciseness</code>, <code>InstructionFollowing</code>, <code>Refusal</code>, <code>Harmfulness</code> and <code>Stereotyping</code>.</li>
+					<li><strong>Tool call:</strong> <code>Builtin.ToolSelectionAccuracy</code> and <code>ToolParameterAccuracy</code>; for skills (August 2026), <code>SkillSelectionAccuracy</code> and <code>SkillInstructionFollowing</code>.</li>
+					<li><strong>Failure analysis</strong> (October 2026, batch only): <code>Builtin.FailureAnalysis</code> finds failures in each session, traces their root causes and groups them across sessions with suggested fixes. A score of 1.0 means failures were found, so <strong>higher is worse</strong>.</li>
+				</ul>
+				<p>Built-in evaluators use AWS-managed judge models through cross-Region inference within your geography (global in a few Regions); their prompts can't be changed. List the exact IDs available to you with <code>aws bedrock-agentcore-control list-evaluators</code>. Third-party evaluators (August 2026) add <code>ThirdParty.DeepEval.*</code> metrics (bias, toxicity, PII leakage, task completion, knowledge retention and more) and <code>ThirdParty.AutoEval.*</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>Custom evaluators</h4>
+				<span class="file">An LLM judge that compares answers with an expected response (Python, boto3; shape from the API reference)</span>
+<pre><code>import boto3
+
+ctl = boto3.client("bedrock-agentcore-control", region_name="us-west-2")
+ctl.create_evaluator(
+    evaluatorName="ResponseSimilarity",
+    level="TRACE",
+    evaluatorConfig={"llmAsAJudge": {
+        <span class="c"># Must include placeholders for the level; the service adds the output format</span>
+        "instructions": (
+            "Compare the agent's actual response to the expected response.\n\n"
+            "Context:\n{context}\n\nActual:\n{assistant_turn}\n\nExpected:\n{expected_response}"
+        ),
+        "ratingScale": {"numerical": [
+            {"label": "No Match", "value": 0.0, "definition": "Contradicts or unrelated"},
+            {"label": "High Similarity", "value": 0.67, "definition": "Covers most key points"},
+            {"label": "Exact Match", "value": 1.0, "definition": "Semantically equivalent"},
+        ]},
+        "modelConfig": {"bedrockEvaluatorModelConfig": {
+            "modelId": "global.anthropic.claude-sonnet-5-5",
+            "inferenceConfig": {"maxTokens": 512},
+        }},
+    }},
+)</code></pre>
+				<ul>
+					<li><strong>Code evaluators:</strong> <code>{"codeBased": {"lambdaConfig": {"lambdaArn": ..., "lambdaTimeoutInSeconds": 60}}}</code>. The Lambda receives the session's spans and the target trace or span IDs, and returns <code>{"label": "PASS", "value": 1.0, "explanation": "..."}</code>. Use them for deterministic checks (format, policy rules, calling your own systems).</li>
+					<li><strong>Multi-dimension</strong> (October 2026): one judge call scores up to 50 named dimensions. <strong>Derived</strong> evaluators run a built-in or third-party evaluator's logic on your own model, in your account.</li>
+					<li>Rating scales are numerical, categorical or multi-dimensional. Only evaluators returning a <strong>numeric</strong> value can drive recommendations and A/B tests, so a pass-fail categorical scale won't do there.</li>
+					<li>Evaluators that use ground truth (<code>{expected_response}</code>, assertions, expected trajectory) can't run online, because production traffic has no expected answers.</li>
+				</ul>
+			</div>
+
+			<h2 id="s5">Online evaluation</h2>
+			<p>An <strong>online evaluation configuration</strong> samples completed sessions from production logs and scores them continuously.</p>
+			<span class="file">Score 10% of production sessions for goal success and helpfulness (Python, boto3)</span>
+<pre><code>ctl.create_online_evaluation_config(
+    <span class="c"># Letters, digits and underscores only</span>
+    onlineEvaluationConfigName="orders_agent_prod",
+    dataSourceConfig={"cloudWatchLogs": {
+        "logGroupNames": ["/aws/bedrock-agentcore/runtimes/OrdersAgent-AbCdEf1234-DEFAULT"],
+        <span class="c"># Runtime agents: RUNTIME_NAME.ENDPOINT; elsewhere: your OTEL service.name</span>
+        "serviceNames": ["OrdersAgent.DEFAULT"],
+    }},
+    evaluators=[{"evaluatorId": "Builtin.GoalSuccessRate"}, {"evaluatorId": "Builtin.Helpfulness"}],
+    rule={
+        "samplingConfig": {"samplingPercentage": 10.0},
+        <span class="c"># A session is complete after this much inactivity</span>
+        "sessionConfig": {"sessionTimeoutMinutes": 15},
+    },
+    evaluationExecutionRoleArn="arn:aws:iam::111111111111:role/AgentCoreEvaluationRole",
+    enableOnCreate=True,
+)</code></pre>
+			<ul>
+				<li>Up to 25 evaluators, sampling from 0.01% to 100%, and up to 5 filters on span attributes (for example only <code>attributes.customer_tier</code> equal to <code>enterprise</code>).</li>
+				<li>Results are log events in <code>/aws/bedrock-agentcore/evaluations/results/CONFIG_ID</code> (or the source or your own log group) and metrics you can alarm on; the agent's Evaluations tab in CloudWatch GenAI Observability charts them.</li>
+				<li>The execution role (trusted by <code>bedrock-agentcore.amazonaws.com</code>) queries the agent's logs, writes results, and invokes models for custom judges; the console and CLI can create it.</li>
+				<li>Custom evaluators used by an enabled configuration are locked: disable the configuration or clone the evaluator to change it. CLI: <code>agentcore eval online-eval create --name N --agent ID --evaluators Builtin.GoalSuccessRate --sampling-rate 10</code>, then <code>pause</code>, <code>resume</code> and <code>logs</code>.</li>
+			</ul>
+			<div class="callout trap"><p>"No spans were found for the session" usually means the <code>serviceNames</code> value doesn't match (it's <code>RUNTIME_NAME.ENDPOINT</code> such as <code>OrdersAgent.DEFAULT</code> on Runtime), Transaction Search is off, the session ID isn't on the spans, or you didn't wait: allow 2 to 5 minutes after an invocation before evaluating it.</p></div>
+
+			<h2 id="s6">On-demand and batch evaluation</h2>
+			<ul>
+				<li><strong>On demand</strong> (<code>Evaluate</code> on the <code>bedrock-agentcore</code> client): synchronous, one evaluator and one session per call, up to 10 results returned (the last 10 traces or tool calls by default). You fetch the session's spans from CloudWatch Logs yourself, or let the SDK's <code>EvaluationClient(region_name=...).run(evaluator_ids=[...], session_id=..., agent_id=...)</code> collect them and batch the calls. Pass <code>evaluationReferenceInputs</code> for ground truth. CLI: <code>agentcore eval ondemand evaluate --agent ID --session-ids S --evaluators Builtin.Helpfulness</code>.</li>
+				<li><strong>Batch</strong> (generally available June 2026, <code>StartBatchEvaluation</code>): scores up to 500 sessions from a time range or a list of session IDs with up to 10 evaluators, runs under the caller's credentials (no service role), and returns per-evaluator average scores, plus failure-analysis insights. Ground truth per session goes in <code>evaluationMetadata.sessionMetadata</code>. It costs 25% less than online evaluation. Run one batch before and one after a change and compare the averages.</li>
+				<li><strong>Datasets and user simulation</strong> (datasets in preview): store scenarios (turns with expected responses, assertions, expected trajectories) as versioned datasets, let the SDK runners invoke your agent on them and evaluate, or have an LLM play the user with a goal and profile (<code>bedrock-agentcore[simulation]</code>) to test multi-turn behaviour before launch.</li>
+			</ul>
+			<p>Evaluations parses traces from Strands, LangGraph, OpenAI Agents SDK, LlamaIndex, Google ADK, Claude Agent SDK and Vercel AI SDK, in Python and TypeScript, and any OpenTelemetry or OpenInference instrumentation that follows the generative AI conventions.</p>
+
+			<h2 id="s7">Optimization</h2>
+			<div class="entry">
+				<h4>Recommendations</h4>
+				<p><code>StartRecommendation</code> (generally available 17 June 2026) analyses recent traces against <strong>exactly one numeric evaluator</strong> (for example <code>Builtin.GoalSuccessRate</code> for task agents) and returns a recommended system prompt with an explanation; tool-description recommendations need no evaluator and suggest clearer descriptions where the agent picks the wrong tools. Traces come from CloudWatch Logs (by log group <strong>ARN</strong>, not name), inline spans, or an existing batch or online evaluation. Nothing changes automatically: you review and apply. Generating recommendations is free.</p>
+			</div>
+			<div class="entry">
+				<h4>Configuration bundles</h4>
+				<p>A <strong>configuration bundle</strong> is a versioned snapshot of an agent's dynamic settings (system prompt, model, temperature, tool descriptions, any JSON), keyed by Runtime or Gateway ARN, with git-like versions and branches. Updates must name the latest version as parent. With SDK 1.8 or later, the agent reads the active version from request baggage through <code>BedrockAgentCoreContext.get_config_bundle()</code> (returning <code>{}</code> when none is set), so a prompt changes without redeploying; in Strands, apply it in a hook before each model call. Gateway applies tool-description overrides from a bundle on <code>tools/list</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>A/B tests</h4>
+				<ul>
+					<li><code>CreateABTest</code> on a gateway splits traffic between <strong>exactly two variants</strong> (<code>C</code> control and <code>T1</code> treatment): two configuration bundle versions on the same agent, or two gateway targets (different agents or endpoints). Assignment is sticky per session ID; one test per gateway.</li>
+				<li>An online evaluation configuration (at 100% sampling during the test) scores both variants; results show sample size, mean, change, p-value, a 95% confidence interval and a significance flag per evaluator, about 15 minutes after sessions end. Check every evaluator: one can regress while another improves.</li>
+				<li>After stopping the test, route all traffic to the winner with a Gateway rule (AWS CLI <code>create-gateway-rule</code>). For a bundle test, add a <code>configurationBundle.staticOverride</code> rule even if the control won, because the agent's built-in prompt isn't the control bundle.</li>
+				<li>There's no A/B fee: you pay for the gateway calls, Runtime and evaluations used.</li>
+			</ul>
+			</div>
+			<div class="callout retired"><p><strong>Status change.</strong> The preview <strong>Insights</strong> feature (failure, user-intent and execution-summary reports, including recurring reports) stopped accepting new jobs on 16 October 2026 and stopped recurring reports on 31 October 2026. Use the <code>Builtin.FailureAnalysis</code> evaluator in batch evaluation instead. Many code tabs in AWS's guide still use the retired Python starter toolkit and pre-1.0 CLI commands: use <code>agentcore eval ...</code> (CLI 1.0) and the <code>bedrock_agentcore</code> SDK.</p></div>
+
+			<h2 id="s8">Quotas, pricing and Regions</h2>
+			<ul>
+				<li><strong>Evaluations pricing:</strong> built-in evaluators $0.0024 per 1,000 input tokens and $0.012 per 1,000 output tokens (model included); custom evaluators $1.50 per 1,000 evaluations plus your model or Lambda cost; batch 25% less. Each evaluation sends the whole relevant context, so tokens add up: AWS's example of 45,000 built-in evaluations at 15,000 input tokens each costs about $1,782 a month. Sample online traffic (1 to 10%) and use batch for regression runs.</li>
+				<li><strong>Quotas:</strong> 1,000 online configurations, 25 evaluators each; built-in evaluations up to 1,000,000 input tokens and 1,200 evaluations per minute; on-demand 20,000 spans and one evaluator per call; batch 5 active jobs, 500 sessions and 10 evaluators per job; 10,000 custom evaluators; 5 active recommendations; 20 active A/B tests; 1,000 configuration bundles.</li>
+				<li><strong>Regions:</strong> Evaluations in all AgentCore Regions including GovCloud (US-West); optimization in the commercial Regions only.</li>
+			</ul>
+
+			<h2 id="s9">What's changed</h2>
+			<ul>
+				<li><strong>October to November 2026:</strong> multi-dimension evaluators; <code>Builtin.FailureAnalysis</code> in batch evaluation; Insights preview retired (16 and 31 October); CLI 1.0 with evaluation commands under <code>agentcore eval</code> and Transaction Search on by default; OverheadLatency metric for Runtime V2.</li>
+				<li><strong>September 2026:</strong> evaluations for TypeScript agents (Strands, LangGraph, OpenAI Agents, Vercel AI SDK).</li>
+				<li><strong>August 2026:</strong> third-party and derived evaluators; skill evaluators.</li>
+				<li><strong>July 2026:</strong> more frameworks for evaluations; per-agent span log groups by default for new agents (from 20 July); ActiveSessionCount metric; PrivateLink for evaluations and optimization.</li>
+				<li><strong>June 2026:</strong> recommendations, batch evaluation and A/B tests generally available (17 June).</li>
+				<li><strong>March to April 2026:</strong> Evaluations generally available with code evaluators and ground truth (31 March); one-click observability for Memory and Gateway; cross-account observability and trace UI improvements (April); optimization preview (30 April).</li>
+				<li><strong>2025:</strong> Observability in preview (16 July) and generally available (13 October); Evaluations preview (2 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d4-task-4-3.html">AIP-C01 Task 4.3: monitoring systems for GenAI applications</a> and <a href="../../aws-aip/d5-task-5-1.html">AIP-C01 Task 5.1: evaluation systems for GenAI</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="evaluation.html"><small>Previous</small>Model and RAG evaluation</a>
+				<span class="next"><small>Next</small>Managed Knowledge Bases (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock AgentCore Observability, Evaluations and Optimization, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>

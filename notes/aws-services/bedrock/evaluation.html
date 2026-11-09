@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Amazon Bedrock Model and RAG Evaluation | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon Bedrock Evaluations: automatic, LLM-as-a-judge, human and RAG evaluation jobs, built-in metric IDs and score directions, judge models, JSONL dataset formats including bring-your-own responses, CreateEvaluationJob examples for a model and a Knowledge Base, custom metrics, the service role, reading and comparing results, quality gates in CI, quotas, pricing and how it differs from AgentCore Evaluations.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">Bedrock</a><span class="sep">/</span><span class="here">Model and RAG evaluation</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon Bedrock &middot; Evaluations &middot; Last checked 9 November 2026</span>
+		<h1>Model and RAG evaluation</h1>
+		<p>Measure before you ship: Amazon Bedrock Evaluations runs jobs over your own prompt dataset that score a model, a prompt or a Knowledge Base with algorithms, an LLM judge or human reviewers, so you can pick models, compare prompt versions and catch RAG regressions with numbers instead of impressions.</p>
+		<div class="tags"><span class="tag code">Bedrock Evaluations</span><span class="tag">LLM-as-a-judge</span><span class="tag">RAG evaluation</span><span class="tag">Custom metrics</span><span class="tag">boto3</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Which evaluation to use</a></li>
+				<li><a href="#s2">Metrics</a></li>
+				<li><a href="#s3">Datasets</a></li>
+				<li><a href="#s4">A model evaluation job</a></li>
+				<li><a href="#s5">A RAG evaluation job</a></li>
+				<li><a href="#s6">Permissions</a></li>
+				<li><a href="#s7">Results and comparisons</a></li>
+				<li><a href="#s8">Designing good evaluations</a></li>
+				<li><a href="#s9">Quotas, pricing and Regions</a></li>
+				<li><a href="#s10">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Which evaluation to use</h2>
+			<p>All job types use one API, <code>CreateEvaluationJob</code> on the <code>bedrock</code> control-plane client, with <code>applicationType</code> set to <code>ModelEvaluation</code> or <code>RagEvaluation</code>. Each job reads a JSONL dataset from S3 and writes scores to S3.</p>
+			<ul>
+				<li><strong>Automatic (programmatic):</strong> fixed algorithms score accuracy, robustness and toxicity for a task type (generation, summarization, question answering, classification), on AWS's built-in datasets or yours. Cheap and repeatable, but blunt: good for comparing raw models on standard tasks.</li>
+				<li><strong>LLM-as-a-judge:</strong> a judge model rates each answer for quality (correctness, completeness, faithfulness, helpfulness and more) and responsible AI (harmfulness, stereotyping, refusal), with an explanation. Add <strong>custom metrics</strong> (your own judge prompt and rating scale) for things like brand voice. The usual choice for prompts and applications.</li>
+				<li><strong>Human:</strong> your own work team (up to 50 workers) rates or compares the answers of up to two models with thumbs up or down, Likert scales or rankings. For subjective quality and for checking that the judge agrees with people.</li>
+				<li><strong>RAG evaluation:</strong> scores a Knowledge Base on <strong>retrieval only</strong> (are the retrieved passages relevant and do they cover the answer) or on <strong>retrieve and generate</strong> (is the final answer correct, complete, faithful to the passages and properly cited).</li>
+				<li><strong>Bring your own responses:</strong> for model, human and RAG jobs you can supply responses (and retrieved passages and citations) produced anywhere, by another provider or your own RAG pipeline, and Bedrock only scores them.</li>
+			</ul>
+			<div class="table-wrap">
+				<table class="stack labeled compare">
+					<thead><tr><th>Bedrock Evaluations</th><th>AgentCore Evaluations</th></tr></thead>
+					<tbody>
+						<tr class="group"><th colspan="2">Evaluates</th></tr>
+						<tr><td data-label="Bedrock Evaluations">Models, prompts and RAG answers, one prompt at a time</td><td data-label="AgentCore Evaluations">Agents from their traces: whole sessions, single turns and tool choices</td></tr>
+						<tr class="group"><th colspan="2">When</th></tr>
+						<tr><td data-label="Bedrock Evaluations">Offline batch jobs over a fixed dataset</td><td data-label="AgentCore Evaluations">Online sampling of production traffic, on demand or batch</td></tr>
+						<tr class="group"><th colspan="2">Pricing</th></tr>
+						<tr><td data-label="Bedrock Evaluations">Model and judge inference only</td><td data-label="AgentCore Evaluations">Per-token price for built-in evaluators, per evaluation for custom ones</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Use Bedrock Evaluations to choose and tune; use <a href="agentcore-observability-evaluations.html#s4">AgentCore Evaluations</a> to watch agents in production.</p>
+
+			<h2 id="s2">Metrics</h2>
+			<div class="entry">
+				<h4>LLM-as-a-judge (model evaluation)</h4>
+				<p><code>Builtin.Correctness</code>, <code>Builtin.Completeness</code>, <code>Builtin.Faithfulness</code> (no information beyond what's in or inferable from the prompt), <code>Builtin.Helpfulness</code>, <code>Builtin.Coherence</code>, <code>Builtin.Relevance</code>, <code>Builtin.FollowingInstructions</code>, <code>Builtin.ProfessionalStyleAndTone</code>, and the responsible-AI metrics <code>Builtin.Harmfulness</code>, <code>Builtin.Stereotyping</code> and <code>Builtin.Refusal</code>. A reference answer is optional; Correctness and Completeness use it when present.</p>
+			</div>
+			<div class="entry">
+				<h4>RAG evaluation</h4>
+				<ul>
+					<li><strong>Retrieve only:</strong> <code>Builtin.ContextRelevance</code> and <code>Builtin.ContextCoverage</code> (needs reference answers).</li>
+					<li><strong>Retrieve and generate:</strong> <code>Builtin.Correctness</code>, <code>Builtin.Completeness</code>, <code>Builtin.Helpfulness</code>, <code>Builtin.LogicalCoherence</code>, <code>Builtin.Faithfulness</code> (compared with the retrieved passages, so it detects hallucination), <code>Builtin.CitationPrecision</code> and <code>Builtin.CitationCoverage</code> (use the two together), <code>Builtin.Harmfulness</code>, <code>Builtin.Stereotyping</code> and <code>Builtin.Refusal</code>.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Automatic (programmatic)</h4>
+				<p><code>Builtin.Accuracy</code>, <code>Builtin.Robustness</code> and <code>Builtin.Toxicity</code>, computed differently per task: real-world-knowledge score for generation, BERTScore for summarization, F1 for question answering, classification accuracy for classification (no toxicity there). Robustness re-runs each prompt with about five small perturbations (typos, case, whitespace, numbers as words), which multiplies inference cost. Built-in datasets (T-REx, BOLD, WikiText-2, RealToxicityPrompts, Gigaword, BoolQ, Natural Questions, TriviaQA, women's clothing reviews) are sampled to 100 prompts. Cohere models can't complete toxicity evaluation.</p>
+			</div>
+			<div class="entry">
+				<h4>Reading scores</h4>
+				<ul>
+					<li>The judge rates each answer on a 2- to 7-point scale, normalized to <strong>0 to 1</strong>; reports show the average and a histogram per metric.</li>
+					<li>For <strong>Harmfulness, Stereotyping and Refusal a higher score is worse</strong>; for programmatic robustness and toxicity, lower is better. Everything else: higher is better.</li>
+					<li>The judge prompts and rubrics are published in the documentation for each judge model, so you can see exactly what "correct" means.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Judge models</h4>
+				<p>About 22 judges are supported, including Amazon Nova Pro, Nova Premier, Nova Micro and Nova 2 Lite, Claude models from 3.5 Sonnet to Sonnet 4.6 and Opus 4.8, OpenAI GPT-5.4 and GPT-5.5, Llama 3.1 70B and Mistral Large (the RAG list currently omits Claude Sonnet 4.5). One judge per job for built-in metrics, and one (which can differ) for custom metrics. The generator, the judge and the S3 data must be in the job's Region, and judges vary by Region.</p>
+			</div>
+			<div class="callout trap"><p>The coherence metric is <code>Builtin.Coherence</code> in model evaluation but <code>Builtin.LogicalCoherence</code> in RAG evaluation. And the judge is tuned for English: scores on other languages are less reliable.</p></div>
+
+			<h2 id="s3">Datasets</h2>
+			<p>JSONL files in S3 (one JSON object per line), up to 1,000 prompts per dataset and 4 KB per prompt, up to 5 datasets per job. An optional <code>category</code> gives per-segment scores.</p>
+			<span class="file">Model evaluation, Bedrock calls the model (one line of the .jsonl file)</span>
+<pre><code>{"prompt": "How do I reset my router?", "referenceResponse": "Hold the reset button for 10 seconds, then wait for the lights to settle.", "category": "devices"}</code></pre>
+			<span class="file">Model evaluation with your own responses (one modelIdentifier across the whole file)</span>
+<pre><code>{"prompt": "How do I reset my router?", "referenceResponse": "Hold the reset button for 10 seconds.", "modelResponses": [{"response": "Press and hold reset for ten seconds.", "modelIdentifier": "support_bot_v2"}]}</code></pre>
+			<span class="file">RAG evaluation, Bedrock calls the Knowledge Base (retrieve-and-generate allows up to 5 turns; retrieve-only 1)</span>
+<pre><code>{"conversationTurns": [{"prompt": {"content": [{"text": "What is the refund window for online orders?"}]}, "referenceResponses": [{"content": [{"text": "30 days from delivery."}]}]}]}</code></pre>
+			<span class="file">RAG retrieve-and-generate with your own pipeline's output, passages and citations</span>
+<pre><code>{"conversationTurns": [{"prompt": {"content": [{"text": "What is the refund window?"}]}, "referenceResponses": [{"content": [{"text": "30 days from delivery."}]}], "output": {"text": "You can return items within 30 days of delivery.", "knowledgeBaseIdentifier": "my_rag_source", "retrievedPassages": {"retrievalResults": [{"content": {"text": "Refunds are accepted within 30 days of delivery."}, "metadata": {"source": "policy.pdf"}}]}, "citations": [{"generatedResponsePart": {"textResponsePart": {"span": {"start": 0, "end": 48}, "text": "You can return items within 30 days of delivery."}}, "retrievedReferences": [{"content": {"text": "Refunds are accepted within 30 days of delivery."}, "metadata": {"source": "policy.pdf"}}]}]}}]}</code></pre>
+			<ul>
+				<li>The reference for RAG is the <strong>expected answer</strong>, not the expected chunks.</li>
+				<li>Bring-your-own RAG output uses <code>retrievedResults</code> for retrieve-only jobs but <code>retrievedPassages</code> for retrieve-and-generate; <code>knowledgeBaseIdentifier</code> must be the same on every line and match the job's source identifier. Without citations, don't select the citation metrics.</li>
+			</ul>
+
+			<h2 id="s4">A model evaluation job</h2>
+			<span class="file">LLM-as-a-judge with built-in metrics and one custom metric (Python, boto3; field names from the API reference)</span>
+<pre><code>import json
+import time
+
+import boto3
+
+bedrock = boto3.client("bedrock", region_name="us-east-1")
+
+resp = bedrock.create_evaluation_job(
+    <span class="c"># Lowercase letters, digits and hyphens only</span>
+    jobName="support-bot-judge-2026-11-09",
+    roleArn="arn:aws:iam::111111111111:role/BedrockEvalRole",
+    applicationType="ModelEvaluation",
+    evaluationConfig={"automated": {
+        "datasetMetricConfigs": [{
+            <span class="c"># As in AWS's judge examples</span>
+            "taskType": "General",
+            "dataset": {
+                "name": "support-golden-v3",
+                "datasetLocation": {"s3Uri": "s3://eval-111111111111/datasets/support-golden-v3.jsonl"},
+            },
+            "metricNames": ["Builtin.Correctness", "Builtin.Faithfulness", "Builtin.Harmfulness", "brand-voice"],
+        }],
+        <span class="c"># Judge for the built-in metrics (exactly one)</span>
+        "evaluatorModelConfig": {"bedrockEvaluatorModels": [{"modelIdentifier": "amazon.nova-pro-v1:0"}]},
+        "customMetricConfig": {
+            "customMetrics": [{"customMetricDefinition": {
+                "name": "brand-voice",
+                "instructions": (
+                    "You are a brand editor checking support replies against our voice: friendly, plain words, "
+                    "no jargon. Rate the response.\nPrompt: {{prompt}}\nResponse: {{prediction}}"
+                ),
+                "ratingScale": [
+                    {"definition": "Off brand", "value": {"floatValue": 0}},
+                    {"definition": "Partly on brand", "value": {"floatValue": 1}},
+                    {"definition": "On brand", "value": {"floatValue": 2}},
+                ],
+            }}],
+            <span class="c"># Judge for custom metrics (exactly one; can differ)</span>
+            "evaluatorModelConfig": {"bedrockEvaluatorModels": [{"modelIdentifier": "amazon.nova-premier-v1:0"}]},
+        },
+    }},
+    <span class="c"># The model being evaluated (one per automated job)</span>
+    inferenceConfig={"models": [{"bedrockModel": {
+        "modelIdentifier": "amazon.nova-2-lite-v1:0",
+        "inferenceParams": json.dumps({"inferenceConfig": {"maxTokens": 512, "temperature": 0}}),
+    }}]},
+    outputDataConfig={"s3Uri": "s3://eval-111111111111/results/"},
+    jobTags=[{"key": "project", "value": "support-bot"}],
+)
+arn = resp["jobArn"]
+while (status := bedrock.get_evaluation_job(jobIdentifier=arn)["status"]) in ("InProgress", "Stopping"):
+    time.sleep(60)
+print(status)</code></pre>
+			<ul>
+				<li>To score your own responses instead of calling a model, use <code>inferenceConfig={"models": [{"precomputedInferenceSource": {"inferenceSourceIdentifier": "support_bot_v2"}}]}</code>, matching the dataset's <code>modelIdentifier</code>.</li>
+				<li>The model can be a foundation model, an inference profile (including application profiles), a custom, distilled or imported model, a prompt router, Provisioned Throughput or a Marketplace model; Responses API models on <code>bedrock-mantle</code> are API and CLI only.</li>
+				<li><strong>Custom metrics:</strong> up to 10 per job. Variables (<code>{{prompt}}</code>, <code>{{prediction}}</code>, <code>{{ground_truth}}</code>, and for RAG <code>{{context}}</code>) go at the end of the instructions (up to 5,000 characters); define the rating scale separately, not in the prompt. A custom metric without a scale returns explanations only, no scores.</li>
+				<li>Status values: <code>InProgress</code>, <code>Completed</code>, <code>Failed</code> (see <code>failureMessages</code>), <code>Stopping</code>, <code>Stopped</code>, <code>Deleting</code>. Stop with <code>stop_evaluation_job</code>; delete old jobs with <code>batch_delete_evaluation_job</code> (up to 25; results in S3 stay).</li>
+			</ul>
+			<div class="callout trap"><p><code>jobName</code> allows only lowercase letters, digits and hyphens (up to 63 characters), so names such as <code>my_rag_eval</code> in some AWS examples fail. The tags parameter is <code>jobTags</code>, not <code>tags</code>. An automated job evaluates <strong>one</strong> model: to compare models, run one job per model with the same dataset and judge, then compare.</p></div>
+
+			<h2 id="s5">A RAG evaluation job</h2>
+			<span class="file">Retrieve-and-generate evaluation of a Knowledge Base with hybrid search (Python, boto3)</span>
+<pre><code>resp = bedrock.create_evaluation_job(
+    jobName="kb-hybrid-top10-rag-eval",
+    roleArn="arn:aws:iam::111111111111:role/BedrockRagEvalRole",
+    applicationType="RagEvaluation",
+    evaluationConfig={"automated": {
+        "datasetMetricConfigs": [{
+            <span class="c"># Ignored for RAG jobs</span>
+            "taskType": "General",
+            "dataset": {
+                "name": "kb-questions",
+                "datasetLocation": {"s3Uri": "s3://eval-111111111111/datasets/kb-questions.jsonl"},
+            },
+            "metricNames": [
+                "Builtin.Correctness", "Builtin.Completeness", "Builtin.Faithfulness",
+                "Builtin.CitationPrecision", "Builtin.CitationCoverage",
+            ],
+        }],
+        "evaluatorModelConfig": {"bedrockEvaluatorModels": [{"modelIdentifier": "amazon.nova-pro-v1:0"}]},
+    }},
+    inferenceConfig={"ragConfigs": [{"knowledgeBaseConfig": {"retrieveAndGenerateConfig": {
+        "type": "KNOWLEDGE_BASE",
+        "knowledgeBaseConfiguration": {
+            "knowledgeBaseId": "KB_ID",
+            "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+            "retrievalConfiguration": {"vectorSearchConfiguration": {
+                "numberOfResults": 10,
+                "overrideSearchType": "HYBRID",
+            }},
+        },
+    }}}]},
+    outputDataConfig={"s3Uri": "s3://eval-111111111111/rag-results/"},
+)</code></pre>
+			<ul>
+				<li><strong>Retrieve only:</strong> use <code>{"knowledgeBaseConfig": {"retrieveConfig": {"knowledgeBaseId": "KB_ID", "knowledgeBaseRetrievalConfiguration": {"vectorSearchConfiguration": {"numberOfResults": 5}}}}}</code> with <code>Builtin.ContextRelevance</code> and <code>Builtin.ContextCoverage</code>. This isolates retrieval problems (chunking, embeddings, search type, number of results) from generation problems.</li>
+				<li><strong>Your own RAG pipeline:</strong> use <code>{"precomputedRagSourceConfig": {"retrieveAndGenerateSourceConfig": {"ragSourceIdentifier": "my_rag_source"}}}</code> (or <code>retrieveSourceConfig</code>) with a bring-your-own dataset.</li>
+				<li>Change one setting per job (search type, number of results, chunking, generator model, prompt) and compare: that's how you find what actually moves the scores.</li>
+			</ul>
+			<div class="callout trap"><p>According to an official AWS sample, <code>CreateEvaluationJob</code> can't evaluate the new <strong>Managed Knowledge Bases</strong> directly (their retrieval configuration isn't accepted). Evaluate them by exporting answers and passages as a bring-your-own dataset, with AgentCore Evaluations on agent traces, or with an open-source framework such as RAGAS.</p></div>
+
+			<h2 id="s6">Permissions</h2>
+			<span class="file">Service role trust policy (as in AWS's evaluation service role pages)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "bedrock.amazonaws.com"},
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {"aws:SourceAccount": "111111111111"},
+      "ArnEquals": {"aws:SourceArn": "arn:aws:bedrock:us-east-1:111111111111:evaluation-job/*"}
+    }
+  }]
+}</code></pre>
+			<ul>
+				<li>The role needs <code>bedrock:InvokeModel</code> <strong>plus</strong> <code>bedrock:CreateModelInvocationJob</code> and <code>bedrock:StopModelInvocationJob</code> (jobs run as batch inference) on both the generator and the judge (foundation models, inference profiles, provisioned and imported models as used).</li>
+				<li>S3: read the dataset (<code>s3:GetObject</code>, <code>s3:ListBucket</code>) and write results (<code>s3:PutObject</code>, <code>s3:GetBucketLocation</code> and multipart actions).</li>
+				<li>RAG jobs add <code>bedrock:Retrieve</code> and <code>bedrock:RetrieveAndGenerate</code> on the knowledge base ARN.</li>
+				<li>The caller needs <code>bedrock:CreateEvaluationJob</code> and <code>iam:PassRole</code> to <code>bedrock.amazonaws.com</code>. With a customer managed KMS key (<code>customerEncryptionKeyId</code>), the key policy allows Bedrock to decrypt and generate data keys for evaluation jobs.</li>
+				<li>Human jobs also need a SageMaker flow definition and work team, and CORS on the output bucket when created from the console.</li>
+			</ul>
+
+			<h2 id="s7">Results and comparisons</h2>
+			<ul>
+				<li>The console report card (under Inference and assessment, Evaluations) shows each metric's average and histogram, and each prompt's response, reference and scores; hover a score for the judge's explanation. The console shows explanations for only the first 5 prompts: the full results are in S3.</li>
+				<li>Results are JSONL under <code>s3://OUTPUT/JOB_NAME/JOB_UUID/models/MODEL/taskTypes/TASK/datasets/DATASET/</code>, each line holding the input record, the model response and <code>automatedEvaluationResult.scores</code> (<code>metricName</code> and <code>result</code>). Judge answers the service can't parse are kept in S3 but left out of averages.</li>
+				<li><strong>Compare</strong> in the console takes jobs that used the same metrics and shows a radar chart and score differences, for models or for RAG configurations.</li>
+				<li>Failed inferences are excluded from metrics: compare "prompts with responses" with the total before trusting an average.</li>
+			</ul>
+
+			<h2 id="s8">Designing good evaluations</h2>
+			<ul>
+				<li><strong>Golden dataset:</strong> real user questions plus edge cases (ambiguous, out of scope, adversarial), with reference answers where you can write them, and categories for the segments you care about. Over 1,000 prompts, sample by category.</li>
+				<li><strong>Keep the judge fixed:</strong> use the same judge model and settings across every job you compare, set the generator's temperature to 0, and record the configuration. AWS requires a separate evaluator model from the generator; whether the same model may play both roles isn't stated, so keep them different.</li>
+				<li><strong>Calibrate:</strong> have people rate a sample (a human job) and check the judge agrees before relying on it.</li>
+				<li><strong>Quality gates in CI:</strong> there's no built-in pass or fail. Start a job, poll until complete, read the S3 results, and fail the build when an average drops below your threshold (for example faithfulness under 0.9 or harmfulness above 0.05). Watch the 20 concurrent-job limit and delete old jobs.</li>
+				<li><strong>Prompt versions:</strong> render each Prompt management version into the dataset (or generate responses with each version and bring them), run one job per version with the same judge, and compare.</li>
+				<li>SageMaker Clarify's foundation model evaluation is closed to new customers; AWS names Bedrock Evaluations and Guardrails as its replacement.</li>
+			</ul>
+
+			<h2 id="s9">Quotas, pricing and Regions</h2>
+			<ul>
+				<li><strong>Quotas</strong> (not adjustable): 20 concurrent automatic jobs and 10 concurrent human jobs per account and Region, 5,000 jobs in total, 5 datasets and 1 model per automated job (2 for human jobs), 1,000 prompts per dataset, 4 KB per prompt, 10 custom metrics. The quotas page also lists 3 metrics per dataset for automated jobs, while AWS's judge and RAG examples use more, so test your metric count.</li>
+				<li><strong>Pricing:</strong> no evaluation fee. You pay the generator's inference and the judge's tokens at on-demand Standard prices (the judge prompts themselves count as input), plus normal Knowledge Base charges for RAG jobs; algorithmic scores are free; human jobs add $0.21 per completed task. Robustness multiplies generator calls.</li>
+				<li><strong>Regions:</strong> launched in us-east-1 and us-west-2 and has since expanded (including GovCloud, Seoul and Zurich, and judge and RAG evaluation in most major Regions); judge models vary by Region, so check the model list for yours.</li>
+			</ul>
+
+			<h2 id="s10">What's changed</h2>
+			<ul>
+				<li><strong>2025 to 2026:</strong> newer judge models added to the documentation (Nova 2 Lite, Claude Haiku 4.5, Sonnet 4.5 and 4.6, Opus 4.5 to 4.8, GPT-5.4 and GPT-5.5) and Responses API models as generators, without separate announcements; no other new Bedrock Evaluations features announced since April 2025. Agent evaluation arrived separately in AgentCore Evaluations (generally available 31 March 2026).</li>
+				<li><strong>17 April 2025:</strong> custom metrics for model and RAG evaluation.</li>
+				<li><strong>20 March 2025:</strong> LLM-as-a-judge and RAG evaluation generally available, with bring-your-own responses and citation metrics.</li>
+				<li><strong>1 December 2024:</strong> LLM-as-a-judge and RAG evaluation preview; comparing jobs.</li>
+				<li><strong>September to October 2024:</strong> evaluating inference profiles, custom models and imported models.</li>
+				<li><strong>23 April 2024:</strong> model evaluation (automatic and human) generally available, after a preview from November 2023.</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-aip/d5-task-5-1.html">AIP-C01 Task 5.1: evaluation systems for GenAI</a> and <a href="../../aws-aif/d3-task-3-4.html">AIF-C01 Task 3.4: evaluating FM performance</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="agentcore-memory-tools.html"><small>Previous</small>Memory and built-in tools</a>
+				<a class="next" href="agentcore-observability-evaluations.html"><small>Next</small>Observability, Evaluations and Optimization</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon Bedrock Evaluations, checked against the AWS documentation on 9 November 2026.</div>
+</footer>
+
+</body>
+</html>
