@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker AI Training and Tuning | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to SageMaker AI training jobs: the container contract, built-in algorithms, script mode and your own containers, File, FastFile and Pipe input, ModelTrainer (SDK V3) and the CreateTrainingJob API, Spot and checkpoints, warm pools, instance preference lists and training plans, distributed training, Debugger and its replacements, automatic model tuning, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">Training and tuning</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Train &middot; Last checked 10 November 2026</span>
+		<h1>Training and tuning</h1>
+		<p>Training jobs from the inside out: what the container sees, the three ways to bring an algorithm, getting data in, running jobs with ModelTrainer or the API, cutting cost with Spot and warm pools, getting capacity, distributed training, debugging, automatic model tuning, and the security settings, quotas and prices that apply.</p>
+		<div class="tags"><span class="tag code">CreateTrainingJob</span><span class="tag">ModelTrainer</span><span class="tag">Built-in algorithms</span><span class="tag">Spot</span><span class="tag">Automatic model tuning</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">How a training job works</a></li>
+				<li><a href="#s2">Three ways to bring an algorithm</a></li>
+				<li><a href="#s3">Getting data in</a></li>
+				<li><a href="#s4">Training with ModelTrainer</a></li>
+				<li><a href="#s5">Training with the API</a></li>
+				<li><a href="#s6">Spot, warm pools and capacity</a></li>
+				<li><a href="#s7">Distributed training</a></li>
+				<li><a href="#s8">Debugging and monitoring</a></li>
+				<li><a href="#s9">Automatic model tuning</a></li>
+				<li><a href="#s10">Security</a></li>
+				<li><a href="#s11">Quotas and pricing</a></li>
+				<li><a href="#s12">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">How a training job works</h2>
+			<p>A <strong>training job</strong> starts the instances you asked for, pulls your container image, copies or mounts the input data, runs the container with the argument <code>train</code>, uploads the result to S3 and shuts everything down. You pay from the start of the job to the end of the upload, including data download and model upload.</p>
+			<div class="entry">
+				<h4>What the container sees</h4>
+				<ul>
+					<li><strong>Inputs:</strong> data channels under <code>/opt/ml/input/data/CHANNEL</code>; hyperparameters in <code>/opt/ml/input/config/hyperparameters.json</code> (all values are strings); the cluster layout in <code>resourceconfig.json</code> (<code>current_host</code> such as <code>algo-1</code>, and the list of <code>hosts</code>).</li>
+					<li><strong>Outputs:</strong> whatever the code writes to <strong><code>/opt/ml/model</code></strong> becomes <code>model.tar.gz</code> in the output path; <code>/opt/ml/output/data</code> becomes <code>output.tar.gz</code>; <code>/opt/ml/checkpoints</code> syncs to S3 continuously if checkpoints are configured; the first 1,024 characters of <code>/opt/ml/output/failure</code> become the job's <code>FailureReason</code>. Set <code>CompressionType</code> to <code>NONE</code> to skip the tar step for large models.</li>
+					<li><strong>Environment:</strong> AWS framework containers (through the training toolkit) set <code>SM_MODEL_DIR</code>, <code>SM_CHANNEL_TRAIN</code> (one per channel), <code>SM_HPS</code>, <code>SM_HOSTS</code>, <code>SM_CURRENT_HOST</code> and <code>SM_NUM_GPUS</code>, and pass hyperparameters as command-line arguments.</li>
+					<li><strong>Stopping:</strong> on a stop request or when the maximum run time is reached, the container gets SIGTERM and 120 seconds to save its work before SIGKILL.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Status, logs and metrics</h4>
+				<p>The status is <code>InProgress</code>, <code>Completed</code>, <code>Failed</code>, <code>Stopping</code> or <code>Stopped</code>; the <strong>secondary status</strong> says what's happening: <code>Starting</code>, <code>Pending</code> (waiting for capacity), <code>Downloading</code>, <code>Training</code>, <code>Interrupted</code> (Spot capacity reclaimed), <code>Uploading</code>, <code>MaxRuntimeExceeded</code> or <code>MaxWaitTimeExceeded</code>. Logs go to CloudWatch group <code>/aws/sagemaker/TrainingJobs</code> with one stream per host. Instance metrics (CPU, memory, GPU, GPU memory, disk) are in the namespace of the same name per host, and your own metrics come from <strong><code>MetricDefinitions</code></strong>: up to 40 regular expressions that SageMaker matches against the log output and publishes to CloudWatch. Built-in algorithms define theirs automatically.</p>
+			</div>
+
+			<h2 id="s2">Three ways to bring an algorithm</h2>
+			<div class="entry">
+				<h4>Built-in algorithms</h4>
+				<p>AWS-provided images you configure only with hyperparameters. CSV input must have <strong>no header and the label in the first column</strong> (unsupervised algorithms use <code>text/csv;label_size=0</code>); <code>application/x-recordio-protobuf</code> suits sparse data. The main ones by problem type:</p>
+				<ul>
+					<li><strong>Tabular classification and regression:</strong> XGBoost (CSV, LibSVM, Parquet; CPU, GPU from 1.2; memory-bound, so prefer M5 over C instances), Linear Learner, k-NN, Factorization Machines (sparse data such as click prediction and recommendations; recordIO-protobuf only), and LightGBM, CatBoost, AutoGluon-Tabular and TabTransformer.</li>
+					<li><strong>Unsupervised:</strong> K-Means (clustering), PCA (dimensionality reduction), Random Cut Forest (anomaly detection, CPU only), IP Insights (unusual IP use), LDA and NTM (topic modelling).</li>
+					<li><strong>Time series:</strong> DeepAR (JSON Lines or Parquet).</li>
+					<li><strong>Text:</strong> BlazingText (Word2Vec and text classification), Object2Vec (pair embeddings), Seq2Seq (translation, summarization; GPU), Text Classification - TensorFlow.</li>
+					<li><strong>Vision:</strong> Image Classification, Object Detection (MXNet and TensorFlow versions) and Semantic Segmentation, all GPU.</li>
+				</ul>
+				<p>Only Image Classification - MXNet, Object Detection - MXNet and Semantic Segmentation support <strong>incremental training</strong> (a <code>model</code> channel pointing at the previous artifact). Built-in images are pulled with SageMaker's own credentials, so IAM can't restrict which built-in algorithm someone uses. Image URIs differ by Region and version (XGBoost in us-east-1 is <code>683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1</code>; don't use <code>:latest</code>); <code>image_uris.retrieve()</code> in the SDK looks them up.</p>
+			</div>
+			<div class="entry">
+				<h4>Script mode on AWS framework containers</h4>
+				<p>You write <code>train.py</code> (plus <code>requirements.txt</code>) and run it on an AWS Deep Learning Container for PyTorch, TensorFlow or Hugging Face, or the SageMaker scikit-learn and XGBoost framework containers (account <code>763104351884</code> for the Deep Learning Containers). The container installs requirements, sets the <code>SM_*</code> variables and runs your script. This is the usual choice for custom models.</p>
+			</div>
+			<div class="entry">
+				<h4>Your own container</h4>
+				<p>Push an image to ECR with a <code>train</code> executable or an exec-form <code>ENTRYPOINT</code> that follows the <code>/opt/ml</code> layout; install <code>sagemaker-training</code> to get script-mode behaviour. Private registries work through <code>TrainingImageConfig</code>, and <strong>AWS Marketplace algorithms</strong> (<code>AlgorithmName</code>) always run with network isolation.</p>
+			</div>
+
+			<h2 id="s3">Getting data in</h2>
+			<ul>
+				<li><strong>File mode</strong> (default): downloads the whole channel to the instance volume before training starts, so the volume must hold the data, model and checkpoints. Works with every data source type.</li>
+				<li><strong>FastFile mode</strong>: presents S3 as a read-only file system and streams on demand, so training starts immediately and the data needn't fit on disk; best for sequential reads. S3 prefixes only (no manifests); end the prefix with <code>/</code>.</li>
+				<li><strong>Pipe mode</strong>: streams S3 into a FIFO per channel per epoch; your code or algorithm must support it. AWS describes it as largely replaced by FastFile mode, but exams still ask about it as the way to start fast on large datasets.</li>
+				<li><strong>Distribution:</strong> <code>FullyReplicated</code> gives every instance all the data; <strong><code>ShardedByS3Key</code></strong> gives each instance about 1/n of the objects, so split the data into at least as many files as instances.</li>
+				<li><strong>FSx for Lustre and EFS</strong> (<code>FileSystemDataSource</code>): mounted in seconds whatever the size; needs a <code>VpcConfig</code> (for FSx, a subnet in its Availability Zone). Recommended for large distributed jobs that reread data.</li>
+				<li><strong>Limits:</strong> 1 to 20 channels per job, data in the job's Region. <code>VolumeSizeInGB</code> sizes the EBS volume (default 30 in the SDKs); instance types with local NVMe storage (such as ml.p4d, ml.g5) use that instead.</li>
+			</ul>
+
+			<h2 id="s4">Training with ModelTrainer</h2>
+			<p>In SDK V3, <strong><code>ModelTrainer</code></strong> replaces <code>Estimator</code> and the framework estimators: you give it an image, source code and configuration objects, and it rejects any argument it doesn't know.</p>
+			<span class="file">Distributed PyTorch on two GPU instances with Spot, checkpoints and a VPC (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.core import image_uris
+from sagemaker.core.helper.session_helper import Session, get_execution_role
+<span class="c"># New home of the config classes; sagemaker.train.configs still works but is deprecated</span>
+from sagemaker.core.training.configs import (
+    CheckpointConfig, Compute, InputData, Networking, OutputDataConfig, SourceCode, StoppingCondition,
+)
+from sagemaker.train import ModelTrainer
+from sagemaker.train.distributed import Torchrun
+
+session = Session()
+image = image_uris.retrieve(framework="pytorch", region=session.boto_region_name, version="2.5.1",
+                            py_version="py311", instance_type="ml.g5.12xlarge", image_scope="training")
+
+trainer = ModelTrainer(
+    training_image=image,
+    role=get_execution_role(),
+    base_job_name="ddp-demo",
+    source_code=SourceCode(source_dir="./src", entry_script="train.py", requirements="requirements.txt"),
+    <span class="c"># One process per GPU: ml.g5.12xlarge has 4</span>
+    distributed=Torchrun(process_count_per_node=4),
+    <span class="c"># Spot can't be combined with warm pools or instance preference lists</span>
+    compute=Compute(instance_type="ml.g5.12xlarge", instance_count=2, volume_size_in_gb=100,
+                    enable_managed_spot_training=True),
+    <span class="c"># Wait time covers waiting for Spot capacity plus running</span>
+    stopping_condition=StoppingCondition(max_runtime_in_seconds=4 * 3600, max_wait_time_in_seconds=8 * 3600),
+    checkpoint_config=CheckpointConfig(s3_uri="s3://ml-111111111111/ddp/checkpoints/"),
+    output_data_config=OutputDataConfig(s3_output_path="s3://ml-111111111111/ddp/output/"),
+    <span class="c"># The security group must allow all traffic from itself for the nodes to talk</span>
+    networking=Networking(subnets=["subnet-0aaa"], security_group_ids=["sg-0train"],
+                          enable_inter_container_traffic_encryption=True),
+    hyperparameters={"epochs": 5, "lr": 3e-4},
+)
+trainer.train(input_data_config=[InputData(channel_name="train", data_source="s3://ml-111111111111/ddp/train/")],
+              wait=False)</code></pre>
+			<span class="file">The matching train.py: read the SageMaker environment, resume from a checkpoint, save the model (Python)</span>
+<pre><code>import argparse
+import json
+import os
+
+CKPT_DIR = "/opt/ml/checkpoints"
+
+
+def main():
+    p = argparse.ArgumentParser()
+    <span class="c"># Hyperparameters arrive as command-line arguments</span>
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--model-dir", default=os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
+    p.add_argument("--train", default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
+    args = p.parse_args()
+    host = os.environ.get("SM_CURRENT_HOST", "algo-1")
+
+    <span class="c"># After a Spot interruption, SageMaker restores /opt/ml/checkpoints from S3</span>
+    ckpt = os.path.join(CKPT_DIR, f"ckpt-{host}.json")
+    start = json.load(open(ckpt))["epoch"] if os.path.exists(ckpt) else 0
+
+    for epoch in range(start, args.epochs):
+        loss = 0.0  <span class="c"># real training goes here</span>
+        <span class="c"># A MetricDefinitions regex such as "train_loss=([0-9\.]+)" turns this into a metric</span>
+        print(f"epoch={epoch} train_loss={loss:.4f}")
+        os.makedirs(CKPT_DIR, exist_ok=True)
+        json.dump({"epoch": epoch + 1}, open(ckpt, "w"))
+
+    <span class="c"># Everything in the model directory becomes model.tar.gz in S3</span>
+    os.makedirs(args.model_dir, exist_ok=True)
+    json.dump({"trained": True}, open(os.path.join(args.model_dir, "model.json"), "w"))
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+			<ul>
+				<li><strong>Test locally first:</strong> <code>ModelTrainer(training_mode=Mode.LOCAL_CONTAINER, compute=Compute(instance_type="local_cpu", ...))</code> runs the same container in Docker on your machine.</li>
+				<li><strong>Other options:</strong> <code>with_metric_definitions</code>, <code>with_retry_strategy</code>, <code>with_infra_check_config</code> (hardware and network health check before training), <code>with_remote_debug_config</code>, MPI with <code>MPI()</code>, and <code>@remote</code> (from <code>sagemaker.core.remote_function</code>) to run a Python function as a training job.</li>
+				<li><strong>V2 equivalent</strong> (what exam material shows): <code>PyTorch(entry_point="train.py", framework_version=..., instance_type=..., instance_count=2, distribution={"torch_distributed": {"enabled": True}}, use_spot_instances=True, max_run=..., max_wait=..., checkpoint_s3_uri=...)</code> then <code>.fit({"train": "s3://..."})</code>.</li>
+			</ul>
+			<div class="callout trap"><p>Some AWS documentation samples rewritten for V3 still pass V2-only arguments to <code>ModelTrainer</code>, such as <code>distribution=</code>, <code>max_run=</code>, <code>enable_remote_debug=</code> or <code>compiler_config=</code>. They fail, because <code>ModelTrainer</code> rejects unknown arguments. Use <code>distributed=Torchrun()</code>, <code>StoppingCondition</code> and the <code>with_*</code> methods instead.</p></div>
+
+			<h2 id="s5">Training with the API</h2>
+			<span class="file">Built-in XGBoost with Spot, checkpoints, a VPC, network isolation, KMS keys and a custom metric (Python, boto3)</span>
+<pre><code>import boto3
+
+sm = boto3.client("sagemaker", region_name="us-east-1")
+KEY = "arn:aws:kms:us-east-1:111111111111:key/EXAMPLE-KEY-ID"
+
+
+def channel(name, uri):
+    <span class="c"># Built-in XGBoost CSV: label in the first column, no header</span>
+    return {"ChannelName": name, "ContentType": "text/csv",
+            "DataSource": {"S3DataSource": {"S3DataType": "S3Prefix", "S3Uri": uri,
+                                            "S3DataDistributionType": "FullyReplicated"}}}
+
+
+sm.create_training_job(
+    TrainingJobName="churn-xgb-2026-11-10-01",
+    <span class="c"># The caller needs iam:PassRole on this role</span>
+    RoleArn="arn:aws:iam::111111111111:role/SageMakerTrainingRole",
+    AlgorithmSpecification={
+        "TrainingImage": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1",
+        "TrainingInputMode": "File",
+        <span class="c"># Built-ins publish their own metrics; MetricDefinitions matter most for your own code</span>
+        "MetricDefinitions": [{"Name": "train:loss", "Regex": "train_loss=([0-9\\.]+)"}],
+    },
+    <span class="c"># Values are always strings</span>
+    HyperParameters={"objective": "binary:logistic", "num_round": "300", "eval_metric": "auc"},
+    InputDataConfig=[channel("train", "s3://ml-111111111111/churn/train/"),
+                     channel("validation", "s3://ml-111111111111/churn/validation/")],
+    OutputDataConfig={"S3OutputPath": "s3://ml-111111111111/churn/output/", "KmsKeyId": KEY},
+    <span class="c"># VolumeKmsKeyId isn't allowed on instance types with local NVMe storage</span>
+    ResourceConfig={"InstanceType": "ml.m5.2xlarge", "InstanceCount": 1, "VolumeSizeInGB": 50, "VolumeKmsKeyId": KEY},
+    EnableManagedSpotTraining=True,
+    <span class="c"># MaxWaitTimeInSeconds (waiting plus running) must be at least MaxRuntimeInSeconds</span>
+    StoppingCondition={"MaxRuntimeInSeconds": 3600, "MaxWaitTimeInSeconds": 7200},
+    CheckpointConfig={"S3Uri": "s3://ml-111111111111/churn/checkpoints/"},
+    <span class="c"># Private subnets need an S3 gateway endpoint to reach the data</span>
+    VpcConfig={"Subnets": ["subnet-0aaa", "subnet-0bbb"], "SecurityGroupIds": ["sg-0train"]},
+    <span class="c"># The container gets no network access and no AWS credentials</span>
+    EnableNetworkIsolation=True,
+    Tags=[{"Key": "project", "Value": "churn"}],
+)
+
+job = sm.describe_training_job(TrainingJobName="churn-xgb-2026-11-10-01")
+print(job["TrainingJobStatus"], job["SecondaryStatus"])
+<span class="c"># When it completes: Spot saving % = (1 - BillableTimeInSeconds / TrainingTimeInSeconds) * 100</span></code></pre>
+			<p>Also useful on <code>CreateTrainingJob</code>: <code>RetryStrategy</code> (1 to 30 automatic retries, only for internal service errors), <code>InfraCheckConfig</code>, <code>RemoteDebugConfig</code>, <code>MlflowConfig</code> to log to <a href="studio-environments.html#s9">managed MLflow</a>, and <code>Environment</code> (up to 100 variables). Don't put secrets in hyperparameters, environment variables or tags: <code>DescribeTrainingJob</code> shows them.</p>
+
+			<h2 id="s6">Spot, warm pools and capacity</h2>
+			<div class="entry">
+				<h4>Managed Spot training</h4>
+				<p>Runs the job on spare capacity for <strong>up to 90% less</strong> (AWS's current figure; some API pages still say 80%). If capacity is reclaimed the job pauses (<code>Interrupted</code>) and resumes when capacity returns, restoring <code>/opt/ml/checkpoints</code> from S3, so <strong>write checkpoints</strong> unless the job is short. It <strong>never falls back to On-Demand</strong>: when <code>MaxWaitTimeInSeconds</code> passes, the job stops with <code>MaxWaitTimeExceeded</code>. Built-in algorithms that can't checkpoint are limited to a one-hour wait. Spot has its own instance quotas (20 per job, 4 across jobs by default).</p>
+			</div>
+			<div class="entry">
+				<h4>Managed warm pools</h4>
+				<p>Set <code>KeepAlivePeriodInSeconds</code> (up to 3,600 seconds per the guide) and the instances stay up after the job, so the next job with the <strong>same</strong> role, instance type and count, volume size and key, VPC settings and network isolation and encryption flags starts in seconds; a pool can be reused job after job for up to 28 days. You pay for the retained time. Warm pools don't work with Spot or heterogeneous clusters, and the warm pool quota is <strong>0 per instance type</strong> by default, so without an increase no pool is kept. Set the period to 0 with <code>UpdateTrainingJob</code> to release a pool early.</p>
+			</div>
+			<div class="entry">
+				<h4>Getting GPU capacity</h4>
+				<ul>
+					<li><strong>Instance preference lists</strong> (September 2026): <code>ResourceConfig.InstancePreferences</code> lists up to five instance types tried in order; the job runs on the first one with capacity (<code>SelectedInstanceType</code> shows which). <code>MaxPendingTimeInSeconds</code> bounds the wait for accelerated types. Not combinable with Spot or <code>InstanceType</code>; the quota is checked for every type, and your code must run on all of them.</li>
+					<li><strong>Flexible training plans:</strong> reserve GPU or Trainium instances (ml.p4d, p5, p5e, p5en, p6-b200, trn1, trn2 and others) for 1 to 182 days, up to 56 days ahead, paid upfront and not cancellable. Pass <code>TrainingPlanArn</code>; jobs wait as <code>Pending</code> until the plan is active. Plans are bought separately for training jobs, HyperPod, endpoints or Studio.</li>
+					<li><strong>AWS Batch</strong> can queue SageMaker training jobs with priorities and fair share (July 2025), with quota management and preemption since March 2026, at no Batch charge.</li>
+					<li><strong>Heterogeneous clusters</strong> (<code>InstanceGroups</code>, up to five groups) put CPU-heavy data preprocessing on cheap CPU instances so GPUs stay busy.</li>
+					<li><strong>Faster starts:</strong> SOCI-indexed images (October 2026; Deep Learning Container tags ending <code>-soci</code>) load the image lazily, so large containers start in seconds.</li>
+				</ul>
+			</div>
+
+			<h2 id="s7">Distributed training</h2>
+			<ul>
+				<li><strong>Data parallel</strong> when the data is large: each GPU holds a copy of the model and processes different batches, and gradients are averaged. <strong>Model parallel</strong> when the model doesn't fit on one GPU: the model itself is split.</li>
+				<li><strong>Launchers:</strong> PyTorch DDP and FSDP through <code>torchrun</code> (<code>Torchrun()</code> in V3, <code>{"torch_distributed": {"enabled": True}}</code> in V2), MPI, DeepSpeed and parameter servers all work.</li>
+				<li><strong>SageMaker libraries:</strong> SMDDP (faster AllReduce and AllGather on ml.p4d and p4de, plus AllReduce on ml.p3dn) and SMP v2 (FSDP-based sharding, tensor, expert and context parallelism, FP8 on P5). Neither has a deprecation notice, but neither has had a release since April 2025 and SMP supports PyTorch only up to 2.5.1, while the Deep Learning Containers are at 2.10. Prefer native PyTorch unless you need a specific feature.</li>
+				<li><strong>Networking:</strong> the security group must allow all traffic to and from itself (needed for EFA too). Inter-container traffic encryption adds IPsec between nodes (allow UDP 500 and ESP from the group) and slows deep learning jobs.</li>
+				<li><strong>Training Compiler</strong> gets no new releases. For multi-week foundation model training on persistent, self-healing clusters, see HyperPod (feature page to come); for fine-tuning foundation models without managing instances, serverless model customization (feature page to come).</li>
+			</ul>
+
+			<h2 id="s8">Debugging and monitoring</h2>
+			<div class="callout retired"><p><strong>Debugger</strong> has been closed to new customers since 30 July 2026, and <strong>Profiler</strong> support ends 30 June 2027. Exams still ask about them: Debugger's free built-in rules (<code>VanishingGradient</code>, <code>ExplodingTensor</code>, <code>Overfit</code>, <code>LossNotDecreasing</code>, <code>PoorWeightInitialization</code> and others) watch tensors during training and can stop the job, and Profiler finds CPU, GPU and I/O bottlenecks. AWS's replacements: MLflow or TensorBoard for metrics and tracking, TensorBoard histograms for gradients and weights, CloudWatch for system profiling, and CloudWatch alarms plus MLflow run comparison for automatic checks.</p></div>
+			<ul>
+				<li><strong>MLflow:</strong> pass <code>MlflowConfig</code> on the job, or log from the script, to track parameters, metrics and models across runs. The old Experiments SDK works only in Studio Classic.</li>
+				<li><strong>TensorBoard:</strong> write logs with <code>TensorBoardOutputConfig</code> and open them in the TensorBoard app in Studio (five Regions, ml.r5.large).</li>
+				<li><strong>Interactive debugging:</strong> with <code>RemoteDebugConfig</code> enabled, open a shell in the running container with <code>aws ssm start-session --target sagemaker-training-job:JOB_algo-1</code>. Not available with network isolation or for built-in algorithms.</li>
+			</ul>
+
+			<h2 id="s9">Automatic model tuning</h2>
+			<p><strong>Automatic model tuning</strong> runs many training jobs with different hyperparameters and keeps the one with the best objective metric. The tuning itself is free; you pay for the training jobs.</p>
+			<ul>
+				<li><strong>Bayesian</strong> (default) learns from finished jobs which values to try next, so it gets smarter with <strong>fewer jobs in parallel</strong>. <strong>Random</strong> scales to full parallelism without losing quality. <strong>Grid</strong> tries every combination of categorical values. <strong>Hyperband</strong> uses metrics reported during training to stop weak configurations early and move resources to promising ones; it's the fastest for large iterative jobs.</li>
+				<li><strong>Ranges:</strong> integer, continuous and categorical. Use <strong>logarithmic</strong> scaling when a range spans orders of magnitude (a linear search of 0.0001 to 1.0 spends about 90% of the jobs between 0.1 and 1.0), and reverse logarithmic for values sensitive near 1, such as momentum.</li>
+				<li><strong>Early stopping</strong> (<code>Auto</code>) stops a job whose objective is worse than the median of earlier jobs at the same epoch; the algorithm must report the metric every epoch, and it must be off for Hyperband. <strong>Completion criteria</strong> end the whole tuning job at a target value, after N jobs without improvement, or on convergence.</li>
+				<li><strong>Warm start</strong> reuses up to five earlier tuning jobs: <code>IdenticalDataAndAlgorithm</code> (same data and image, new ranges) or <code>TransferLearning</code> (data, ranges or image version changed). <strong>Autotune</strong> chooses ranges, strategy and limits for you from hints.</li>
+				<li><strong>Limits:</strong> 10 parallel training jobs per tuning job and 750 jobs per tuning job (not adjustable), 30 tunable hyperparameters. AWS suggests about 50 or more jobs for a typical search. Multi-objective tuning isn't supported: combine metrics into one.</li>
+			</ul>
+			<span class="file">Bayesian tuning of XGBoost with a log-scaled learning rate, early stopping and completion criteria (Python, boto3; reuses sm and channel() from the API example above)</span>
+<pre><code>sm.create_hyper_parameter_tuning_job(
+    <span class="c"># Up to 32 characters; becomes the prefix of every training job name</span>
+    HyperParameterTuningJobName="churn-xgb-bayes-01",
+    HyperParameterTuningJobConfig={
+        "Strategy": "Bayesian",
+        "HyperParameterTuningJobObjective": {"Type": "Maximize", "MetricName": "validation:auc"},
+        "ResourceLimits": {"MaxNumberOfTrainingJobs": 40, "MaxParallelTrainingJobs": 4},
+        "ParameterRanges": {
+            "ContinuousParameterRanges": [
+                {"Name": "eta", "MinValue": "0.001", "MaxValue": "0.5", "ScalingType": "Logarithmic"},
+                {"Name": "subsample", "MinValue": "0.5", "MaxValue": "1.0", "ScalingType": "Linear"},
+            ],
+            "IntegerParameterRanges": [{"Name": "max_depth", "MinValue": "3", "MaxValue": "10", "ScalingType": "Auto"}],
+        },
+        "TrainingJobEarlyStoppingType": "Auto",
+        "TuningJobCompletionCriteria": {
+            "TargetObjectiveMetricValue": 0.95,
+            "BestObjectiveNotImproving": {"MaxNumberOfTrainingJobsNotImproving": 10},
+        },
+    },
+    TrainingJobDefinition={
+        "AlgorithmSpecification": {
+            "TrainingImage": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1",
+            "TrainingInputMode": "File",
+        },
+        "RoleArn": "arn:aws:iam::111111111111:role/SageMakerTrainingRole",
+        "StaticHyperParameters": {"objective": "binary:logistic", "num_round": "300", "eval_metric": "auc"},
+        "InputDataConfig": [channel("train", "s3://ml-111111111111/churn/train/"),
+                            channel("validation", "s3://ml-111111111111/churn/validation/")],
+        "OutputDataConfig": {"S3OutputPath": "s3://ml-111111111111/churn/hpo/"},
+        "ResourceConfig": {"InstanceType": "ml.m5.2xlarge", "InstanceCount": 1, "VolumeSizeInGB": 30},
+        <span class="c"># Tuning jobs can use Spot too</span>
+        "EnableManagedSpotTraining": True,
+        "StoppingCondition": {"MaxRuntimeInSeconds": 1800, "MaxWaitTimeInSeconds": 3600},
+    },
+)
+
+best = sm.describe_hyper_parameter_tuning_job(HyperParameterTuningJobName="churn-xgb-bayes-01")["BestTrainingJob"]
+print(best["TrainingJobName"], best["FinalHyperParameterTuningJobObjectiveMetric"])</code></pre>
+			<p>In SDK V3 the same job is <code>HyperparameterTuner(model_trainer=trainer, objective_metric_name="validation:auc", hyperparameter_ranges={...}, strategy="Bayesian", max_jobs=40, max_parallel_jobs=4, early_stopping_type="Auto").tune(inputs=[...])</code>, with range classes from <code>sagemaker.core.parameter</code>.</p>
+
+			<h2 id="s10">Security</h2>
+			<ul>
+				<li><strong>By default the container can reach the internet.</strong> With a <code>VpcConfig</code>, SageMaker attaches network interfaces in your subnets; private subnets need an <strong>S3 gateway endpoint</strong> (or a NAT gateway) for data, interface endpoints for other AWS services, and endpoint or bucket policies to limit what can be read.</li>
+				<li><strong>Network isolation</strong> blocks all network calls from the container except between nodes of the same job, and gives it no AWS credentials. SageMaker still downloads input and uploads output for it. Code that calls AWS APIs, installs packages from the internet or logs to a remote MLflow breaks under isolation.</li>
+				<li><strong>Encryption:</strong> <code>OutputDataConfig.KmsKeyId</code> for artifacts in S3 and <code>VolumeKmsKeyId</code> for the EBS volume; local NVMe storage is encrypted by the instance hardware and doesn't take a key. Inter-container encryption protects traffic between nodes.</li>
+				<li><strong>IAM:</strong> callers need <code>iam:PassRole</code> on the execution role. Enforce settings with <code>sagemaker:VpcSubnets</code>, <code>sagemaker:NetworkIsolation</code>, <code>sagemaker:InterContainerTrafficEncryption</code>, <code>sagemaker:VolumeKmsKey</code>, <code>sagemaker:OutputKmsKey</code>, <code>sagemaker:InstanceTypes</code>, <code>sagemaker:ImageArns</code>, <code>sagemaker:EnableRemoteDebug</code> and <code>sagemaker:KeepAlivePeriod</code> (see the <a href="index.html#s8">overview's SCP example</a>).</li>
+			</ul>
+
+			<h2 id="s11">Quotas and pricing</h2>
+			<ul>
+				<li><strong>Run time:</strong> <code>MaxRuntimeInSeconds</code> defaults to 1 day and can be set up to 28 days, but the account quota caps jobs at 5 days until you raise it.</li>
+				<li><strong>Instances:</strong> 20 per job and 4 across all jobs by default, and most per-instance-type quotas start at 0 on new accounts (<a href="index.html#s6">quotas</a>). 1,024 GB of EBS per instance.</li>
+				<li><strong>Per job:</strong> 100 hyperparameters (keys up to 256 characters, values up to 2,500), 20 channels, 40 metric definitions, 50 tags, names up to 63 characters unique per Region. <code>CreateTrainingJob</code> is limited to one call per second.</li>
+				<li><strong>Pricing:</strong> per instance-hour for the instance type, plus storage, for the billable time (including download and upload). Tuning adds no charge; Debugger built-in rules are free. The free tier gives 50 hours a month of ml.m4.xlarge or ml.m5.xlarge training for two months; SageMaker Savings Plans cover training.</li>
+			</ul>
+
+			<h2 id="s12">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> training plan extensions (March); AWS Batch quota management and preemption for training jobs (25 March); training plan utilization metrics (April); training plans reservable from Studio (May); Debugger closed to new customers (30 July) and Profiler sunset announced; instance preference lists (15 September); SOCI-indexed images (29 October).</li>
+				<li><strong>2025:</strong> P6-B200 for training jobs (June); P4 and P5 prices cut by up to 45% (June); M7i, C7i and R7i for training (June); Nova customization recipes (July); AWS Batch scheduling for training jobs (31 July); P6e-GB200 UltraServers and the single-GPU ml.p5.4xlarge (August); SDK V3 with <code>ModelTrainer</code> and a V3 tuner (November); training plans for inference (November); <code>MlflowConfig</code> and serverless MLflow (December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-mla/d2-task-2-2.html">MLA-C01 Task 2.2: training and refining models</a> (built-in algorithms, script mode, tuning), <a href="../../aws-mla/d2-task-2-1.html">MLA-C01 Task 2.1: choosing a modelling approach</a>, <a href="../../aws-mla/d2-task-2-3.html">MLA-C01 Task 2.3: analyzing model performance</a> (Debugger), <a href="../../aws-mla/d4-task-4-2.html">MLA-C01 Task 4.2: infrastructure and costs</a> (Spot), the <a href="../../aws-mla/services-sagemaker-amt.html">MLA-C01 notes on automatic model tuning</a>, and <a href="../../aws-aif/d1-task-1-3.html#s4">AIF-C01 Task 1.3: the ML development lifecycle</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="studio-environments.html"><small>Previous</small>Studio and development environments</a>
+				<span class="next"><small>Next</small>JumpStart and model customization (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on SageMaker AI training jobs and automatic model tuning, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
