@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.2: Respond to Security Events | AWS SCS-C03 Notes</title>
+	<meta name="description" content="SCS-C03 Task 2.2 study guide: capturing memory, snapshots and logs as forensic evidence and sharing them with a forensics account, tracing access keys and role sessions in CloudTrail, validating GuardDuty, Macie and Inspector findings to scope impact, containing credentials, instances, buckets, containers and functions, why security groups don't cut tracked connections, eradication and recovery with AWS Backup and point-in-time restores, and root cause analysis with Amazon Detective.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="scs.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SCS-C03</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Incident Response &middot; 14%</span>
+		<h1>Task 2.2: Respond to security events</h1>
+		<p>The response itself: preserving evidence before it disappears, following the attacker through the logs, working out what was touched, cutting off access, removing what the attacker left behind, restoring clean systems, and finding out how it happened.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Forensics</span><span class="tag">CloudTrail</span><span class="tag">IAM</span><span class="tag">AWS Backup</span><span class="tag">Detective</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Capturing forensic artifacts</a></li>
+				<li><a href="#s2">Searching and correlating logs</a></li>
+				<li><a href="#s3">Validating findings and scoping impact</a></li>
+				<li><a href="#s4">Containing, eradicating and recovering</a></li>
+				<li><a href="#s5">Root cause analysis</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.2</span>
+				<p><strong>Respond to security events.</strong></p>
+			</div>
+			<p>This is the operations phase of the plan from <a href="d2-task-2-1.html">Task 2.1</a>: analyze, contain, eradicate, recover, then learn. Exam questions here are full of traps where the obvious action destroys evidence or doesn't actually stop the attacker: stopping an instance before capturing memory, swapping a security group and assuming open connections are closed, rotating a KMS key to "revoke" it, deleting an access key while sessions it created keep working. The details below are the ones that decide those questions.</p>
+			<p><strong>Running example.</strong> The same company. GuardDuty in the security tooling account (222222222222) raises <code>UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS</code>: credentials from the role on a web server in prod (111111111111) are being used from an IP address outside AWS. The responders, using the access and Forensics OU accounts prepared in Task 2.1, work through this page's steps.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Skill</th><th>What you need to be able to do</th></tr></thead>
+					<tbody>
+						<tr><td>2.2.1</td><td data-label="What you need to be able to do">Capture memory, disk, logs and configuration as evidence, in the right order, and store it safely</td></tr>
+						<tr><td>2.2.2</td><td data-label="What you need to be able to do">Follow access keys and role sessions across CloudTrail, network and application logs</td></tr>
+						<tr><td>2.2.3</td><td data-label="What you need to be able to do">Validate findings and work out what was touched and what the credentials could do</td></tr>
+						<tr><td>2.2.4</td><td data-label="What you need to be able to do">Contain and eradicate by resource type, then recover from backups and clean builds</td></tr>
+						<tr><td>2.2.5</td><td data-label="What you need to be able to do">Find the root cause with Detective and the other investigation tools</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout note"><p>The <strong>AWS Security Incident Response Guide</strong> whitepaper still exists as a document, but its web pages now redirect to the user guide of the AWS Security Incident Response service, whose Contain, Eradicate and Recover pages carry the current AWS guidance. This page draws on that guide, the service documentation and AWS's sample playbooks.</p></div>
+
+			<!-- Skill 2.2.1 -->
+			<h2 id="s1">Capturing forensic artifacts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.1</span><span class="skill-text">Capture and store relevant system and application logs as forensic artifacts.</span></p>
+
+				<h3>A compromised EC2 instance</h3>
+				<div class="entry">
+					<h4>Volatile evidence first</h4>
+					<p>Memory holds running processes, network connections and decrypted secrets that exist nowhere else. AWS's EC2 forensics playbook says to capture memory <strong>before</strong> isolating or shutting the instance down. Stopping, hibernating or terminating an instance also cryptographically erases its <strong>instance store</strong> volumes, so copy anything there first. A reboot keeps instance store but loses memory. The order in the running example:</p>
+				</div>
+				<ol class="flow">
+					<li><b>Preserve the instance</b>Turn on termination and stop protection, set shutdown behavior to stop, set <code>DeleteOnTermination</code> to false on every volume, and take the instance out of its Auto Scaling group (detach, or enter standby) and target groups so it isn't replaced or terminated.</li>
+					<li><b>Record metadata</b>Instance ID and type, AMI, IP addresses, security groups, VPC and subnet, role, launch time, tags; console output and a screenshot.</li>
+					<li><b>Capture memory</b>Run a memory acquisition tool (AWS samples use AVML; LiME is the other common one) through SSM Run Command, writing to the evidence bucket.</li>
+					<li><b>Snapshot the disks</b>Crash-consistent snapshots of every attached volume in one call, tagged with the case ID.</li>
+					<li><b>Then contain</b>Network and credential containment (<a href="#s4">Skill 2.2.4</a>), now that the evidence is safe.</li>
+				</ol>
+				<span class="file">Preserve, record and snapshot the web server (AWS CLI, prod account)</span>
+<pre><code># 1. Don't let anything terminate or replace it
+aws ec2 modify-instance-attribute --instance-id i-0abc1234def567890 --disable-api-termination
+aws ec2 modify-instance-attribute --instance-id i-0abc1234def567890 --disable-api-stop
+aws ec2 modify-instance-attribute --instance-id i-0abc1234def567890 \
+  --block-device-mappings '[{"DeviceName": "/dev/xvda", "Ebs": {"DeleteOnTermination": false}}]'
+aws autoscaling enter-standby --auto-scaling-group-name web-asg \
+  --instance-ids i-0abc1234def567890 --should-decrement-desired-capacity
+
+# 2. What the console showed (Nitro: --latest gives the most recent output)
+aws ec2 get-console-output --instance-id i-0abc1234def567890 --latest --output text &gt; console-output.txt
+aws ec2 get-console-screenshot --instance-id i-0abc1234def567890
+
+# 4. One crash-consistent snapshot per attached volume, tagged for the case
+aws ec2 create-snapshots \
+  --instance-specification InstanceId=i-0abc1234def567890 \
+  --copy-tags-from-source volume \
+  --description "IR-2026-117 evidence" \
+  --tag-specifications 'ResourceType=snapshot,Tags=[{Key=case,Value=IR-2026-117}]'</code></pre>
+				<div class="callout trap"><p>Termination protection isn't available for Spot Instances; detach a Spot instance from its group and rely on scale-in protection instead. And don't stop the instance "to be safe": memory and instance store evidence are gone the moment it stops.</p></div>
+
+				<h3>Moving evidence to the forensics account</h3>
+				<div class="entry">
+					<h4>Sharing encrypted snapshots</h4>
+					<p>The investigation happens in the forensics account, in the <strong>same Region</strong> as the incident (moving data between jurisdictions can have legal consequences). Snapshots are shared with <code>modify-snapshot-attribute</code>, but only if they're unencrypted or encrypted with a <strong>customer managed key</strong>: snapshots encrypted with the default <code>aws/ebs</code> key can't be shared. If that's what you have, copy the snapshot with a customer managed key first. The key policy must let the forensics account use the key, including creating grants for EBS.</p>
+					<span class="file">Let the forensics account use the evidence key (two statements of the KMS key policy, prod account)</span>
+<pre><code>[
+  {
+    "Sid": "AllowForensicsAccountToUseTheKey",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::666666666666:root" },
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+    "Resource": "*"
+  },
+  {
+    "Sid": "AllowForensicsAccountToCreateGrantsForEBS",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::666666666666:root" },
+    "Action": ["kms:CreateGrant", "kms:ListGrants", "kms:RevokeGrant"],
+    "Resource": "*",
+    "Condition": { "Bool": { "kms:GrantIsForAWSResource": true } }
+  }
+]</code></pre>
+					<span class="file">Share the snapshot; the forensics account then copies it with its own key (AWS CLI)</span>
+<pre><code># In prod (111111111111)
+aws ec2 modify-snapshot-attribute --snapshot-id snap-0abcdef1234567890 \
+  --attribute createVolumePermission --operation-type add --user-ids 666666666666
+
+# In the forensics account (666666666666): make its own copy, encrypted with its own key
+aws ec2 copy-snapshot --source-region us-east-1 --source-snapshot-id snap-0abcdef1234567890 \
+  --encrypted --kms-key-id arn:aws:kms:us-east-1:666666666666:key/forensics-key-id \
+  --description "IR-2026-117 working copy"</code></pre>
+					<p>CloudTrail in the owner account records use of the shared snapshot (<code>SharedSnapshotCopyInitiated</code>, <code>SharedSnapshotVolumeCreated</code>), which becomes part of the chain of custody. RDS has the same rule: snapshots encrypted with the default RDS key can't be shared.</p>
+				</div>
+				<div class="entry">
+					<h4>Handling evidence</h4>
+					<p>Treat evidence as read-only: work only on copies, mount evidence volumes read-only on the forensic instance, and record who accessed what and when. Store memory images and exported logs in the forensics account's S3 bucket with <strong>Object Lock</strong> (Task 1.2), so nobody can alter or delete them, and let CloudTrail data events record every read. The EBS direct APIs return a SHA-256 checksum for each block read from a snapshot, which helps show the data wasn't altered in transit. Once the case closes, delete the forensic instance and copies unless a legal or regulatory requirement says to keep them.</p>
+				</div>
+
+				<h3>Other resource types</h3>
+				<div class="entry">
+					<h4>Containers, functions and databases</h4>
+					<ul>
+						<li><strong>EKS:</strong> find the pod's node (<code>kubectl get pods &lt;pod&gt; -o=jsonpath='{.spec.nodeName}'</code>) and its instance ID, label the pod and node for the investigation, capture container state and logs on the node with <code>crictl ps</code> and <code>crictl logs</code>, then capture node memory and snapshot its volumes as for EC2. If one pod of a Deployment is compromised, assume all of them are. Keep the cluster's control plane audit logs (Task 1.2).</li>
+						<li><strong>ECS on Fargate:</strong> there's no host to image, so the evidence is the task's logs, its definition and image, and CloudTrail; GuardDuty's guidance is to isolate the task's traffic, then stop it.</li>
+						<li><strong>Lambda:</strong> <code>aws lambda get-function --function-name orders-api --qualifier 7</code> returns the configuration (role, layers, environment variables) and a link to download that version's code, valid for 10 minutes. Download it before anyone redeploys. Environment variable values are omitted from CloudTrail.</li>
+						<li><strong>RDS and Aurora:</strong> take a manual snapshot (<code>aws rds create-db-snapshot</code>) and keep the database's audit and error logs.</li>
+						<li><strong>S3:</strong> with versioning, earlier versions of changed objects are evidence; CloudTrail data events and server access logs show who read what.</li>
+					</ul>
+				</div>
+				<div class="callout tip"><p>"Preserve evidence from a compromised instance with minimal data loss" points to <strong>memory capture first, then EBS snapshots, then isolation</strong>, with termination protection and the instance taken out of its Auto Scaling group. Automating that sequence is what the Automated Forensics Orchestrator guidance does (<a href="d2-task-2-1.html#s4">Task 2.1</a>).</p></div>
+			</div>
+
+			<!-- Skill 2.2.2 -->
+			<h2 id="s2">Searching and correlating logs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.2</span><span class="skill-text">Search and correlate logs for security events across applications and AWS services.</span></p>
+
+				<h3>Following the credentials</h3>
+				<div class="entry">
+					<h4>Access key IDs</h4>
+					<p>An access key ID tells you what kind of credential you're chasing. Keys starting <strong><code>AKIA</code></strong> are long-term keys of an IAM user (or the root user); keys starting <strong><code>ASIA</code></strong> are temporary credentials from AWS STS. <code>aws sts get-access-key-info --access-key-id ...</code> returns only the owning account ID, not who owns it or whether it's still active. For an AKIA key, the IAM credential report names the user; for an ASIA key, find the STS call that issued it.</p>
+				</div>
+				<div class="entry">
+					<h4>Role sessions and chains</h4>
+					<p>Every call made with a role session carries <code>userIdentity.accessKeyId</code> (the session's ASIA key) and <code>userIdentity.sessionContext.sessionIssuer</code> (the role it came from), with <code>attributes.creationDate</code> saying when the session started and <code>ec2RoleDelivery</code> showing whether the credentials came from IMDSv1 or IMDSv2. The <code>AssumeRole</code> event that created a session lists the new key in <code>responseElements.credentials.accessKeyId</code>, so searching for that key follows the attacker into the next role. If roles are assumed with a <strong>source identity</strong> (<code>sts:SetSourceIdentity</code>), it appears in <code>sessionContext.sourceIdentity</code> on every later call and can't be changed, even through chained roles, unlike the role session name.</p>
+				</div>
+
+				<h3>Where to search</h3>
+				<div class="entry">
+					<h4>CloudTrail Event history</h4>
+					<p>For a quick first look, <code>lookup-events</code> searches the last 90 days of <strong>management events</strong> in the current Region (and Insights events with <code>--event-category insight</code>). It takes one attribute per call (<code>AccessKeyId</code>, <code>EventName</code>, <code>EventSource</code>, <code>ResourceName</code>, <code>ResourceType</code>, <code>Username</code>, <code>ReadOnly</code> or <code>EventId</code>), returns up to 50 events per page and allows two requests per second.</p>
+					<span class="file">Everything the stolen session key did in us-east-1 recently (AWS CLI)</span>
+<pre><code>aws cloudtrail lookup-events \
+  --region us-east-1 \
+  --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=ASIAIOSFODNN7EXAMPLE \
+  --start-time 2026-11-08T00:00:00Z \
+  --query 'Events[].[EventTime,EventName,EventSource]' --output table</code></pre>
+				</div>
+				<div class="entry">
+					<h4>Athena over the organization trail</h4>
+					<p>Event history can't see data events, other Regions or anything older than 90 days, so the real investigation runs on the organization trail in the log archive (with the Athena table from <a href="d1-task-1-2.html#s4">Task 1.2</a>) or on Security Lake. The two questions that matter first: where did the stolen credentials come from, and what did they do?</p>
+					<span class="file">Every call made with the instance role from outside the VPC, by source IP and action (Athena SQL)</span>
+<pre><code>SELECT eventtime, sourceipaddress, useragent, eventsource, eventname, errorcode,
+       useridentity.accesskeyid
+FROM cloudtrail_prod_use1
+WHERE "timestamp" &gt;= '2026/11/07'
+  AND useridentity.sessioncontext.sessionissuer.arn = 'arn:aws:iam::111111111111:role/web-server-role'
+  AND sourceipaddress NOT LIKE '10.%'          -- the VPC's own range
+ORDER BY eventtime;</code></pre>
+					<p>The documented CloudTrail table definition doesn't include <code>sessioncontext.sourceidentity</code>; add it to the <code>useridentity</code> struct if you trace sessions by source identity. Then pivot on what the query returns: the attacker's IP in VPC Flow Logs and WAF logs, domains the instance resolved in Resolver query logs, and requests in application logs. Logs Insights can do the same across log groups, and its OpenSearch SQL language can join log groups in one query.</p>
+				</div>
+				<div class="callout trap"><p><code>lookup-events</code> isn't an organization-wide search: it covers one account and one Region, management events only. "Find every S3 object the attacker downloaded" needs S3 data events from the trail (Athena, Security Lake), not Event history.</p></div>
+			</div>
+
+			<!-- Skill 2.2.3 -->
+			<h2 id="s3">Validating findings and scoping impact</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.3</span><span class="skill-text">Validate findings from AWS security services to assess the scope and impact of an event.</span></p>
+
+				<h3>Is the finding real?</h3>
+				<div class="entry">
+					<h4>Reading a GuardDuty finding</h4>
+					<ul>
+						<li><strong>Resource role:</strong> <code>TARGET</code> means your resource was acted on (the finding has an Actor section); <code>ACTOR</code> means your instance attacked something else (it has a Target section).</li>
+						<li><strong>Count, created and updated:</strong> how often the activity recurred, and whether it's still going on (updated later than created).</li>
+						<li><strong>Action:</strong> network connection, port probe, DNS request, AWS API call (with the API, user agent and whether the remote account is affiliated with you) or RDS login attempt.</li>
+						<li><strong>Evidence:</strong> for threat intelligence findings, the threat list and indicator that matched.</li>
+					</ul>
+					<p>For an attack sequence (Extended Threat Detection), the <strong>signals</strong> show each step that was linked: high-risk API calls, unusual ASNs, malicious IPs or domains, and, since 2026, vulnerabilities and misconfigurations. For credential exfiltration, <code>InsideAWS</code> means the credentials were used from another AWS account (check whether it's one of yours) and <code>OutsideAWS</code> from outside AWS.</p>
+				</div>
+				<div class="callout trap"><p>GuardDuty learns. If credential exfiltration findings for an instance stop appearing, it may be because the model now treats the remote host as expected, not because the attacker has gone. Silence isn't evidence of containment; check CloudTrail.</p></div>
+				<div class="entry">
+					<h4>False positives</h4>
+					<p>If the activity is legitimate (a vulnerability scanner, a known egress IP), there are two tools. A <strong>suppression rule</strong> archives matching findings as they arrive; build them only for findings you've repeatedly confirmed as false positives, with at least two criteria (finding type plus scanner AMI, bastion tag or egress IP). A <strong>trusted entity list</strong> (IPs, and since August 2025 domains) stops GuardDuty generating findings for those public addresses at all. Both hide data from Extended Threat Detection, Security Hub CSPM, Detective and EventBridge, so keep them narrow.</p>
+				</div>
+
+				<h3>How far did it reach?</h3>
+				<div class="entry">
+					<h4>What the credentials could do and did do</h4>
+					<p>The role's policies and the IAM <strong>last accessed</strong> data (service level, and action level for most services) show what the stolen credentials could reach and what was actually used; combine that with CloudTrail for the incident window. IAM Access Analyzer adds external access findings (resources shared outside the organization, perhaps by the attacker) and unused access findings.</p>
+					<span class="file">Which services and actions the role has used (AWS CLI)</span>
+<pre><code>JOB=$(aws iam generate-service-last-accessed-details \
+  --arn arn:aws:iam::111111111111:role/web-server-role \
+  --granularity ACTION_LEVEL --query JobId --output text)
+aws iam get-service-last-accessed-details --job-id "$JOB"</code></pre>
+					<p>AWS warns not to decide permissions only on the absence of last accessed data: tracking started at different dates for different services.</p>
+				</div>
+				<div class="entry">
+					<h4>Data and vulnerabilities</h4>
+					<ul>
+						<li><strong>Data exposure:</strong> if the role could read S3 buckets, Macie sensitive data findings and automated discovery show which of those buckets hold personal, financial or credential data, which decides notification obligations. GuardDuty S3 findings with an <code>ANONYMOUS_PRINCIPAL</code> caller mean a public bucket was read.</li>
+						<li><strong>Exploitability:</strong> Amazon Inspector findings on the instance show whether a vulnerability has a known exploit and a fix (<code>exploitAvailable</code>, <code>fixAvailable</code>) and, for EC2, which ports are reachable from the internet, which helps answer how the attacker got in and which other instances share the weakness. For container images, Inspector shows how many running tasks and pods use the image.</li>
+					</ul>
+				</div>
+			</div>
+
+			<!-- Skill 2.2.4 -->
+			<h2 id="s4">Containing, eradicating and recovering</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.4</span><span class="skill-text">Respond to affected resources by containing and eradicating threats, and recover resources (for example, by implementing network containment controls, restoring backups).</span></p>
+
+				<h3>Containing credentials</h3>
+				<div class="entry">
+					<h4>Long-term access keys</h4>
+					<p>Deactivate rather than delete first (<code>aws iam update-access-key --user-name app-user --access-key-id AKIA... --status Inactive</code>): deactivation is reversible and keeps the key ID for the investigation; delete it once the replacement works. When AWS finds an exposed key it attaches <code>AWSCompromisedKeyQuarantineV3</code> to the user and opens a support case; follow the case instead of removing the policy. Deactivating a key also invalidates every <strong>presigned URL</strong> signed with it, even ones with a later expiry.</p>
+				</div>
+				<div class="entry">
+					<h4>Role sessions can't be deleted, only denied</h4>
+					<p>Temporary credentials stay valid until they expire (up to 36 hours), and deleting the key that created them doesn't end them. Instead, add a deny that applies to them. <strong>Revoke active sessions</strong> on the role (console, Revoke sessions tab) attaches an inline policy named <code>AWSRevokeOlderSessions</code> that denies everything to sessions issued before the moment you clicked; new sessions, including the legitimate workload's next credentials, keep working.</p>
+					<span class="file">What "revoke active sessions" attaches to the role (IAM inline policy, with the time you revoked)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": {
+    "Effect": "Deny",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {
+      "DateLessThan": { "aws:TokenIssueTime": "2026-11-09T14:32:00Z" }
+    }
+  }
+}</code></pre>
+					<p>To deny one principal or session rather than every older session, AWS's examples use <code>aws:userid</code> (for example <code>"AROAEXAMPLEROLEID:*"</code> for all sessions of a role), <code>aws:PrincipalArn</code> or <code>aws:SourceIdentity</code>. Sessions revoked this way can still use permissions a <strong>resource-based policy</strong> grants them, so add the deny there too for sensitive resources. Revoking doesn't work on service-linked roles.</p>
+				</div>
+				<div class="entry">
+					<h4>Stolen instance credentials</h4>
+					<p>In the running example the instance role's credentials are being used from outside AWS. Revoking older sessions on the role stops the stolen copy, but the instance will fetch new credentials, so the root cause (often IMDSv1 and a server-side request forgery bug, or a compromised host) must also be closed. AWS documents a policy that denies instance credentials used anywhere except from their own instance's VPC, usable in identity policies, SCPs and resource policies:</p>
+					<span class="file">Instance role credentials only work from the instance's own VPC (SCP or identity policy)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RequireSameVPC",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": { "aws:SourceVpc": "${aws:Ec2InstanceSourceVpc}" },
+        "Null": { "ec2:SourceInstanceARN": "false" },
+        "BoolIfExists": { "aws:ViaAWSService": "false" }
+      }
+    }
+  ]
+}</code></pre>
+					<p><code>aws:SourceVpc</code> is only in the request when the call goes through a VPC endpoint, so this pattern assumes the workload reaches AWS APIs through endpoints. Removing or replacing the instance profile (<code>disassociate-iam-instance-profile</code>) stops new credentials but doesn't invalidate ones already issued, so revoke sessions as well. A deny on <code>ec2:RoleDelivery</code> below <code>2.0</code> blocks credentials obtained through IMDSv1.</p>
+				</div>
+				<div class="entry">
+					<h4>IAM Identity Center users and member account root users</h4>
+					<p>Roles created by Identity Center permission sets can't be edited, so contain the <strong>user</strong>: AWS recommends a pre-staged SCP that denies everything when <code>identitystore:userId</code> equals the user's ID, then removing the user's assignments, disabling them in the identity provider, <strong>deleting their active sessions before disabling the user</strong> (afterwards the console can't end them), and leaving the deny in place for at least 12 hours. For a member account's <strong>root user</strong>, centralized root access lets the management account or a delegated administrator run <code>aws sts assume-root</code> with the <code>IAMDeleteRootUserCredentials</code> task policy (through a Regional STS endpoint) to remove the root password, keys and MFA without ever signing in as root.</p>
+				</div>
+
+				<h3>Containing the network</h3>
+				<div class="entry">
+					<h4>Security groups don't cut existing connections</h4>
+					<p>The standard isolation step is replacing all of an instance's security groups with an <strong>isolation security group</strong> that has no inbound and no outbound rules. But security groups are stateful: when you change them, <strong>tracked connections already open continue</strong> until they time out, and an idle established TCP connection stays tracked for 5 days by default on most instance types (350 seconds on the newest Nitro generation). An attacker's open reverse shell survives the swap. AWS's GuardDuty remediation, the EC2 documentation and the AWS containment runbook all say this.</p>
+					<p>To break existing connections immediately, use a <strong>network ACL</strong>: NACLs are stateless, so a deny rule stops packets at once, but it applies to the whole subnet. The exception to the tracking rule: flows allowed by rules open to <code>0.0.0.0/0</code> on all ports in both directions aren't tracked, so removing those rules drops them at once.</p>
+				</div>
+				<div class="table-wrap">
+					<table class="stack labeled compare">
+						<thead><tr><th>Isolation security group</th><th>Network ACL deny</th><th>DNS Firewall block</th></tr></thead>
+						<tbody>
+							<tr class="group"><th colspan="3">Scope</th></tr>
+							<tr><td data-label="Isolation security group">One instance (or network interface)</td><td data-label="Network ACL deny">Every instance in the subnet</td><td data-label="DNS Firewall block">Every VPC associated with the rule group</td></tr>
+							<tr class="group"><th colspan="3">Existing connections</th></tr>
+							<tr><td data-label="Isolation security group">Tracked connections continue until they time out</td><td data-label="Network ACL deny">Broken immediately</td><td data-label="DNS Firewall block">Unaffected; stops new lookups of the domain</td></tr>
+							<tr class="group"><th colspan="3">Use it for</th></tr>
+							<tr><td data-label="Isolation security group">Isolating one host while keeping it running for forensics</td><td data-label="Network ACL deny">Cutting a live attacker session at once, or blocking an IP range</td><td data-label="DNS Firewall block">Stopping command-and-control and exfiltration domains</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<span class="file">Cut every session to and from the attacker's network at once (AWS CLI, subnet's NACL)</span>
+<pre><code># NACL rules are evaluated lowest number first; put the denies ahead of the allows
+aws ec2 create-network-acl-entry --network-acl-id acl-0abc1234def567890 \
+  --ingress --rule-number 10 --protocol -1 --cidr-block 203.0.113.0/24 --rule-action deny
+aws ec2 create-network-acl-entry --network-acl-id acl-0abc1234def567890 \
+  --egress --rule-number 10 --protocol -1 --cidr-block 203.0.113.0/24 --rule-action deny</code></pre>
+				<p>Other network controls complete the picture: add attacker IPs to a <strong>WAF IP set</strong> used by a block rule (<code>update-ip-set</code> replaces the whole list, so get the current list and its lock token first, then write the merged list), block domains with <strong>Route 53 Resolver DNS Firewall</strong> (security groups don't control DNS queries to the VPC resolver), and add rules to <strong>Network Firewall</strong> for traffic between VPCs and the internet.</p>
+
+				<h3>Containing other resources</h3>
+				<div class="entry">
+					<h4>Buckets, containers and functions</h4>
+					<ul>
+						<li><strong>S3:</strong> turn on Block Public Access for the bucket (or the account), add a bucket policy deny for everything but the responders, and deactivate the keys that signed any leaked presigned URLs. A bucket policy can also refuse signatures older than a set age with <code>s3:signatureAge</code>.</li>
+						<li><strong>EKS:</strong> apply a deny-all <code>NetworkPolicy</code> to the compromised pods, cordon the node (<code>kubectl cordon</code>), remove AWS permissions from the node's role, and remove the attacker's access entry or <code>aws-auth</code> mapping. A network policy doesn't help if the attacker controls the node; then isolate the node with security groups. Fargate pods can't be cordoned, so the network policy is the tool there.</li>
+						<li><strong>ECS:</strong> block the task's traffic, find other tasks using the same image, start fixed replacements, then stop the compromised tasks and remove the image from the repository.</li>
+						<li><strong>Lambda:</strong> set reserved concurrency to 0 (<code>aws lambda put-function-concurrency --function-name orders-api --reserved-concurrent-executions 0</code>), which stops all invocations until removed; then remove or fix triggers and redeploy a known-good version.</li>
+					</ul>
+					<span class="file">Isolate the compromised pods (Kubernetes NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ir-deny-all
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      status: quarantine       # label applied to the compromised pods
+  policyTypes:
+    - Ingress
+    - Egress                   # no rules listed, so nothing is allowed either way</code></pre>
+				</div>
+
+				<h3>Eradication</h3>
+				<div class="entry">
+					<h4>Remove everything the attacker left</h4>
+					<p>AWS's guidance is to work in phases: high-value changes first, longer-term hardening later. Look for persistence in <strong>every Region</strong>, including ones the company never uses: new IAM users, access keys, roles and policies, new SAML or OIDC identity providers, instances and AMIs (including stopped ones), snapshots, Lambda functions and layers, EventBridge rules, and changes that weaken detection (deleted trails, GuardDuty detectors or Config recorders, Block Public Access removed). Then:</p>
+					<ul>
+						<li><strong>Rebuild, don't clean:</strong> replace compromised instances and containers with new ones from a trusted AMI or image, patched (Systems Manager Patch Manager) and with the vulnerability fixed.</li>
+						<li><strong>Rotate what may have been read:</strong> Secrets Manager secrets (<code>aws secretsmanager rotate-secret --secret-id prod/orders/db</code>), database passwords, API keys and anything in environment variables the attacker could see.</li>
+						<li><strong>Don't rely on KMS key rotation:</strong> rotating a KMS key keeps the old key material, so old ciphertext still decrypts and a compromised data key stays compromised. Fix the key policy and grants, or disable the key.</li>
+					</ul>
+				</div>
+
+				<h3>Recovery</h3>
+				<div class="entry">
+					<h4>Restoring from protected backups</h4>
+					<p>Backups help only if the attacker couldn't delete or encrypt them. <strong>AWS Backup Vault Lock</strong> enforces retention on a vault: in <strong>governance mode</strong> users with the right IAM permissions can remove the lock; in <strong>compliance mode</strong>, once the grace time (at least 72 hours) has passed, nobody can change or delete the vault or its lock, not even AWS. A <strong>logically air-gapped vault</strong> always uses compliance mode, stores backups in an AWS-owned account, can be shared with a recovery account through AWS RAM, and since November 2025 can be the primary backup target; with multi-party approval you can restore from it even if the owning account is lost. A <strong>legal hold</strong> keeps chosen backups from deletion indefinitely.</p>
+					<span class="file">Lock the prod vault in compliance mode after a 3-day grace time (AWS CLI)</span>
+<pre><code># --changeable-for-days makes it compliance mode; omit it for governance mode
+aws backup put-backup-vault-lock-configuration \
+  --backup-vault-name prod-vault \
+  --changeable-for-days 3 \
+  --min-retention-days 35 \
+  --max-retention-days 365</code></pre>
+					<p>Before restoring, make sure the backup itself is clean: <strong>GuardDuty Malware Protection for AWS Backup</strong> (November 2025) scans EBS snapshots, AMIs and recovery points. AWS Backup <strong>restore testing</strong> checks regularly that restores work at all.</p>
+				</div>
+				<div class="entry">
+					<h4>Point-in-time recovery</h4>
+					<ul>
+						<li><strong>DynamoDB</strong> point-in-time recovery restores to any second in a window of 1 to 35 days, always into a <strong>new table</strong>.</li>
+						<li><strong>RDS</strong> restores to a point in time as a new DB instance (<code>restore-db-instance-to-point-in-time</code>), so the compromised one stays for investigation.</li>
+						<li><strong>S3 versioning</strong> restores an object by copying an earlier version over the current one, or by deleting the bad current version.</li>
+						<li><strong>AWS Elastic Disaster Recovery</strong> recovers whole servers to a point in time before the attack (useful against ransomware), and supports drills without disrupting replication.</li>
+					</ul>
+					<p>Reconnect restored systems only after the eradication steps are complete and the restored versions are patched; otherwise the attacker comes straight back in through the same route.</p>
+				</div>
+				<div class="callout tip"><p>"Immediately terminate the attacker's active SSH session to the instance" points to a <strong>network ACL deny</strong>, not a security group change. "Stop stolen role credentials working without breaking the application" points to <strong>revoke active sessions</strong> on the role. "Backups that can't be deleted even by an administrator with full access" points to <strong>Vault Lock in compliance mode</strong> or a logically air-gapped vault.</p></div>
+			</div>
+
+			<!-- Skill 2.2.5 -->
+			<h2 id="s5">Root cause analysis</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.5</span><span class="skill-text">Describe methods to conduct root cause analysis (for example, Amazon Detective).</span></p>
+
+				<h3>Amazon Detective</h3>
+				<div class="entry">
+					<h4>A behavior graph of the organization</h4>
+					<p><strong>Detective</strong> builds a behavior graph from CloudTrail, VPC Flow Logs and GuardDuty findings (plus optional EKS audit logs and Security Hub CSPM findings, or Security Lake data), keeps up to a year of history, and uses its own copy of the data, so it doesn't affect your logging. For any entity (a role, a user, an IP, an instance) it shows activity during a <strong>scope time</strong> compared with the 45 days before: new geolocations, unusual API calls, new user agents, traffic volumes. That comparison is what turns "this role was used from a new country" into a root cause.</p>
+					<ul>
+						<li><strong>Finding groups</strong> collect related findings and entities into one event, with a timeline and a generative AI summary (on by default, at no extra charge).</li>
+						<li><strong>Detective Investigation</strong> analyzes an IAM user or role for indicators of compromise: attack tactics, impossible travel, flagged IP addresses and related finding groups, producing a report.</li>
+						<li>From a GuardDuty finding, <strong>Investigate in Detective</strong> opens the entity with the right scope time.</li>
+					</ul>
+					<span class="file">Investigate the instance role over the incident window (AWS CLI, Detective administrator)</span>
+<pre><code>aws detective start-investigation \
+  --graph-arn arn:aws:detective:us-east-1:222222222222:graph:fdac8011456e4e6182facb26dfceade0 \
+  --entity-arn arn:aws:iam::111111111111:role/web-server-role \
+  --scope-start-time 2026-11-07T00:00:00Z \
+  --scope-end-time 2026-11-09T15:00:00Z</code></pre>
+					<p>Detective no longer requires GuardDuty to be enabled (since February 2024), uses the same delegated administrator pattern as the other services, and needs about two weeks of data before its baselines are meaningful.</p>
+				</div>
+
+				<h3>Other investigation tools</h3>
+				<div class="entry">
+					<h4>AI-assisted investigation</h4>
+					<ul>
+						<li><strong>GuardDuty Investigation</strong> (preview since June 2026, in 10 Regions) analyzes a finding, an account or the organization over the last 90 days and returns a risk level, a summary, MITRE ATT&amp;CK techniques and recommended actions. It's enabled as the <code>AI_ANALYST</code> feature on the detector.</li>
+						<li><strong>AWS Security Incident Response</strong> runs an AI investigative agent on AWS-supported cases (not self-managed ones), building a timeline from CloudTrail, IAM and EC2 data.</li>
+						<li><strong>CloudWatch investigations</strong> is for operational incidents (metrics, deployments, AWS Health), not security root cause.</li>
+					</ul>
+				</div>
+				<div class="entry">
+					<h4>Finishing the analysis</h4>
+					<p>The root cause in the running example is the first event in the chain: Athena shows the instance's credentials first used outside the VPC minutes after an HTTP request in the ALB and WAF logs that reached the instance metadata service through a server-side request forgery bug, and <code>ec2RoleDelivery</code> shows the credentials came from IMDSv1. The fixes that follow (require IMDSv2 everywhere with an SCP or declarative policy, fix the code, add the WAF rule, add the same-VPC credential policy) and the incident metrics (time to detect, contain and recover, and attacker dwell time) go into the post-incident report and back into the playbooks.</p>
+					<p>If the investigation shows AWS resources being used to attack others, or abuse by another AWS customer, report it to AWS Trust &amp; Safety (the abuse form or <code>trustandsafety@support.aws.com</code>); for credentials used from another AWS account, GuardDuty's guidance is to include the finding's full JSON. Respond quickly to abuse notices AWS sends you.</p>
+				</div>
+				<div class="callout tip"><p>"Determine how the compromised role was used and where the activity came from over the past weeks" points to <strong>Amazon Detective</strong>. "Query a year of CloudTrail data events for exactly what was read" points to <strong>Athena or Security Lake</strong>. Detective shows patterns and context; the logs hold the detail.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Evidence order: protect the instance (termination and stop protection, <code>DeleteOnTermination</code> false, out of its Auto Scaling group), record metadata, capture memory, snapshot every volume with <code>create-snapshots</code>, then isolate. Stopping erases memory and instance store.</li>
+				<li>Share evidence snapshots only with a customer managed key (never <code>aws/ebs</code>); grant the forensics account in the key policy; it copies with its own key; same Region; Object Lock evidence bucket; work on copies.</li>
+				<li>AKIA keys are long-term, ASIA keys are STS; <code>get-access-key-info</code> gives only the account; follow <code>AssumeRole</code> response keys and <code>sourceIdentity</code>. Event history: 90 days, management events, one attribute, 50 per page; use Athena or Security Lake for everything else.</li>
+				<li>Scope: GuardDuty resource role, count and action details, attack sequence signals; findings can stop because GuardDuty learns; suppression and trusted lists hide data; last accessed data, Access Analyzer, Macie and Inspector show reach and impact.</li>
+				<li>Credentials: deactivate keys (also kills their presigned URLs); revoke older role sessions with <code>aws:TokenIssueTime</code>; same-VPC policy with <code>aws:Ec2InstanceSourceVpc</code>; Identity Center: pre-staged SCP on <code>identitystore:userId</code>, delete sessions before disabling; root via <code>assume-root</code>.</li>
+				<li>Network: security group changes leave tracked connections open (up to 5 days idle); NACL denies cut them at once; WAF IP sets (replace the whole list), DNS Firewall, Network Firewall. EKS deny-all NetworkPolicy and cordon; Lambda reserved concurrency 0.</li>
+				<li>Eradicate in every Region: persistence in IAM, identity providers, compute and automation; rebuild from trusted images; rotate secrets; KMS rotation doesn't revoke anything.</li>
+				<li>Recover: Vault Lock compliance mode (immutable after at least 72 hours), logically air-gapped vaults, legal holds, Malware Protection for Backup, restore testing; DynamoDB and RDS point-in-time restores create new resources; S3 versions; Elastic Disaster Recovery.</li>
+				<li>Root cause: Detective behavior graph (45-day baseline, finding groups, Investigation for IAM users and roles), GuardDuty Investigation (preview), Security IR AI agent; fixes and metrics into the post-incident report.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-1.html"><small>Previous</small>Task 2.1: Design and test an incident response plan</a>
+				<a class="next" href="d3-task-3-1.html"><small>Next</small>Task 3.1: Network edge security controls</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
