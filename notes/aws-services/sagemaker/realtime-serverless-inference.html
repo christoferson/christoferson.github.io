@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker AI Real-time and Serverless Inference | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to SageMaker AI real-time and serverless inference: models, endpoint configurations and endpoints, the container contract, ModelBuilder and boto3 deployment, variants, multi-model and multi-container endpoints, inference components and LoRA adapters, streaming, the OpenAI-compatible API, stateful sessions, autoscaling and scale to zero, serverless limits, deployment guardrails and shadow tests, instance pools and GPU partitioning, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">Real-time and serverless inference</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Deploy &middot; Last checked 10 November 2026</span>
+		<h1>Real-time and serverless inference</h1>
+		<p>Hosting models behind an HTTPS endpoint: the three objects that make an endpoint, deploying with ModelBuilder or the API, putting several models on one endpoint, calling it (including streaming and the OpenAI-compatible API), scaling it down to zero, serverless endpoints and their limits, safe rollouts, getting GPU capacity, and the security settings, quotas and prices that apply.</p>
+		<div class="tags"><span class="tag code">CreateEndpoint</span><span class="tag">Inference components</span><span class="tag">Autoscaling</span><span class="tag">Serverless inference</span><span class="tag">Deployment guardrails</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">How hosting fits together</a></li>
+				<li><a href="#s2">Deploying a model</a></li>
+				<li><a href="#s3">Several models on one endpoint</a></li>
+				<li><a href="#s4">Inference components</a></li>
+				<li><a href="#s5">Calling an endpoint</a></li>
+				<li><a href="#s6">Autoscaling and scale to zero</a></li>
+				<li><a href="#s7">Serverless inference</a></li>
+				<li><a href="#s8">Safe deployments and testing</a></li>
+				<li><a href="#s9">Capacity and GPUs</a></li>
+				<li><a href="#s10">Security</a></li>
+				<li><a href="#s11">Quotas and pricing</a></li>
+				<li><a href="#s12">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">How hosting fits together</h2>
+			<ol class="flow">
+				<li><b>Model</b><code>CreateModel</code>: the container image, the model artifacts, environment variables, the execution role, and optional VPC and network isolation. One <code>PrimaryContainer</code>, or up to 15 <code>Containers</code>.</li>
+				<li><b>Endpoint configuration</b><code>CreateEndpointConfig</code>: 1 to 10 <strong>production variants</strong> (model, instance type, count, traffic weight, or a serverless configuration), plus data capture, the KMS key and observability settings. It can't be changed; every update needs a new one.</li>
+				<li><b>Endpoint</b><code>CreateEndpoint</code>: SageMaker starts the instances, pulls the image, downloads the artifacts and waits for health checks. The status goes <code>Creating</code> to <code>InService</code> (or <code>Failed</code>, where only delete works).</li>
+				<li><b>Change</b><code>UpdateEndpoint</code> with a new configuration builds a new fleet and then removes the old one, without downtime; <code>UpdateEndpointWeightsAndCapacities</code> changes weights and counts in place.</li>
+			</ol>
+			<div class="entry">
+				<h4>The container contract</h4>
+				<ul>
+					<li>SageMaker runs <code>docker run IMAGE serve</code> and talks to <strong>port 8080</strong>: <code>POST /invocations</code> for requests and <code>GET /ping</code> for health. Model artifacts are unpacked to <code>/opt/ml/model</code> (read-only).</li>
+					<li><code>/ping</code> must answer 200 within <strong>2 seconds</strong>, and do so consistently within <strong>8 minutes of startup</strong>, or the deployment fails; for large models raise <code>ContainerStartupHealthCheckTimeoutInSeconds</code> and <code>ModelDataDownloadTimeoutInSeconds</code> (60 to 3,600 seconds each) on the variant. Later failing pings get the instance replaced (not on inference-component endpoints).</li>
+					<li>Each request must be answered within 60 seconds, and bodies are limited to 6 MB (see the <a href="index.html#s5">overview's runtime limits</a> for headers and error codes).</li>
+					<li>On scale-in and updates the container gets SIGTERM, then SIGKILL 30 seconds later. Don't bundle NVIDIA drivers in the image.</li>
+				</ul>
+			</div>
+			<p><code>ModelDataUrl</code> must be a single <code>.tar.gz</code>. For large language models, <code>ModelDataSource</code> points at <strong>uncompressed</strong> files under an S3 prefix instead, which skips the unpacking step, but it can't be used with serverless or multi-model endpoints, batch transform or Marketplace models.</p>
+
+			<h2 id="s2">Deploying a model</h2>
+			<span class="file">Deploy an image and artifacts, then call the endpoint (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.serve import ModelBuilder
+from sagemaker.serve.builder.schema_builder import SchemaBuilder
+
+mb = ModelBuilder(
+    image_uri="111111111111.dkr.ecr.us-east-1.amazonaws.com/churn-serve:1.4",
+    s3_model_data_url="s3://ml-111111111111/churn/model.tar.gz",
+    role_arn="arn:aws:iam::111111111111:role/SageMakerExecutionRole",
+    instance_type="ml.m5.xlarge",
+    <span class="c"># Sample input and output let ModelBuilder set up serialization</span>
+    schema_builder=SchemaBuilder(sample_input={"features": [0.1, 3, 12]}, sample_output={"churn": 0.82}),
+)
+mb.build()
+endpoint = mb.deploy(endpoint_name="churn-ep", initial_instance_count=2)
+
+<span class="c"># deploy() returns an Endpoint resource, not a V2 Predictor</span>
+resp = endpoint.invoke(body=b'{"features": [0.1, 3, 12]}', content_type="application/json")
+print(resp.body.read())</code></pre>
+			<p><code>ModelBuilder</code> also takes <code>model=</code> a trained <code>ModelTrainer</code>, a training job, a model package, a JumpStart ID (see <a href="model-customization.html#s3">JumpStart</a>) or an S3 URI, or an <code>inference_spec=</code> with your own load and invoke functions. In SDK V2 the same thing is <code>Model(image_uri=..., model_data=..., role=...).deploy(initial_instance_count=2, instance_type="ml.m5.xlarge")</code>, which returns a <code>Predictor</code>.</p>
+			<span class="file">The same deployment through the API (Python, boto3)</span>
+<pre><code>import boto3
+
+sm = boto3.client("sagemaker")
+smr = boto3.client("sagemaker-runtime")
+
+sm.create_model(
+    ModelName="churn-v14",
+    ExecutionRoleArn="arn:aws:iam::111111111111:role/SageMakerExecutionRole",
+    PrimaryContainer={
+        "Image": "111111111111.dkr.ecr.us-east-1.amazonaws.com/churn-serve:1.4",
+        "ModelDataUrl": "s3://ml-111111111111/churn/model.tar.gz",
+        "Environment": {"LOG_LEVEL": "info"},
+    },
+)
+sm.create_endpoint_config(
+    EndpointConfigName="churn-cfg-v14",
+    ProductionVariants=[{
+        "VariantName": "AllTraffic",
+        "ModelName": "churn-v14",
+        "InstanceType": "ml.m5.xlarge",
+        "InitialInstanceCount": 2,
+    }],
+)
+<span class="c"># The config store is eventually consistent; AWS suggests describing it first</span>
+sm.describe_endpoint_config(EndpointConfigName="churn-cfg-v14")
+sm.create_endpoint(EndpointName="churn-ep", EndpointConfigName="churn-cfg-v14")
+sm.get_waiter("endpoint_in_service").wait(EndpointName="churn-ep")
+
+r = smr.invoke_endpoint(EndpointName="churn-ep", ContentType="application/json",
+                        Body=b'{"features": [0.1, 3, 12]}')
+print(r["Body"].read())</code></pre>
+
+			<h2 id="s3">Several models on one endpoint</h2>
+			<ul>
+				<li><strong>Production variants</strong> (up to 10 per configuration): different models or instance types behind one endpoint, with traffic split by <code>InitialVariantWeight</code> (weight divided by the sum of weights). Callers can force one with <code>TargetVariant</code>; the response header <code>x-Amzn-Invoked-Production-Variant</code> says which answered. This is the classic <strong>A/B test</strong>.</li>
+				<li><strong>Multi-model endpoints</strong> (<code>Mode: MultiModel</code>): AWS's choice for "a large number of models that use the same ML framework on a shared serving container". Models stay in S3 and load on first call with <code>TargetModel="model-123.tar.gz"</code>; idle ones are unloaded when memory runs short. Add a model by uploading it, remove it by deleting it. Callers must tolerate cold starts. CPU instances, or GPU with NVIDIA Triton. No serverless, data capture, Model Monitor, shadow tests or response streaming.</li>
+				<li><strong>Multi-container endpoints:</strong> up to 15 containers with different frameworks on one endpoint, called directly with <code>TargetContainerHostname</code> (<code>InferenceExecutionConfig.Mode = Direct</code>).</li>
+				<li><strong>Serial inference pipelines:</strong> 2 to 15 containers run in sequence on every instance (<code>Mode = Serial</code>), for example preprocessing, prediction and postprocessing. No extra charge; the pipeline is changed only by updating the endpoint.</li>
+				<li><strong>Inference components:</strong> each model gets its own CPU, accelerator and memory reservation, its own number of copies, and its own scaling and updates. AWS calls them "the most flexible way to deploy multiple models to an endpoint"; they're the only way to scale to zero, host LoRA adapters or use GPU partitions.</li>
+			</ul>
+
+			<h2 id="s4">Inference components</h2>
+			<p>An inference-component endpoint has variants without a <code>ModelName</code>; the execution role (and VPC settings) move to the endpoint configuration, and models are added afterwards with <code>CreateInferenceComponent</code>.</p>
+			<span class="file">An endpoint with a base model and a LoRA adapter (Python, boto3; sm and smr as above)</span>
+<pre><code>import time
+
+sm.create_endpoint_config(
+    EndpointConfigName="llm-ic-cfg",
+    ExecutionRoleArn="arn:aws:iam::111111111111:role/SageMakerExecutionRole",
+    ProductionVariants=[{
+        "VariantName": "main",
+        "InstanceType": "ml.g6.12xlarge",
+        "InitialInstanceCount": 1,
+        <span class="c"># SageMaker adds and removes instances to fit the copies; 0 allows scale to zero</span>
+        "ManagedInstanceScaling": {"Status": "ENABLED", "MinInstanceCount": 0, "MaxInstanceCount": 4},
+        "RoutingConfig": {"RoutingStrategy": "LEAST_OUTSTANDING_REQUESTS"},
+    }],
+)
+sm.create_endpoint(EndpointName="llm-ep", EndpointConfigName="llm-ic-cfg")
+sm.get_waiter("endpoint_in_service").wait(EndpointName="llm-ep")
+
+sm.create_inference_component(
+    InferenceComponentName="llama-base",
+    EndpointName="llm-ep",
+    VariantName="main",
+    Specification={
+        "ModelName": "llama31-8b",
+        "ComputeResourceRequirements": {
+            "NumberOfAcceleratorDevicesRequired": 1,
+            "NumberOfCpuCoresRequired": 4,
+            "MinMemoryRequiredInMb": 16384,
+        },
+    },
+    RuntimeConfig={"CopyCount": 1},
+)
+
+<span class="c"># There's no waiter for inference components; poll the status</span>
+while sm.describe_inference_component(InferenceComponentName="llama-base")["InferenceComponentStatus"] != "InService":
+    time.sleep(30)
+
+<span class="c"># An adapter shares the base component's compute, so it has no resource requirements</span>
+sm.create_inference_component(
+    InferenceComponentName="llama-support-adapter",
+    EndpointName="llm-ep",
+    Specification={
+        "BaseInferenceComponentName": "llama-base",
+        "Container": {"ArtifactUrl": "s3://ml-111111111111/adapters/support/adapter.tar.gz"},
+    },
+)
+
+r = smr.invoke_endpoint(EndpointName="llm-ep", InferenceComponentName="llama-support-adapter",
+                        ContentType="application/json",
+                        Body=b'{"inputs": "My invoice is wrong", "parameters": {"max_new_tokens": 128}}')</code></pre>
+			<ul>
+				<li><strong>Copies:</strong> <code>UpdateInferenceComponentRuntimeConfig</code> changes <code>CopyCount</code> (a separate IAM action); <code>UpdateInferenceComponent</code> changes the model or image with a rolling update, copy by copy, instead of doubling the fleet.</li>
+				<li><strong>Placement:</strong> <code>SchedulingConfig</code> chooses <code>SPREAD</code> or <code>BINPACK</code> and how evenly copies sit across Availability Zones; <code>ScaleInPolicy</code> on the variant chooses <code>IDLE_RELEASE</code> (remove empty instances) or <code>CONSOLIDATION</code> (repack copies to free instances). <code>DataCacheConfig</code> caches the image and artifacts on each instance so new copies start faster.</li>
+				<li><strong>Several instance types:</strong> <code>Specifications</code> (up to 5, one per instance type) works with <a href="#s9">instance pools</a>.</li>
+			</ul>
+
+			<h2 id="s5">Calling an endpoint</h2>
+			<span class="file">Stream tokens as they're generated (Python, boto3)</span>
+<pre><code>import json
+
+import boto3
+
+smr = boto3.client("sagemaker-runtime")
+resp = smr.invoke_endpoint_with_response_stream(
+    EndpointName="llm-ep",
+    InferenceComponentName="llama-base",
+    ContentType="application/json",
+    Body=json.dumps({"inputs": "Explain VPC endpoints.", "parameters": {"max_new_tokens": 256}, "stream": True}),
+)
+
+<span class="c"># Parts can split or join the container's lines, so buffer and split on newlines</span>
+buf = b""
+for event in resp["Body"]:
+    if "PayloadPart" in event:
+        buf += event["PayloadPart"]["Bytes"]
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if line.strip():
+                print(line.decode("utf-8"))
+    elif "ModelStreamError" in event:
+        raise RuntimeError(event["ModelStreamError"])</code></pre>
+			<p>What each line contains depends on the container (TGI and vLLM send server-sent event lines). Streaming uses the <code>sagemaker:InvokeEndpoint</code> permission, isn't available in the AWS CLI, and doesn't work with multi-model endpoints.</p>
+			<div class="entry">
+				<h4>OpenAI-compatible API (21 May 2026)</h4>
+				<p>Every endpoint and inference component also answers OpenAI Chat Completions requests (including streaming) at <code>/endpoints/NAME/openai/v1</code> (or <code>/endpoints/NAME/inference-components/IC/openai/v1</code>), if the container serves <code>/v1/chat/completions</code>: the SageMaker vLLM and SGLang containers do. Clients authenticate with a <strong>bearer token</strong>, a pre-signed SigV4 URL made locally from your credentials and valid for up to 12 hours.</p>
+			</div>
+			<span class="file">Call an endpoint with the OpenAI SDK (Python)</span>
+<pre><code>from datetime import timedelta
+
+from openai import OpenAI
+from sagemaker.core.token_generator import generate_token
+
+region = "us-east-1"
+<span class="c"># Valid for the shorter of the expiry and your credentials' remaining life</span>
+token = generate_token(region=region, expiry=timedelta(hours=1))
+
+client = OpenAI(
+    base_url=f"https://runtime.sagemaker.{region}.amazonaws.com/endpoints/llm-ep/openai/v1",
+    api_key=token,
+)
+<span class="c"># model is passed through to the container and can be empty</span>
+reply = client.chat.completions.create(model="", messages=[{"role": "user", "content": "Explain VPC endpoints."}])
+print(reply.choices[0].message.content)</code></pre>
+			<div class="callout trap"><p>Bearer-token calls need <code>sagemaker:InvokeEndpoint</code> on the endpoint <strong>and <code>sagemaker:CallWithBearerToken</code> on <code>"*"</code></strong> (it has no resource-level permissions). The token carries all of its creator's permissions until it expires, so keep expiries short and treat it like a password.</p></div>
+			<ul>
+				<li><strong>Stateful sessions:</strong> send <code>SessionId="NEW_SESSION"</code>; the container returns a session ID with an expiry, and later requests with that ID go to the same instance (useful for cached context). The container decides how a session closes. A session can't be started with the streaming API, only continued.</li>
+				<li><strong>Bidirectional streaming</strong> (25 November 2025): for speech and voice agents, the client keeps an HTTP/2 connection (port 8443, up to 30 minutes) and SageMaker relays it to a WebSocket in the container (<code>/invocations-bidirectional-stream</code>; the image needs the label <code>com.amazonaws.sagemaker.capabilities.bidirectional-streaming=true</code>). It's not in boto3 or the CLI; AWS provides an experimental HTTP/2 Python SDK.</li>
+				<li><strong>Routing</strong> (<code>RoutingConfig</code> on the variant): <code>LEAST_OUTSTANDING_REQUESTS</code>, <code>RANDOM</code>, or <code>PREFIX_AWARE</code>, which sends requests sharing a prompt prefix (or a <code>PrefixAwareId</code> header) to the same instance to reuse its KV cache.</li>
+			</ul>
+
+			<h2 id="s6">Autoscaling and scale to zero</h2>
+			<p>Endpoints scale through <strong>Application Auto Scaling</strong>: register the variant (or inference component) as a scalable target, then attach target tracking, step or scheduled policies.</p>
+			<span class="file">Target tracking on invocations per instance for a variant (Python, boto3)</span>
+<pre><code>import boto3
+
+aas = boto3.client("application-autoscaling")
+resource = "endpoint/churn-ep/variant/AllTraffic"
+
+aas.register_scalable_target(
+    ServiceNamespace="sagemaker",
+    ResourceId=resource,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    MinCapacity=2,
+    MaxCapacity=8,
+)
+aas.put_scaling_policy(
+    PolicyName="churn-invocations",
+    ServiceNamespace="sagemaker",
+    ResourceId=resource,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        <span class="c"># Invocations per instance per minute; find it with a load test</span>
+        "TargetValue": 70.0,
+        "PredefinedMetricSpecification": {"PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"},
+        "ScaleInCooldown": 600,
+        "ScaleOutCooldown": 300,
+    },
+)</code></pre>
+			<ul>
+				<li><strong>Predefined metrics:</strong> <code>SageMakerVariantInvocationsPerInstance</code>, <code>SageMakerInferenceComponentInvocationsPerCopy</code>, <code>SageMakerVariantProvisionedConcurrencyUtilization</code> (serverless), and the <strong>high-resolution</strong> concurrency metrics <code>SageMakerVariantConcurrentRequestsPerModelHighResolution</code> and <code>SageMakerInferenceComponentConcurrentRequestsPerCopyHighResolution</code>, published every 10 seconds and counting queued and still-streaming requests. They make scale-out faster for LLMs; scale-in isn't faster.</li>
+				<li><strong>Cooldowns</strong> default to 300 seconds each way. A plain variant's minimum is 1; you can also scale on CloudWatch metrics such as <code>CPUUtilization</code> in <code>/aws/sagemaker/Endpoints</code>.</li>
+			</ul>
+			<span class="file">Scale an inference component to zero and back (Python, boto3; aas as above)</span>
+<pre><code>import boto3
+
+cw = boto3.client("cloudwatch")
+ic = "inference-component/llama-base"
+dim = "sagemaker:inference-component:DesiredCopyCount"
+
+<span class="c"># Needs ManagedInstanceScaling MinInstanceCount 0 on the variant</span>
+aas.register_scalable_target(ServiceNamespace="sagemaker", ResourceId=ic,
+                             ScalableDimension=dim, MinCapacity=0, MaxCapacity=4)
+aas.put_scaling_policy(
+    PolicyName="llama-per-copy", ServiceNamespace="sagemaker", ResourceId=ic, ScalableDimension=dim,
+    PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        "TargetValue": 1.0,
+        "PredefinedMetricSpecification": {"PredefinedMetricType": "SageMakerInferenceComponentInvocationsPerCopy"},
+        "ScaleInCooldown": 300, "ScaleOutCooldown": 300,
+    },
+)
+
+<span class="c"># Target tracking can't scale out from zero copies: a step policy does, fired by an alarm</span>
+step = aas.put_scaling_policy(
+    PolicyName="llama-from-zero", ServiceNamespace="sagemaker", ResourceId=ic, ScalableDimension=dim,
+    PolicyType="StepScaling",
+    StepScalingPolicyConfiguration={
+        "AdjustmentType": "ChangeInCapacity", "MetricAggregationType": "Maximum", "Cooldown": 60,
+        "StepAdjustments": [{"MetricIntervalLowerBound": 0, "ScalingAdjustment": 1}],
+    },
+)
+cw.put_metric_alarm(
+    AlarmName="llama-no-capacity", Namespace="AWS/SageMaker", MetricName="NoCapacityInvocationFailures",
+    Dimensions=[{"Name": "InferenceComponentName", "Value": "llama-base"}],
+    Statistic="Sum", Period=60, EvaluationPeriods=1, Threshold=1,
+    ComparisonOperator="GreaterThanThreshold", AlarmActions=[step["PolicyARN"]],
+)</code></pre>
+			<div class="callout trap"><p>Scale to zero works <strong>only on inference-component endpoints</strong>. Coming back from zero "takes several minutes", and requests fail until an instance and a copy are ready, so the first callers need retries or a queue (or use <a href="async-batch-optimization.html">asynchronous inference</a>, which can also scale to zero).</p></div>
+
+			<h2 id="s7">Serverless inference</h2>
+			<p>Serverless endpoints run on AWS-managed compute (built on Lambda), scale to zero by themselves and bill only while processing: right for intermittent traffic that can tolerate cold starts. Set a <code>ServerlessConfig</code> on the variant instead of an instance type and count.</p>
+			<span class="file">A serverless variant with provisioned concurrency (Python, boto3)</span>
+<pre><code>sm.create_endpoint_config(
+    EndpointConfigName="churn-sls-cfg",
+    ProductionVariants=[{
+        "VariantName": "AllTraffic",
+        "ModelName": "churn-v14",
+        "ServerlessConfig": {
+            <span class="c"># 1024 to 6144 in 1 GB steps; vCPUs scale with memory</span>
+            "MemorySizeInMB": 2048,
+            "MaxConcurrency": 20,
+            <span class="c"># Optional, warm capacity (billed while provisioned)</span>
+            "ProvisionedConcurrency": 2,
+        },
+    }],
+)
+sm.create_endpoint(EndpointName="churn-sls", EndpointConfigName="churn-sls-cfg")</code></pre>
+			<ul>
+				<li><strong>Limits:</strong> memory 1,024 to 6,144 MB, 5 GB of disk, a 10 GB image, payloads up to 4 MB, responses within 60 seconds, and <code>MaxConcurrency</code> 1 to 200 per endpoint (requests above it are throttled).</li>
+				<li><strong>Not supported:</strong> GPUs, Marketplace model packages, private Docker registries, multi-model endpoints, <strong>VPC configuration</strong>, <strong>network isolation</strong>, data capture, multiple variants, Model Monitor, inference pipelines, uncompressed <code>ModelDataSource</code>, deployment guardrails and shadow tests.</li>
+				<li><strong>Cold starts</strong> depend on image and model size; watch <code>OverheadLatency</code>. <strong>Provisioned concurrency</strong> (up to <code>MaxConcurrency</code>) keeps instances warm, and can be scaled with Application Auto Scaling on <code>sagemaker:variant:DesiredProvisionedConcurrency</code> with <code>SageMakerVariantProvisionedConcurrencyUtilization</code>, or on a schedule (not through CloudFormation).</li>
+				<li><strong>Conversion:</strong> a serverless endpoint can be updated to instances, but an instance-based endpoint can't become serverless, and the change can't be reversed.</li>
+				<li><strong>Quotas:</strong> the account defaults are 5 serverless endpoints and a total concurrency of 10 per Region; the documented maximums are 50 endpoints and 1,000 (500 in smaller Regions) total concurrency after increases.</li>
+			</ul>
+
+			<h2 id="s8">Safe deployments and testing</h2>
+			<p><strong>Deployment guardrails</strong> control how <code>UpdateEndpoint</code> shifts traffic. With no policy, SageMaker does blue/green all at once.</p>
+			<span class="file">Canary rollout with automatic rollback on alarms (Python, boto3)</span>
+<pre><code>sm.update_endpoint(
+    EndpointName="churn-ep",
+    EndpointConfigName="churn-cfg-v15",
+    DeploymentConfig={
+        "BlueGreenUpdatePolicy": {
+            "TrafficRoutingConfiguration": {
+                "Type": "CANARY",
+                <span class="c"># Up to 50% of the fleet; then a baking period before the rest</span>
+                "CanarySize": {"Type": "CAPACITY_PERCENT", "Value": 10},
+                "WaitIntervalInSeconds": 600,
+            },
+            <span class="c"># Keep the old fleet briefly after the switch</span>
+            "TerminationWaitInSeconds": 300,
+            <span class="c"># Must exceed the total of the waits</span>
+            "MaximumExecutionTimeoutInSeconds": 3600,
+        },
+        "AutoRollbackConfiguration": {"Alarms": [{"AlarmName": "churn-ep-5xx"}, {"AlarmName": "churn-ep-p99-latency"}]},
+    },
+)</code></pre>
+			<ul>
+				<li><strong>Traffic shifting:</strong> <code>ALL_AT_ONCE</code>, <code>CANARY</code> (one slice, bake, then the rest) or <code>LINEAR</code> (10 to 50% steps). Any alarm in <code>ALARM</code> during baking rolls back to the old fleet.</li>
+				<li><strong>Rolling updates</strong> (<code>RollingUpdatePolicy</code>): replace the fleet in batches (<code>MaximumBatchSize</code> 5 to 50%, type <code>INSTANCE_COUNT</code> or <code>CAPACITY_PERCENT</code>) without doubling instances; good for large GPU fleets. Not for serverless or multi-variant endpoints.</li>
+				<li><strong>Exclusions:</strong> the new configuration must keep the same variant name; Marketplace containers and Inf1 instances fall back to all at once with no baking.</li>
+				<li><strong>Shadow tests</strong> (<code>CreateInferenceExperiment</code>, type <code>ShadowMode</code>): copy a percentage of live requests to a shadow variant, compare metrics, and return only the production response to callers. One production and one shadow variant, 7 days by default; you pay only for the shadow instances. Not for serverless, asynchronous, multi-model, multi-container, Marketplace or Inf1 endpoints.</li>
+				<li><strong>A/B tests</strong> use variant weights, then <code>UpdateEndpointWeightsAndCapacities</code> to move traffic (for example 50/50, then 0/100) with no new fleet.</li>
+			</ul>
+
+			<h2 id="s9">Capacity and GPUs</h2>
+			<ul>
+				<li><strong>Instance pools</strong> (May 2026): give a variant <code>InstancePools</code> (up to 5 types with priorities 1 to 5) instead of one <code>InstanceType</code>; when a type is out of capacity SageMaker falls back to the next within <code>VariantInstanceProvisionTimeoutInSeconds</code> (300 to 3,600). Scale-in removes lower-priority instances first, and <code>ModelNameOverride</code> gives each type its own optimized model.</li>
+				<li><strong>GPU partitioning</strong> (30 October 2026): <code>AcceleratorPartitionLayouts</code> on the variant splits P4d, P5, G7 and G7e GPUs into up to 7 MIG slices, and each inference component asks for an <code>AcceleratorPartitionType</code> such as <code>mig-3g.40gb</code>. The layout can't be changed on a running endpoint (create a new one), and partitioned endpoints don't publish GPU, CPU or memory utilization.</li>
+				<li><strong>Reserved capacity:</strong> a <a href="training.html#s6">training plan</a> for endpoints, referenced by <code>CapacityReservationConfig</code>. When the plan ends, an endpoint set to <code>capacity-reservations-only</code> stops serving; deleting the endpoint doesn't refund the plan.</li>
+				<li><strong>Drivers:</strong> <code>InferenceAmiVersion</code> picks the GPU driver and CUDA version, for example <code>al2-ami-sagemaker-inference-gpu-3-1</code> (driver 550, CUDA 12.4) or <code>al2023-ami-sagemaker-inference-gpu-4-1</code> (580, CUDA 13.0).</li>
+				<li><strong>Faster scale-out:</strong> automatic container image caching (June 2026, no settings) and Fast Model Loader; the <a href="async-batch-optimization.html">optimization page</a> covers them.</li>
+				<li><strong>Elastic Inference is gone:</strong> <code>AcceleratorType</code> is "no longer supported"; use small GPU or Inferentia instances.</li>
+			</ul>
+
+			<h2 id="s10">Security</h2>
+			<ul>
+				<li><strong>VPC:</strong> set <code>VpcConfig</code> on the model with <strong>at least two subnets in different Availability Zones</strong>; without internet access, add an S3 gateway endpoint for artifacts. Callers in a VPC reach the runtime privately through an interface endpoint (<code>runtime.sagemaker</code>), which must exist in their Availability Zone.</li>
+				<li><strong>Network isolation</strong> (<code>EnableNetworkIsolation</code>) stops the container making any network calls; SageMaker still downloads the artifacts for it. It can't be combined with Fast Model Loader, and serverless doesn't support it.</li>
+				<li><strong>Encryption:</strong> <code>KmsKeyId</code> on the endpoint configuration encrypts the EBS volume but <strong>not local NVMe storage</strong>, which instance hardware encrypts; data capture and core dumps take their own keys.</li>
+				<li><strong>IAM:</strong> callers need <code>sagemaker:InvokeEndpoint</code> on the endpoint (and inference component); <code>sagemaker:TargetModel</code> restricts which multi-model artifacts they can call. Enforce settings at creation with <code>sagemaker:InstanceTypes</code>, <code>sagemaker:VpcSubnets</code>, <code>sagemaker:NetworkIsolation</code>, <code>sagemaker:VolumeKmsKeyArn</code>, <code>sagemaker:ServerlessMaxConcurrency</code> and <code>sagemaker:ServerlessMemorySize</code>.</li>
+			</ul>
+
+			<h2 id="s11">Quotas and pricing</h2>
+			<ul>
+				<li><strong>Quotas:</strong> instance-type quotas for endpoint usage start at 0 on new accounts, and 4 instances per endpoint and across endpoints by default (<a href="index.html#s6">quotas</a>). <code>InvokeEndpoint</code> is limited to 10,000 requests per second per account and Region (not adjustable); create, update and delete calls to 1 per second.</li>
+				<li><strong>Real-time:</strong> per instance-hour while the endpoint exists, whether or not it gets traffic (in N. Virginia, for example, ml.m5.xlarge $0.23, ml.g5.xlarge $1.408, ml.g6.2xlarge $1.222, ml.p5.48xlarge $63.296), plus $0.016 per GB of data in and out.</li>
+				<li><strong>Serverless:</strong> per second of compute at a rate set by memory ($0.00004 per second at 2 GB) plus data; AWS's example of 10 million 100 ms requests at 2 GB costs $40.16. Provisioned concurrency adds a charge for the time it's provisioned.</li>
+				<li><strong>Savings:</strong> SageMaker Savings Plans (up to 64%, 1 or 3 years) cover real-time inference; serverless and asynchronous aren't listed. P4 and P5 prices fell by up to 45% in June 2025. Shadow-test data and inference pipelines add no charge.</li>
+				<li><strong>Free tier</strong> (first two months, per the pricing page): 125 hours a month of ml.m4.xlarge or ml.m5.xlarge real-time hosting and 150,000 seconds of serverless inference.</li>
+			</ul>
+
+			<h2 id="s12">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> AI inference recommendations with benchmark jobs (April); instance pools with automatic fallback (May); the OpenAI-compatible API with bearer tokens (21 May); detailed observability with TTFT, inter-token latency and GPU metrics (June); automatic container image caching (30 June); G7 instances (July); GPU partitioning with MIG (30 October).</li>
+				<li><strong>2025:</strong> rolling updates for inference-component endpoints (10 March); up to 45% lower P4 and P5 prices (June); P6e-GB200 UltraServers (August); bidirectional streaming (25 November); training plans for endpoints (26 November).</li>
+				<li><strong>2024:</strong> <code>InferenceAmiVersion</code> (September); scale to zero and multi-adapter LoRA inference with inference components (25 November); container caching and Fast Model Loader (6 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-mla/d3-task-3-1.html">MLA-C01 Task 3.1: selecting deployment infrastructure</a>, <a href="../../aws-mla/d4-task-4-2.html">MLA-C01 Task 4.2: infrastructure and costs</a>, the <a href="../../aws-mla/services-sagemaker-deploy.html">MLA-C01 notes on model deployment</a> (MLA-C02, which replaced C01 on 29 September 2026, keeps multi-model and multi-container strategies, VPC endpoints, scaling metrics and rollback), <a href="../../aws-aip/d2-task-2-2.html">AIP-C01 Task 2.2: model deployment strategies</a>, <a href="../../aws-aip/d4-task-4-1.html">AIP-C01 Task 4.1: cost optimization</a>, <a href="../../aws-aip/d4-task-4-2.html">AIP-C01 Task 4.2: application performance</a>, and <a href="../../aws-aif/d1-task-1-1.html#s3">AIF-C01 Task 1.1: types of inferencing</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="hyperpod.html"><small>Previous</small>HyperPod</a>
+				<span class="next"><small>Next</small>Async, batch and inference optimization (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on SageMaker AI real-time endpoints, inference components and serverless inference, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
