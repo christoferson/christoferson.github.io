@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker HyperPod | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to Amazon SageMaker HyperPod: when to choose persistent clusters, Slurm or Amazon EKS orchestration, CreateCluster, lifecycle scripts and node access, health monitoring, deep health checks and auto-resume, the training operator, checkpointless and elastic training, tiered checkpointing, task governance, Spot and Karpenter, recipes and the hyp CLI, HyperPod inference with KV caching and the Inference Gateway, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">HyperPod</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Train and host &middot; Last checked 10 November 2026</span>
+		<h1>HyperPod</h1>
+		<p>Persistent, self-healing GPU and Trainium clusters for long, large training runs and for hosting models: choosing Slurm or Amazon EKS, creating a cluster, how HyperPod finds and replaces bad hardware, the training operator and its checkpointless and elastic modes, sharing a cluster between teams, running jobs and recipes, serving models, and the security settings, quotas and prices that apply.</p>
+		<div class="tags"><span class="tag code">CreateCluster</span><span class="tag">Slurm</span><span class="tag">Amazon EKS</span><span class="tag">Task governance</span><span class="tag">HyperPod inference</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">What HyperPod is for</a></li>
+				<li><a href="#s2">Slurm or Amazon EKS</a></li>
+				<li><a href="#s3">Creating a cluster</a></li>
+				<li><a href="#s4">Nodes, access and software</a></li>
+				<li><a href="#s5">Resiliency</a></li>
+				<li><a href="#s6">Training jobs on EKS</a></li>
+				<li><a href="#s7">Task governance, Spot and autoscaling</a></li>
+				<li><a href="#s8">Recipes, data and observability</a></li>
+				<li><a href="#s9">HyperPod inference</a></li>
+				<li><a href="#s10">Security and networking</a></li>
+				<li><a href="#s11">Quotas and pricing</a></li>
+				<li><a href="#s12">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">What HyperPod is for</h2>
+			<p><strong>SageMaker HyperPod</strong> gives you a <strong>persistent cluster</strong> of accelerated instances that SageMaker AI watches and repairs: when a GPU or Trainium chip fails, it detects the fault, replaces or reboots the node, and lets the job resume. AWS's FAQ puts it at "longer and larger training workloads that require high amount of compute instances", and it can run training and inference on the same cluster. It's in 18 Regions.</p>
+			<ul>
+				<li><strong>Choose a <a href="training.html">training job</a></strong> when each run is self-contained: SageMaker starts and stops the instances, and you pay per job.</li>
+				<li><strong>Choose <a href="model-customization.html#s6">serverless customization</a></strong> to fine-tune a supported model without choosing any instances.</li>
+				<li><strong>Choose HyperPod</strong> for weeks-long pre-training or fine-tuning on dozens or hundreds of GPUs, for a shared cluster that several teams queue work on, for Slurm or Kubernetes tooling your researchers already use, or for Nova continued pre-training, which runs only on HyperPod.</li>
+			</ul>
+			<p>You pay for the instances for as long as the cluster holds them, busy or not, so a cluster only pays off when it's kept full.</p>
+
+			<h2 id="s2">Slurm or Amazon EKS</h2>
+			<table class="stack labeled compare">
+				<thead><tr><th>Slurm</th><th>Amazon EKS</th></tr></thead>
+				<tbody>
+					<tr class="group"><th colspan="2">Who it suits</th></tr>
+					<tr><td data-label="Slurm">HPC-style research teams who submit <code>sbatch</code> jobs and log in to nodes</td><td data-label="Amazon EKS">Platform teams running containers, with Kubernetes tooling, quotas between teams and model hosting</td></tr>
+					<tr class="group"><th colspan="2">Layout</th></tr>
+					<tr><td data-label="Slurm">One controller group, at most one login group, and compute groups that each map to a partition (plus a <code>dev</code> partition with every node)</td><td data-label="Amazon EKS">An EKS cluster you own is the control plane; HyperPod instances join it as worker nodes, one HyperPod cluster per EKS cluster</td></tr>
+					<tr class="group"><th colspan="2">Only on this orchestrator</th></tr>
+					<tr><td data-label="Slurm">FSx for OpenZFS home directories, multiple head nodes, Slurm topology</td><td data-label="Amazon EKS">Training operator, checkpointless and elastic training, tiered checkpointing, task governance, Spot, Karpenter, MIG, IDEs, inference</td></tr>
+					<tr class="group"><th colspan="2">VPC</th></tr>
+					<tr><td data-label="Slurm">Optional (without one, HyperPod uses its own platform subnet)</td><td data-label="Amazon EKS">Required, with private subnets and the VPC CNI</td></tr>
+				</tbody>
+			</table>
+			<p>Since 26 February 2026 Slurm is configured through the API: each instance group gets <code>SlurmConfig</code> with a <code>NodeType</code> (<code>Controller</code>, <code>Login</code> or <code>Compute</code>, fixed once set) and, for compute groups, one <code>PartitionNames</code> entry. The old <code>provisioning_parameters.json</code> file in the lifecycle-script folder still works but is now called legacy. <code>Orchestrator.Slurm.SlurmConfigStrategy</code> decides what happens to manual edits of <code>slurm.conf</code>: <code>Managed</code> (the default) makes cluster updates fail if the file drifted, <code>Overwrite</code> replaces it, and <code>Merge</code> keeps your changes.</p>
+
+			<h2 id="s3">Creating a cluster</h2>
+			<p>For EKS, first create the EKS cluster (Kubernetes 1.30 to 1.35, authentication mode <code>API</code> or <code>API_AND_CONFIG_MAP</code>) and, if you're not using the console or the CloudFormation quick start, install the HyperPod Helm chart from <code>helm_chart/HyperPodHelmChart</code> in the <code>sagemaker-hyperpod-cli</code> repository. It brings the health monitoring agent, the Kubeflow training and MPI operators, the NVIDIA, Neuron and EFA device plugins and Kueue. Install it <em>before</em> calling <code>CreateCluster</code>.</p>
+			<span class="file">An EKS-orchestrated cluster with one GPU group (Python, boto3)</span>
+<pre><code>import boto3
+
+sm = boto3.client("sagemaker", region_name="us-west-2")
+resp = sm.create_cluster(
+    ClusterName="ml-cluster",
+    Orchestrator={"Eks": {"ClusterArn": "arn:aws:eks:us-west-2:111111111111:cluster/ml-eks"}},
+    InstanceGroups=[{
+        "InstanceGroupName": "gpu-workers",
+        "InstanceType": "ml.p5.48xlarge",
+        "InstanceCount": 4,
+        <span class="c"># The bucket name must start with sagemaker- or the instance role can't read it</span>
+        "LifeCycleConfig": {"SourceS3Uri": "s3://sagemaker-ml-111111111111/lifecycle/", "OnCreate": "on_create.sh"},
+        "ExecutionRole": "arn:aws:iam::111111111111:role/HyperPodInstanceRole",
+        "ThreadsPerCore": 1,
+        <span class="c"># Adds about 2 hours per node before it takes work</span>
+        "OnStartDeepHealthChecks": ["InstanceStress", "InstanceConnectivity"],
+        <span class="c"># Extra EBS volume, mounted at /opt/sagemaker</span>
+        "InstanceStorageConfigs": [{"EbsVolumeConfig": {"VolumeSizeInGB": 500}}],
+    }],
+    <span class="c"># Private subnets; the security group must allow all traffic from itself (EFA)</span>
+    VpcConfig={"SecurityGroupIds": ["sg-0hyperpod"], "Subnets": ["subnet-0aaa"]},
+    NodeRecovery="Automatic",
+    NodeProvisioningMode="Continuous",
+    Tags=[{"Key": "team", "Value": "research"}],
+)
+print(resp["ClusterArn"])</code></pre>
+			<ul>
+				<li><strong>Only <code>ClusterName</code> is required</strong> by the API; <code>Orchestrator</code> takes exactly one of <code>Eks</code> or <code>Slurm</code>. Each instance group needs a name, a count (0 to 6,758) and an execution role; up to 100 groups.</li>
+				<li><strong>Continuous provisioning</strong> (<code>NodeProvisioningMode="Continuous"</code>, now the default for new clusters) provisions nodes in the background with retries and partial success, keeps groups in service while they scale, records <code>ListClusterEvents</code>, and doesn't bill for launches that fail. Flexible instance groups (<code>InstanceRequirements</code> with up to 20 types in priority order), <code>MinInstanceCount</code>, customer managed EBS keys and logical node IDs all need it.</li>
+				<li><strong>Fixed after creation:</strong> the cluster <code>VpcConfig</code>, a group's <code>OverrideVpcConfig</code>, its Spot or On-Demand capacity type, a Slurm <code>NodeType</code> and an EBS key. Plan subnets for growth: a p5.48xlarge takes 81 IP addresses on EKS and 32 on Slurm.</li>
+				<li><strong>Other ways in:</strong> the console's quick and custom setups, CloudFormation <code>AWS::SageMaker::Cluster</code>, Terraform <code>awscc_sagemaker_cluster</code>, <code>hyp init cluster-stack</code> in the CLI, and the SageMaker AI MCP server.</li>
+				<li><strong>Change it later</strong> with <code>UpdateCluster</code> (counts, new groups, <code>InstanceGroupsToDelete</code>), <code>BatchAddClusterNodes</code> and <code>BatchDeleteClusterNodes</code>.</li>
+			</ul>
+
+			<h2 id="s4">Nodes, access and software</h2>
+			<ul>
+				<li><strong>Lifecycle scripts:</strong> <code>OnCreate</code> (usually <code>on_create.sh</code>) runs on every new node; AWS's base scripts in <code>aws-samples/awsome-distributed-training</code> set up Slurm, users, FSx mounts and Docker. HyperPod writes a <code>resource_config.json</code> on each node describing the cluster. A failing script fails the node, so test changes on a small group.</li>
+				<li><strong>Access:</strong> through Session Manager, with the target <code>sagemaker-cluster:CLUSTERID_GROUPNAME-INSTANCEID</code> (users need <code>ssm:StartSession</code>); SSH works through <code>AWS-StartSSHSession</code> as a proxy. On Slurm you arrive as root and switch to <code>ubuntu</code>. On EKS, users also need an EKS access entry and Kubernetes RBAC.</li>
+				<li><strong>Images:</strong> HyperPod's public AMIs (Ubuntu 22.04 for Slurm, AL2023 for EKS), or your own AMI built from one (EKS since August 2025, Slurm since July 2026). Since July 2026 you can pin an <code>ImageReleaseVersion</code>, roll back, and set <code>AutoPatchConfig</code> to patch when nodes are idle.</li>
+				<li><strong><code>UpdateClusterSoftware</code></strong> rolls nodes to a new AMI and <strong>replaces the root volume</strong>, so anything stored there is lost; keep data on FSx, S3 or the <code>/opt/sagemaker</code> volume.</li>
+				<li><strong>EKS pods per node are limited</strong> because each HyperPod instance gets one network interface (49 pods on p5.48xlarge). Pods can't reach the instance metadata service unless they use the host network; give them AWS access with EKS Pod Identity or IRSA. Don't install a local NVMe CSI driver: it conflicts with the volume group the AMI builds.</li>
+			</ul>
+
+			<h2 id="s5">Resiliency</h2>
+			<ol class="flow">
+				<li><b>Check before work</b>Optional <strong>deep health checks</strong> when nodes join: <code>InstanceStress</code> (DCGM diagnostics, NVLink, EFA loopback; Neuron tests on Trainium) and <code>InstanceConnectivity</code> (NCCL or NCCOM across nodes); the developer guide also lists <code>MultiNodeTrainingValidation</code> (Megatron runs, EKS on EFA GPUs). About 2 hours per node; failing nodes are replaced. <code>StartClusterHealthCheck</code> runs them on demand.</li>
+				<li><b>Watch</b>The <strong>health monitoring agent</strong> on every GPU and Trainium node reads DCGM, <code>nvidia-smi</code>, Neuron monitors and EC2 platform logs.</li>
+				<li><b>Mark</b>On EKS a faulty node gets the label <code>sagemaker.amazonaws.com/node-health-status</code> (<code>Unschedulable</code>, <code>UnschedulablePendingReboot</code> or <code>UnschedulablePendingReplacement</code>) and a <code>NoSchedule</code> taint; on Slurm it's drained.</li>
+				<li><b>Repair</b>With <code>NodeRecovery="Automatic"</code>, HyperPod reboots or replaces the node. You can also trigger it with <code>BatchRebootClusterNodes</code> or <code>BatchReplaceClusterNodes</code> (up to 25 nodes per call) or from the console.</li>
+				<li><b>Resume</b>The job restarts from its last checkpoint on healthy nodes, or keeps going without one (checkpointless training).</li>
+			</ol>
+			<div class="callout trap"><p><strong>CPU-only nodes are never replaced automatically</strong>: the agent and deep health checks cover GPU and Trainium instances only. <code>BatchReplaceClusterNodes</code> wipes both the root and secondary volumes, and on a Karpenter-managed cluster a replaced node isn't guaranteed to come back.</p></div>
+			<span class="file">train.sbatch: a Slurm job that resumes after a node is replaced (Bash)</span>
+<pre><code>#!/bin/bash
+#SBATCH --job-name=llama-pretrain
+#SBATCH --nodes=8
+#SBATCH --exclusive
+#SBATCH --output=logs/%x_%j.out
+
+<span class="c"># Auto-resume reruns this step on the replacement node set.</span>
+<span class="c"># Do all setup inside the script, and build the node list with scontrol there:</span>
+<span class="c"># $SLURM_JOB_NODELIST can be stale after a replacement.</span>
+srun --auto-resume=1 ./train_auto_resume.sh</code></pre>
+			<p>Auto-resume applies only to the <code>srun</code> step it's on, needs an exclusive allocation, and always replaces rather than reboots the faulty node. The training code must save checkpoints to shared storage and load the latest one at start.</p>
+
+			<h2 id="s6">Training jobs on EKS</h2>
+			<p>You can submit standard Kubeflow <code>PyTorchJob</code>s, but the <strong>HyperPod training operator</strong> (EKS add-on <code>amazon-sagemaker-hyperpod-training-operator</code>, which needs cert-manager and the EKS Pod Identity Agent) adds finer recovery: it restarts only the failed processes, watches logs for hangs, and can keep spare nodes. Its images must include the HyperPod elastic agent and start with <code>hyperpodrun</code> instead of <code>torchrun</code>.</p>
+			<span class="file">job.yaml: a HyperPodPyTorchJob in a team queue (YAML, kubectl apply)</span>
+<pre><code>apiVersion: sagemaker.amazonaws.com/v1
+kind: HyperPodPyTorchJob
+metadata:
+  name: llama-sft
+  namespace: hyperpod-ns-research
+  labels:
+    <span class="c"># Task governance queue and priority (see the next section)</span>
+    kueue.x-k8s.io/queue-name: hyperpod-ns-research-localqueue
+    kueue.x-k8s.io/priority-class: training-priority
+spec:
+  nprocPerNode: "8"
+  runPolicy:
+    jobMaxRetryCount: 3
+    cleanPodPolicy: None
+  replicaSpecs:
+    - name: workers
+      replicas: 4
+      template:
+        spec:
+          containers:
+            - name: trainer
+              image: 111111111111.dkr.ecr.us-west-2.amazonaws.com/llama-train:1.0
+              command: ["hyperpodrun", "--nproc-per-node=8", "train.py"]
+              resources:
+                limits:
+                  nvidia.com/gpu: 8
+                  vpc.amazonaws.com/efa: 32</code></pre>
+			<p>The CLI equivalent is <code>hyp create hyp-pytorch-job --job-name llama-sft --image IMAGE --instance-type ml.p5.48xlarge --tasks-per-node 8 --queue-name hyperpod-ns-research-localqueue</code>, after <code>hyp set-cluster-context --cluster-name ml-cluster</code>. The <code>hyperpodrun</code> arguments shown follow <code>torchrun</code>'s; check the operator guide for the exact flags.</p>
+			<div class="entry">
+				<h4>Checkpointless training (3 December 2025)</h4>
+				<p>Keeps the training state spread across the cluster and, when a node fails, swaps in a replacement and copies the state from healthy peers, so recovery takes minutes instead of reloading a checkpoint. It needs EKS, training operator 1.2.0 or later and elastic agent 1.1.0 or later, and is built on NVIDIA NeMo; AWS provides recipes for gpt-oss 120B and Llama 3 70B on p5.48xlarge.</p>
+			</div>
+			<div class="entry">
+				<h4>Elastic training (3 December 2025)</h4>
+				<p>Lets a job grow and shrink its number of data-parallel replicas as nodes come and go (<code>spec.elasticPolicy</code> with <code>minReplicas</code>, <code>maxReplicas</code> and a step), with PyTorch DDP or FSDP and distributed checkpoints. It <strong>can't be combined</strong> with checkpointless training, managed tiered checkpointing or Spot.</p>
+			</div>
+			<div class="entry">
+				<h4>Managed tiered checkpointing (8 September 2025)</h4>
+				<p>Turned on per cluster with <code>TieredStorageConfig={"Mode": "Enable"}</code>: checkpoints go to CPU memory, are copied to neighbouring nodes and are written to S3 periodically, so frequent checkpoints cost little. Training code uses the <code>amzn-sagemaker-checkpointing</code> library with PyTorch distributed checkpoint <code>async_save</code>. EKS only.</p>
+			</div>
+
+			<h2 id="s7">Task governance, Spot and autoscaling</h2>
+			<p><strong>Task governance</strong> (EKS add-on <code>amazon-sagemaker-hyperpod-taskgovernance</code>, which installs its own Kueue, so remove any existing Kueue first) shares one cluster between teams:</p>
+			<ul>
+				<li><strong>Cluster policy</strong> (<code>CreateClusterSchedulerConfig</code>): up to 10 priority classes with weights, fair share on or off (off means first come, first served), and optional sharing of idle, unallocated capacity.</li>
+				<li><strong>Compute allocation per team</strong> (<code>CreateComputeQuota</code>): instances, accelerators, vCPU or memory (including GPU partitions); whether the team lends idle capacity, borrows (up to a <code>BorrowLimit</code> percentage, 50 by default) or both; and whether higher-priority work may preempt the team's lower-priority tasks.</li>
+				<li><strong>Naming:</strong> each team gets namespace <code>hyperpod-ns-TEAM</code> and queue <code>hyperpod-ns-TEAM-localqueue</code>; jobs pick a priority with the label <code>kueue.x-k8s.io/priority-class: NAME-priority</code>. An unknown class rejects the job; none means the lowest rank.</li>
+			</ul>
+			<ul>
+				<li><strong>Spot</strong> (EKS only, since 24 November 2025): set <code>CapacityRequirements={"Spot": {}}</code> on an instance group, up to 90% off On-Demand. HyperPod drains the node on the best-effort two-minute notice and replaces capacity; jobs must checkpoint. The Spot quotas start at 0.</li>
+				<li><strong>Karpenter autoscaling</strong> (18 September 2025): <code>AutoScaling={"Mode": "Enable", "AutoScalerType": "Karpenter"}</code> plus a <code>ClusterRole</code> that HyperPod assumes to add and remove nodes, groups starting at 0 instances, and a <code>HyperpodNodeClass</code> referenced from Karpenter <code>NodePool</code>s. It can fall back from Spot to On-Demand groups.</li>
+				<li><strong>GPU partitioning (MIG)</strong> on p4d, p4de, p5, p5e, p5en and B200 instances splits a GPU into up to seven slices for small jobs, notebooks and inference (not on flexible instance groups).</li>
+			</ul>
+
+			<h2 id="s8">Recipes, data and observability</h2>
+			<ul>
+				<li><strong>Recipes</strong> (<code>aws/sagemaker-hyperpod-recipes</code>, now version 2): tested YAML configurations for pre-training, SFT, DPO, LoRA and RL of Nova, Llama, Qwen, DeepSeek R1 Distill, gpt-oss, Gemma 4 and other families, launched with <code>python3 main.py recipes=PATH cluster=k8s ...</code> or the launcher scripts. The same recipes run on training jobs (<code>ModelTrainer.from_recipe</code>); on Slurm only the LLM fine-tuning recipes are supported.</li>
+				<li><strong>HyperPod CLI v3</strong> (<code>pip install sagemaker-hyperpod</code>, Linux and macOS): <code>hyp list-cluster</code>, <code>hyp set-cluster-context</code>, <code>hyp create</code>, <code>list</code>, <code>describe</code>, <code>delete</code> and <code>get-logs</code> for <code>hyp-pytorch-job</code>, plus template-driven <code>hyp init</code>, <code>configure</code>, <code>validate</code>. Some AWS pages still show the older <code>hyperpod start-job</code> commands of CLI v2.</li>
+				<li><strong>Data:</strong> FSx for Lustre in the same Availability Zone for training data and checkpoints (set per group in <code>InstanceStorageConfigs</code> on Slurm), S3 through Mountpoint or a gateway endpoint, EFS, and EBS through the CSI driver.</li>
+				<li><strong>Observability:</strong> the HyperPod observability add-on sends GPU, EFA, file system, Kueue and job metrics to Amazon Managed Service for Prometheus with Amazon Managed Grafana dashboards; cluster and node logs go to CloudWatch <code>/aws/sagemaker/Clusters/...</code>; Container Insights and EventBridge events cover status changes.</li>
+				<li><strong>Developer tools:</strong> JupyterLab and Code Editor spaces on EKS clusters (the SageMaker Spaces add-on, November 2025), HyperPod clusters visible in Studio, the SageMaker AI MCP server (read-only unless started with <code>--allow-write</code>), and HyperPod troubleshooting skills for coding assistants (June 2026).</li>
+			</ul>
+
+			<h2 id="s9">HyperPod inference</h2>
+			<p>Since July 2025, EKS clusters can host models through the <strong>HyperPod inference operator</strong> (EKS add-on <code>amazon-sagemaker-hyperpod-inference</code>; it needs the AWS Load Balancer Controller, KEDA, cert-manager and the S3 and FSx CSI drivers). You declare a <code>JumpStartModel</code> (a public-hub model ID) or an <code>InferenceEndpointConfig</code> (your weights in S3 or FSx), and the operator runs it, puts a load balancer in front, scales it with KEDA on CloudWatch metrics and can register a SageMaker endpoint so clients call it with <code>InvokeEndpoint</code>.</p>
+			<span class="file">llama.yaml: serve weights from S3 with vLLM and KV-cache-aware routing (YAML, kubectl apply)</span>
+<pre><code>apiVersion: inference.sagemaker.aws.amazon.com/v1
+kind: InferenceEndpointConfig
+metadata:
+  name: llama-s3
+  namespace: default
+spec:
+  modelName: Llama-3.1-8B-Instruct
+  instanceType: ml.g5.24xlarge
+  invocationEndpoint: v1/chat/completions
+  replicas: 2
+  modelSourceConfig:
+    modelSourceType: s3
+    s3Storage:
+      bucketName: models-111111111111
+      region: us-west-2
+    modelLocation: Llama-3.1-8B-Instruct
+    prefetchEnabled: true
+  <span class="c"># vLLM only; prefixaware is the default strategy</span>
+  intelligentRoutingSpec:
+    enabled: true
+    routingStrategy: prefixaware
+  worker:
+    image: vllm/vllm-openai:v0.19.1
+    modelInvocationPort:
+      containerPort: 8000
+      name: http
+    modelVolumeMount:
+      name: model-weights
+      mountPath: /opt/ml/model
+    resources:
+      limits:
+        nvidia.com/gpu: 4
+      requests:
+        cpu: 30000m
+        memory: 100Gi
+        nvidia.com/gpu: 4
+    args: ["--model", "/opt/ml/model", "--port", "8000", "--tensor-parallel-size", "4"]</code></pre>
+			<ul>
+				<li><strong>Managed tiered KV cache and intelligent routing</strong> (November 2025): <code>kvCacheSpec</code> keeps attention caches in memory (L1) and in Redis or HyperPod tiered storage (L2), and routing sends requests to the replica most likely to hold the prefix: <code>prefixaware</code>, <code>kvaware</code> (needs <code>invocationEndpoint</code> set to <code>/completions</code>), <code>session</code> or <code>roundrobin</code>.</li>
+				<li><strong>Inference Gateway</strong> (24 September 2026): part of the inference add-on from version 2.0.0, built on the Kubernetes Gateway API inference extension; enable it per model with <code>spec.inferenceGateway.enabled</code>, instead of (not with) <code>intelligentRoutingSpec</code>. Needs vLLM 0.9.2 or later or SGLang with metrics.</li>
+				<li><strong>Also:</strong> data capture (May 2026), disaggregated prefill and decode (<code>pdSpec</code>, July 2026), model weight and image caching (September 2026), and fallback across instance types.</li>
+			</ul>
+			<div class="callout trap"><p>The Inference Gateway has <strong>no request authentication by default</strong>; AWS strongly recommends configuring <code>spec.auth.jwt</code>. KV cache data isn't encrypted at rest, and the managed tiered L2 store isn't isolated between deployments on the same cluster, so don't mix tenants that mustn't see each other's prompts.</p></div>
+
+			<h2 id="s10">Security and networking</h2>
+			<ul>
+				<li><strong>Instance execution role:</strong> attach <code>AmazonSageMakerClusterInstanceRolePolicy</code> (CloudWatch metrics and logs, SSM messages, and S3 reads from buckets named <code>sagemaker-*</code>). EKS nodes also need network-interface and ECR permissions; Slurm in your own VPC needs network-interface permissions for auto-resume. AWS's IAM page says to start from <code>AmazonSageMakerHyperPodServiceRolePolicy</code>, but that is the policy of the service-linked role <code>AWSServiceRoleForSageMakerHyperPod</code>, which SageMaker creates for itself.</li>
+				<li><strong>Enforce settings</strong> on <code>CreateCluster</code> and <code>UpdateCluster</code> with <code>sagemaker:InstanceTypes</code>, <code>sagemaker:VpcSubnets</code> and <code>sagemaker:VpcSecurityGroupIds</code>.</li>
+				<li><strong>EFA:</strong> the security group must allow all inbound and outbound traffic to and from itself (an outbound rule to 0.0.0.0/0 alone makes EFA health checks fail), and EFA traffic can't cross Availability Zones, so keep a training group in one subnet. <code>efa-only</code> interfaces (June 2026) use no IP addresses.</li>
+				<li><strong>Encryption:</strong> EBS volumes can use a customer managed key (<code>VolumeKmsKeyId</code>; the root volume with <code>RootVolume: true</code>) in continuous mode only, not in the console or on restricted instance groups, and the key can't be changed later. The role needs <code>kms:CreateGrant</code> and <code>kms:DescribeKey</code>.</li>
+			</ul>
+
+			<h2 id="s11">Quotas and pricing</h2>
+			<div class="callout trap"><p>A new account can't create a useful cluster: <strong>"Total number of instances allowed across SageMaker HyperPod clusters"</strong>, its Spot equivalent and every <code>ml.TYPE for cluster usage</code> quota start at <strong>0</strong>. The 20-instances-per-cluster default is a separate quota. Request increases (and check the VPC network-interface quota) before you build; the console checks quotas before creating a cluster.</p></div>
+			<ul>
+				<li><strong>Instances:</strong> billed per instance for as long as the cluster holds it, at HyperPod On-Demand rates, plus extra EBS storage. The EKS control plane, FSx and S3 are billed by those services. AWS's example: 4 ml.g5.24xlarge at $10.18 an hour for 720 hours plus 100 GB each comes to $29,374.40. Savings Plans eligibility for HyperPod isn't stated.</li>
+				<li><strong>Spot:</strong> up to 90% off On-Demand, EKS only.</li>
+				<li><strong>Flexible training plans:</strong> reserve GPU capacity for a HyperPod cluster (<code>TrainingPlanArn</code> on the group) for 1 to 182 days, up to 56 days ahead, paid upfront and not cancellable; AWS claims up to 65% savings. HyperPod offerings are in one Availability Zone, plans end at 11:30 UTC, and HyperPod instances stop an hour before the reservation ends, so checkpoint before then. See <a href="training.html#s6">training plans</a>.</li>
+				<li><strong>Task governance</strong> is free; AWS claims up to 40% savings from sharing idle capacity.</li>
+			</ul>
+
+			<h2 id="s12">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> quota validation in the console (January); node actions in the console (February); API-driven Slurm configuration (26 February); idle resource sharing (March); Slurm continuous provisioning (25 March); gang scheduling (April); flexible instance groups and on-demand deep health checks (April); inference data capture (May); EFA-only interfaces and troubleshooting skills (1 June); AMI versioning and auto-patching (July); disaggregated prefill and decode (July); custom AMIs on Slurm (July); Ray enhancements (August); model caching (September); Inference Gateway (24 September).</li>
+				<li><strong>2025:</strong> IAM condition keys (March); multiple Slurm head nodes (March); training operator (30 June); HyperPod inference, the CLI and SDK and the observability add-on (10 July); EKS continuous provisioning (August); custom AMIs on EKS (August); customer managed EBS keys (27 August); managed tiered checkpointing (8 September); Karpenter autoscaling (18 September); IDE spaces (21 November); Spot and MIG (24 November); MCP server (25 November); node reboot and replace APIs and tiered KV cache (26 November); checkpointless and elastic training (3 December).</li>
+				<li><strong>2024:</strong> EKS orchestration (10 September); multiple Availability Zones (November); recipes, flexible training plans and task governance (4 December).</li>
+			</ul>
+			<p>None of the AIP-C01, MLA-C02 or AIF-C01 exam guides names HyperPod; questions reach it through distributed training, GPU capacity and LLM hosting. Related exam pages: <a href="../../aws-aip/d2-task-2-2.html">AIP-C01 Task 2.2: model deployment strategies</a>, <a href="../../aws-aip/d4-task-4-2.html">AIP-C01 Task 4.2: optimizing application performance</a>, and <a href="../../aws-mla/services-sagemaker.html">the MLA-C01 SageMaker overview</a> (distributed training).</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="model-customization.html"><small>Previous</small>JumpStart and model customization</a>
+				<span class="next"><small>Next</small>Real-time and serverless inference (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on Amazon SageMaker HyperPod clusters for training and inference, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
