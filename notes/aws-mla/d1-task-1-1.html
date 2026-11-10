@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 1.1: Collect and Store Data | AWS MLA-C02 Notes</title>
+	<meta name="description" content="MLA-C02 Task 1.1 study guide: extracting ML data from S3, EBS, EFS, FSx, RDS, DynamoDB and OpenSearch, storage decisions for training data, troubleshooting capacity and throttling, streaming ingestion with Kinesis, Firehose, Managed Service for Apache Flink and MSK, Parquet versus CSV and JSON, merging data with Glue, Spark and Athena, vector stores (S3 Vectors, OpenSearch, pgvector), text, image and audio data, and Feature Store ingestion.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="mla.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">MLA-C02</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">Task 1.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Data Preparation for ML and AI &middot; 28%</span>
+		<h1>Task 1.1: Collect and store data</h1>
+		<p>Getting data out of the places it lives, choosing where training data should sit, fixing ingestion that runs out of capacity, streaming events in, picking file formats, joining sources, and storing the vectors, documents, images and features that ML and generative AI applications need.</p>
+		<div class="tags"><span class="tag code">MLA-C02</span><span class="tag">S3</span><span class="tag">Kinesis</span><span class="tag">Glue</span><span class="tag">S3 Vectors</span><span class="tag">Feature Store</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Extracting from data sources</a></li>
+				<li><a href="#s2">Storage decisions</a></li>
+				<li><a href="#s3">Capacity and scalability problems</a></li>
+				<li><a href="#s4">Streaming ingestion</a></li>
+				<li><a href="#s5">Data formats</a></li>
+				<li><a href="#s6">Merging data</a></li>
+				<li><a href="#s7">Vector databases</a></li>
+				<li><a href="#s8">Text, images and audio</a></li>
+				<li><a href="#s9">Ingesting into Feature Store</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.1</span>
+				<p><strong>Collect and store data.</strong></p>
+			</div>
+			<p>Questions in this task describe where data is today and what a training job, a feature pipeline or a RAG assistant needs, and ask for the extraction method, the storage service or the format that fits. Most answers come down to a few habits: land data in <strong>S3 as Parquet</strong>, extract with the source's own export feature rather than scanning a live database, stream with <strong>Kinesis or MSK</strong> into Firehose or Flink, and match the vector store to the scale, latency and filtering the application needs.</p>
+			<p><strong>Running example.</strong> An online retailer (account 111111111111, Region us-east-1) builds two things. A <strong>churn model</strong> trained on customer profiles in Aurora PostgreSQL, orders in DynamoDB and clickstream events from the website. A <strong>product-support assistant</strong> that answers questions with RAG over help articles, manuals, product images and recorded support calls. Its data lake bucket is <code>retail-ml-111111111111</code>. Every task page in this guide reuses it.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> Amazon S3 Select is closed to new customers (since 25 July 2024); use Athena or filter after a GET. Kinesis Data Analytics for SQL is discontinued (no new applications since 15 October 2025, existing ones deleted from 27 January 2026), and Kinesis Data Analytics for Apache Flink is now <strong>Amazon Managed Service for Apache Flink</strong>. Kinesis Data Firehose is now <strong>Amazon Data Firehose</strong>. AWS Glue 0.9, 1.0 and 2.0 reached end of life on 1 April 2026.</p></div>
+
+			<!-- Skill 1.1.1 -->
+			<h2 id="s1">Extracting from data sources</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.1</span><span class="skill-text">Extract data from data sources (for example, Amazon S3, Amazon EBS, Amazon EFS, Amazon RDS, Amazon DynamoDB, Amazon OpenSearch Service).</span></p>
+				<p>The rule behind most right answers: use the source's <strong>export</strong> feature, which doesn't load the production system, and land the result in S3. Training jobs read from S3, EFS or FSx for Lustre.</p>
+
+				<h3>Amazon S3</h3>
+				<div class="entry">
+					<h4>Querying a subset of the data lake</h4>
+					<p>To pull a subset of a large dataset, run it through <strong>Athena</strong>. <code>UNLOAD</code> writes a query result straight to S3 in a chosen format without creating a table (CTAS does the same and registers a table). A SageMaker Processing job can also take an Athena or Redshift query directly as an input (<code>DatasetDefinition</code>), which writes the result and mounts it for the job.</p>
+					<span class="file">Export the last year of orders for training as Parquet (SQL, Amazon Athena)</span>
+<pre><code>UNLOAD (
+  SELECT customer_id, order_total, items, channel, order_month
+  FROM retail.orders
+  WHERE order_date &gt;= date '2025-11-01'
+)
+TO 's3://retail-ml-111111111111/churn/extracts/orders/'
+WITH (format = 'PARQUET', compression = 'SNAPPY', partitioned_by = ARRAY['order_month'])</code></pre>
+					<ul>
+						<li>The target prefix must be empty unless you write partitions; <code>UNLOAD</code> never overwrites. Partition columns go last in the SELECT, and one statement can write at most 100 partitions.</li>
+						<li>Default compression is gzip for Parquet and zlib for ORC; JSON and text are always gzipped.</li>
+					</ul>
+				</div>
+
+				<h3>Amazon EBS, Amazon EFS and FSx for Lustre</h3>
+				<div class="entry">
+					<h4>What a training job can read</h4>
+					<p>SageMaker training reads from <strong>S3</strong> (including S3 Express One Zone), <strong>EFS</strong> or <strong>FSx for Lustre</strong>. <strong>EBS is not a training data source</strong>: data on an EBS volume (or a volume restored from a snapshot) is attached to an EC2 instance and copied to S3, EFS or FSx first. EFS and FSx channels need a VPC configuration, use File mode only, and FSx needs a subnet in the file system's Availability Zone. The data must already be on the file system before the job starts.</p>
+					<span class="file">A training channel on FSx for Lustre (JSON, part of the CreateTrainingJob request)</span>
+<pre><code>{
+  "ChannelName": "train",
+  "InputMode": "File",
+  "DataSource": {
+    "FileSystemDataSource": {
+      "FileSystemId": "fs-0123456789abcdef0",
+      "FileSystemType": "FSxLustre",
+      "DirectoryPath": "/fsx/churn/train",
+      "FileSystemAccessMode": "ro"
+    }
+  }
+}</code></pre>
+					<p>An FSx file system linked to S3 (a data repository association) loads files lazily on first read, so the first epoch is slower.</p>
+				</div>
+
+				<h3>Amazon RDS and Aurora</h3>
+				<div class="entry">
+					<h4>Snapshot and cluster export to S3</h4>
+					<p><strong>Export to S3</strong> writes a snapshot (manual, automated or AWS Backup) as compressed <strong>Parquet</strong> without touching the live database; Aurora can also export a live cluster by cloning it. It needs a bucket in the same Region, an IAM role trusted by <code>export.rds.amazonaws.com</code> and a <strong>KMS key</strong>, runs up to 5 exports per account at once, and the result can't be restored back into RDS. For continuous replication without an export pipeline, zero-ETL integrations replicate Aurora, RDS and DynamoDB into Amazon Redshift.</p>
+					<span class="file">Export the customers schema from last night's snapshot (AWS CLI)</span>
+<pre><code>aws rds start-export-task \
+  --export-task-identifier churn-customers-2026-11-11 \
+  --source-arn arn:aws:rds:us-east-1:111111111111:cluster-snapshot:rds:retail-prod-2026-11-11-03-00 \
+  --s3-bucket-name retail-ml-111111111111 \
+  --s3-prefix churn/extracts/customers \
+  --iam-role-arn arn:aws:iam::111111111111:role/rds-s3-export \
+  --kms-key-id arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab \
+  --export-only retail.customers</code></pre>
+				</div>
+
+				<h3>Amazon DynamoDB</h3>
+				<div class="entry">
+					<h4>Export instead of Scan</h4>
+					<p><strong>Export to S3</strong> needs point-in-time recovery, consumes <strong>no read capacity</strong> and can be full or incremental (15 minutes to 24 hours of changes). The output is <strong>DynamoDB JSON or Amazon Ion, not Parquet</strong>, so convert it with Glue or Athena afterwards. Since October 2026 an export can be filtered: a key condition reduces the data you're billed for, a filter expression doesn't. A full <code>Scan</code> for training data consumes capacity and can throttle the table.</p>
+					<span class="file">Full export of the orders table (AWS CLI)</span>
+<pre><code>aws dynamodb export-table-to-point-in-time \
+  --table-arn arn:aws:dynamodb:us-east-1:111111111111:table/orders \
+  --s3-bucket retail-ml-111111111111 \
+  --s3-prefix churn/extracts/orders-ddb \
+  --export-format DYNAMODB_JSON \
+  --export-type FULL_EXPORT</code></pre>
+				</div>
+
+				<h3>Amazon OpenSearch Service</h3>
+				<div class="entry">
+					<h4>Snapshots and paging</h4>
+					<p>Automated snapshots are for recovering the cluster only. To move indexes, take a <strong>manual snapshot</strong> to your own bucket (the caller needs <code>iam:PassRole</code> on the snapshot role, and the bucket must not have a Glacier lifecycle rule). To get the documents themselves, for example the support assistant's chunks for an evaluation set, page through them with <strong>point in time</strong> and <code>search_after</code> (OpenSearch 2.5 or later).</p>
+				</div>
+				<div class="callout trap"><p>Exports differ by source: RDS and Aurora export Parquet, DynamoDB exports JSON or Ion, OpenSearch snapshots are segment files rather than rows. And S3 Select, which older material uses to "pull a few columns from a CSV in S3", isn't available to new accounts.</p></div>
+			</div>
+
+			<!-- Skill 1.1.2 -->
+			<h2 id="s2">Storage decisions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.2</span><span class="skill-text">Make storage decisions and configure storage services based on cost, performance, data structure, and data compliance.</span></p>
+
+				<h3>Where training data should sit</h3>
+				<div class="entry">
+					<h4>AWS's own guidance for SageMaker</h4>
+					<ul>
+						<li><strong>S3 with File mode</strong> for small datasets (AWS suggests under 50 to 100 GB): the job copies the data to the instance before training. Pack many small files (under 50 MB) into larger files of about 150 MB (TFRecord, WebDataset, RecordIO).</li>
+						<li><strong>S3 with FastFile mode</strong> for larger datasets of files over 50 MB: data streams on demand behind a normal file path, with no VPC or file system. Pipe mode still exists but AWS calls it "largely replaced" by FastFile.</li>
+						<li><strong>FSx for Lustre</strong> for very large datasets, many small files that can't be combined, or random reads, and for distributed training that rereads data; <strong>EFS</strong> when the data already lives there.</li>
+						<li><strong>S3 Express One Zone</strong> for the lowest latency next to the compute (one Availability Zone, single-digit milliseconds, higher request rates). Keep the master copy in S3 Standard, because data in a single zone can be lost with it.</li>
+					</ul>
+				</div>
+
+				<h3>Cost</h3>
+				<div class="entry">
+					<h4>Storage classes and tiers</h4>
+					<p>S3 Standard costs about $0.023 per GB-month in us-east-1. <strong>S3 Intelligent-Tiering</strong> moves objects not accessed for 30 days to an infrequent tier and after 90 days to an archive instant tier, with no retrieval fees, which suits training data reread only when models are retrained; objects under 128 KB aren't tiered, and the monitoring fee per object matters for millions of tiny files. FSx for Lustre has its own Intelligent-Tiering (30 and 90 days) that AWS calls the best price and performance balance for most workloads. EFS throughput: <strong>Elastic</strong> is the console default and recommended; Bursting is the CLI and API default.</p>
+				</div>
+
+				<h3>Structure and compliance</h3>
+				<div class="entry">
+					<h4>Matching the store to the data and the rules</h4>
+					<ul>
+						<li><strong>Structure:</strong> tabular history in S3 (Parquet, Iceberg tables), key-value lookups in DynamoDB, relational data in Aurora or RDS, documents and media as S3 objects, features in Feature Store, embeddings in a vector store.</li>
+						<li><strong>Encryption:</strong> S3 encrypts new objects with SSE-S3 by default; use SSE-KMS where key control or audit is required. Training and processing volumes take a <code>VolumeKmsKeyId</code>, except on instance types with local NVMe storage, which are encrypted by the hardware.</li>
+						<li><strong>Retention:</strong> S3 Object Lock (with versioning) keeps an immutable copy of the exact training data behind an audited model.</li>
+						<li><strong>Sensitive data:</strong> Amazon Macie finds personal data in S3 general purpose buckets, with findings in EventBridge and Security Hub CSPM.</li>
+						<li><strong>Residency:</strong> a SageMaker job reads data only from its own Region, so data that must stay in a Region is trained there.</li>
+					</ul>
+				</div>
+			</div>
+
+			<!-- Skill 1.1.3 -->
+			<h2 id="s3">Capacity and scalability problems</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.3</span><span class="skill-text">Troubleshoot and debug data ingestion and storage issues that involve capacity and scalability.</span></p>
+				<ul>
+					<li><strong>S3 503 Slow Down:</strong> S3 supports at least 3,500 writes and 5,500 reads per second per partitioned prefix, so spread keys across prefixes (for example by date) and retry with backoff. On a versioned bucket, objects with millions of versions also trigger throttling; AWS recommends fewer than 100,000 versions per object and a lifecycle rule to expire noncurrent versions. A job that rewrites <code>features/latest.parquet</code> every minute builds those up quickly.</li>
+					<li><strong>DynamoDB throttling:</strong> exceptions now carry <code>ThrottlingReasons</code>. <code>TableWriteKeyRangeThroughputExceeded</code> means a hot partition key, which more capacity won't fix; change the key design or spread writes. <code>ProvisionedThroughputExceeded</code> means raise capacity or switch to on-demand (allowed 4 times per 24 hours since August 2025). Contributor Insights can show the throttled keys.</li>
+					<li><strong>"No space left on device" in training:</strong> File mode needs the whole channel, the model and checkpoints to fit on the volume. Raise <code>VolumeSizeInGB</code> on EBS-backed instance types, switch to FastFile or FSx, or choose an instance type with more local NVMe storage (where <code>VolumeSizeInGB</code> adds nothing). Write large scratch files to <code>/tmp</code>, not small system directories.</li>
+					<li><strong>Slow reads from EFS:</strong> in Bursting mode, a small file system runs out of <code>BurstCreditBalance</code>; when <code>MeteredIOBytes</code> reaches <code>PermittedThroughput</code>, change to Elastic throughput. SageMaker training volumes are gp2, so their IOPS scale with size.</li>
+					<li><strong>RDS running out of storage:</strong> storage autoscaling grows the volume when free space is at 10% or less for 5 minutes, but at most 4 times in 24 hours, so it can't save a single huge bulk load; size for the load or set a higher maximum.</li>
+					<li><strong>Kinesis throttling:</strong> a provisioned shard takes 1 MB or 1,000 records per second; a hot shard needs a higher-cardinality partition key, and rising <code>GetRecords.IteratorAgeMilliseconds</code> means consumers are falling behind (more shards or enhanced fan-out).</li>
+				</ul>
+			</div>
+
+			<!-- Skill 1.1.4 -->
+			<h2 id="s4">Streaming ingestion</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.4</span><span class="skill-text">Use AWS streaming data sources to ingest data (for example, by using Amazon Kinesis, Apache Flink, Apache Kafka).</span></p>
+				<ol class="flow">
+					<li><b>Capture</b>The website sends clickstream events to <strong>Kinesis Data Streams</strong> (or a Kafka topic on Amazon MSK).</li>
+					<li><b>Land</b><strong>Amazon Data Firehose</strong> reads the stream, converts JSON to Parquet and writes it to S3 partitioned by date, for training and Athena.</li>
+					<li><b>Compute</b><strong>Managed Service for Apache Flink</strong> reads the same stream and computes rolling features, such as support-page visits in the last 30 minutes.</li>
+					<li><b>Serve</b>The Flink application (or a Lambda consumer) writes those features to the Feature Store online store with <code>PutRecord</code> for real-time predictions.</li>
+				</ol>
+				<ul>
+					<li><strong>Kinesis Data Streams:</strong> on-demand (two variants) or provisioned capacity; per shard 1 MB/s in and 2 MB/s out (shared, or 2 MB/s per consumer with enhanced fan-out); records up to 10 MiB; retention 24 hours by default, up to 365 days for replaying data into a new feature pipeline. Resharding works only in provisioned mode.</li>
+					<li><strong>Amazon Data Firehose:</strong> sources are direct PUT, Kinesis Data Streams or MSK; destinations include S3, Apache Iceberg tables (including S3 Tables), Redshift and OpenSearch. <strong>Record format conversion</strong> turns JSON into Parquet or ORC using a Glue Data Catalog table schema (CSV needs a Lambda transform to JSON first, and fields missing from the schema are dropped). Buffering is 1 to 128 MiB or 0 to 900 seconds, and dynamic partitioning builds S3 prefixes from fields in the records.</li>
+					<li><strong>Managed Service for Apache Flink:</strong> stateful, exactly-once stream processing; the current runtime is Flink 1.20 (1.13 and older reached end of support), billed per KPU (1 vCPU and 4 GB). Use it for windows, joins and aggregations that Firehose can't do.</li>
+					<li><strong>Amazon MSK:</strong> managed Apache Kafka as provisioned clusters with Standard or <strong>Express brokers</strong> (since November 2024, faster scaling, no storage to provision) or MSK Serverless (IAM access control required). Choose it when producers already use Kafka.</li>
+				</ul>
+			</div>
+
+			<!-- Skill 1.1.5 -->
+			<h2 id="s5">Data formats</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.5</span><span class="skill-text">Ingest from and write by using appropriate data formats (for example, Apache Parquet, JSON, CSV, ORC) based on data access patterns.</span></p>
+				<ul>
+					<li><strong>Parquet and ORC</strong> (columnar): compress each column, skip blocks with min and max statistics (predicate pushdown), split across readers and support schema evolution. Best for analytics and feature extraction that read a few columns of wide tables, and the default for Athena CTAS. ORC files are often smaller; Parquet is the common choice with Spark and Arrow.</li>
+					<li><strong>JSON and JSON Lines</strong>: one record at a time, nested fields, easy to stream; what applications and Firehose receive. Convert to Parquet for repeated analytics.</li>
+					<li><strong>CSV</strong>: simple interchange and the input many SageMaker built-in algorithms expect, with <strong>no header row and the label in the first column</strong> (unsupervised algorithms use <code>text/csv;label_size=0</code>).</li>
+					<li><strong>Avro</strong>: row-based with its schema embedded, good for streaming and Kafka. <strong>RecordIO-protobuf</strong>: SageMaker's binary format for Linear Learner, k-means, PCA, Factorization Machines and other built-ins, efficient for sparse data and Pipe mode.</li>
+					<li><strong>Apache Iceberg tables</strong>: Parquet files with table-level transactions, time travel and schema changes, used by S3 Tables, Firehose and the Feature Store offline store.</li>
+				</ul>
+				<div class="callout tip"><p>Match the format to the algorithm: XGBoost reads CSV, LibSVM and (for distributed GPU training with Dask) Parquet; BlazingText and DeepAR read JSON Lines; image algorithms read JPEG and PNG. Converting a whole data lake to the "best" format doesn't help if the training container can't read it.</p></div>
+			</div>
+
+			<!-- Skill 1.1.6 -->
+			<h2 id="s6">Merging data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.6</span><span class="skill-text">Merge data from multiple sources (for example, by using programming techniques, AWS Glue, Apache Spark).</span></p>
+				<p>The churn training set joins customer profiles (from the Aurora export) with order history (from the DynamoDB export, converted). In an AWS Glue job:</p>
+				<span class="file">Join customers and orders and write Parquet partitioned by month (Python, AWS Glue ETL job)</span>
+<pre><code>import sys
+
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+glueContext = GlueContext(SparkContext.getOrCreate())
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+<span class="c"># transformation_ctx lets job bookmarks skip data already processed</span>
+customers = glueContext.create_dynamic_frame.from_catalog(
+    database="retail", table_name="customers", transformation_ctx="customers")
+orders = glueContext.create_dynamic_frame.from_catalog(
+    database="retail", table_name="orders", transformation_ctx="orders")
+
+<span class="c"># An inner equality join that keeps both key columns, so drop the duplicate</span>
+joined = customers.join(paths1=["customer_id"], paths2=["cust_id"], frame2=orders).drop_fields(["cust_id"])
+
+glueContext.write_dynamic_frame.from_options(
+    frame=joined, connection_type="s3",
+    connection_options={"path": "s3://retail-ml-111111111111/churn/joined/", "partitionKeys": ["order_month"]},
+    format="parquet", format_options={"useGlueParquetWriter": True},
+    transformation_ctx="sink")
+job.commit()</code></pre>
+				<ul>
+					<li><strong>Other join types:</strong> <code>DynamicFrame.join</code> is inner only; for left, outer or anti joins convert with <code>toDF()</code>, use Spark's <code>join(how=...)</code>, and convert back with <code>DynamicFrame.fromDF</code>. <code>mergeDynamicFrame</code> upserts a staging frame into a source by primary key.</li>
+					<li><strong>Mixed types</strong> across sources become choice columns; fix them with <code>resolveChoice</code> before writing. <code>relationalize</code> flattens nested JSON.</li>
+					<li><strong>Glue versions:</strong> 5.1 (Spark 3.5) is the default and 6.0 (Spark 4.1) shipped in August 2026. With Adaptive Query Execution (on by default from Glue 4.0) Spark broadcasts small tables in joins automatically.</li>
+					<li><strong>Other tools:</strong> Athena SQL joins plus CTAS for SQL users; Spark on EMR or EMR Serverless, or a PySpark Processing job, for large custom joins; pandas in a Processing job for small data; AWS Glue DataBrew and SageMaker Canvas (Data Wrangler) for visual joins; zero-ETL integrations to avoid building the pipeline at all.</li>
+				</ul>
+				<div class="callout trap"><p>Joining features to labels by customer ID alone leaks the future: a feature computed after the churn date makes the model look better than it is. Join on the entity and a point in time (Feature Store's point-in-time queries do this, <a href="#s9">Skill 1.1.9</a>). Job bookmarks also silently do nothing without <code>transformation_ctx</code> and <code>job.commit()</code>.</p></div>
+			</div>
+
+			<!-- Skill 1.1.7 -->
+			<h2 id="s7">Vector databases</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.7</span><span class="skill-text">Configure scalable vector databases for AI applications (for example, OpenSearch Service, Amazon RDS with pgvector, Amazon S3) based on specifications.</span></p>
+				<p>The support assistant embeds help-article chunks with Titan Text Embeddings V2 (1,024 dimensions) and searches them by similarity, filtered by product category and language. Which store fits depends on the specification:</p>
+				<ul>
+					<li><strong>Amazon S3 Vectors</strong>: the lowest cost for large, infrequently queried collections, with no cluster. Up to 2 billion vectors per index, 1 to 4,096 dimensions, float32 only, cosine or Euclidean distance, sub-second queries (about 100 ms when frequent), up to 10,000 results per query. Indexes in buckets created since 30 September 2026 apply metadata filters before the search (ENHANCED mode). No keyword or hybrid search.</li>
+					<li><strong>Amazon OpenSearch Service</strong> (managed domains or Serverless): millisecond latency, high query rates, <strong>hybrid keyword and vector search</strong>, aggregations and rich filters. Use the faiss engine with HNSW; compression or disk mode cuts memory, and GPU acceleration speeds up index builds.</li>
+					<li><strong>Aurora PostgreSQL or RDS for PostgreSQL with pgvector</strong> (0.8.2): embeddings next to relational data, SQL filters and joins, moderate scale. Use an HNSW index; on filtered queries turn on iterative scan (0.8.0 and later) so results aren't cut short.</li>
+					<li><strong>Others:</strong> DocumentDB (5.0 instance-based clusters, 2,000 indexed dimensions), MemoryDB and ElastiCache Serverless for Valkey (in-memory, microsecond latency, for real-time recommendations or semantic caching), Neptune Analytics for graph plus vector.</li>
+				</ul>
+				<span class="file">Create an S3 Vectors index, add a chunk and query it with a filter (Python, boto3)</span>
+<pre><code>import json
+
+import boto3
+import numpy as np
+
+s3v = boto3.client("s3vectors", region_name="us-east-1")
+bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+
+def embed(text):
+    r = bedrock.invoke_model(modelId="amazon.titan-embed-text-v2:0",
+                             body=json.dumps({"inputText": text, "dimensions": 1024}))
+    return np.array(json.loads(r["body"].read())["embedding"], dtype=np.float32).tolist()
+
+
+s3v.create_vector_bucket(vectorBucketName="retail-support-vectors")
+s3v.create_index(
+    vectorBucketName="retail-support-vectors", indexName="support-articles",
+    dataType="float32", dimension=1024, distanceMetric="cosine",
+    <span class="c"># Returned with results but never filtered on; this can't be changed later</span>
+    metadataConfiguration={"nonFilterableMetadataKeys": ["chunk_text"]},
+)
+
+text = "Items can be returned within 30 days of delivery..."
+s3v.put_vectors(vectorBucketName="retail-support-vectors", indexName="support-articles", vectors=[{
+    "key": "returns-policy#1",
+    "data": {"float32": embed(text)},
+    "metadata": {"category": "returns", "locale": "en-GB", "chunk_text": text},
+}])
+
+<span class="c"># A filter or returnMetadata also needs s3vectors:GetVectors permission</span>
+resp = s3v.query_vectors(
+    vectorBucketName="retail-support-vectors", indexName="support-articles",
+    queryVector={"float32": embed("How long do I have to send back a jacket?")},
+    topK=5,
+    filter={"$and": [{"category": "returns"}, {"locale": {"$in": ["en-GB", "en-US"]}}]},
+    returnMetadata=True, returnDistance=True,
+)
+for v in resp["vectors"]:
+    print(v["key"], v["distance"])</code></pre>
+				<span class="file">The same chunks in Aurora PostgreSQL with pgvector (SQL)</span>
+<pre><code>CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE support_chunks (id uuid PRIMARY KEY, embedding vector(1024), chunk text, category text);
+
+-- HNSW needs no training step, so it can be built before the data is loaded
+CREATE INDEX support_chunks_hnsw ON support_chunks
+  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+
+SET hnsw.ef_search = 100;                 -- default 40; higher means better recall, slower queries
+SET hnsw.iterative_scan = 'relaxed_order'; -- pgvector 0.8.0+: keep scanning when a filter removes rows
+
+SELECT id, chunk FROM support_chunks
+WHERE category = 'returns'
+ORDER BY embedding &lt;=&gt; $1               -- cosine distance to the query embedding
+LIMIT 5;</code></pre>
+				<div class="callout trap"><p>Vector store limits that decide questions: S3 Vectors is float32 with cosine or Euclidean only and its non-filterable keys are fixed at creation; an OpenSearch k-NN query without <code>size</code> returns k results per shard, and a <code>post_filter</code> can return fewer than k; IVFFlat indexes in pgvector must be built after loading data, HNSW indexes needn't; pgvector doesn't upgrade with the database engine (run <code>ALTER EXTENSION vector UPDATE</code>). Amazon Bedrock Knowledge Bases can manage any of these stores for you (see the <a href="../aws-services/bedrock/knowledge-bases-custom.html">Knowledge Bases notes</a>).</p></div>
+			</div>
+
+			<!-- Skill 1.1.8 -->
+			<h2 id="s8">Text, images and audio</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.8</span><span class="skill-text">Ingest and store diverse data types (for example, text, images, audio) for AI and ML applications.</span></p>
+				<ul>
+					<li><strong>Store the originals in S3</strong>, organized by prefix, with descriptive information in user-defined metadata (2 KB, set at upload and changed only by copying), object tags (10 per object, usable in IAM and lifecycle rules) or the newer <strong>object annotations</strong> (up to 1,000 per object version, added after upload, for things such as labels or model outputs), and query it all through S3 Metadata tables.</li>
+					<li><strong>Audio:</strong> Amazon Transcribe turns recorded support calls in S3 into text (<code>StartTranscriptionJob</code> with exactly one of <code>LanguageCode</code>, <code>IdentifyLanguage</code> or <code>IdentifyMultipleLanguages</code>), with speaker labels and PII redaction; <code>OutputBucketName</code> takes a bucket name, not an <code>s3://</code> URI.</li>
+					<li><strong>Documents:</strong> Amazon Textract extracts text, forms and tables from manuals. Synchronous calls take one page of a PDF; multipage PDFs (up to 3,000 pages) use the asynchronous APIs with an SNS notification, and results stay only 7 days unless written to your bucket.</li>
+					<li><strong>Images and video:</strong> embed them directly with a multimodal model. Titan Multimodal Embeddings G1 averages text and image into one vector (up to 1,024 dimensions); <strong>Amazon Nova Multimodal Embeddings</strong> puts text, documents, images, video and audio in one space (up to 3,072 dimensions) and segments long video asynchronously. Amazon Bedrock Data Automation instead converts documents, images, audio and video into structured text.</li>
+					<li><strong>Training jobs:</strong> a manifest file lists exactly which objects to train on; an augmented manifest (JSON Lines with data and labels, Pipe mode only) carries labels with each item, and the <code>Converse</code> data type carries conversations for fine-tuning.</li>
+				</ul>
+			</div>
+
+			<!-- Skill 1.1.9 -->
+			<h2 id="s9">Ingesting into Feature Store</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1.9</span><span class="skill-text">Ingest data into SageMaker Feature Store.</span></p>
+				<p>Feature Store keeps the latest features per customer in an online store for real-time inference and every version in an offline store in S3 for training (the concepts, tiers and point-in-time queries are in the <a href="../aws-services/sagemaker/data-prep-feature-store.html#s5">SageMaker data preparation notes</a>). <code>PutRecord</code> is the single ingestion API for both batch and streaming.</p>
+				<span class="file">Write streaming features from Kinesis to the online store (Python, AWS Lambda)</span>
+<pre><code>import base64
+import json
+
+import boto3
+
+fs = boto3.client("sagemaker-featurestore-runtime")
+
+
+def handler(event, context):
+    for rec in event["Records"]:
+        click = json.loads(base64.b64decode(rec["kinesis"]["data"]))
+        <span class="c"># Every value is sent as a string; PutRecord replaces the whole record</span>
+        fs.put_record(
+            FeatureGroupName="customer-activity",
+            Record=[
+                {"FeatureName": "customer_id", "ValueAsString": click["customer_id"]},
+                {"FeatureName": "event_time", "ValueAsString": click["event_time"]},
+                {"FeatureName": "support_visits_30m", "ValueAsString": str(click["support_visits_30m"])},
+            ],
+            TargetStores=["OnlineStore", "OfflineStore"],
+        )</code></pre>
+				<ul>
+					<li><strong>Streaming:</strong> your own consumer (Lambda, a Flink sink or a KCL application) calls <code>PutRecord</code>, or <code>BatchWriteRecord</code> for up to 25 records (July 2026); there's no managed Kinesis or Flink connector. Limits are 500 writes per second per record identifier and 350 KB per record.</li>
+					<li><strong>Batch:</strong> <code>ingest_dataframe</code> in the SDK, the Feature Store Spark connector (<code>FeatureStoreManager.ingest_data</code>, with <code>target_stores=["OfflineStore"]</code> to backfill history straight to S3 without touching the online store), a feature processor pipeline, or a Canvas data flow export.</li>
+					<li><strong>Write rules:</strong> a record with an older event time than the stored one goes only to the offline store; <code>TargetStores</code> limits a write to one store; a per-record <code>TtlDuration</code> expires online records. Offline data appears in S3 within about 15 minutes.</li>
+				</ul>
+				<div class="callout trap"><p>The Spark connector is documented for Spark 3.0 to 3.3, older than the Spark in current Glue and EMR releases, so check compatibility before choosing it. And an offline-only backfill doesn't update the online store: real-time predictions keep reading the old values until a <code>PutRecord</code> reaches the online store.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/storage/how-to-optimize-querying-your-data-in-amazon-s3/">How to optimize querying your data in Amazon S3</a> (AWS Storage Blog, July 2024, updated October 2025): what replaces S3 Select, with client-side filtering and Athena examples.</li>
+				<li><a href="https://aws.amazon.com/blogs/storage/how-snap-optimizes-ai-storage-with-amazon-fsx-for-lustre-intelligent-tiering/">How Snap optimizes AI storage with Amazon FSx for Lustre Intelligent-Tiering</a> (AWS Storage Blog, October 2026): FSx for Lustre for training data with S3 for preprocessing and archive, at scale.</li>
+				<li><a href="https://aws.amazon.com/blogs/big-data/stream-real-time-data-into-apache-iceberg-tables-in-amazon-s3-using-amazon-data-firehose/">Stream real-time data into Apache Iceberg tables in Amazon S3 using Amazon Data Firehose</a> (AWS Big Data Blog, November 2024): streaming into Iceberg tables with inserts, updates and deletes, queried in Athena.</li>
+				<li><a href="https://aws.amazon.com/blogs/database/supercharging-vector-search-performance-and-relevance-with-pgvector-0-8-0-on-amazon-aurora-postgresql/">Supercharging vector search performance and relevance with pgvector 0.8.0 on Amazon Aurora PostgreSQL</a> (AWS Database Blog, May 2025): HNSW iterative scans that fix filtered queries returning too few rows.</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Extract with export features: Athena UNLOAD (empty target, 100 partitions), RDS and Aurora export to S3 (Parquet, KMS key required, 5 at a time), DynamoDB export (needs PITR, no read capacity, JSON or Ion only), OpenSearch manual snapshots and point in time paging. S3 Select is closed to new customers.</li>
+				<li>Training reads S3, EFS or FSx for Lustre, not EBS. File mode for small data, FastFile for large files, FSx for huge, small-file or random-read data, Express One Zone for lowest latency with a master copy elsewhere.</li>
+				<li>Capacity: S3 503s mean spread prefixes and back off (or too many versions per object); DynamoDB <code>KeyRangeThroughputExceeded</code> means a hot key; out of disk means a bigger volume, FastFile or FSx; EFS Bursting runs out of credits; RDS autoscaling won't save one bulk load.</li>
+				<li>Streaming: Kinesis Data Streams or MSK in, Firehose to land Parquet in S3 (JSON input with a Glue schema), Managed Service for Apache Flink for stateful features, Feature Store online for serving.</li>
+				<li>Formats: Parquet or ORC for analytics, JSON for streaming and APIs, CSV without header and label first for built-ins, RecordIO-protobuf for sparse built-in input, Iceberg for tables with updates.</li>
+				<li>Merging: Glue <code>join</code> is inner and duplicates keys; use Spark for other joins; resolve choice types; join features to labels by point in time.</li>
+				<li>Vectors: S3 Vectors for cheap scale, OpenSearch for latency and hybrid search, pgvector for relational data with HNSW and iterative scan; check dimensions, distance metrics and filtering before choosing.</li>
+				<li>Feature Store: <code>PutRecord</code> (or <code>BatchWriteRecord</code>) for streaming, the SDK, Spark connector or feature processors for batch; older event times go offline only.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="index.html"><small>Previous</small>MLA-C02 overview</a>
+				<span class="next"><small>Next</small>Task 1.2: Transformation, feature engineering and pre-processing (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Machine Learning Engineer &ndash; Associate (MLA-C02) exam guide, checked on 11 November 2026.</div>
+</footer>
+
+</body>
+</html>
