@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker AI Data Preparation and Feature Store | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to preparing data on SageMaker AI: Processing jobs with scikit-learn and Spark, inputs from S3, Athena and Redshift, Canvas with Data Wrangler and AutoML, Feature Store online and offline stores, ingestion, point-in-time queries, throughput, security and quotas, the maintenance status of Ground Truth and A2I, and related AWS data services.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">Data preparation and Feature Store</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Prepare &middot; Last checked 11 November 2026</span>
+		<h1>Data preparation and Feature Store</h1>
+		<p>Getting data ready for training and serving: Processing jobs for scripted preparation at scale, Canvas with Data Wrangler for visual preparation and no-code models, Feature Store for sharing consistent features between training and inference, what happened to Ground Truth and A2I, and where the other AWS data services fit.</p>
+		<div class="tags"><span class="tag code">CreateProcessingJob</span><span class="tag">Canvas</span><span class="tag">Data Wrangler</span><span class="tag">Feature Store</span><span class="tag">Ground Truth</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Choosing a data preparation tool</a></li>
+				<li><a href="#s2">Processing jobs</a></li>
+				<li><a href="#s3">Processing in code</a></li>
+				<li><a href="#s4">Canvas and Data Wrangler</a></li>
+				<li><a href="#s5">Feature Store concepts</a></li>
+				<li><a href="#s6">Creating and using a feature group</a></li>
+				<li><a href="#s7">Training sets and the offline store</a></li>
+				<li><a href="#s8">Ground Truth and A2I</a></li>
+				<li><a href="#s9">Security, quotas and pricing</a></li>
+				<li><a href="#s10">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Choosing a data preparation tool</h2>
+			<ul>
+				<li><strong>Processing jobs:</strong> your own Python, scikit-learn or Spark code on managed instances, started from a notebook or as a <a href="pipelines-mlops.html#s3">pipeline step</a>. The default for repeatable feature engineering and evaluation.</li>
+				<li><strong>Canvas with Data Wrangler:</strong> visual preparation with 300+ transforms, data quality reports and a chat assistant, for analysts or for exploring data before writing code; flows export to Processing, Pipelines, Feature Store or Python.</li>
+				<li><strong>Feature Store:</strong> where finished features live, so training and real-time inference read the same values.</li>
+				<li><strong>Other AWS services:</strong> AWS Glue and Spark on Amazon EMR for large ETL, AWS Glue DataBrew for visual cleaning outside SageMaker (250+ transforms), AWS Glue Data Quality for rule-based validation, Amazon Athena for SQL over S3, and data processing jobs in SageMaker Unified Studio.</li>
+			</ul>
+			<p>MLA-C02 Domain 1 (28% of the exam) names Glue, DataBrew, Spark on EMR, Data Wrangler and Feature Store for transforming and storing features, and DataBrew and Glue Data Quality for validation; AIP-C01 Task 1.3 names Glue Data Quality, Data Wrangler and SageMaker Processing.</p>
+
+			<h2 id="s2">Processing jobs</h2>
+			<p>A Processing job starts instances, copies or streams the inputs under <code>/opt/ml/processing/</code>, runs your container (any image, with <code>ContainerEntrypoint</code> and arguments), uploads whatever the code writes to the output folders, and stops. AWS provides scikit-learn and Spark images; any other image works too.</p>
+			<ul>
+				<li><strong>Inputs</strong> (up to 10): S3 prefixes or manifests, in <code>File</code> mode (copied first) or <code>Pipe</code> mode (streamed; Gzip input only works with Pipe), either <code>FullyReplicated</code> to every instance or <code>ShardedByS3Key</code> to split objects between instances. A <code>DatasetDefinition</code> can run an Athena or Redshift query and feed the result as an input; it defaults to <code>ShardedByS3Key</code>.</li>
+				<li><strong>Outputs</strong> (up to 10): S3 locations uploaded at the end (<code>EndOfJob</code>) or while running (<code>Continuous</code>), with one KMS key for all of them. A Feature Store output only names the feature group; your script still writes the records.</li>
+				<li><strong>Instances:</strong> 1 to 100 per job, with a storage volume of 1 to 16,384 GB (local NVMe on instance types that have it, which can't take a <code>VolumeKmsKeyId</code>). Since September 2026, <code>InstancePreferences</code> lists up to five instance types to fall back through when capacity is short.</li>
+				<li><strong>Run time:</strong> the account quota caps jobs at 5 days by default (adjustable; the API allows 9), and the SDK sets 24 hours if you don't.</li>
+				<li><strong>Inside the container:</strong> <code>/opt/ml/config/resourceconfig.json</code> lists the hosts for multi-instance work; logs and CPU, memory, GPU and disk metrics go to CloudWatch. Don't put secrets in <code>Environment</code>.</li>
+			</ul>
+			<div class="callout trap"><p>On a new account, the per-instance-type quotas for processing are <strong>0 for almost every type, including ml.m5.xlarge</strong>; only ml.t3.medium, ml.t3.large and ml.t3.xlarge start above zero. The first job fails with <code>ResourceLimitExceeded</code> until you request an increase (see the <a href="index.html#s6">overview's quotas</a>).</p></div>
+
+			<h2 id="s3">Processing in code</h2>
+			<p>SDK V3 has no <code>SKLearnProcessor</code>: use <code>ScriptProcessor</code> with the scikit-learn image (or <code>FrameworkProcessor</code> to upload a whole source folder with requirements).</p>
+			<span class="file">Split and scale data with scikit-learn (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.core import image_uris
+from sagemaker.core.helper.session_helper import Session, get_execution_role
+from sagemaker.core.processing import ScriptProcessor
+from sagemaker.core.shapes import ProcessingInput, ProcessingOutput, ProcessingS3Input, ProcessingS3Output
+
+session = Session()
+region = session.boto_region_name
+
+processor = ScriptProcessor(
+    image_uri=image_uris.retrieve(framework="sklearn", region=region, version="1.2-1",
+                                  py_version="py3", instance_type="ml.m5.xlarge"),
+    instance_type="ml.m5.xlarge",
+    instance_count=1,
+    base_job_name="churn-prep",
+    role=get_execution_role(),
+    sagemaker_session=session,
+)
+processor.run(
+    code="code/preprocess.py",
+    inputs=[ProcessingInput(input_name="raw", s3_input=ProcessingS3Input(
+        s3_uri="s3://ml-111111111111/churn/raw/", local_path="/opt/ml/processing/input",
+        s3_data_type="S3Prefix", s3_input_mode="File"))],
+    outputs=[ProcessingOutput(output_name=name, s3_output=ProcessingS3Output(
+        s3_uri=f"s3://ml-111111111111/churn/{name}/", local_path=f"/opt/ml/processing/{name}",
+        s3_upload_mode="EndOfJob")) for name in ("train", "validation", "test")],
+    arguments=["--test-size", "0.2"],
+)</code></pre>
+			<span class="file">code/preprocess.py: what runs inside the container (Python)</span>
+<pre><code>import argparse
+import glob
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--test-size", type=float, default=0.2)
+args = parser.parse_args()
+
+df = pd.concat(pd.read_csv(f) for f in glob.glob("/opt/ml/processing/input/*.csv"))
+df = df.drop_duplicates().dropna(subset=["churned"])
+
+train, rest = train_test_split(df, test_size=args.test_size * 2, stratify=df["churned"], random_state=42)
+validation, test = train_test_split(rest, test_size=0.5, stratify=rest["churned"], random_state=42)
+
+<span class="c"># Fit the scaler on training data only, to avoid leaking test information</span>
+numeric = ["tenure_months", "monthly_charges"]
+scaler = StandardScaler().fit(train[numeric])
+for name, part in (("train", train), ("validation", validation), ("test", test)):
+    part = part.copy()
+    part[numeric] = scaler.transform(part[numeric])
+    <span class="c"># Built-in XGBoost wants the label first and no header</span>
+    cols = ["churned"] + [c for c in part.columns if c != "churned"]
+    part[cols].to_csv(f"/opt/ml/processing/{name}/{name}.csv", header=False, index=False)</code></pre>
+			<span class="file">The same preparation on Spark across two instances (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.core.helper.session_helper import get_execution_role
+from sagemaker.core.spark.processing import PySparkProcessor
+
+spark = PySparkProcessor(base_job_name="churn-spark-prep", framework_version="3.5",
+                         role=get_execution_role(), instance_count=2, instance_type="ml.m5.xlarge",
+                         max_runtime_in_seconds=3600)
+spark.run(
+    submit_app="code/spark_prep.py",
+    arguments=["--in", "s3://ml-111111111111/churn/raw/", "--out", "s3://ml-111111111111/churn/prepared/"],
+    <span class="c"># Keep the Spark UI event logs to inspect the job afterwards</span>
+    spark_event_logs_s3_uri="s3://ml-111111111111/spark-logs/",
+)</code></pre>
+
+			<h2 id="s4">Canvas and Data Wrangler</h2>
+			<p><strong>SageMaker Canvas</strong> is the no-code workspace in SageMaker AI, and <strong>Data Wrangler now lives inside it</strong>: the new Studio doesn't run the classic Data Wrangler interface, and Canvas can import classic Data Wrangler flows.</p>
+			<ul>
+				<li><strong>Data preparation:</strong> import from S3, Athena, Redshift (provisioned clusters, not Redshift Serverless), Snowflake, Databricks, JDBC databases and 40+ SaaS sources; build a data flow from 300+ transforms; run the Data Quality and Insights report (missing values, outliers, target leakage, a quick model); or describe changes in plain language with chat for data prep (three Regions, using a Claude model on Bedrock), which writes editable code. Data over 5 GB is processed by EMR Serverless automatically.</li>
+				<li><strong>Export</strong> a flow as a Processing job, a pipeline, a Feature Store ingestion notebook, a serial inference pipeline step or Python code, so production runs the same transforms.</li>
+				<li><strong>Models without code:</strong> numeric and categorical prediction, time series forecasting, image and text classification, built by AutoML (Autopilot's engine, up to 250 candidates). <strong>Quick build</strong> takes 2 to 20 minutes; <strong>Standard build</strong> takes 2 to 4 hours and gives the most accurate model. Ready-to-use models (built on Textract, Rekognition and Comprehend) and Amazon Q Developer guidance are included.</li>
+				<li><strong>Cost:</strong> $1.90 per session hour while logged in, plus training and EMR Serverless charges. <strong>Log out to stop session charges</strong>; each user's 100 GB storage volume is billed until the user profile is deleted.</li>
+			</ul>
+
+			<h2 id="s5">Feature Store concepts</h2>
+			<p>A <strong>feature group</strong> is a table of features with a <strong>record identifier</strong> (such as <code>customer_id</code>) and an <strong>event time</strong>. It has an online store, an offline store, or both.</p>
+			<ul>
+				<li><strong>Online store:</strong> the latest record per identifier, read in milliseconds with <code>GetRecord</code> during inference. Tiers: <code>Standard</code> (default), <code>Standard_V2</code> (September 2026, adds partial updates with <code>UpdateRecord</code>; migrating to it is one-way) and <code>InMemory</code> (ElastiCache-based for the lowest latency, online-only groups, no customer managed KMS key). A <strong>TTL</strong> deletes records a set time after their event time.</li>
+				<li><strong>Offline store:</strong> every version of every record as Parquet in S3, with a Glue Data Catalog table (Glue format, partitioned by hour, or Apache Iceberg, partitioned by day) for Athena or Spark. Writes appear within about 15 minutes.</li>
+				<li><strong>Throughput:</strong> <code>OnDemand</code> or <code>Provisioned</code> read and write units (provisioned only for Standard online or offline-only groups); switching to on-demand is allowed once every 24 hours.</li>
+				<li><strong>Write rules:</strong> <code>PutRecord</code> replaces the whole record. A record with an older event time than the stored one goes only to the offline store, which is how late-arriving history is backfilled without changing what inference sees.</li>
+				<li><strong>Ingestion paths:</strong> <code>PutRecord</code> from streaming code (Kinesis or Kafka consumers), <code>BatchWriteRecord</code> (25 records per call, July 2026), the SDK's <code>ingest_dataframe</code>, a Spark connector on EMR, Data Wrangler exports, and <strong>feature processors</strong> (<code>@feature_processor</code>) that turn a transformation into a scheduled pipeline.</li>
+			</ul>
+
+			<h2 id="s6">Creating and using a feature group</h2>
+			<span class="file">Create a feature group, write a record and read it back (Python, boto3)</span>
+<pre><code>import time
+from datetime import datetime, timezone
+
+import boto3
+
+sm = boto3.client("sagemaker")
+fs = boto3.client("sagemaker-featurestore-runtime")
+
+sm.create_feature_group(
+    FeatureGroupName="customers",
+    RecordIdentifierFeatureName="customer_id",
+    EventTimeFeatureName="event_time",
+    FeatureDefinitions=[
+        {"FeatureName": "customer_id", "FeatureType": "String"},
+        <span class="c"># Iceberg tables need a String event time in ISO-8601</span>
+        {"FeatureName": "event_time", "FeatureType": "String"},
+        {"FeatureName": "tenure_months", "FeatureType": "Integral"},
+        {"FeatureName": "monthly_charges", "FeatureType": "Fractional"},
+        {"FeatureName": "support_calls_30d", "FeatureType": "Integral"},
+    ],
+    OnlineStoreConfig={"EnableOnlineStore": True,
+                       "SecurityConfig": {"KmsKeyId": "alias/fs-online"}},
+    OfflineStoreConfig={
+        "S3StorageConfig": {"S3Uri": "s3://ml-111111111111/feature-store/",
+                            "KmsKeyId": "alias/fs-offline"},
+        "TableFormat": "Iceberg",
+    },
+    ThroughputConfig={"ThroughputMode": "OnDemand"},
+    RoleArn="arn:aws:iam::111111111111:role/FeatureStoreOfflineRole",
+)
+while sm.describe_feature_group(FeatureGroupName="customers")["FeatureGroupStatus"] == "Creating":
+    time.sleep(15)
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+<span class="c"># All values are sent as strings, whatever the feature type</span>
+fs.put_record(FeatureGroupName="customers", Record=[
+    {"FeatureName": "customer_id", "ValueAsString": "C001"},
+    {"FeatureName": "event_time", "ValueAsString": now},
+    {"FeatureName": "tenure_months", "ValueAsString": "18"},
+    {"FeatureName": "monthly_charges", "ValueAsString": "42.5"},
+    {"FeatureName": "support_calls_30d", "ValueAsString": "3"},
+])
+
+<span class="c"># At inference time: an empty response means no record for this ID</span>
+rec = fs.get_record(FeatureGroupName="customers", RecordIdentifierValueAsString="C001",
+                    FeatureNames=["tenure_months", "monthly_charges", "support_calls_30d"])
+print({f["FeatureName"]: f["ValueAsString"] for f in rec.get("Record", [])})</code></pre>
+			<ul>
+				<li><strong>Batch reads:</strong> <code>BatchGetRecord</code> takes up to 100 identifiers across feature groups; <code>ListRecords</code> (July 2026) pages through identifiers in the online store.</li>
+				<li><strong>Deletes:</strong> <code>DeleteRecord</code> with <code>SoftDelete</code> (the default, blanks the features) or <code>HardDelete</code> (removes the online record); both add an <code>is_deleted</code> row to the offline store.</li>
+				<li><strong>SDK V3</strong> (since May 2026, <code>sagemaker-mlops</code> 3.8 or later): <code>FeatureGroupManager.create(...)</code>, <code>ingest_dataframe(...)</code> and <code>FeatureGroup.get(...).get_record(...)</code> in <code>sagemaker.mlops.feature_store</code>, plus Lake Formation settings for the offline store.</li>
+				<li><strong>Sharing:</strong> AWS RAM shares the feature group catalog (to discover groups) and individual groups with read, read-write or admin access.</li>
+			</ul>
+
+			<h2 id="s7">Training sets and the offline store</h2>
+			<p>A training set must use the feature values <strong>as they were at each label's time</strong>, or the model learns from information it won't have at inference (data leakage). The offline store keeps every version, and AWS's query picks the latest non-deleted record as of a given time:</p>
+			<span class="file">Latest record per customer as of 1 October 2026 (SQL, Amazon Athena)</span>
+<pre><code><span class="c">-- Replace the table with the name from DescribeFeatureGroup</span>
+SELECT * FROM (
+  SELECT *,
+         row_number() OVER (
+           PARTITION BY customer_id
+           ORDER BY event_time DESC, api_invocation_time DESC, write_time DESC
+         ) AS row_num
+  FROM sagemaker_featurestore.customers_1731300000
+  WHERE event_time &lt;= '2026-10-01T00:00:00Z'
+)
+WHERE row_num = 1 AND NOT is_deleted;</code></pre>
+			<ul>
+				<li><strong>Table name:</strong> the generated Glue table name is in <code>DescribeFeatureGroup</code> under <code>OfflineStoreConfig.DataCatalogConfig</code> (custom names are possible since July 2026). Compare event times as timestamps or ISO strings to match the feature type.</li>
+				<li><strong>Point-in-time joins</strong> across feature groups and a label table: the SDK's <code>DatasetBuilder</code> (<code>.point_in_time_accurate_join()</code>, <code>.as_of()</code>, <code>.to_dataframe()</code>) builds the query for you. The developer guide's V3 example imports a <code>FeatureStore</code> class that the SDK doesn't export; use <code>DatasetBuilder.create(...)</code>.</li>
+				<li><strong>Columns added</strong> to every offline row: <code>write_time</code>, <code>api_invocation_time</code> and <code>is_deleted</code> (reserved names you can't use as features).</li>
+			</ul>
+
+			<h2 id="s8">Ground Truth and A2I</h2>
+			<div class="callout retired"><p><strong>SageMaker Ground Truth</strong> and <strong>Amazon Augmented AI (A2I)</strong>, along with Mechanical Turk, have been <strong>closed to new customers since 30 July 2026</strong>; existing customers keep using them without new features. Ground Truth Plus ended on 30 June 2026. AWS hasn't named a replacement, and the Ground Truth product page now describes an expert-assisted generative AI customization service.</p></div>
+			<ul>
+				<li><strong>Ground Truth</strong> ran labeling jobs for images (bounding boxes, classification, segmentation), text (entities, classification), video and 3D point clouds, with private or vendor workforces, custom HTML templates and <strong>automated data labeling</strong> (active learning labels the easy items with a model and sends the rest to people), writing an output manifest to S3.</li>
+				<li><strong>A2I</strong> sent low-confidence or sampled predictions to human reviewers, built in for Textract and Rekognition and custom for any model.</li>
+				<li><strong>On the exams:</strong> MLA-C02 asks you to "label and annotate data" without naming a service and adds human-in-the-loop evaluation; AIP-C01 still lists Ground Truth and A2I as in scope; AIF-C01 mentions labeling and human audits as concepts.</li>
+			</ul>
+
+			<h2 id="s9">Security, quotas and pricing</h2>
+			<ul>
+				<li><strong>Processing security:</strong> <code>NetworkConfig</code> sets a VPC, network isolation and encryption between instances; output and volume KMS keys as above. Athena and Redshift dataset definitions take their own KMS key.</li>
+				<li><strong>Feature Store keys:</strong> the online store uses an AWS owned key and the offline store an AWS managed key unless you supply symmetric customer managed keys. A <code>kms:ViaService</code> condition works only on the online store's key, so <strong>one key with that condition for both stores makes creation fail</strong>. Every data-plane call needs <code>kms:Decrypt</code> on a customer managed key.</li>
+				<li><strong>Feature Store IAM:</strong> <code>sagemaker:PutRecord</code>, <code>GetRecord</code>, <code>BatchGetRecord</code>, <code>DeleteRecord</code> and <code>ListRecords</code>; <code>BatchWriteRecord</code> needs both <code>BatchWriteRecord</code> and <code>PutRecord</code>, and <code>UpdateRecord</code> is authorized as <code>PutRecord</code> (narrow it with <code>sagemaker:IsUpdateRecord</code>). The runtime has a PrivateLink endpoint (<code>sagemaker.featurestore-runtime</code>), and Lake Formation can control column and row access to the offline tables.</li>
+				<li><strong>Quotas:</strong> processing jobs as above (4 instances across all jobs, 20 per job); Feature Store 100 feature groups, 2,500 features per group, 350 KB per record, 10,000 requests per second per API, and per record identifier 2,400 reads and 500 writes per second.</li>
+				<li><strong>Pricing (N. Virginia):</strong> Processing per instance-hour (ml.m5.xlarge $0.23) plus $0.10 per GB-month of storage; Feature Store Standard $1.25 per million write units, $0.25 per million read units and $0.45 per GB-month (InMemory $0.233 per GB-hour, 5 GiB minimum); Canvas $1.90 per session hour.</li>
+			</ul>
+
+			<h2 id="s10">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> Glue 5.1 for Unified Studio data processing jobs (March); Feature Store in SDK V3 with Lake Formation access control (12 May); a visual Feature Store interface in Unified Studio (22 May); Ground Truth Plus ended (30 June); Ground Truth, A2I and Mechanical Turk closed to new customers (30 July); <code>BatchWriteRecord</code>, <code>ListRecords</code> and custom offline table names (9 July); <code>UpdateRecord</code> with the Standard_V2 tier (8 September); instance preference lists for processing (15 September); MLA-C02 replaced MLA-C01 (29 September).</li>
+				<li><strong>2025:</strong> Amazon Q Developer in Canvas (February); M7i, C7i and R7i for processing (June); Unified Studio data processing jobs (July); single-GPU P5 for processing (August).</li>
+				<li><strong>2024:</strong> Canvas training priced by instance use (March); Canvas data preparation at petabyte scale through EMR Serverless and import of classic Data Wrangler flows (August); SageMaker renamed SageMaker AI (3 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-mla/d1-task-1-1.html">MLA-C01 Task 1.1: ingesting and storing data</a>, <a href="../../aws-mla/d1-task-1-2.html">MLA-C01 Task 1.2: data transformation and feature engineering</a> and <a href="../../aws-mla/d1-task-1-3.html">Task 1.3: data integrity</a> (MLA-C02 Domain 1 keeps Feature Store, Data Wrangler, DataBrew and Glue Data Quality), <a href="../../aws-aip/d1-task-1-3.html">AIP-C01 Task 1.3: data validation and processing</a>, and <a href="../../aws-aif/d1-task-1-3.html">AIF-C01 Task 1.3: the ML development lifecycle</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="monitoring-governance.html"><small>Previous</small>Monitoring and governance</a>
+				<a class="next" href="index.html"><small>Back</small>SageMaker AI overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on SageMaker AI Processing, Canvas, Data Wrangler and Feature Store, checked against the AWS documentation on 11 November 2026.</div>
+</footer>
+
+</body>
+</html>
