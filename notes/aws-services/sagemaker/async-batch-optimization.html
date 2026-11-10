@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker AI Async, Batch and Inference Optimization | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to SageMaker AI asynchronous inference (S3 queues, SNS notifications, scaling to zero on backlog), batch transform (splitting, filters and joins, ordering, errors), inference optimization jobs (quantization, compilation, EAGLE speculative decoding, fast model loading), generative AI inference recommendations and benchmarks, the classic Inference Recommender, SageMaker Neo, inference metrics, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">Async, batch and inference optimization</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Deploy &middot; Last checked 10 November 2026</span>
+		<h1>Async, batch and inference optimization</h1>
+		<p>The inference options that don't answer while the caller waits, and the tools that make any endpoint faster or cheaper: asynchronous endpoints that queue work and can scale to zero, batch transform over whole datasets, optimization jobs for large language models, AWS's inference recommendations and benchmarks, SageMaker Neo, the metrics to watch, and the security settings, quotas and prices that apply.</p>
+		<div class="tags"><span class="tag code">InvokeEndpointAsync</span><span class="tag code">CreateTransformJob</span><span class="tag code">CreateOptimizationJob</span><span class="tag">Inference recommendations</span><span class="tag">Neo</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">Choosing an inference option</a></li>
+				<li><a href="#s2">Asynchronous inference</a></li>
+				<li><a href="#s3">Scaling async endpoints to zero</a></li>
+				<li><a href="#s4">Batch transform</a></li>
+				<li><a href="#s5">Optimizing LLM inference</a></li>
+				<li><a href="#s6">Inference recommendations and benchmarks</a></li>
+				<li><a href="#s7">SageMaker Neo</a></li>
+				<li><a href="#s8">Metrics to watch</a></li>
+				<li><a href="#s9">Security, quotas and pricing</a></li>
+				<li><a href="#s10">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">Choosing an inference option</h2>
+			<ul>
+				<li><strong><a href="realtime-serverless-inference.html">Real-time</a></strong>: an answer within 60 seconds for payloads up to 6 MB, on instances that run all the time (or scale to zero with inference components).</li>
+				<li><strong><a href="realtime-serverless-inference.html#s7">Serverless</a></strong>: the same synchronous call for intermittent traffic that tolerates cold starts; no GPUs, 4 MB payloads.</li>
+				<li><strong>Asynchronous</strong>: in AWS's words, for "requests with large payload sizes (up to 1GB), long processing times (up to one hour), and near real-time latency requirements". Requests queue, results land in S3, and the endpoint can scale to zero between bursts.</li>
+				<li><strong>Batch transform</strong>: "get inferences from large datasets" and "run inference when you don't need a persistent endpoint". A job reads a whole S3 prefix, writes one output file per input file and shuts down.</li>
+			</ul>
+			<p>Exams often contrast them: a nightly scoring run over a data lake is batch; a 20-minute video or document analysis that a user waits for by notification is async; a fraud check during checkout is real-time; a rarely used internal tool is serverless.</p>
+
+			<h2 id="s2">Asynchronous inference</h2>
+			<p>Add an <code>AsyncInferenceConfig</code> to the endpoint configuration; the endpoint then <strong>accepts only asynchronous calls</strong>. Callers put the input in S3 (or send up to 128,000 bytes inline) and call <code>InvokeEndpointAsync</code>, which returns HTTP 202 straight away with the output location. SageMaker queues the request, runs it, writes the result to S3 and, if configured, notifies SNS.</p>
+			<span class="file">An async endpoint with notifications, and a request (Python, boto3)</span>
+<pre><code>import boto3
+
+sm = boto3.client("sagemaker")
+smr = boto3.client("sagemaker-runtime")
+
+sm.create_endpoint_config(
+    EndpointConfigName="docs-async-cfg",
+    ProductionVariants=[{
+        "VariantName": "variant1",
+        "ModelName": "doc-summarizer",
+        "InstanceType": "ml.g5.xlarge",
+        "InitialInstanceCount": 1,
+    }],
+    AsyncInferenceConfig={
+        <span class="c"># 1 to 1000; leave it out and SageMaker picks a value</span>
+        "ClientConfig": {"MaxConcurrentInvocationsPerInstance": 4},
+        "OutputConfig": {
+            "S3OutputPath": "s3://ml-111111111111/async/out/",
+            "S3FailurePath": "s3://ml-111111111111/async/failed/",
+            "KmsKeyId": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+            "NotificationConfig": {
+                "SuccessTopic": "arn:aws:sns:us-east-1:111111111111:async-ok",
+                "ErrorTopic": "arn:aws:sns:us-east-1:111111111111:async-err",
+                <span class="c"># Only responses of 128 KB or less are embedded in the message</span>
+                "IncludeInferenceResponseIn": ["SUCCESS_NOTIFICATION_TOPIC"],
+            },
+        },
+    },
+)
+sm.create_endpoint(EndpointName="docs-async", EndpointConfigName="docs-async-cfg")
+sm.get_waiter("endpoint_in_service").wait(EndpointName="docs-async")
+
+r = smr.invoke_endpoint_async(
+    EndpointName="docs-async",
+    <span class="c"># Or Body= up to 128,000 bytes; never both</span>
+    InputLocation="s3://ml-111111111111/async/in/req-0001.json",
+    ContentType="application/json",
+    InferenceId="req-0001",
+    RequestTTLSeconds=3600,         <span class="c"># time allowed in the queue: 60 to 21600, default 21600</span>
+    InvocationTimeoutSeconds=1800,  <span class="c"># processing time: 1 to 3600, default 900</span>
+)
+<span class="c"># The result isn't there yet; poll this S3 key or wait for SNS</span>
+print(r["InferenceId"], r["OutputLocation"], r["FailureLocation"])</code></pre>
+			<ul>
+				<li><strong>Prebuilt containers</strong> need environment variables to use the full payload size and timeout: <code>TS_MAX_REQUEST_SIZE</code>, <code>TS_MAX_RESPONSE_SIZE</code> and <code>TS_DEFAULT_RESPONSE_TIMEOUT</code> for TorchServe, or the <code>MMS_</code> equivalents for Multi Model Server and Hugging Face containers. Without them, large or slow requests fail early.</li>
+				<li><strong>Notifications</strong> carry the endpoint, input and output locations, the inference ID and <code>invocationStatus</code>; subscribe an SQS queue or Lambda function to drive the next step.</li>
+				<li><strong>Not supported with async:</strong> multi-model endpoints, shadow tests, Marketplace containers and Inf1 with deployment guardrails. Instance pools do work, including scaling from zero.</li>
+				<li><strong>SDK V3:</strong> <code>mb.deploy(..., inference_config=AsyncInferenceConfig(output_path=..., failure_path=..., notification_config=...))</code> from <code>sagemaker.core.inference_config</code>, then <code>endpoint.invoke_async(...)</code>.</li>
+			</ul>
+
+			<h2 id="s3">Scaling async endpoints to zero</h2>
+			<p>Async endpoints have been able to scale to <strong>zero instances</strong> since long before inference components: requests that arrive meanwhile wait in the queue. AWS recommends tracking the backlog per instance, plus a step policy that wakes the endpoint as soon as anything waits.</p>
+			<span class="file">Backlog-based scaling with a wake-up policy (Python, boto3; continues the example above)</span>
+<pre><code>aas = boto3.client("application-autoscaling")
+cw = boto3.client("cloudwatch")
+resource_id = "endpoint/docs-async/variant/variant1"
+dim = "sagemaker:variant:DesiredInstanceCount"
+
+aas.register_scalable_target(ServiceNamespace="sagemaker", ResourceId=resource_id,
+                             ScalableDimension=dim, MinCapacity=0, MaxCapacity=5)
+
+<span class="c"># Async endpoints don't publish Invocations, so track the queue instead</span>
+aas.put_scaling_policy(
+    PolicyName="backlog-per-instance", ServiceNamespace="sagemaker", ResourceId=resource_id,
+    ScalableDimension=dim, PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        "TargetValue": 5.0,
+        "CustomizedMetricSpecification": {
+            "MetricName": "ApproximateBacklogSizePerInstance", "Namespace": "AWS/SageMaker",
+            "Dimensions": [{"Name": "EndpointName", "Value": "docs-async"}], "Statistic": "Average",
+        },
+        "ScaleInCooldown": 600, "ScaleOutCooldown": 300,
+    },
+)
+
+<span class="c"># Without this, a scaled-to-zero endpoint waits until the backlog passes the target</span>
+step = aas.put_scaling_policy(
+    PolicyName="HasBacklogWithoutCapacity-ScalingPolicy", ServiceNamespace="sagemaker",
+    ResourceId=resource_id, ScalableDimension=dim, PolicyType="StepScaling",
+    StepScalingPolicyConfiguration={
+        "AdjustmentType": "ChangeInCapacity", "MetricAggregationType": "Average", "Cooldown": 300,
+        "StepAdjustments": [{"MetricIntervalLowerBound": 0, "ScalingAdjustment": 1}],
+    },
+)
+cw.put_metric_alarm(
+    AlarmName="docs-async-backlog-no-capacity", Namespace="AWS/SageMaker",
+    MetricName="HasBacklogWithoutCapacity",
+    Dimensions=[{"Name": "EndpointName", "Value": "docs-async"}],
+    Statistic="Average", Period=60, EvaluationPeriods=2, DatapointsToAlarm=2, Threshold=1,
+    ComparisonOperator="GreaterThanOrEqualToThreshold", AlarmActions=[step["PolicyARN"]],
+)</code></pre>
+			<p>When several policies apply, the one asking for the most capacity wins. The cooldowns are an example; tune them to how long a request takes.</p>
+			<div class="entry">
+				<h4>Async metrics (AWS/SageMaker)</h4>
+				<p>By endpoint: <code>ApproximateBacklogSize</code>, <code>ApproximateBacklogSizePerInstance</code>, <code>ApproximateAgeOfOldestRequest</code> and <code>HasBacklogWithoutCapacity</code>. By variant: <code>TimeInBacklog</code>, <code>TotalProcessingTime</code>, <code>ExpiredRequests</code> (the TTL ran out), <code>InvocationFailures</code>, <code>RequestDownloadFailures</code>, <code>ResponseUploadFailures</code> and <code>NotificationFailures</code>. <code>Invocations</code>, <code>InvocationsPerInstance</code> and <code>OverheadLatency</code> are <strong>not</strong> published for async endpoints. Logs are in <code>/aws/sagemaker/Endpoints/NAME</code>, with the inference ID on each line.</p>
+			</div>
+
+			<h2 id="s4">Batch transform</h2>
+			<p>A transform job starts instances for an existing model, splits each S3 input file into requests, calls the container's <code>/invocations</code>, writes <code>FILE.out</code> for each input and stops. Results keep the order of the input records.</p>
+			<span class="file">Score CSV files, dropping the ID column for the model and keeping it in the output (Python, boto3)</span>
+<pre><code>sm.create_transform_job(
+    TransformJobName="churn-batch-2026-11-10",
+    ModelName="churn-xgb",
+    <span class="c"># MultiRecord packs many lines into each request; needs a SplitType other than None</span>
+    BatchStrategy="MultiRecord",
+    MaxConcurrentTransforms=4,
+    <span class="c"># Concurrent transforms x payload must be 100 MB or less</span>
+    MaxPayloadInMB=6,
+    ModelClientConfig={"InvocationsTimeoutInSeconds": 600, "InvocationsMaxRetries": 3},
+    TransformInput={
+        "DataSource": {"S3DataSource": {"S3DataType": "S3Prefix", "S3Uri": "s3://ml-111111111111/churn/in/"}},
+        "ContentType": "text/csv",
+        "SplitType": "Line",
+    },
+    TransformOutput={
+        "S3OutputPath": "s3://ml-111111111111/churn/out/",
+        "Accept": "text/csv",
+        "AssembleWith": "Line",
+        "KmsKeyId": "alias/ml-batch-output",
+    },
+    TransformResources={"InstanceType": "ml.m5.xlarge", "InstanceCount": 2},
+    DataProcessing={
+        "InputFilter": "$[1:]",     <span class="c"># the model sees every column except column 0 (the ID)</span>
+        "JoinSource": "Input",      <span class="c"># append the prediction to the original row</span>
+        "OutputFilter": "$[0,-1]",  <span class="c"># keep only the ID and the prediction</span>
+    },
+)
+sm.get_waiter("transform_job_completed_or_stopped").wait(TransformJobName="churn-batch-2026-11-10")</code></pre>
+			<ul>
+				<li><strong>Input:</strong> an <code>S3Prefix</code> or a <code>ManifestFile</code> (not an augmented manifest), optionally Gzip-compressed. <code>SplitType</code> is <code>None</code> (each object is one request), <code>Line</code>, <code>RecordIO</code> or <code>TFRecord</code>.</li>
+				<li><strong>Filters and joins</strong> (JSONPath): only JSON, JSON Lines and CSV; for CSV, both <code>SplitType</code> and <code>AssembleWith</code> must be <code>Line</code> and only index paths work. With JSON, the prediction goes in a <code>SageMakerOutput</code> attribute.</li>
+				<li><strong>Parallelism:</strong> files are divided between instances by S3 key, so <strong>a single large file uses only one instance</strong>; split the data into at least as many files as instances. <code>MaxConcurrentTransforms</code> should match the container's workers.</li>
+				<li><strong>Errors:</strong> an <code>.out</code> file is written only if its whole input file succeeds; other files continue, but the job ends <code>Failed</code>. Add an S3 lifecycle rule to clean up incomplete multipart uploads. A job has no run-time limit setting.</li>
+				<li><strong>SDK V3:</strong> <code>Transformer(model_name=..., instance_count=2, instance_type="ml.m5.xlarge", strategy="MultiRecord", assemble_with="Line", output_path=...)</code> from <code>sagemaker.core.transformer</code>, then <code>.transform(data, content_type="text/csv", split_type="Line", input_filter=..., join_source="Input", output_filter=...)</code>.</li>
+				<li><strong>Batch data capture</strong> (<code>DataCaptureConfig</code>) records inputs and outputs for monitoring; Model Monitor itself has been closed to new customers since 30 July 2026.</li>
+			</ul>
+
+			<h2 id="s5">Optimizing LLM inference</h2>
+			<p>An <strong>inference optimization job</strong> (<code>CreateOptimizationJob</code>) prepares a large language model for a specific instance type and writes an optimized copy to S3, with a recommended Large Model Inference (LMI) container image to serve it.</p>
+			<ul>
+				<li><strong>Quantization:</strong> smaller weights for less GPU memory and higher throughput: INT4-AWQ, FP8 or INT8-SmoothQuant (<code>OPTION_QUANTIZE</code>; SmoothQuant only with compilation).</li>
+				<li><strong>Compilation:</strong> ahead-of-time compilation with TensorRT-LLM on GPUs or the AWS Neuron SDK on Inferentia and Trainium, so new instances don't compile at startup. Neuron supports compilation only.</li>
+				<li><strong>Speculative decoding:</strong> a small draft model proposes tokens that the main model checks in one pass. Use SageMaker's draft model, a JumpStart one or your own; or, since 25 November 2025, train <strong>EAGLE</strong> heads (EAGLE 2 or 3, chosen by architecture) on your own data for up to 2.5 times the throughput. Compilation and speculative decoding can't be combined.</li>
+				<li><strong>Fast model loading:</strong> pre-shards the weights (<code>OPTION_TENSOR_PARALLEL_DEGREE</code>, which must divide the instance's GPU count) so they stream straight from S3 to the GPUs. Sharded models deploy to inference-component endpoints and can't use network isolation.</li>
+			</ul>
+			<span class="file">Quantize a model to AWQ for ml.g6.12xlarge (Python, boto3)</span>
+<pre><code>sm.create_optimization_job(
+    OptimizationJobName="llama31-8b-awq",
+    RoleArn="arn:aws:iam::111111111111:role/SageMakerExecutionRole",
+    ModelSource={"S3": {"S3Uri": "s3://ml-111111111111/models/llama-3-1-8b/",
+                        "ModelAccessConfig": {"AcceptEula": True}}},
+    DeploymentInstanceType="ml.g6.12xlarge",
+    OptimizationConfigs=[{"ModelQuantizationConfig": {"OverrideEnvironment": {"OPTION_QUANTIZE": "awq"}}}],
+    OutputConfig={"S3OutputLocation": "s3://ml-111111111111/optimized/llama31-8b-awq/"},
+    StoppingCondition={"MaxRuntimeInSeconds": 36000},
+)
+
+job = sm.describe_optimization_job(OptimizationJobName="llama31-8b-awq")
+<span class="c"># Status is upper case: INPROGRESS, COMPLETED, FAILED ...</span>
+print(job["OptimizationJobStatus"], job.get("OptimizationOutput", {}).get("RecommendedInferenceImage"))</code></pre>
+			<p>Deploy the output by creating a model from the S3 location and the recommended image. For EAGLE, the configuration is <code>{"ModelSpeculativeDecodingConfig": {"Technique": "EAGLE", "TrainingDataSource": {"S3Uri": ..., "S3DataType": "S3Prefix"}}}</code> with training data in ShareGPT or OpenAI chat format; the job runs four training jobs in a row (AWS's examples allow 5 days). In SDK V3, <code>ModelBuilder.optimize(instance_type=..., quantization_config=..., output_path=...)</code> runs the job and returns a model you then deploy. Optimization jobs bill for the instances they use.</p>
+
+			<h2 id="s6">Inference recommendations and benchmarks</h2>
+			<p>Since 21 April 2026, AWS calls its <strong>generative AI inference recommendations</strong> "the recommended approach for most customers", with manual optimization jobs the do-it-yourself route. You give a model (Hugging Face format with safetensors) and one goal (lowest cost, lowest time to first token, or highest throughput); SageMaker tries optimizations, benchmarks them on up to three instance types with NVIDIA AIPerf, and returns ranked deployment configurations with measured latency, throughput and cost.</p>
+			<span class="file">Get recommendations and deploy the best one (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.serve import ModelBuilder
+
+mb = ModelBuilder(model="s3://ml-111111111111/models/qwen3-8b/",
+                  role_arn="arn:aws:iam::111111111111:role/SageMakerExecutionRole")
+
+<span class="c"># One target: "throughput", "ttft-ms" or "cost"; up to three instance types</span>
+mb.generate_deployment_recommendations(
+    performance_target="ttft-ms",
+    instance_types=["ml.g6e.2xlarge", "ml.g5.2xlarge"],
+    output_path="s3://ml-111111111111/recommendations/qwen3-8b/",
+)
+for rec in mb.recommendations:
+    print(rec)
+
+mb.deploy(role="arn:aws:iam::111111111111:role/SageMakerExecutionRole", recommendation_index=0)</code></pre>
+			<ul>
+				<li><strong>APIs:</strong> <code>CreateAIWorkloadConfig</code> (the traffic to simulate: concurrency, prompt and output token counts, streaming, or your own data), <code>CreateAIRecommendationJob</code>, and <code>CreateAIBenchmarkJob</code>, which load-tests an existing endpoint through its OpenAI-compatible API (list the inference components, or it fails). Results can go to MLflow (June 2026), and LoRA adapters can be included (July 2026).</li>
+				<li><strong>Studio:</strong> <em>Jobs</em>, <em>Inference optimization</em>; custom benchmarks typically take one to three hours, and the test endpoints are deleted afterwards.</li>
+				<li><strong>Cost and quotas:</strong> no service fee, but you pay for the benchmark compute (existing training plan reservations can be used); 2 parallel recommendation and 2 parallel benchmark jobs by default.</li>
+				<li><strong>Classic Inference Recommender</strong> is still available for any model: <code>CreateInferenceRecommendationsJob</code> with <code>JobType</code> <code>Default</code> (instance recommendations within about 45 minutes) or <code>Advanced</code> (a custom load test with traffic phases and latency limits, about 2 hours), for real-time or serverless endpoints. Exams still name it as the way to choose an instance type.</li>
+			</ul>
+
+			<h2 id="s7">SageMaker Neo</h2>
+			<p><strong>Neo</strong> compiles trained models (TensorFlow, Keras, PyTorch, MXNet, ONNX, TF-Lite, XGBoost and others) for a target: cloud instance families such as ml_c5, ml_g4dn and ml_inf1, or edge devices such as NVIDIA Jetson and Raspberry Pi, with a small runtime (DLR) on the device. Start a job with <code>CreateCompilationJob</code>: <code>InputConfig</code> (the S3 artifact, the framework and the input shape in <code>DataInputConfig</code>) and <code>OutputConfig</code> (a <code>TargetDevice</code>, or a <code>TargetPlatform</code> by OS, architecture and accelerator). Its framework versions are old (PyTorch up to 2.0, for example); for current LLMs on Inferentia2 and Trainium use Neuron through optimization jobs.</p>
+			<div class="callout retired"><p><strong>SageMaker Edge Manager reached end of life on 26 April 2024</strong>: its console, packaging jobs and device fleets are gone and its APIs no longer work. AWS suggests ONNX Runtime with AWS IoT Greengrass V2 for managing models on devices. MLA-C02 dropped "SageMaker Neo edge optimization"; AIP-C01 still lists Neo as in scope.</p></div>
+
+			<h2 id="s8">Metrics to watch</h2>
+			<ul>
+				<li><strong>Latency:</strong> <code>ModelLatency</code> is the time inside your container and <code>OverheadLatency</code> is SageMaker's own time, both in <strong>microseconds</strong>; total latency adds the network. A rising <code>OverheadLatency</code> on serverless points at cold starts, as does <code>ModelSetupTime</code>.</li>
+				<li><strong>Traffic and errors:</strong> <code>Invocations</code>, <code>InvocationsPerInstance</code>, <code>Invocation4XXErrors</code>, <code>Invocation5XXErrors</code> and <code>InvocationModelErrors</code>; concurrency metrics <code>ConcurrentRequestsPerModel</code> and <code>ConcurrentRequestsPerCopy</code>.</li>
+				<li><strong>Instances:</strong> CPU, memory, GPU, GPU memory and disk in <code>/aws/sagemaker/Endpoints</code> (batch jobs in <code>/aws/sagemaker/TransformJobs</code>, without disk).</li>
+				<li><strong>Detailed observability</strong> (18 June 2026, on by default for new real-time endpoint configurations): OpenTelemetry metrics for time to first token, inter-token latency, KV cache, queue depth, tokens per second and per-GPU use, lifecycle events such as cold starts, a SageMaker AI Insights dashboard in CloudWatch and PromQL queries. No extra SageMaker charge; CloudWatch charges may apply. <code>MetricsConfig</code> also sets publish frequency (10 to 300 seconds) and per-instance and per-GPU dimensions.</li>
+			</ul>
+
+			<h2 id="s9">Security, quotas and pricing</h2>
+			<ul>
+				<li><strong>Async permissions:</strong> the execution role needs <code>s3:GetObject</code>, <code>s3:PutObject</code> and <code>s3:AbortMultipartUpload</code> on the objects, <code>s3:ListBucket</code> on the bucket, and <code>sns:Publish</code> on the topics (plus KMS permissions for encrypted topics). Callers need <code>sagemaker:InvokeEndpointAsync</code>. <code>OutputConfig.KmsKeyId</code> encrypts results in S3.</li>
+				<li><strong>Batch encryption and network:</strong> <code>TransformOutput.KmsKeyId</code> (the key policy must allow the model's role), <code>VolumeKmsKeyId</code> (not on instance types with local NVMe storage) and a key for captured data. The model's <code>VpcConfig</code> and network isolation apply to batch jobs too.</li>
+				<li><strong>Quotas:</strong> 4 instances across all transform jobs by default and per-type transform quotas at 0 on new accounts; 2 parallel Neo compilation jobs; async endpoints share the endpoint instance quotas.</li>
+				<li><strong>Pricing:</strong> async and batch bill per instance-hour for the instances running (AWS's async example: ml.c5.xlarge at $0.20 an hour for 77.5 hours, $16.38 a month); there's no charge for S3 reads and writes in the same Region. SageMaker Savings Plans cover batch transform; async isn't named.</li>
+			</ul>
+
+			<h2 id="s10">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> generative AI inference recommendations and benchmarks (21 April); instance pools for real-time and async endpoints (May); MLflow tracking for recommendation jobs (June); detailed observability (18 June); automatic container image caching (30 June); LoRA adapters in recommendations (July); Model Monitor closed to new customers (30 July).</li>
+				<li><strong>2025:</strong> EAGLE speculative decoding trained on your data (25 November).</li>
+				<li><strong>2024:</strong> Edge Manager end of life (26 April); fast model loading in optimization jobs (November); SageMaker renamed SageMaker AI (3 December); container caching and Fast Model Loader (6 December).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-mla/d3-task-3-1.html">MLA-C01 Task 3.1: selecting deployment infrastructure</a> and the <a href="../../aws-mla/services-sagemaker-deploy.html">MLA-C01 notes on model deployment</a> (MLA-C02 keeps real-time and batch inference strategies and drops Neo edge optimization), <a href="../../aws-aip/d4-task-4-2.html">AIP-C01 Task 4.2: application performance</a> (benchmarking, batch inference, LLM latency), <a href="../../aws-aip/d2-task-2-2.html#s3">AIP-C01 Task 2.2: optimized deployments</a>, and <a href="../../aws-aif/d1-task-1-1.html#s3">AIF-C01 Task 1.1: types of inferencing</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="realtime-serverless-inference.html"><small>Previous</small>Real-time and serverless inference</a>
+				<span class="next"><small>Next</small>Pipelines and MLOps (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on SageMaker AI asynchronous inference, batch transform and inference optimization, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
