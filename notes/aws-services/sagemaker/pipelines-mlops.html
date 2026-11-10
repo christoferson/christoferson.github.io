@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SageMaker AI Pipelines and MLOps | AWS Service Notes</title>
+	<meta name="description" content="A practical guide to MLOps on SageMaker AI: Pipelines steps, parameters, properties and conditions, an SDK V3 pipeline, caching, retries, selective execution, scheduling and limits, Model Registry versions, approvals and lifecycle stages, approval-triggered deployment with EventBridge, cross-account registries, Projects templates, lineage tracking, other orchestrators, security, quotas and pricing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../services.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">Services</a><span class="sep">/</span><a href="index.html">SageMaker AI</a><span class="sep">/</span><span class="here">Pipelines and MLOps</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Amazon SageMaker AI &middot; Operate &middot; Last checked 10 November 2026</span>
+		<h1>Pipelines and MLOps</h1>
+		<p>Automating the path from data to a deployed model: building and running SageMaker Pipelines, versioning and approving models in the Model Registry, deploying automatically when a model is approved, sharing models across accounts, starting from Projects templates, tracing lineage, choosing another orchestrator, and the security settings, quotas and prices that apply.</p>
+		<div class="tags"><span class="tag">Pipelines</span><span class="tag">Model Registry</span><span class="tag code">ModelApprovalStatus</span><span class="tag">EventBridge</span><span class="tag">Projects</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#s1">The MLOps pieces</a></li>
+				<li><a href="#s2">How a pipeline is built</a></li>
+				<li><a href="#s3">A pipeline in SDK V3</a></li>
+				<li><a href="#s4">Running pipelines</a></li>
+				<li><a href="#s5">Model Registry</a></li>
+				<li><a href="#s6">Deploying on approval</a></li>
+				<li><a href="#s7">Across accounts</a></li>
+				<li><a href="#s8">Projects</a></li>
+				<li><a href="#s9">Lineage, experiments and notebook jobs</a></li>
+				<li><a href="#s10">Other orchestrators</a></li>
+				<li><a href="#s11">Security, quotas and pricing</a></li>
+				<li><a href="#s12">What's changed</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="s1">The MLOps pieces</h2>
+			<ol class="flow">
+				<li><b>Build</b><strong>SageMaker Pipelines</strong> runs the repeatable workflow: prepare data, train, evaluate, and register the model only if it's good enough.</li>
+				<li><b>Version</b>The <strong>Model Registry</strong> keeps each registered model as a numbered version in a model package group, with metrics, an approval status and lifecycle stages.</li>
+				<li><b>Approve</b>A person (or an automated test) sets the version to <code>Approved</code>; IAM can restrict who may do that.</li>
+				<li><b>Deploy</b>The approval event starts a deployment pipeline (CodePipeline, Lambda or a pipeline step) that rolls the version to staging, then production, with <a href="realtime-serverless-inference.html#s8">deployment guardrails</a>.</li>
+				<li><b>Trace and repeat</b>Lineage tracking records what data, code and image produced each model; monitoring or a schedule triggers retraining.</li>
+			</ol>
+			<p><strong>SageMaker Projects</strong> package all of this as templates with source repositories and CI/CD already wired up, and MLflow (see <a href="studio-environments.html#s9">managed MLflow</a>) tracks experiments. None of them is required: Pipelines works without a project.</p>
+
+			<h2 id="s2">How a pipeline is built</h2>
+			<p>A pipeline is a directed graph of <strong>steps</strong>, defined in JSON and usually written with the Python SDK, the drag-and-drop designer in Studio (since August 2024) or the API. Order comes from <strong>data dependencies</strong>: when one step's input is another step's output property, the second waits for the first. <code>depends_on</code> adds an explicit order.</p>
+			<ul>
+				<li><strong>Job steps:</strong> Processing, Training, Tuning, AutoML (ensembling mode only), Transform, EMR and EMR Serverless, Notebook Job, and in the designer Execute code (runs as a training job) and Fine-tune model (a JumpStart model).</li>
+				<li><strong>Model steps:</strong> <code>ModelStep</code> creates or registers a model (the older <code>CreateModelStep</code> and <code>RegisterModel</code> still work but are no longer supported); the designer has a Deploy model step, and SDK V3 added endpoint configuration, endpoint and inference component steps in September 2026.</li>
+				<li><strong>Control steps:</strong> Condition (if and else branches), Fail (stops the run with a message), Callback (sends an SQS message and waits for <code>SendPipelineExecutionStepSuccess</code> or <code>Failure</code>), Lambda (up to 10 minutes, same Region), and in SDK V3 ForEach and Cleanup (October 2026).</li>
+				<li><strong>Check steps:</strong> ClarifyCheck (bias and explainability) and QualityCheck (data and model quality) compare against baselines; both depend on Clarify and Model Monitor, which have been closed to new customers since 30 July 2026, so new users run the checks in a Processing step.</li>
+				<li><strong><code>@step</code></strong> turns a plain Python function into a step that runs as a training job; it doesn't support caching or property files.</li>
+				<li><strong>Parameters</strong> (<code>ParameterString</code>, <code>ParameterInteger</code>, <code>ParameterFloat</code>, <code>ParameterBoolean</code>; up to 200) are set per run. <strong>Properties</strong> mirror the step's Describe response, such as <code>step_train.properties.ModelArtifacts.S3ModelArtifacts</code>. <strong><code>JsonGet</code></strong> with a <strong><code>PropertyFile</code></strong> reads a value from a JSON file a Processing step wrote, such as an evaluation metric for a condition. <strong>Execution variables</strong> such as <code>PIPELINE_EXECUTION_ID</code> resolve at run time.</li>
+			</ul>
+			<div class="callout trap"><p>Don't put secrets in parameters or step environment variables: <code>DescribePipeline</code> returns them in the definition. Pass a Secrets Manager name and read it in the code instead.</p></div>
+
+			<h2 id="s3">A pipeline in SDK V3</h2>
+			<p>In SDK V3 the primitives (parameters, properties, conditions, functions) are in <code>sagemaker.core.workflow</code> and the pipeline and steps in <code>sagemaker.mlops.workflow</code>. Steps get their arguments by calling the job's normal method (<code>run()</code>, <code>train()</code>, <code>register()</code>) under a <code>PipelineSession</code>, which records the request instead of starting a job.</p>
+			<span class="file">Prepare, train, evaluate, and register only if the error is low enough (Python, SageMaker Python SDK V3)</span>
+<pre><code>from sagemaker.core import image_uris
+from sagemaker.core.helper.session_helper import Session, get_execution_role
+from sagemaker.core.processing import ScriptProcessor
+from sagemaker.core.shapes import ProcessingInput, ProcessingOutput, ProcessingS3Input, ProcessingS3Output
+from sagemaker.core.training.configs import Compute, InputData
+from sagemaker.core.workflow.conditions import ConditionLessThanOrEqualTo
+from sagemaker.core.workflow.functions import JsonGet
+from sagemaker.core.workflow.parameters import ParameterFloat, ParameterString
+from sagemaker.core.workflow.pipeline_context import PipelineSession
+from sagemaker.core.workflow.properties import PropertyFile
+from sagemaker.mlops.workflow.condition_step import ConditionStep
+from sagemaker.mlops.workflow.fail_step import FailStep
+from sagemaker.mlops.workflow.model_step import ModelStep
+from sagemaker.mlops.workflow.pipeline import Pipeline
+from sagemaker.mlops.workflow.steps import CacheConfig, ProcessingStep, TrainingStep
+from sagemaker.serve import ModelBuilder
+from sagemaker.train import ModelTrainer
+
+ps = PipelineSession()
+role = get_execution_role()
+region = Session().boto_region_name
+bucket = "ml-111111111111"
+
+input_uri = ParameterString(name="InputDataUrl", default_value=f"s3://{bucket}/raw/churn.csv")
+mse_max = ParameterFloat(name="MseThreshold", default_value=6.0)
+<span class="c"># Off by default; reuse a successful run with the same inputs for 30 days</span>
+cache = CacheConfig(enable_caching=True, expire_after="P30D")
+
+
+def s3_in(name, uri):
+    return ProcessingInput(input_name=name, s3_input=ProcessingS3Input(
+        s3_uri=uri, local_path=f"/opt/ml/processing/{name}", s3_data_type="S3Prefix", s3_input_mode="File"))
+
+
+def s3_out(name):
+    return ProcessingOutput(output_name=name, s3_output=ProcessingS3Output(
+        s3_uri=f"s3://{bucket}/churn/{name}", local_path=f"/opt/ml/processing/{name}", s3_upload_mode="EndOfJob"))
+
+
+sk_image = image_uris.retrieve(framework="sklearn", region=region, version="1.2-1",
+                               py_version="py3", instance_type="ml.m5.xlarge")
+proc = ScriptProcessor(image_uri=sk_image, instance_type="ml.m5.xlarge", instance_count=1,
+                       role=role, sagemaker_session=ps)
+
+step_prep = ProcessingStep(name="Prep", cache_config=cache, step_args=proc.run(
+    code="code/preprocess.py", inputs=[s3_in("raw", input_uri)],
+    outputs=[s3_out("train"), s3_out("validation"), s3_out("test")]))
+
+xgb_image = image_uris.retrieve(framework="xgboost", region=region, version="1.7-1")
+trainer = ModelTrainer(training_image=xgb_image, role=role, sagemaker_session=ps,
+                       compute=Compute(instance_type="ml.m5.xlarge", instance_count=1),
+                       hyperparameters={"objective": "reg:squarederror", "num_round": 50})
+prep_out = step_prep.properties.ProcessingOutputConfig.Outputs
+<span class="c"># V3 TrainingStep has no estimator argument: step_args must come from train()</span>
+step_train = TrainingStep(name="Train", cache_config=cache, step_args=trainer.train(input_data_config=[
+    InputData(channel_name="train", data_source=prep_out["train"].S3Output.S3Uri),
+    InputData(channel_name="validation", data_source=prep_out["validation"].S3Output.S3Uri),
+]))
+
+model_uri = step_train.properties.ModelArtifacts.S3ModelArtifacts
+report = PropertyFile(name="EvalReport", output_name="evaluation", path="evaluation.json")
+step_eval = ProcessingStep(name="Evaluate", property_files=[report], step_args=proc.run(
+    code="code/evaluate.py",
+    inputs=[s3_in("model", model_uri), s3_in("test", prep_out["test"].S3Output.S3Uri)],
+    outputs=[s3_out("evaluation")]))
+
+mb = ModelBuilder(s3_model_data_url=model_uri, image_uri=xgb_image, role_arn=role, sagemaker_session=ps)
+step_register = ModelStep(name="Register", step_args=mb.register(
+    model_package_group_name="churn-models", content_types=["text/csv"], response_types=["text/csv"],
+    inference_instances=["ml.m5.xlarge"], approval_status="PendingManualApproval"))
+
+<span class="c"># Every condition in the list must be true; there's no nesting</span>
+step_check = ConditionStep(
+    name="CheckMse",
+    conditions=[ConditionLessThanOrEqualTo(
+        left=JsonGet(step_name=step_eval.name, property_file=report, json_path="regression_metrics.mse.value"),
+        right=mse_max)],
+    if_steps=[step_register],
+    else_steps=[FailStep(name="MseTooHigh", error_message="MSE above threshold")],
+)
+
+pipeline = Pipeline(name="churn-train", parameters=[input_uri, mse_max],
+                    steps=[step_prep, step_train, step_eval, step_check], sagemaker_session=ps)
+pipeline.upsert(role_arn=role)  <span class="c"># create, or update if it exists</span>
+execution = pipeline.start(parameters={"MseThreshold": 5.5})
+execution.wait()</code></pre>
+			<p>The evaluation script writes <code>evaluation.json</code> such as <code>{"regression_metrics": {"mse": {"value": 4.2}}}</code>. In SDK V2 the same classes live in <code>sagemaker.workflow.*</code>, training uses an <code>Estimator</code> (<code>TrainingStep(step_args=estimator.fit(...))</code>), and registration is <code>ModelStep(step_args=model.register(...))</code>; AWS's documentation pages still mix the two, so check the import paths when copying.</p>
+
+			<h2 id="s4">Running pipelines</h2>
+			<ul>
+				<li><strong>Executions</strong> are <code>Executing</code>, <code>Stopping</code>, <code>Stopped</code>, <code>Failed</code>, <code>Succeeded</code> or <code>CompletedWithFailures</code> (with SDK V3 run conditions, when steps that run after a failure finish). Every update creates a <strong>pipeline version</strong>, and a run can name a <code>PipelineVersionId</code>.</li>
+				<li><strong>Caching</strong> works for Processing, Training, Tuning, AutoML, Transform, check and EMR steps, within one pipeline, reusing the latest successful run with identical arguments until <code>expire_after</code> (an ISO 8601 duration).</li>
+				<li><strong>Retries:</strong> service faults and throttling are retried automatically; add <code>SageMakerJobStepRetryPolicy</code> for <code>CAPACITY_ERROR</code>, <code>RESOURCE_LIMIT</code> or <code>INTERNAL_ERROR</code> with either <code>max_attempts</code> (up to 20) or <code>expire_after_mins</code> (up to 14,400), not both. <code>RetryPipelineExecution</code> restarts a failed run from the failed steps.</li>
+				<li><strong>Selective execution</strong> reruns chosen steps and takes the other steps' outputs from an earlier run, handy while debugging one step.</li>
+				<li><strong>Parallelism:</strong> ready steps run in parallel unless <code>ParallelismConfiguration.MaxParallelExecutionSteps</code> limits them, per execution.</li>
+				<li><strong>Scheduling and triggers:</strong> a pipeline can be an EventBridge rule target (for example on new data in S3), or scheduled with <code>pipeline.put_triggers(triggers=[PipelineSchedule(name=..., cron=...)], role_arn=...)</code> through EventBridge Scheduler. Deleting a pipeline doesn't delete its schedules.</li>
+				<li><strong>Local mode</strong> (<code>LocalPipelineSession</code>) runs Training, Processing, Transform, Model, Condition and Fail steps in Docker on your machine, one at a time, for quick tests.</li>
+				<li><strong>Sharing:</strong> AWS RAM can share a pipeline read-only, or with permission to start, stop and retry runs, which then run in the owner's account.</li>
+			</ul>
+			<div class="callout trap"><p>A run that ends in a <strong>Fail step can't be retried</strong>, and nothing can depend on a Fail step. Callback and Lambda steps also block stopping: the run waits for the callback answer or the Lambda function to finish (or time out, by default after 120 seconds while the function keeps running).</p></div>
+
+			<h2 id="s5">Model Registry</h2>
+			<p>A <strong>model package group</strong> holds the versions of one model (1, 2, 3...); each <strong>model package</strong> records the inference image and artifacts, supported content types and instance types, metrics reports (quality, bias, explainability), drift baselines, custom metadata (up to 50 entries), an optional model card and lineage. Groups can be organized into nested <strong>collections</strong>.</p>
+			<ul>
+				<li><strong><code>ModelApprovalStatus</code>:</strong> <code>PendingManualApproval</code>, <code>Approved</code> or <code>Rejected</code>, changed with <code>UpdateModelPackage</code> (with an <code>ApprovalDescription</code>). Only <code>Approved</code> versions deploy from Studio and the project templates.</li>
+				<li><strong>Lifecycle stages</strong> (November 2024): <code>ModelLifeCycle</code> with a <code>Stage</code> (such as Development, QA, PreProduction, Production, Archived) and a <code>StageStatus</code> (such as PendingApproval, Approved, Rejected, Retired). Stage changes are searchable and emit events, and IAM condition keys can limit who moves a model into a stage. A stage doesn't replace the approval status.</li>
+				<li><strong>Rollback:</strong> with the project templates, changing an approved version to <code>Rejected</code> redeploys the latest remaining approved version.</li>
+				<li><strong>MLflow:</strong> models registered in managed MLflow can be registered automatically in the Model Registry as well.</li>
+				<li><strong>Deploy a version</strong> by naming it in the model: <code>create_model(Containers=[{"ModelPackageName": ARN}])</code>, or <code>ModelBuilder(model=ARN, ...)</code> in SDK V3; the image and artifacts come from the package.</li>
+				<li><strong>Tags</strong> come from the group: <code>CreateModelPackage</code> with a group name can't take its own tags.</li>
+			</ul>
+
+			<h2 id="s6">Deploying on approval</h2>
+			<p>Every change to a model package emits a <strong>"SageMaker Model Package State Change"</strong> event. An EventBridge rule that matches approved versions of one group can start a CodePipeline deployment pipeline or a Lambda function.</p>
+			<span class="file">EventBridge rule pattern: approved versions of churn-models (JSON)</span>
+<pre><code>{
+  "source": ["aws.sagemaker"],
+  "detail-type": ["SageMaker Model Package State Change"],
+  "detail": {
+    "ModelPackageGroupName": ["churn-models"],
+    "ModelApprovalStatus": ["Approved"]
+  }
+}</code></pre>
+			<span class="file">deploy_approved.py: create or update the endpoint for the approved version (Python, AWS Lambda)</span>
+<pre><code>import time
+
+import boto3
+from botocore.exceptions import ClientError
+
+sm = boto3.client("sagemaker")
+ROLE = "arn:aws:iam::111111111111:role/SageMakerDeployRole"
+ENDPOINT = "churn-prod"
+
+
+def handler(event, context):
+    arn = event["detail"]["ModelPackageArn"]
+    <span class="c"># Events can repeat and fire for any field change, so check the current state</span>
+    pkg = sm.describe_model_package(ModelPackageName=arn)
+    if pkg["ModelApprovalStatus"] != "Approved":
+        return {"skipped": arn}
+
+    model = f"churn-v{pkg['ModelPackageVersion']}-{int(time.time())}"
+    sm.create_model(ModelName=model, ExecutionRoleArn=ROLE, Containers=[{"ModelPackageName": arn}])
+    sm.create_endpoint_config(EndpointConfigName=model, ProductionVariants=[{
+        "VariantName": "AllTraffic", "ModelName": model,
+        "InstanceType": "ml.m5.xlarge", "InitialInstanceCount": 2,
+    }])
+    try:
+        sm.describe_endpoint(EndpointName=ENDPOINT)
+    except ClientError:
+        sm.create_endpoint(EndpointName=ENDPOINT, EndpointConfigName=model)
+        return {"created": arn}
+    <span class="c"># Add a DeploymentConfig here for canary rollout and alarm rollback</span>
+    sm.update_endpoint(EndpointName=ENDPOINT, EndpointConfigName=model)
+    return {"updated": arn}</code></pre>
+			<p>AWS's deployment template does the same with CloudFormation: a build stage generates stack parameters for the approved version, deploys to staging, waits for a <strong>manual approval</strong> in CodePipeline, then deploys to production. Pipeline runs also emit "SageMaker Model Building Pipeline Execution Status Change" and step status events for notifications.</p>
+
+			<h2 id="s7">Across accounts</h2>
+			<p>A common layout keeps a central registry in a shared account, trains in a development account and deploys from staging and production accounts. Share a group with a resource policy (<code>PutModelPackageGroupPolicy</code>) or through AWS RAM (since June 2024; custom RAM permissions must be promoted before the group is visible).</p>
+			<span class="file">Model package group policy: let account 222222222222 read and deploy versions (JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadGroup",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
+      "Action": "sagemaker:DescribeModelPackageGroup",
+      "Resource": "arn:aws:sagemaker:us-east-1:111111111111:model-package-group/churn-models"
+    },
+    {
+      "Sid": "UseVersions",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
+      "Action": [
+        "sagemaker:DescribeModelPackage",
+        "sagemaker:ListModelPackages",
+        "sagemaker:UpdateModelPackage",
+        "sagemaker:CreateModel"
+      ],
+      "Resource": "arn:aws:sagemaker:us-east-1:111111111111:model-package/churn-models/*"
+    }
+  ]
+}</code></pre>
+			<div class="callout trap"><p>The group policy alone isn't enough to deploy in another account: the <strong>ECR repository policy</strong>, the <strong>S3 bucket policy</strong> for the artifacts and a <strong>KMS key grant</strong> must also allow that account, and AWS requires the training output to be encrypted with a customer managed KMS key for cross-account deployment. To register from another account, allow <code>sagemaker:CreateModelPackage</code> on <code>model-package/churn-models/*</code> and call it with the group's ARN.</p></div>
+
+			<h2 id="s8">Projects</h2>
+			<p>A <strong>project</strong> provisions an MLOps setup from a template and tags every resource with the project name and ID. AWS's templates connect to GitHub or Bitbucket through an AWS CodeStar connection (tagged <code>sagemaker=true</code>) and use CodePipeline and CodeBuild, or Jenkins:</p>
+			<ul>
+				<li><strong>Model building and training:</strong> a pipeline in the repository; each commit upserts and runs it.</li>
+				<li><strong>Model deployment:</strong> deploys approved versions to staging, then, after a manual approval, to production.</li>
+				<li><strong>Both together</strong>, with Model Monitor, or with a container image build.</li>
+				<li><strong>Your own templates:</strong> CloudFormation templates in S3 (since October 2025, now AWS's recommendation) or AWS Service Catalog products, shown in Studio when tagged <code>sagemaker:studio-visibility=true</code>.</li>
+			</ul>
+			<div class="callout retired"><p><strong>The CodeCommit-based project templates were removed</strong> (unsupported from 9 September 2024, removed by 28 October 2024) and didn't return when CodeCommit itself came back to general availability in November 2025. Some documentation pages still describe CodeCommit repositories in templates. MLA-C02 still names CodeCommit among the CI/CD services to know.</p></div>
+			<p>Projects need the <code>AmazonSageMakerServiceCatalogProducts*</code> service roles that Studio creates when project templates are turned on for the domain (don't create them by hand), and each user's execution role must be added to the "Amazon SageMaker Solutions and ML Ops products" portfolio. SageMaker Unified Studio projects are a different, DataZone-based construct.</p>
+
+			<h2 id="s9">Lineage, experiments and notebook jobs</h2>
+			<ul>
+				<li><strong>ML Lineage Tracking</strong> records <em>artifacts</em> (datasets, images, models), <em>actions</em> (steps, deployments), <em>contexts</em> (endpoints, model groups) and their <em>associations</em>. Jobs, model packages and endpoints create entities automatically; <code>QueryLineage</code> walks up or down the graph (up to 10 hops), for example from an endpoint back to its training data. S3 artifacts are identified by URI, not content, so overwrite-in-place breaks the trail.</li>
+				<li><strong>Experiments:</strong> the classic SageMaker Experiments SDK works only in Studio Classic; AWS recommends MLflow. Pipelines create an experiment per pipeline and a run group per execution, and can log to an MLflow experiment.</li>
+				<li><strong>Notebook jobs</strong> run a notebook on a schedule (as a training job) from Studio or JupyterLab, or as a <code>NotebookJobStep</code> in a pipeline.</li>
+			</ul>
+
+			<h2 id="s10">Other orchestrators</h2>
+			<ul>
+				<li><strong>AWS Step Functions</strong> has optimized SageMaker integrations for training, processing, tuning, transform, model, endpoint configuration and endpoint calls (with <code>.sync</code> to wait for jobs). It suits workflows that mix ML with many other AWS services; it has no task-token callback for SageMaker jobs.</li>
+				<li><strong>Apache Airflow</strong> (including Amazon MWAA) can drive SageMaker through its SageMaker integrations, for teams that already schedule data pipelines there.</li>
+				<li><strong>Kubernetes:</strong> SageMaker operators and Kubeflow Pipelines components run SageMaker jobs from a cluster.</li>
+				<li><strong>AWS Batch</strong> can queue training jobs with quotas and preemption between teams (2025 and 2026).</li>
+			</ul>
+			<p>AWS lists Pipelines' advantages as serverless scaling, the visual editor, deep SageMaker integration, lineage and versioning; exam questions about "automating an ML workflow with SageMaker components and lineage" point to Pipelines.</p>
+
+			<h2 id="s11">Security, quotas and pricing</h2>
+			<ul>
+				<li><strong>Roles:</strong> the pipeline's execution role runs each step unless the step's job names its own role (then the pipeline role needs <code>iam:PassRole</code> on it). The role needs create and describe permissions for each job type, and <code>s3:GetObject</code> for <code>JsonGet</code>. Callers need <code>iam:PassRole</code> on the pipeline role.</li>
+				<li><strong>Job names:</strong> by default <code>pipelines-EXECUTIONID-STEP-...</code>; turn on custom prefixes (<code>PipelineDefinitionConfig(use_custom_job_prefix=True)</code>) to write IAM policies on job name patterns.</li>
+				<li><strong>Network and encryption</strong> are set on each job (VPC, network isolation, KMS keys), and the usual condition keys (<code>sagemaker:VpcSubnets</code>, <code>sagemaker:NetworkIsolation</code>, <code>sagemaker:VolumeKmsKey</code>, <code>sagemaker:OutputKmsKey</code>) apply. <code>sagemaker:ModelApprovalStatus</code> on <code>UpdateModelPackage</code> limits who can approve.</li>
+				<li><strong>Quotas:</strong> 500 pipelines per account and 20 concurrent executions (both adjustable), <strong>50 steps per pipeline</strong> and 200 parameters (not adjustable), a 1 MB definition inline (larger from S3), 250 model package groups and 10,000 model packages, 500 projects.</li>
+				<li><strong>Pricing:</strong> AWS says you pay only for Studio and the jobs and storage the pipeline uses; the Model Registry, Projects and lineage have no line on the pricing page, but Projects create CodePipeline, CodeBuild and other billable resources.</li>
+			</ul>
+
+			<h2 id="s12">What's changed</h2>
+			<ul>
+				<li><strong>2026:</strong> EMR Serverless step in SDK V3 (January); Clarify and Model Monitor, behind the check steps, closed to new customers (30 July); fine-tuning trainers in pipelines (September); endpoint, inference component and lineage steps (24 September); MLA-C02 replaced MLA-C01 (29 September); JobStep (October); run conditions on dependencies (19 October); ForEach and Cleanup steps (21 October); AthenaStep (29 October).</li>
+				<li><strong>2025:</strong> Studio to Unified Studio upgrade (June); MLflow 3.0 (July); pipeline versioning (August); Projects templates from S3 (3 October); SDK V3 with <code>sagemaker.mlops.workflow</code> (November); MLflow Apps with automatic registration in the Model Registry (November); CodeCommit back to general availability (November).</li>
+				<li><strong>2024:</strong> Projects in the new Studio (April); model cards in the Model Registry (June); cross-account sharing of model groups through RAM (June); Pipelines visual designer (15 August); CodeCommit project templates retired (September and October); Model Registry lifecycle stages and lineage view (8 November).</li>
+			</ul>
+			<p>Covered from the exam angle in <a href="../../aws-mla/d3-task-3-3.html">MLA-C01 Task 3.3: CI/CD with automated orchestration tools</a> and the <a href="../../aws-mla/services-sagemaker-mlops.html">MLA-C01 notes on SageMaker MLOps</a> (MLA-C02 Task 3.3 adds rollback, retraining, Model Registry or MLflow versioning and fine-tuned model deployment), <a href="../../aws-aip/d1-task-1-2.html#s4">AIP-C01 Task 1.2: the customized model lifecycle</a> (Model Registry versioning and rollback), <a href="../../aws-aip/d3-task-3-3.html">AIP-C01 Task 3.3: AI governance</a> (lineage), and <a href="../../aws-aif/d1-task-1-3.html">AIF-C01 Task 1.3: the ML development lifecycle and MLOps</a>.</p>
+
+			<nav class="pager" aria-label="Page navigation">
+				<a href="async-batch-optimization.html"><small>Previous</small>Async, batch and inference optimization</a>
+				<span class="next"><small>Next</small>Monitoring and governance (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal notes on SageMaker Pipelines, the Model Registry, Projects and MLOps on SageMaker AI, checked against the AWS documentation on 10 November 2026.</div>
+</footer>
+
+</body>
+</html>
