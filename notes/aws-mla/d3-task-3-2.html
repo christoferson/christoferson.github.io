@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.2: Provision and Configure Resources for ML and AI | AWS MLA-C02 Notes</title>
+	<meta name="description" content="MLA-C02 Task 3.2 study guide: on-demand versus committed capacity for SageMaker AI, Lambda and Bedrock, infrastructure as code with CloudFormation and CDK and cross-stack references, building and maintaining ML containers in ECR, SageMaker AI endpoints in a VPC with interface endpoints and condition keys, deploying with boto3 and the AWS CLI, autoscaling metrics and policies, creating Bedrock knowledge bases, retrieval pipelines and multi-tenant filters, agent state with AgentCore Memory and session managers, GPU scaling, and AgentCore infrastructure.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="mla.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">MLA-C02</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Deployment and Orchestration of ML and AI Workflows &middot; 24%</span>
+		<h1>Task 3.2: Provision and configure resources for ML and AI workloads based on existing architecture and requirements</h1>
+		<p>Setting up the resources that models and agents run on, in code: paying on demand or committing to capacity, wiring infrastructure stacks together, building container images, placing endpoints in a private network, deploying from scripts, choosing what autoscaling watches, creating knowledge bases and retrieval pipelines, keeping agent state, scaling GPUs, and standing up agent infrastructure.</p>
+		<div class="tags"><span class="tag code">MLA-C02</span><span class="tag">CloudFormation</span><span class="tag">ECR</span><span class="tag">VPC</span><span class="tag">Auto scaling</span><span class="tag">AgentCore Memory</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">On-demand or provisioned</a></li>
+				<li><a href="#s2">Automating provisioning</a></li>
+				<li><a href="#s3">Containers</a></li>
+				<li><a href="#s4">Endpoints in a VPC</a></li>
+				<li><a href="#s5">Deploying programmatically</a></li>
+				<li><a href="#s6">Auto scaling metrics</a></li>
+				<li><a href="#s7">Knowledge bases</a></li>
+				<li><a href="#s8">Retrieval pipelines</a></li>
+				<li><a href="#s9">Agent state</a></li>
+				<li><a href="#s10">Scaling GPU workloads</a></li>
+				<li><a href="#s11">Agentic workflow infrastructure</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.2</span>
+				<p><strong>Provision and configure resources for ML and AI workloads based on existing architecture and requirements.</strong></p>
+			</div>
+			<p>This task is new in MLA-C02. Its questions start from an existing setup ("the company's VPC has no internet access", "the network team owns the VPC stack", "traffic triples every Monday") and ask for the configuration that fits: the capacity model, the cross-stack reference, the VPC endpoints, the scaling metric, the knowledge base storage, where agent conversations are kept. <a href="d3-task-3-1.html">Task 3.1</a> chose the hosting options; this task configures them.</p>
+			<p><strong>Running example.</strong> The online retailer (account 111111111111) has a shared network stack with private subnets and no internet route, runs the churn endpoint and a GPU endpoint for its open-weight model, and is adding a help-centre knowledge base and a support agent that remembers customers between conversations.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> ECR's old Clair-based basic image scanning was replaced by AWS-native basic scanning on 2 February 2026 (OS packages only; language packages need enhanced scanning with Amazon Inspector). The SageMaker inference toolkit GitHub repository was archived in November 2025. Enhanced endpoint metrics (per instance and per GPU, published as often as every 10 seconds) arrived in April 2026, and automatic container image caching in June 2026. The CDK constructs for SageMaker and Bedrock are still experimental (alpha), while the AgentCore constructs (apart from Policy) are stable in <code>aws-cdk-lib</code>.</p></div>
+
+			<!-- Skill 3.2.1 -->
+			<h2 id="s1">On-demand or provisioned</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.1</span><span class="skill-text">Optimize resource provisioning between on-demand and provisioned resources for performance and cost efficiency.</span></p>
+				<ul>
+					<li><strong>SageMaker AI endpoints</strong> bill per instance-hour on demand. A <strong>SageMaker Savings Plan</strong> (a one- or three-year dollars-per-hour commitment, up to 64% off, any instance family, size or Region) lowers the price but <strong>doesn't guarantee capacity</strong>. To guarantee scarce GPUs for an endpoint, reserve them with a <strong>training plan for inference</strong> and point the endpoint at it (<code>CapacityReservationConfig</code>); instance pools fall back to other instance types without a commitment.</li>
+					<li><strong>Serverless inference</strong> pays only per request; <strong>provisioned concurrency</strong> removes cold starts but bills while idle, so use it only where cold-start latency matters.</li>
+					<li><strong>Lambda</strong>: reserved concurrency caps a function at no charge; provisioned concurrency keeps instances initialized (billed), must target a version or alias rather than <code>$LATEST</code>, and can be autoscaled on <code>LambdaProvisionedConcurrencyUtilization</code> (a target of 0.7 is common).</li>
+					<li><strong>Bedrock</strong>: on-demand per token by default; Flex for cheaper, delay-tolerant work, Priority for speed, the Reserved tier for committed tokens per minute, and <strong>Provisioned Throughput</strong> (hourly model units, no overflow) for steady high volume or custom models that need it.</li>
+				</ul>
+				<span class="file">Point an endpoint variant at reserved GPU capacity (JSON, part of CreateEndpointConfig)</span>
+<pre><code>{
+  "VariantName": "AllTraffic",
+  "ModelName": "product-copy-lmi",
+  "InstanceType": "ml.p5.48xlarge",
+  "InitialInstanceCount": 2,
+  "CapacityReservationConfig": {
+    "CapacityReservationPreference": "capacity-reservations-only",
+    "MlReservationArn": "arn:aws:sagemaker:us-east-1:111111111111:training-plan/genai-launch-plan"
+  }
+}</code></pre>
+				<div class="callout tip"><p>Steady, predictable usage means a commitment (Savings Plans, Provisioned Throughput, Reserved tier); spiky or unknown usage means on demand with autoscaling, serverless or Bedrock on-demand. When the reservation ends, invocations fail, and deleting the endpoint doesn't cancel the plan.</p></div>
+			</div>
+
+			<!-- Skill 3.2.2 -->
+			<h2 id="s2">Automating provisioning</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.2</span><span class="skill-text">Automate compute resource provisioning with integrated communication between stacks and orchestration services.</span></p>
+				<p>Infrastructure as code: AWS CloudFormation (or the AWS CDK, which generates it) has resource types for <code>AWS::SageMaker::Model</code>, <code>EndpointConfig</code>, <code>Endpoint</code>, <code>InferenceComponent</code> and <code>Pipeline</code>, <code>AWS::Bedrock::KnowledgeBase</code>, <code>DataSource</code> and <code>Guardrail</code>, and <code>AWS::BedrockAgentCore::Runtime</code>, <code>Gateway</code> and <code>Memory</code>. There is no training job resource; run training from a pipeline.</p>
+				<p>Ways for stacks to share values (VPC subnets, bucket names, role ARNs, the current model location):</p>
+				<ul>
+					<li><strong>Export and <code>Fn::ImportValue</code>:</strong> a strong link within one account and Region. Once imported, the exporting stack can't delete or change the value, which can block updates.</li>
+					<li><strong>SSM Parameter Store with <code>{{resolve:ssm:name}}</code></strong>: one stack (or a pipeline) writes a parameter, another reads it at deploy time; looser coupling, no export lock. Values are read only on stack create or update.</li>
+					<li><strong><code>Fn::GetStackOutput</code></strong>: reads another stack's output without an export, across accounts and Regions, as a weak reference. In CDK, references between stacks in one app become exports automatically unless you choose weak references.</li>
+					<li><strong>Nested stacks</strong> to keep sharing inside one stack group.</li>
+				</ul>
+				<span class="file">The serving stack reads the network stack's exports and the latest model from SSM (YAML, CloudFormation)</span>
+<pre><code>Resources:
+  ChurnModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !ImportValue retail-ml-roles-SageMakerHostingRoleArn
+      PrimaryContainer:
+        Image: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:3.2-0
+        <span class="c"># The training pipeline writes the approved model location here</span>
+        ModelDataUrl: '{{resolve:ssm:/retail/churn/approved-model-uri}}'
+      VpcConfig:
+        Subnets:
+          - !ImportValue retail-network-PrivateSubnetA
+          - !ImportValue retail-network-PrivateSubnetB
+        SecurityGroupIds:
+          - !ImportValue retail-network-ModelSecurityGroup
+  ChurnEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt ChurnModel.ModelName  <span class="c"># Ref would return the ARN</span>
+          InstanceType: ml.m5.xlarge
+          InitialInstanceCount: 2</code></pre>
+				<ul>
+					<li><strong>Update behaviour:</strong> almost every <code>Model</code> and <code>EndpointConfig</code> property forces a replacement, while changing an <code>Endpoint</code>'s <code>EndpointConfigName</code> updates it in place with no interruption.</li>
+					<li><strong>Orchestration hooks:</strong> EventBridge events such as "SageMaker Model Package State Change" (approval) can start a pipeline or a deployment; Step Functions can create models, configs and endpoints (endpoint creation has no <code>.sync</code>, so poll <code>DescribeEndpoint</code>), and calls <code>StartPipelineExecution</code> through its AWS SDK integration.</li>
+				</ul>
+				<div class="callout trap"><p><code>Ref</code> on <code>AWS::SageMaker::Model</code>, <code>EndpointConfig</code>, <code>Endpoint</code> and <code>InferenceComponent</code> returns the <strong>ARN</strong>; use <code>!GetAtt X.ModelName</code> (or <code>EndpointName</code>) where a name is expected. Endpoint state change events report <code>IN_SERVICE</code>, while the API returns <code>InService</code>.</p></div>
+			</div>
+
+			<!-- Skill 3.2.3 -->
+			<h2 id="s3">Containers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.3</span><span class="skill-text">Build and maintain containers for ML and AI workloads.</span></p>
+				<ul>
+					<li><strong>Start from AWS images</strong> (Deep Learning Containers, LMI, vLLM, framework containers) and extend them with a Dockerfile <code>FROM</code> the AWS image; build your own only when no image fits (the inference contract is in <a href="d3-task-3-1.html#s5">Task 3.1</a>). Rebuild regularly: AWS images get security patches only for a limited time, and Amazon Linux 2023 based images are the ones AWS can keep patched.</li>
+					<li><strong>Build</strong> in AWS CodeBuild (<code>privilegedMode: true</code> for Docker builds; ARM build images for Graviton), or in SageMaker Studio after a domain admin enables Docker access.</li>
+					<li><strong>Store in Amazon ECR:</strong> turn on <strong>tag immutability</strong> so a tag always means the same image, and reference production images by <strong>digest</strong> (<code>@sha256:...</code>); AWS warns that <code>:latest</code> can pull a newer image than intended. Add <strong>lifecycle policies</strong> to expire or archive old and untagged images.</li>
+					<li><strong>Scan:</strong> basic scanning checks OS packages on push; <strong>enhanced scanning</strong> (Amazon Inspector) also checks Python and other language packages and re-scans continuously as new vulnerabilities are published.</li>
+					<li><strong>Access:</strong> the SageMaker execution role needs <code>ecr:GetAuthorizationToken</code> and the image pull actions; images in another account also need a repository policy granting <code>ecr:BatchGetImage</code> and <code>ecr:GetDownloadUrlForLayer</code>. Images can also come from a private Docker registry inside your VPC (<code>RepositoryAccessMode</code> <code>Vpc</code>).</li>
+				</ul>
+				<span class="file">An immutable, scanned repository and an extended LMI image (Bash, AWS CLI and Docker)</span>
+<pre><code>aws ecr create-repository --repository-name retail/product-copy-lmi \
+    --image-tag-mutability IMMUTABLE
+aws ecr put-registry-scanning-configuration --scan-type ENHANCED \
+    --rules '[{"repositoryFilters":[{"filter":"retail/*","filterType":"WILDCARD"}],"scanFrequency":"CONTINUOUS_SCAN"}]'
+
+<span class="c"># Dockerfile: FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/djl-inference:0.38.0-lmi30.0.0-cu130</span>
+<span class="c">#             COPY serving.properties /opt/ml/model/</span>
+docker build -t 111111111111.dkr.ecr.us-east-1.amazonaws.com/retail/product-copy-lmi:2026-11-11 .
+docker push 111111111111.dkr.ecr.us-east-1.amazonaws.com/retail/product-copy-lmi:2026-11-11</code></pre>
+				<div class="callout tip"><p>Image size drives scale-out time. SageMaker now caches images automatically on new instances for accelerator endpoints (AWS measured an LLM endpoint scaling out in 258 seconds instead of 525), but smaller images still start faster.</p></div>
+			</div>
+
+			<!-- Skill 3.2.4 -->
+			<h2 id="s4">Endpoints in a VPC</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.4</span><span class="skill-text">Configure SageMaker AI endpoints within VPC network environments.</span></p>
+				<ul>
+					<li><strong>Model <code>VpcConfig</code></strong> (1 to 5 security groups, 1 to 16 subnets): SageMaker attaches network interfaces in your subnets so the container can reach resources in your VPC, with no internet access. Use subnets in at least two Availability Zones, even for one instance.</li>
+					<li><strong>Without <code>VpcConfig</code></strong>, containers have internet access by default but can't reach your private resources.</li>
+					<li><strong><code>EnableNetworkIsolation</code></strong> blocks all outbound network calls from the container, even to AWS services. SageMaker still downloads the model artifacts and image for it, using the execution role.</li>
+					<li><strong>Reaching AWS services privately:</strong> an <strong>S3 gateway endpoint</strong> for artifacts and data capture, and <strong>interface endpoints</strong> for anything else the code calls; otherwise a NAT gateway.</li>
+					<li><strong>Calling the endpoint privately:</strong> interface endpoints for <code>com.amazonaws.&lt;region&gt;.sagemaker.runtime</code> (invocations) and <code>sagemaker.api</code> (management), and for Bedrock <code>bedrock-runtime</code>, <code>bedrock-agent-runtime</code>, <code>bedrock</code> and <code>bedrock-agent</code>. An endpoint policy can limit which endpoints may be invoked through it.</li>
+				</ul>
+				<span class="file">A churn model that runs only inside the private subnets (Python, boto3)</span>
+<pre><code>import boto3
+
+sm = boto3.client("sagemaker")
+sm.create_model(
+    ModelName="churn-xgb-2026-11",
+    ExecutionRoleArn="arn:aws:iam::111111111111:role/SageMakerHostingRole",
+    PrimaryContainer={
+        "Image": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:3.2-0",
+        "ModelDataUrl": "s3://retail-ml-111111111111/churn/models/2026-11-01/model.tar.gz",
+    },
+    VpcConfig={
+        "Subnets": ["subnet-0a1b2c3d4e5f60001", "subnet-0a1b2c3d4e5f60002"],  <span class="c"># two AZs</span>
+        "SecurityGroupIds": ["sg-0a1b2c3d4e5f60003"],
+    },
+    EnableNetworkIsolation=True,
+)</code></pre>
+				<p>Enforce it with IAM condition keys, so nobody can create a model outside the approved network:</p>
+				<span class="file">Allow CreateModel only with the approved subnets and network isolation (JSON, IAM policy statement)</span>
+<pre><code>{
+  "Effect": "Allow",
+  "Action": "sagemaker:CreateModel",
+  "Resource": "*",
+  "Condition": {
+    "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-0a1b2c3d4e5f60001", "subnet-0a1b2c3d4e5f60002"]},
+    "Null": {"sagemaker:VpcSubnets": "false"},
+    "StringEquals": {"sagemaker:NetworkIsolation": "true"}
+  }
+}</code></pre>
+				<div class="callout trap"><p>Without the <code>Null</code> condition, a request with <strong>no</strong> VPC settings passes the <code>ForAllValues</code> check. A policy that limits callers with <code>aws:SourceVpce</code> also blocks the SageMaker console. Serverless endpoints don't support VPC configuration.</p></div>
+			</div>
+
+			<!-- Skill 3.2.5 -->
+			<h2 id="s5">Deploying programmatically</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.5</span><span class="skill-text">Deploy and host models programmatically (for example, by using the SageMaker AI SDK for Python, AWS CLI, Boto3).</span></p>
+				<p>The same three objects in every tool: a <strong>model</strong> (image, artifacts, role, network), an <strong>endpoint configuration</strong> (variants, instance types and counts, data capture, async or serverless settings) and an <strong>endpoint</strong>. In the SDK, <code>ModelBuilder</code> builds and deploys them in one call; boto3 and the CLI create each explicitly.</p>
+				<span class="file">Create, wait for and later update the churn endpoint (Bash, AWS CLI)</span>
+<pre><code>aws sagemaker create-endpoint-config --endpoint-config-name churn-cfg-2026-11 \
+    --production-variants '[{"VariantName":"AllTraffic","ModelName":"churn-xgb-2026-11","InstanceType":"ml.m5.xlarge","InitialInstanceCount":2}]'
+aws sagemaker create-endpoint --endpoint-name churn-endpoint --endpoint-config-name churn-cfg-2026-11
+<span class="c"># Polls every 30 seconds; gives up after 120 checks (about an hour)</span>
+aws sagemaker wait endpoint-in-service --endpoint-name churn-endpoint
+
+<span class="c"># New model later: a new config, then update in place (new fleet first, no downtime)</span>
+aws sagemaker update-endpoint --endpoint-name churn-endpoint --endpoint-config-name churn-cfg-2026-12</code></pre>
+				<ul>
+					<li><strong>boto3</strong> has the waiters <code>endpoint_in_service</code> and <code>endpoint_deleted</code>; there is none for inference components, so poll <code>describe_inference_component</code>.</li>
+					<li><strong>Every update needs a new endpoint configuration.</strong> Don't delete a configuration an endpoint is using. <code>UpdateEndpointWeightsAndCapacities</code> changes traffic weights and instance counts without a new configuration.</li>
+					<li><strong>Autoscaled endpoints:</strong> an update that changes the instance type (or removes a variant) fails while autoscaling is registered; deregister the scalable target, update, then register again. Changing only the model is allowed.</li>
+					<li><strong>Clean up</strong> in order: endpoint, endpoint configuration, model. Deleting the endpoint stops the charges but leaves the configuration, the model and the S3 artifacts.</li>
+				</ul>
+			</div>
+
+			<!-- Skill 3.2.6 -->
+			<h2 id="s6">Auto scaling metrics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.6</span><span class="skill-text">Select specific metrics for auto scaling implementations.</span></p>
+				<ul>
+					<li><strong><code>SageMakerVariantInvocationsPerInstance</code></strong> (requests per minute per instance) for classic short requests. Load test one instance to find its peak requests per second, then set the target to peak &times; 0.5 (AWS's suggested starting safety factor) &times; 60.</li>
+					<li><strong><code>SageMakerVariantConcurrentRequestsPerModelHighResolution</code></strong> (and the per-copy version for inference components) for generative AI and streaming: it counts requests in flight, including queued ones and streams until the last token, and is published every 10 seconds, so scale-out reacts much faster.</li>
+					<li><strong><code>SageMakerInferenceComponentInvocationsPerCopy</code></strong> for inference components (the scalable dimension is the copy count).</li>
+					<li><strong><code>ApproximateBacklogSizePerInstance</code></strong> for asynchronous endpoints; <strong><code>SageMakerVariantProvisionedConcurrencyUtilization</code></strong> for serverless provisioned concurrency.</li>
+					<li><strong>CPU or GPU utilization</strong> as a custom metric when compute is the bottleneck (<a href="#s10">Skill 3.2.10</a>).</li>
+				</ul>
+				<span class="file">Scale the GPU endpoint on concurrent requests (Python, boto3)</span>
+<pre><code>import boto3
+
+aas = boto3.client("application-autoscaling")
+resource = "endpoint/product-copy-endpoint/variant/AllTraffic"
+
+aas.register_scalable_target(
+    ServiceNamespace="sagemaker",
+    ResourceId=resource,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    MinCapacity=1,
+    MaxCapacity=6,
+)
+aas.put_scaling_policy(
+    PolicyName="concurrency-target",
+    ServiceNamespace="sagemaker",
+    ResourceId=resource,
+    ScalableDimension="sagemaker:variant:DesiredInstanceCount",
+    PolicyType="TargetTrackingScaling",
+    TargetTrackingScalingPolicyConfiguration={
+        "TargetValue": 5.0,  <span class="c"># requests in flight per model copy</span>
+        "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "SageMakerVariantConcurrentRequestsPerModelHighResolution"},
+        "ScaleOutCooldown": 180,
+        "ScaleInCooldown": 600,
+    },
+)</code></pre>
+				<ul>
+					<li><strong>Policy types:</strong> target tracking (AWS's recommendation in most cases), step scaling (needed to scale out from zero), and scheduled actions (CLI or API only) for known peaks such as Monday mornings.</li>
+					<li><strong>Behaviour:</strong> default cooldowns are 300 seconds; target tracking adds capacity quickly and removes it cautiously (only when the metric is well below target). With several policies, any one can scale out but all must agree to scale in.</li>
+					<li><strong>Custom metrics</strong> must change in proportion to capacity: adding instances should lower the value.</li>
+				</ul>
+			</div>
+
+			<!-- Skill 3.2.7 -->
+			<h2 id="s7">Knowledge bases</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.7</span><span class="skill-text">Create and manage Amazon Bedrock knowledge bases with vector database configurations, document indexing, and retrieval optimization.</span></p>
+				<ul>
+					<li><strong>Managed knowledge base:</strong> Bedrock chooses and runs the embedding model, vector storage, hybrid search and reranking; you add connectors and permissions, and it can sync on a schedule.</li>
+					<li><strong>Customer-managed knowledge base:</strong> you choose the embedding model (and its dimensions and data type) and the vector store: OpenSearch Serverless or managed clusters, S3 Vectors, Aurora PostgreSQL (RDS type), Neptune Analytics, MongoDB Atlas, Pinecone or Redis. The embedding model and store <strong>can't be changed after creation</strong>.</li>
+					<li><strong>Data sources</strong> (S3 and connectors) carry the chunking strategy and parser; <code>StartIngestionJob</code> syncs changes incrementally (only added, changed or deleted files), and <code>IngestKnowledgeBaseDocuments</code> adds or updates single documents directly. Metadata files next to documents enable filtering.</li>
+					<li><strong>Retrieval optimization</strong> (number of results, hybrid search, filters, reranking) is covered in <a href="d2-task-2-2.html#s9">Task 2.2</a> and <a href="d3-task-3-1.html#s8">Task 3.1</a>.</li>
+				</ul>
+				<span class="file">A customer-managed knowledge base on S3 Vectors (Python, boto3)</span>
+<pre><code>import boto3
+
+agent = boto3.client("bedrock-agent", region_name="us-east-1")
+kb = agent.create_knowledge_base(
+    name="help-centre",
+    roleArn="arn:aws:iam::111111111111:role/BedrockKbServiceRole",
+    knowledgeBaseConfiguration={
+        "type": "VECTOR",
+        "vectorKnowledgeBaseConfiguration": {
+            "embeddingModelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0",
+            "embeddingModelConfiguration": {"bedrockEmbeddingModelConfiguration": {
+                "dimensions": 1024, "embeddingDataType": "FLOAT32"}},
+        },
+    },
+    storageConfiguration={
+        "type": "S3_VECTORS",
+        <span class="c"># indexArn alone, or vectorBucketArn plus indexName, never both forms</span>
+        "s3VectorsConfiguration": {
+            "indexArn": "arn:aws:s3vectors:us-east-1:111111111111:bucket/help-vectors/index/articles"},
+    },
+)
+print(kb["knowledgeBase"]["knowledgeBaseId"])</code></pre>
+				<p>The vector index dimension must match the embedding model's (1,024 here). More detail in the <a href="../aws-services/bedrock/knowledge-bases-custom.html#s3">customer-managed knowledge base notes</a>.</p>
+			</div>
+
+			<!-- Skill 3.2.8 -->
+			<h2 id="s8">Retrieval pipelines</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.8</span><span class="skill-text">Implement retrieval pipelines to meet business needs.</span></p>
+				<ul>
+					<li><strong>Freshness:</strong> customer-managed knowledge bases don't sync themselves (managed ones can be scheduled since September 2026), and CloudFormation creates a data source without ingesting it. Trigger <code>StartIngestionJob</code> on a schedule (EventBridge Scheduler or Step Functions), or from S3 events through Lambda; ingestion jobs emit no EventBridge events, so poll <code>GetIngestionJob</code> for the result.</li>
+					<li><strong>Multi-tenant isolation:</strong> AWS's suggested pattern is one shared knowledge base with a tenant attribute in each document's metadata and a <strong>mandatory filter on every query</strong>, injected on the server from the authenticated identity, never from the client. Separate knowledge bases per tenant isolate more strongly but multiply resources (a knowledge base allows 5 data sources).</li>
+					<li><strong>Custom pipelines:</strong> Lambda or Step Functions calling Bedrock embeddings and your own store, when you need steps a knowledge base doesn't offer. Step Functions' optimized Bedrock integration covers <code>InvokeModel</code> and customization jobs; streaming and agentic APIs aren't supported there.</li>
+					<li><strong>Cost and latency:</strong> prompt caching for the fixed instructions, and a semantic cache (for example Amazon ElastiCache) for repeated questions.</li>
+				</ul>
+				<span class="file">Re-sync the knowledge base when help articles change (Python, Lambda handler for S3 events)</span>
+<pre><code>import boto3
+
+agent = boto3.client("bedrock-agent")
+
+def handler(event, context):
+    <span class="c"># One ingestion job per knowledge base at a time; a running job raises ConflictException</span>
+    try:
+        job = agent.start_ingestion_job(knowledgeBaseId="KB12345678", dataSourceId="DS12345678")
+        return {"jobId": job["ingestionJob"]["ingestionJobId"]}
+    except agent.exceptions.ConflictException:
+        return {"skipped": "sync already running"}</code></pre>
+			</div>
+
+			<!-- Skill 3.2.9 -->
+			<h2 id="s9">Agent state</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.9</span><span class="skill-text">Implement agent state management systems.</span></p>
+				<ul>
+					<li><strong>Session state is not durable:</strong> each AgentCore Runtime session runs in its own microVM, ended after 15 minutes idle or 8 hours by default; reusing the session ID afterwards gives a new, empty environment. Keep anything that must survive elsewhere.</li>
+					<li><strong>AgentCore Memory, short-term:</strong> events (conversation turns or JSON) stored per <code>actorId</code> (the customer) and <code>sessionId</code> with <code>CreateEvent</code>, read back with <code>ListEvents</code>; they expire after the configured period.</li>
+					<li><strong>AgentCore Memory, long-term:</strong> strategies extract records asynchronously from events: <strong>semantic</strong> (facts), <strong>user preference</strong>, <strong>summary</strong> (per session) and <strong>episodic</strong> (what happened and how it went), stored under namespaces such as <code>/strategy/{memoryStrategyId}/actors/{actorId}/</code> and searched with <code>RetrieveMemoryRecords</code>. Use namespaces, not metadata alone, to separate customers.</li>
+					<li><strong>Framework session managers:</strong> Strands Agents can persist the conversation and agent state to S3 or local files, and has an AgentCore Memory session manager; a custom repository can store sessions in DynamoDB.</li>
+					<li><strong>Workflow state:</strong> Step Functions (Standard workflows) or Lambda durable functions keep the state of long, multi-step processes with retries and waits for approval.</li>
+				</ul>
+				<span class="file">Store a support conversation turn in AgentCore Memory (Python, boto3)</span>
+<pre><code>from datetime import datetime, timezone
+
+import boto3
+
+memory = boto3.client("bedrock-agentcore", region_name="us-east-1")
+memory.create_event(
+    memoryId="support_memory-a1b2c3d4e5",
+    actorId="customer-48213",
+    sessionId="chat-2026-11-11-0915",
+    eventTimestamp=datetime.now(timezone.utc),
+    payload=[
+        {"conversational": {"role": "USER", "content": {"text": "My jacket zip broke, order 12345."}}},
+        {"conversational": {"role": "ASSISTANT", "content": {"text": "Sorry about that. I've started a repair claim."}}},
+    ],
+)
+<span class="c"># Next visit: retrieve_memory_records() in this customer's namespace recalls the claim</span></code></pre>
+				<div class="callout trap"><p>Long-term records are extracted only from events stored after a strategy is active (no backfill), and extraction is asynchronous, so a fact said a moment ago may not be retrievable yet; keep the recent turns from short-term memory in the prompt. Strands session managers have no locking, so two sessions must not write the same session ID at once.</p></div>
+			</div>
+
+			<!-- Skill 3.2.10 -->
+			<h2 id="s10">Scaling GPU workloads</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.10</span><span class="skill-text">Implement AI-specific resource scaling for GPU workloads.</span></p>
+				<ul>
+					<li><strong>Scale on load, not only on GPU busy-ness:</strong> for LLMs, the high-resolution concurrency metrics track the real load (requests in flight); GPU utilization can read near 100% while capacity remains. AWS's EKS guidance likewise recommends scaling inference on requests or token throughput.</li>
+					<li><strong>GPU metrics</strong> live in <code>/aws/sagemaker/Endpoints</code>: <code>GPUUtilization</code> and <code>GPUMemoryUtilization</code> are summed across GPUs (0 to 400% on a 4-GPU instance); inference component endpoints add normalized (0 to 100%) and reservation metrics. There's no predefined GPU scaling metric, so use a customized metric.</li>
+					<li><strong>Inference components</strong> scale copies of a model, and managed instance scaling adds or removes instances to fit them, down to zero.</li>
+					<li><strong>Slow scale-out:</strong> GPU instances take minutes (image pull, model download, loading), so scale out early, keep a minimum warm, and raise the startup timeouts.</li>
+					<li><strong>Capacity:</strong> GPU instance quotas often start at 0 for P instances; request increases in Service Quotas before launch, and use training plans, instance pools or several instance types when capacity is scarce.</li>
+					<li><strong>Kubernetes:</strong> Karpenter node pools for GPU instances (with the NVIDIA device plugin), KEDA for request-based scaling, and HyperPod's managed Karpenter.</li>
+				</ul>
+				<span class="file">A GPU memory scaling target for an inference component endpoint (JSON, TargetTrackingScalingPolicyConfiguration)</span>
+<pre><code>{
+  "TargetValue": 70.0,
+  "CustomizedMetricSpecification": {
+    "MetricName": "GPUMemoryUtilizationNormalized",
+    "Namespace": "/aws/sagemaker/InferenceComponents",
+    "Dimensions": [{"Name": "InferenceComponentName", "Value": "product-copy-ic"}],
+    "Statistic": "Average",
+    "Unit": "Percent"
+  },
+  "ScaleOutCooldown": 180,
+  "ScaleInCooldown": 600
+}</code></pre>
+			</div>
+
+			<!-- Skill 3.2.11 -->
+			<h2 id="s11">Agentic workflow infrastructure</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.11</span><span class="skill-text">Deploy agentic workflow infrastructure.</span></p>
+				<ul>
+					<li><strong>The pieces:</strong> an AgentCore <strong>Runtime</strong> (the agent code) with a runtime endpoint, a <strong>Gateway</strong> and its targets (tools), a <strong>Memory</strong> resource, <strong>Identity</strong> credential providers for outbound OAuth or API keys, optional <strong>Policy</strong> for tool calls, and the models, knowledge bases and guardrails they use.</li>
+					<li><strong>As code:</strong> CloudFormation types <code>AWS::BedrockAgentCore::Runtime</code>, <code>RuntimeEndpoint</code>, <code>Gateway</code>, <code>GatewayTarget</code>, <code>Memory</code> (which requires an event expiry of 3 to 365 days), <code>WorkloadIdentity</code> and the credential providers; or the stable CDK constructs; or the AgentCore CLI (<code>agentcore deploy</code>, which uses CDK).</li>
+					<li><strong>Networking:</strong> Runtime runs in public mode or in <strong>VPC mode</strong> (your subnets and security groups) when tools live in private networks; add VPC endpoints for the AWS services the agent calls.</li>
+					<li><strong>Access:</strong> callers need <code>InvokeAgentRuntime</code> or <code>InvokeGateway</code>, or sign in through a JWT authorizer; the Runtime execution role needs model, memory and tool permissions; the Gateway role needs permission to invoke its Lambda targets.</li>
+					<li><strong>Observability:</strong> turn on CloudWatch Transaction Search so AgentCore traces and spans appear in the GenAI observability views.</li>
+				</ul>
+				<p>Details in the <a href="../aws-services/bedrock/agentcore-runtime.html">AgentCore Runtime</a> and <a href="../aws-services/bedrock/agentcore-memory-tools.html">Memory and tools</a> notes.</p>
+				<div class="callout trap"><p>Resource names differ: Runtime and Memory names can't contain hyphens (Gateway names can), and <code>Ref</code> returns different things per type (the memory's ARN, the gateway's ID). Changing a Memory's name or encryption key in CloudFormation replaces it, and its stored events with it.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/amazon-sagemaker-inference-launches-faster-auto-scaling-for-generative-ai-models/">Amazon SageMaker inference launches faster auto scaling for generative AI models</a> (AWS Machine Learning Blog, July 2024): the high-resolution concurrency metrics and example policies.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/introducing-container-caching-in-amazon-sagemaker-ai-for-faster-model-scaling/">Introducing container caching in Amazon SageMaker AI for faster model scaling</a> (AWS Machine Learning Blog, June 2026): measured scale-out times with and without image caching.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/multi-tenancy-in-rag-applications-in-a-single-amazon-bedrock-knowledge-base-with-metadata-filtering/">Multi-tenancy in RAG applications in a single Amazon Bedrock knowledge base with metadata filtering</a> (AWS Machine Learning Blog, April 2025): one knowledge base, a tenant filter on every query.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/build-agents-to-learn-from-experiences-using-amazon-bedrock-agentcore-episodic-memory/">Build agents to learn from experiences using Amazon Bedrock AgentCore episodic memory</a> (AWS Machine Learning Blog, January 2026): the episodic strategy in practice (check namespace details against the developer guide).</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Capacity: on demand plus autoscaling for variable load; Savings Plans for price (not capacity); training plans to guarantee endpoint GPUs; provisioned concurrency and Provisioned Throughput only where steady use or cold starts justify them.</li>
+				<li>IaC: CloudFormation or CDK for SageMaker, Bedrock and AgentCore resources; exports for strong links, SSM parameters or <code>Fn::GetStackOutput</code> for loose ones; <code>Ref</code> returns ARNs for SageMaker hosting resources.</li>
+				<li>Containers: extend AWS images, build in CodeBuild, immutable tags and digests, enhanced scanning for language packages, lifecycle policies, cross-account repository policies.</li>
+				<li>VPC: two-AZ subnets and security groups on the model, network isolation, S3 gateway and interface endpoints, condition keys with a <code>Null</code> check; serverless has no VPC.</li>
+				<li>Deploying: model, endpoint config, endpoint; a new config for every update; deregister autoscaling before changing instance types; delete endpoints to stop charges.</li>
+				<li>Scaling metrics: invocations per instance (target = peak &times; 0.5 &times; 60), high-resolution concurrency for LLMs, per-copy metrics for inference components, backlog for async.</li>
+				<li>Knowledge bases: managed or customer-managed with a fixed embedding model and store; schedule or trigger ingestion yourself; one shared knowledge base with a server-side tenant filter.</li>
+				<li>Agent state: Runtime sessions are ephemeral; AgentCore Memory short-term events and long-term strategies by namespace; session managers to S3 or DynamoDB; Step Functions for workflow state.</li>
+				<li>GPUs and agents: scale on concurrency, GPU metrics are summed across GPUs, request GPU quotas early; deploy Runtime, Gateway, Memory and Identity together as code, in VPC mode when tools are private.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-1.html"><small>Previous</small>Task 3.1: Manage deployment infrastructure for ML and AI model types</a>
+				<span class="next"><small>Next</small>Task 3.3: Implement automated orchestration and CI/CD pipelines (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Machine Learning Engineer &ndash; Associate (MLA-C02) exam guide, checked on 11 November 2026.</div>
+</footer>
+
+</body>
+</html>
