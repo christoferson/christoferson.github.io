@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 4.2: Design Disaster Recovery Architectures | AWS SAP-C03 Notes</title>
+	<meta name="description" content="SAP-C03 Task 4.2 study guide: choosing backup and restore, pilot light, warm standby or multi-site by RTO, RPO and cost, continuous replication with AWS Elastic Disaster Recovery, recovery procedures with Resilience Hub and Systems Manager runbooks, multi-Region failover with Route 53, Global Accelerator and ARC Region switch, DR testing with FIS and Resilience Hub, and multi-cluster EKS and ECS strategies.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="sap.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SAP-C03</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">Task 4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Resilience, Migration, and Business Continuity &middot; 15%</span>
+		<h1>Task 4.2: Design disaster recovery architectures</h1>
+		<p>Getting the company back when a Region or a data centre is lost: choosing a recovery strategy each workload can afford, replicating servers and data continuously, writing and automating the recovery steps, switching traffic and databases between Regions reliably, proving it works with regular tests, and doing the same for container platforms.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Elastic Disaster Recovery</span><span class="tag">ARC Region switch</span><span class="tag">Resilience Hub</span><span class="tag">FIS</span><span class="tag">EKS</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Choosing a DR strategy</a></li>
+				<li><a href="#s2">Continuous replication</a></li>
+				<li><a href="#s3">Assessment and recovery procedures</a></li>
+				<li><a href="#s4">Multi-Region failover</a></li>
+				<li><a href="#s5">DR testing</a></li>
+				<li><a href="#s6">Containers across clusters</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.2</span>
+				<p><strong>Design disaster recovery architectures.</strong></p>
+			</div>
+			<p>The <strong>RPO</strong> is how much data you can lose (time since the last recovery point) and the <strong>RTO</strong> is how long you can be down. Both are business decisions, and cost rises as they shrink. A well-built Multi-AZ workload already survives an AZ failure; DR is about losing a Region, a data centre, or data itself (corruption, ransomware). The database replication options are on <a href="d1-task-1-5.html">Task 1.5</a>, global routing on <a href="d1-task-1-4.html">Task 1.4</a>, and AZ-level resilience on Task 4.3.</p>
+			<p><strong>Running example.</strong> Production runs in us-east-1 with DR in us-west-2. The order system (Aurora PostgreSQL global database, ECS services, DynamoDB) needs an RTO of 15 minutes and an RPO under a minute; the reporting tier can wait a day. Some servers stay on premises for now and need protecting in AWS, and the platform team runs an EKS cluster in each Region.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> <strong>CloudEndure Disaster Recovery</strong> was discontinued on 29 September 2025 (except in China), with no upgrade path (use Elastic Disaster Recovery). The <strong>ARC readiness check</strong> closed to new customers on 30 April 2026 (use Region switch plan evaluation), and <strong>Systems Manager Incident Manager</strong> on 7 November 2025 (use OpsCenter or partner tools). New: <strong>ARC Region switch</strong> (August 2025, now 19 types of execution block), AWS Backup for <strong>EKS</strong> (November 2025), managed Argo CD in <strong>EKS Capabilities</strong> (November 2025), ECS native blue/green deployments (July 2025), Elastic Disaster Recovery <strong>recovery plans</strong> (August 2026), and the next-generation Resilience Hub with resilience testing (2026).</p></div>
+
+			<!-- Skill 4.2.1 -->
+			<h2 id="s1">Choosing a DR strategy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.1</span><span class="skill-text">Design disaster recovery solutions to meet business requirements (for example, RTO, RPO, costs).</span></p>
+				<ul>
+					<li><strong>Four strategies, from cheapest to fastest:</strong>
+						<ul>
+							<li><strong>Backup and restore:</strong> recovery in hours. Backups copied to the DR Region, infrastructure redeployed with IaC.</li>
+							<li><strong>Pilot light:</strong> tens of minutes. Data is replicated live, but application servers aren't running (ideally not even deployed) until needed.</li>
+							<li><strong>Warm standby:</strong> minutes. A smaller but working copy serves traffic at once and scales up.</li>
+							<li><strong>Multi-site active/active or hot standby:</strong> near zero. Full capacity in both Regions.</li>
+						</ul>
+					</li>
+					<li><strong>Match each workload, not the company:</strong> the order system on warm standby or hot standby with an Aurora global database and DynamoDB global tables; reporting on backup and restore; on-premises servers on Elastic Disaster Recovery (a pilot light for whole servers).</li>
+					<li><strong>Data is the hard part:</strong> asynchronous replication across Regions means RPO is never quite zero, and replication copies corruption too, so keep point-in-time backups (AWS Backup with vault lock and logically air-gapped vaults) for data disasters. Active/active needs a write pattern: write to one Region (global), write locally (DynamoDB global tables), or partition writes.</li>
+					<li><strong>Statically stable recovery:</strong> prefer data plane actions (Route 53 health checks, ARC routing controls) over control plane actions (creating resources, changing weights, scaling) during an event. Pre-provision what recovery needs, and raise service quotas in the DR Region in advance. Capacity reservations guarantee instances that scaling alone doesn't.</li>
+					<li><strong>Isolation:</strong> separate accounts per Region (or for backups) limit the blast radius of a compromised account.</li>
+				</ul>
+				<div class="callout tip"><p>"Lowest cost, recovery within a day" is backup and restore. "Database must be current but compute can start after the disaster" is pilot light. "Must take traffic immediately at reduced capacity" is warm standby. "No downtime and serve users from both Regions" is multi-site active/active. "Protect against ransomware or accidental deletes" needs immutable backups, not just replication.</p></div>
+			</div>
+
+			<!-- Skill 4.2.2 -->
+			<h2 id="s2">Continuous replication</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.2</span><span class="skill-text">Configure continuous replication to recover quickly from incidents (for example, by using AWS Elastic Disaster Recovery).</span></p>
+				<ul>
+					<li><strong>AWS Elastic Disaster Recovery (DRS)</strong> replicates whole servers at block level from physical servers, VMware, Hyper-V, other clouds, or EC2 in another AZ or Region.
+						<ul>
+							<li><strong>Staging area:</strong> data lands on low-cost replication servers and EBS volumes, so you don't run full-size servers.</li>
+							<li><strong>Objectives:</strong> RPO is typically seconds and RTO minutes (mostly boot time).</li>
+							<li><strong>Recovery points:</strong> point-in-time snapshots (kept 7 days by default) let you recover from before an incident such as ransomware.</li>
+						</ul>
+					</li>
+					<li><strong>Cost:</strong> a flat $0.028 per source server per hour while replicating, including drills and recoveries, plus the staging EBS volumes, snapshots and replication instances, and the recovery instances only while they run.</li>
+					<li><strong>Launch settings</strong> per server (instance type right-sizing, copying the private IP and tags, licensing) and an EC2 launch template control what gets launched. <strong>Post-launch actions</strong> run Systems Manager Automation or Command documents after launch, for example to install agents, check connectivity or create an AMI.</li>
+					<li><strong>Drills and recovery plans:</strong> drills launch copies without stopping replication, so they don't affect RPO or the source. Run them in an isolated subnet, especially with domain controllers. <strong>Recovery plans</strong> (August 2026) order servers into steps, for example databases, then application servers, then web servers, with wait steps between them, in one account and Region.</li>
+					<li><strong>Failback:</strong> on-premises sources fail back with the DRS Failback Client. EC2 workloads protected across Regions or AZs use reverse replication to protect the recovered instances and return later. DRS can also replicate the source VPC configuration (subnets, security groups, route tables) and deploy it as a CloudFormation stack in the recovery Region.</li>
+					<li><strong>Scale:</strong> up to 300 replicating servers per account and Region, a limit that can't be raised; spread larger estates across several staging accounts and recover them into one target account.</li>
+					<li><strong>Data-level replication</strong> for managed services: Aurora global databases, DynamoDB global tables, S3 Replication, RDS cross-Region read replicas, ElastiCache Global Datastore, EFS replication, and AWS Backup cross-Region copies (Task 1.5).</li>
+				</ul>
+				<span class="file">Quarterly drill: launch two protected servers from a point in time, without stopping replication</span>
+<pre><code>aws drs start-recovery \
+  --region us-west-2 \
+  --is-drill \
+  --source-servers \
+    sourceServerID=s-1234567890abcdef0,recoverySnapshotID=pit-0a1b2c3d4e5f60001 \
+    sourceServerID=s-0fedcba0987654321
+<span class="c"># Without recoverySnapshotID, DRS takes an on-demand (latest) snapshot</span></code></pre>
+				<div class="callout trap"><p>The 300 replicating-server quota per account and Region isn't adjustable. OS disk encryption such as BitLocker must be off on the source. DRS recovery plans can't call Lambda or SSM steps or span accounts; cross-service orchestration needs ARC Region switch, which itself has no DRS block, so call DRS from a custom Lambda step.</p></div>
+			</div>
+
+			<!-- Skill 4.2.3 -->
+			<h2 id="s3">Assessment and recovery procedures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.3</span><span class="skill-text">Establish disaster recovery assessment and recovery procedures (for example, by using AWS Resilience Hub, AWS Systems Manager runbooks).</span></p>
+				<ul>
+					<li><strong>AWS Resilience Hub:</strong>
+						<ul>
+							<li><strong>Policy:</strong> define an application from its CloudFormation stacks, resource groups, EKS clusters or tags, and attach a resiliency policy with RTO and RPO targets for application, infrastructure, AZ and Region disruptions.</li>
+							<li><strong>Assessment:</strong> estimates what the current architecture can achieve and reports "policy met" or "policy breached".</li>
+							<li><strong>Recommendations:</strong> architecture changes, CloudWatch alarms, standard operating procedures (SOPs) and FIS experiments.</li>
+							<li><strong>Drift:</strong> flags policy or resource drift when the application changes.</li>
+							<li><strong>Next generation (2026):</strong> adds AI-assisted failure-mode assessment, dependency discovery and pre-built resilience tests.</li>
+						</ul>
+					</li>
+					<li><strong>SOPs as code:</strong> Resilience Hub generates a CloudFormation template for each recommended SOP. It holds the IAM role, an SSM parameter that maps the Systems Manager document to the resource, and an FIS experiment that tests the SOP. Keep custom documents in the application's repository so they deploy with it.</li>
+					<li><strong>Systems Manager Automation runbooks</strong> make the steps repeatable, for example <code>AWS-CreateImage</code>, <code>AWSSupport-RestoreEC2InstanceFromSnapshot</code>, <code>AWS-CreateRdsSnapshot</code> and <code>AWS-StartStopAuroraCluster</code>, plus your own runbooks for application steps. Start them from EventBridge rules, from DRS post-launch actions, or from a Region switch Lambda step; the Region switch SSM block runs only Command documents.</li>
+					<li><strong>Incident response:</strong> with Incident Manager closed to new customers, track recovery work in Systems Manager OpsCenter or a partner tool, and route alarms with EventBridge.</li>
+					<li><strong>Write the decision down:</strong> who declares a disaster, which signals are used, and when to fail back. AWS's DR guidance prefers a human decision with automated steps over fully automatic Region failover, which can flap.</li>
+				</ul>
+				<div class="callout trap"><p>An assessment is an estimate from configuration, not proof; only tests show the real RTO. Automation runbooks used in recovery must not depend on the failed Region (run them in the recovery Region, with copies of documents and parameters there). Incident Manager response plans are a distractor in new designs.</p></div>
+			</div>
+
+			<!-- Skill 4.2.4 -->
+			<h2 id="s4">Multi-Region failover</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.4</span><span class="skill-text">Implement multi-Region disaster recovery solutions that include features such as data replication and failover (for example, by using Amazon Route 53 health checks, AWS Global Accelerator, Amazon Application Recovery Controller).</span></p>
+				<ul>
+					<li><strong>Route 53 failover records with health checks:</strong> DNS answers switch to the secondary when the primary's health check fails. Health checks are data plane and highly reliable, but clients cache DNS for the TTL. Changing record weights during an event is a control plane action.</li>
+					<li><strong>Global Accelerator:</strong> static anycast IPs, with endpoint groups per Region and failover on health (from ELB health checks for ALB and NLB endpoints) in about 30 seconds, with no DNS caching. Traffic dials and endpoint weights shift traffic deliberately, but they are control plane calls (made in us-west-2), and failover traffic ignores a dial of 0.</li>
+					<li><strong>ARC routing controls</strong> are on/off switches that drive Route 53 health checks. They have a highly available data plane spread across five Regions (100% SLA) and safety rules such as "at least one Region on", for manual, reliable failover. They cost $2.50 per cluster-hour.</li>
+					<li><strong>ARC Region switch</strong> ($70 per plan per month) orchestrates the whole recovery between exactly two Regions, active/passive or active/active.
+						<ul>
+							<li><strong>Execution blocks:</strong> scale EC2 Auto Scaling groups, ECS services and EKS workloads; switch over or fail over Aurora global databases, DocumentDB and Neptune global clusters; promote RDS replicas; flip routing controls or Region switch-managed health checks; pause for manual approval; run Lambda or Systems Manager commands; and nest child plans.</li>
+							<li><strong>Triggers:</strong> plans can be started by CloudWatch alarms.</li>
+							<li><strong>Checks:</strong> plans are evaluated every 30 minutes for permissions, configuration, capacity and quota parity.</li>
+							<li><strong>Evidence:</strong> each execution produces a PDF report.</li>
+							<li><strong>Independence:</strong> each Region has its own data plane, so a plan doesn't depend on the Region you're leaving.</li>
+						</ul>
+					</li>
+					<li><strong>Graceful vs ungraceful:</strong> a graceful run does an Aurora switchover with no data loss when both Regions are healthy. An ungraceful run fails over even if the primary is unreachable, accepting some data loss, and skips steps that need the failed Region.</li>
+					<li><strong>After recovery:</strong> a post-recovery workflow rebuilds replicas back to the old Region once it's healthy, ready for failback.</li>
+				</ul>
+				<span class="file">Region switch: move the order system to us-west-2 even though us-east-1 is impaired</span>
+<pre><code>aws arc-region-switch start-plan-execution \
+  --plan-arn "$ORDERS_DR_PLAN_ARN" \
+  --target-region us-west-2 \
+  --action activate \
+  --mode ungraceful \
+  --comment "us-east-1 regional event, declared by incident lead"</code></pre>
+				<div class="callout trap"><p>Region switch scaling blocks request capacity but don't guarantee it, so reserve critical capacity with On-Demand Capacity Reservations. The cheaper Route 53 health check block depends on the Region you're activating, while routing controls don't. The plan's IAM roles, documents and secrets must exist in both Regions. Readiness check answers are outdated; plan evaluation replaced it.</p></div>
+			</div>
+
+			<!-- Skill 4.2.5 -->
+			<h2 id="s5">DR testing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.5</span><span class="skill-text">Establish disaster recovery testing and validation procedures (for example, by using AWS Resilience Hub).</span></p>
+				<ul>
+					<li><strong>Test on a schedule, not only after changes:</strong> DRS drills, Region switch plan runs during game days, AWS Backup restore testing, and Aurora switchovers. Measure actual RTO and RPO against the policy.</li>
+					<li><strong>Resilience Hub</strong> recommends and runs tests (pre-configured resilience tests built on FIS in the next generation), tracks results in the resiliency score, and keeps the evidence for auditors.</li>
+					<li><strong>AWS Fault Injection Service</strong> runs controlled experiments with stop conditions (CloudWatch alarms) and costs $0.10 per action-minute.
+						<ul>
+							<li><strong>Actions:</strong> stop instances, inject API errors, disrupt network connectivity, fail over RDS, pause EBS I/O, and container faults.</li>
+							<li><strong>AZ Availability: Power Interruption</strong> (scenario library) simulates losing an AZ.</li>
+							<li><strong>Cross-Region: Connectivity</strong> cuts Transit Gateway and peering paths and pauses S3, DynamoDB and MemoryDB replication, so you can see how the application behaves when the Regions are split.</li>
+						</ul>
+					</li>
+					<li><strong>Validate data, not just services:</strong> check row counts or checksums after failover, confirm replication lag alarms, and test restores of point-in-time backups into an isolated account.</li>
+					<li><strong>Run game days:</strong> practise the whole process including people (who decides, who communicates), then fix what the test exposed and re-test.</li>
+				</ul>
+				<div class="callout tip"><p>"Prove the 15-minute RTO to auditors" points to scheduled Region switch executions with their PDF reports, or Resilience Hub assessments plus FIS tests. "Find out what happens if replication between Regions stops" is the FIS cross-Region connectivity scenario. Tests without stop conditions in production are a risk; scenarios in the library don't include stop conditions by default.</p></div>
+			</div>
+
+			<!-- Skill 4.2.6 -->
+			<h2 id="s6">Containers across clusters</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2.6</span><span class="skill-text">Implement multi-cluster container strategies to provide high availability and disaster recovery (for example, by using Amazon EKS, Amazon ECS).</span></p>
+				<ul>
+					<li><strong>One cluster per Region, identical by construction:</strong> clusters are Regional, so DR means a second cluster deployed from the same IaC and pipelines.
+						<ul>
+							<li><strong>EKS:</strong> GitOps with Argo CD (now a managed EKS Capability, which can deploy to clusters in other Regions and accounts) keeps workloads in sync. Make sure the GitOps hub itself doesn't live only in the failed Region.</li>
+							<li><strong>ECS:</strong> deploy the same task definitions and services to both Regions; Service Connect namespaces are Regional, so each Region has its own.</li>
+						</ul>
+					</li>
+					<li><strong>Traffic between clusters:</strong> each cluster has its own load balancers, with Route 53 failover or latency records or Global Accelerator in front, as for any multi-Region application. Within a Region, ARC zonal shift and autoshift move traffic away from an AZ for EKS and for the load balancers in front of ECS. Zonal shift cordons nodes and removes endpoints; it doesn't move pods, so keep spare capacity.</li>
+					<li><strong>Images:</strong> ECR cross-Region replication (only new pushes, one hop; backfill copies existing images; repository policies aren't replicated, so use creation templates) so the DR cluster can pull without the primary Region.</li>
+					<li><strong>State:</strong> keep databases and files outside the cluster in replicated services (Aurora global database, DynamoDB global tables, S3, EFS replication). <strong>AWS Backup for EKS</strong> backs up cluster state (Kubernetes objects, node groups, Pod Identity associations) and EBS, EFS and S3 volumes as one composite recovery point. It copies across Regions and accounts, and restores into an existing or a new cluster without overwriting objects. It doesn't include ECR images or VPCs. ECS services are stateless and redeployed from IaC.</li>
+					<li><strong>Capacity and recovery:</strong> Region switch has EKS and ECS scaling blocks that scale the standby cluster to match the primary's recent peak. Use EKS Pod Identity rather than IRSA so roles keep working in a restored or new cluster, whose OIDC issuer differs.</li>
+					<li><strong>Upgrades as a resilience risk:</strong> blue/green clusters, or the EKS control plane rollback to the previous version within 7 days, and ECS native blue/green, linear or canary deployments with bake time and automatic rollback.</li>
+					<li><strong>Testing:</strong> FIS EKS actions (pod delete, pod network latency, terminating node group instances) and ECS actions (stop tasks, drain instances, task network faults).</li>
+				</ul>
+				<span class="file">Back up the EKS cluster state and its volumes, then copy the recovery point to us-west-2</span>
+<pre><code>aws backup start-backup-job \
+  --backup-vault-name platform-vault \
+  --resource-arn arn:aws:eks:us-east-1:333333333333:cluster/platform-prod \
+  --iam-role-arn arn:aws:iam::333333333333:role/service-role/AWSBackupDefaultServiceRole
+<span class="c"># The cluster needs authentication mode API or API_AND_CONFIG_MAP;</span>
+<span class="c"># a backup plan rule with a copy action sends it to the DR Region vault</span></code></pre>
+				<span class="file">ECR: replicate order-service images to the DR Region</span>
+<pre><code>{
+  "rules": [
+    {
+      "destinations": [
+        { "region": "us-west-2", "registryId": "333333333333" }
+      ],
+      "repositoryFilters": [
+        { "filter": "orders", "filterType": "PREFIX_MATCH" }
+      ]
+    }
+  ]
+}</code></pre>
+				<div class="callout trap"><p>EBS-backed pods can't move to another AZ, and restored EBS volumes are pinned to one. EKS zonal shift doesn't cover Fargate, and ECS isn't a zonal shift resource itself (shift its load balancer). An EKS restore keeps the source cluster's OIDC issuer for IRSA, which breaks roles; Pod Identity avoids this. AWS Backup restores skip objects that already exist rather than overwriting them.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/aws/introducing-amazon-application-recovery-controller-region-switch-a-multi-region-application-recovery-service/">Introducing Amazon Application Recovery Controller Region switch</a> (AWS News Blog, August 2025): plans, workflows and execution blocks (more block types have been added since).</li>
+				<li><a href="https://aws.amazon.com/blogs/storage/cross-account-disaster-recovery-setup-using-aws-elastic-disaster-recovery-in-secured-networks-part-2-failover-and-failback-implementation/">Cross-account disaster recovery setup using AWS Elastic Disaster Recovery in secured networks, Part 2</a> (AWS Storage Blog, September 2025): staging and target accounts, failover and failback over private networks.</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/pilot-light-with-reserved-capacity-how-to-optimize-dr-cost-using-on-demand-capacity-reservations/">Pilot light with reserved capacity</a> (AWS Architecture Blog, March 2025, updated March 2026): reserving recovery capacity without paying for full standby.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/secure-eks-clusters-with-the-new-support-for-amazon-eks-in-aws-backup/">Secure EKS clusters with the new support for Amazon EKS in AWS Backup</a> (AWS News Blog, November 2025): cluster state and volume backups with restore to a new cluster.</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Strategy: backup and restore, pilot light, warm standby, multi-site, chosen per workload by RTO, RPO and cost; immutable backups for data disasters; data plane actions and pre-provisioned capacity and quotas for recovery.</li>
+				<li>Replication: Elastic Disaster Recovery for whole servers (flat per-server fee, drills without RPO impact, recovery plans, failback, 300 servers per account), managed-service replication for data.</li>
+				<li>Procedures: Resilience Hub policies, assessments and SOPs as code, Systems Manager runbooks started from EventBridge, DRS or Region switch; OpsCenter instead of Incident Manager.</li>
+				<li>Failover: Route 53 health checks and ARC routing controls on the data plane, Global Accelerator for fast IP-level failover, ARC Region switch to orchestrate databases, compute and traffic between two Regions.</li>
+				<li>Testing and containers: scheduled drills, plan runs and FIS scenarios with stop conditions; one cluster per Region from GitOps and IaC, ECR replication, AWS Backup for EKS, state outside the cluster, Pod Identity for portability.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-1.html"><small>Previous</small>Task 4.1: Design migration strategies by using AWS frameworks</a>
+				<span class="next"><small>Next</small>Task 4.3: Design solutions to meet business continuity and resiliency requirements (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026; checked on 12 November 2026.</div>
+</footer>
+
+</body>
+</html>
