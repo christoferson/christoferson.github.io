@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 2.2: Design Encryption and Key Management Strategies | AWS SAP-C03 Notes</title>
+	<meta name="description" content="SAP-C03 Task 2.2 study guide: encryption at rest with AWS KMS customer managed keys, rotation and multi-account key strategy, encryption in transit with TLS 1.3, ACM and AWS Private CA, dedicated HSMs with AWS CloudHSM and CloudHSM key stores for regulatory needs, and post-quantum cryptography with hybrid ML-KEM TLS, ML-DSA signing keys and ML-KEM keys in KMS.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="sap.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SAP-C03</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">Task 2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Security, Compliance, and Governance &middot; 25%</span>
+		<h1>Task 2.2: Design solutions to implement encryption and key management strategies</h1>
+		<p>How the company protects regulated customer data with keys it controls: who owns each KMS key across dozens of accounts, how keys rotate, where TLS ends and which certificates it uses, when a dedicated HSM is really required, and how to start moving to post-quantum cryptography now.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">AWS KMS</span><span class="tag">ACM</span><span class="tag">AWS Private CA</span><span class="tag">CloudHSM</span><span class="tag">ML-KEM</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Encryption at rest with KMS</a></li>
+				<li><a href="#s2">Encryption in transit and certificates</a></li>
+				<li><a href="#s3">Dedicated HSMs</a></li>
+				<li><a href="#s4">Post-quantum cryptography</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 2.2</span>
+				<p><strong>Design solutions to implement encryption and key management strategies.</strong></p>
+			</div>
+			<p>At Professional level the questions are about ownership and fit: which account owns a key, why an AWS managed key breaks cross-account sharing, whether a regulation really needs single-tenant HSMs, and which parts of post-quantum TLS AWS does for you. Service-by-service encryption settings, imported key material, external key stores and secrets rotation are in the <a href="../aws-scs/d5-task-5-2.html">SCS data at rest notes</a>, <a href="../aws-scs/d5-task-5-1.html">SCS data in transit notes</a> and <a href="../aws-scs/d5-task-5-3.html">SCS keys and secrets notes</a>.</p>
+			<p><strong>Running example.</strong> Regulated customer data sits in Aurora and S3 in us-east-1 with DR in us-west-2. The analytics account (444444444444) shares curated S3 data with business-unit accounts such as 555555555555. Card tokenization still runs on an on-premises HSM, and the security team must show a plan for quantum-safe cryptography in the next audit.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> The CloudHSM <strong>hsm1.medium</strong> type reached end of support on 31 March 2026 (clusters were migrated to <strong>hsm2m.medium</strong>). S3 has blocked <strong>SSE-C</strong> by default on new general purpose buckets since April 2026. ACM public certificates are now valid for <strong>198 days</strong>, falling to under 100 days from 15 March 2027 and under 47 days from 15 March 2029, so only managed renewal is practical. The Secrets Manager Agent is now the <strong>AWS Workload Credentials Provider</strong>. New: custom KMS rotation periods and on-demand rotation (April 2024), <strong>ML-DSA</strong> signing keys in KMS (June 2025), post-quantum ELB policies (September 2025), Private CA ML-DSA certificates (November 2025), exportable public ACM certificates, key last-usage tracking (2026) and <strong>ML-KEM</strong> keys in KMS (October 2026).</p></div>
+
+			<!-- Skill 2.2.1 -->
+			<h2 id="s1">Encryption at rest with KMS</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.1</span><span class="skill-text">Implement encryption at rest by using customer managed keys and automatic key rotation (for example, by using AWS KMS).</span></p>
+				<ul>
+					<li><strong>Customer managed keys when control matters:</strong> you own the key policy, rotation, grants and deletion, and only customer managed keys can be used across accounts. AWS managed keys (<code>aws/s3</code>, <code>aws/rds</code>) can't, so encrypted snapshots, S3 objects or backups under them can't be shared; and RCPs don't apply to them.</li>
+					<li><strong>Who owns the keys:</strong>
+						<ul>
+							<li><strong>Keys in each workload account</strong> keep the blast radius small and let teams manage their own keys; a central team enforces standards with SCPs, Config rules and IaC.</li>
+							<li><strong>A central key account</strong> gives one place to administer and audit keys, but one bad key policy or deletion affects every user.</li>
+							<li>Request quota doesn't decide it: KMS throttles the <strong>calling</strong> account, not the account that owns the key. The shared symmetric quota is 10,000 to 100,000 requests per second per account per Region, depending on the Region.</li>
+						</ul>
+					</li>
+					<li><strong>Cross-account use</strong> needs a key policy statement in the owner account and an IAM policy in the caller account. Callers must use the key ARN (an alias resolves in their own account), and admin actions such as deleting the key never work cross-account.</li>
+					<li><strong>Narrow the key policy</strong> with <code>kms:ViaService</code> (only through S3 or RDS), <code>kms:CallerAccount</code>, and <code>kms:EncryptionContext:</code> keys. S3 Bucket Keys cut KMS calls and cost for SSE-KMS buckets, and make the encryption context the bucket ARN.</li>
+					<li><strong>Rotation:</strong> automatic rotation applies to symmetric customer managed keys with KMS-generated material. It's off by default, and the period can be 90 to 2,560 days (default 365). On-demand rotation (up to 25 per key) also works for imported material. Rotation keeps the key ID and old material, so old ciphertext still decrypts and no data is re-encrypted. Asymmetric, HMAC and custom key store keys rotate manually: create a new key and move the alias.</li>
+					<li><strong>Keys across Regions:</strong> multi-Region keys share key material so the DR Region decrypts without a cross-Region call; policies, grants and aliases are set per Region.</li>
+				</ul>
+				<span class="file">Key policy in the analytics account: business unit 555555555555 may decrypt only through S3, only for the curated bucket</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KeyAdmins",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::444444444444:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "BusinessUnitDecryptViaS3",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::555555555555:root" },
+      "Action": ["kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.us-east-1.amazonaws.com",
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::example-curated"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<span class="file">Rotate every 180 days, and once now after a suspected exposure</span>
+<pre><code>aws kms enable-key-rotation \
+  --key-id arn:aws:kms:us-east-1:444444444444:key/1234abcd-12ab-34cd-56ef-1234567890ab \
+  --rotation-period-in-days 180
+
+aws kms rotate-key-on-demand \
+  --key-id arn:aws:kms:us-east-1:444444444444:key/1234abcd-12ab-34cd-56ef-1234567890ab
+<span class="c"># Rotation doesn't re-encrypt data keys already in use: a leaked data key</span>
+<span class="c"># still needs the data re-encrypted under a new one</span></code></pre>
+				<div class="callout trap"><p>"Share encrypted snapshots or replicate SSE-KMS objects to another account" fails with an AWS managed key; the answer is a customer managed key with a cross-account key policy. Never use <code>ForAllValues</code> with <code>kms:EncryptionContext:</code> keys (KMS rejects it). Some resources can only be encrypted at creation (RDS, EFS): encrypting later means copy or snapshot, then restore.</p></div>
+			</div>
+
+			<!-- Skill 2.2.2 -->
+			<h2 id="s2">Encryption in transit and certificates</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.2</span><span class="skill-text">Implement encryption in transit by using certificate management (for example, TLS 1.3, AWS Certificate Manager [ACM], AWS Private CA).</span></p>
+				<ul>
+					<li><strong>Where TLS ends:</strong> at CloudFront (certificate in us-east-1), at the ALB or NLB (re-encrypt to targets when end-to-end encryption is required), or at the target with an NLB TCP pass-through or ALB mutual TLS. Pick TLS 1.3 security policies; the console default for new ELB HTTPS listeners is a TLS 1.3 post-quantum policy, but the CLI and CloudFormation still default to the 2016 policy that allows TLS 1.0.</li>
+					<li><strong>Force TLS</strong> on the data path: <code>aws:SecureTransport</code> and <code>s3:TlsVersion</code> in bucket policies, <code>rds.force_ssl</code> or <code>require_secure_transport</code> for databases, in-transit encryption for ElastiCache and MSK.</li>
+					<li><strong>ACM public certificates</strong> are free on integrated services (ELB, CloudFront, API Gateway) and renew automatically. With validity shrinking to 198 days now and much shorter later, avoid imported certificates, which ACM never renews. Exportable public certificates (paid) cover EC2, containers and on-premises servers.</li>
+					<li><strong>AWS Private CA</strong> for internal TLS, mTLS and device identity:
+						<ul>
+							<li>Build a root plus subordinate CAs in a central account and share them through <strong>RAM</strong>. Member accounts request private certificates in ACM, which renews them; the receiving account owns that renewal.</li>
+							<li><strong>General-purpose mode</strong> costs $400 per CA per month. <strong>Short-lived mode</strong> costs $50 per month and issues certificates valid for up to 7 days (no revocation needed), but ACM can't issue from it.</li>
+							<li>CAs are Regional, so DR needs a CA in the DR Region.</li>
+						</ul>
+					</li>
+					<li><strong>Service-to-service:</strong> ECS Service Connect and VPC Lattice terminate TLS with Private CA or ACM certificates (App Mesh has reached end of support).</li>
+				</ul>
+				<span class="file">Orders API listener with TLS 1.3 and hybrid post-quantum key exchange (set the policy explicitly in IaC)</span>
+<pre><code>aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/orders/50dc6c495c0c9188 \
+  --protocol HTTPS --port 443 \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09 \
+  --certificates CertificateArn=arn:aws:acm:us-east-1:111111111111:certificate/example-cert-id \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:us-east-1:111111111111:targetgroup/orders/73e2d6bc24d8a067</code></pre>
+				<span class="file">Member account: private certificate from the shared CA, renewed by ACM</span>
+<pre><code>aws acm request-certificate \
+  --domain-name orders.internal.example.com \
+  --certificate-authority-arn arn:aws:acm-pca:us-east-1:111111111111:certificate-authority/example-ca-id</code></pre>
+				<div class="callout tip"><p>"Internal services need certificates that rotate every few days" points to a short-lived Private CA used directly, not ACM. "Hundreds of accounts need private certificates without running a CA each" points to one CA hierarchy shared with RAM. "End-to-end encryption to the instances" means HTTPS target groups or NLB pass-through, not just an HTTPS listener.</p></div>
+			</div>
+
+			<!-- Skill 2.2.3 -->
+			<h2 id="s3">Dedicated HSMs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.3</span><span class="skill-text">Implement dedicated hardware security modules to comply with regulations (for example, AWS CloudHSM).</span></p>
+				<ul>
+					<li><strong>KMS first:</strong> KMS keys already live in FIPS 140-3 Level 3 validated HSMs, so "FIPS Level 3" alone isn't a reason for CloudHSM. Choose CloudHSM when the requirement is a <strong>single-tenant</strong> HSM that only you control (AWS has no access to keys, and lost credentials can't be recovered), standard HSM interfaces (PKCS#11, JCE, OpenSSL, Windows CNG/KSP), or algorithms KMS doesn't offer.</li>
+					<li><strong>Typical uses:</strong> TLS offload for web servers, Oracle TDE, protecting the private key of your own issuing CA, and lifting an on-premises HSM application. Payment workloads (PIN blocks, card keys) belong in <strong>AWS Payment Cryptography</strong> instead.</li>
+					<li><strong>Cluster design:</strong> HSMs in your VPC across AZs, with at least 2 HSMs in 2 AZs for production and 3 for mission-critical workloads. A cluster holds up to 28 HSMs, and you pay per HSM-hour whether it's busy or not. The cluster mode (FIPS or non-FIPS) is fixed at creation.</li>
+					<li><strong>Durability and DR:</strong> AWS takes backups automatically; copy them to the DR Region and create a cluster there from the backup.</li>
+					<li><strong>CloudHSM key store:</strong> KMS keys whose material is generated and used in your cluster, so integrated services (S3, EBS, RDS) still work. It needs 2 active HSMs in different AZs, a <code>kmsuser</code> crypto user, and no mTLS on the cluster. It supports symmetric keys only, with no automatic rotation, no multi-Region keys and no SLA, and every key store shares a fixed 1,800 requests per second. AWS prefers it over an external key store when a custom store is required.</li>
+				</ul>
+				<span class="file">CloudHSM: copy the latest backup to the DR Region, then back KMS keys with the cluster</span>
+<pre><code>aws cloudhsmv2 copy-backup-to-region \
+  --backup-id backup-1234567890abcdef0 \
+  --destination-region us-west-2
+
+aws kms create-custom-key-store \
+  --custom-key-store-name tokenization-store \
+  --cloud-hsm-cluster-id cluster-1a23b4cdefg \
+  --key-store-password "&lt;kmsuser password&gt;" \
+  --trust-anchor-certificate file://customerCA.crt
+<span class="c"># Then connect-custom-key-store and create keys with --origin AWS_CLOUDHSM</span></code></pre>
+				<div class="callout trap"><p>A cluster restored from a copied backup in another Region is a different cluster to KMS: keys in a key store there can't decrypt ciphertext from the original store. Between backups, you alone are responsible for keys created in the HSMs. Turning on mTLS on the cluster breaks the KMS key store connection.</p></div>
+			</div>
+
+			<!-- Skill 2.2.4 -->
+			<h2 id="s4">Post-quantum cryptography</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2.4</span><span class="skill-text">Design post-quantum cryptography strategies (for example, by using AWS KMS with Module-Lattice Digital Signature Algorithm [ML-DSA], Module-Lattice-Based Key-Encapsulation Mechanism [ML-KEM]).</span></p>
+				<ul>
+					<li><strong>The threat:</strong> traffic recorded today could be decrypted by a future quantum computer ("harvest now, decrypt later"), and signatures on long-lived firmware or roots of trust could be forged. Symmetric encryption with 256-bit keys is considered safe, so data at rest under AES-256 KMS keys doesn't need re-encrypting. <strong>Data in transit comes first.</strong></li>
+					<li><strong>AWS's migration plan</strong> has four workstreams: inventory and planning; hybrid key exchange (classical ECDH plus <strong>ML-KEM</strong>) on public endpoints; <strong>ML-DSA</strong> signing for long-lived roots of trust; and post-quantum certificates for session authentication as standards mature.</li>
+					<li><strong>What AWS does for you:</strong> KMS, ACM, IAM, STS, S3, Secrets Manager and CloudFront (viewer side, TLS 1.3) negotiate hybrid ML-KEM with any client that offers it. CloudFront to origin is not there yet.</li>
+					<li><strong>What you must do:</strong>
+						<ul>
+							<li>Update clients: SDKs, the CLI or runtimes with OpenSSL 3.5 or later; defaults differ by SDK and platform.</li>
+							<li>Opt in on resources you configure: ELB <code>...-PQ-2025-09</code> policies, API Gateway <code>SecurityPolicy_TLS13_1_2_PQ_2025_09</code>, Transfer Family <code>TransferSecurityPolicy-2025-03</code> for SFTP, and newer RDS and Aurora engine versions.</li>
+							<li>Move off the Classic Load Balancer, which has no post-quantum plan.</li>
+						</ul>
+					</li>
+					<li><strong>Prove it:</strong> CloudTrail records <code>tlsDetails.keyExchange</code> (for example <code>X25519MLKEM768</code>), so a metric filter can flag callers still on classical key exchange.</li>
+					<li><strong>ML-DSA in KMS</strong> (<code>ML_DSA_44</code>, <code>65</code>, <code>87</code>) signs code, firmware and documents with one algorithm, <code>ML_DSA_SHAKE_256</code>. Raw messages can be up to 4,096 bytes; for larger ones send the 64-byte message representative (<code>EXTERNAL_MU</code>). Private CA can issue ML-DSA CAs and certificates for code signing, device identity and mTLS.</li>
+					<li><strong>ML-KEM in KMS</strong> (<code>ML_KEM_512</code>, <code>768</code>, <code>1024</code>) establishes a shared secret with <code>Encapsulate</code> and <code>Decapsulate</code>, which you feed into a key derivation function. A wrong key or tampered ciphertext returns random bytes rather than an error, so both sides must confirm they derived the same secret.</li>
+					<li><strong>Crypto agility:</strong> keep algorithms in configuration, not code, and use aliases and envelope encryption so keys and algorithms can change without touching data.</li>
+				</ul>
+				<span class="file">Release signing key with ML-DSA; sign the 64-byte mu of a large firmware image</span>
+<pre><code>aws kms create-key \
+  --key-spec ML_DSA_65 \
+  --key-usage SIGN_VERIFY \
+  --description "Firmware release signing"
+
+aws kms sign \
+  --key-id alias/firmware-signing \
+  --message fileb://firmware-mu.bin \
+  --message-type EXTERNAL_MU \
+  --signing-algorithm ML_DSA_SHAKE_256</code></pre>
+				<span class="file">CloudWatch Logs metric filter: KMS calls that didn't use post-quantum key exchange</span>
+<pre><code>{ ($.eventSource = "kms.amazonaws.com") &amp;&amp;
+  ($.userIdentity.invokedBy NOT EXISTS) &amp;&amp;
+  (($.tlsDetails.keyExchange != "*MLKEM*") ||
+   ($.tlsDetails.keyExchange NOT EXISTS)) }</code></pre>
+				<div class="callout tip"><p>"Protect against harvest-now-decrypt-later" means hybrid ML-KEM TLS (update clients, opt in on load balancers and APIs), not re-encrypting S3 data. "Signatures must stay trustworthy for 20 years" means ML-DSA keys in KMS. Calls AWS services make for you don't show <code>tlsDetails</code>, which is why the filter excludes them.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/aws-post-quantum-cryptography-migration-plan/">AWS post-quantum cryptography migration plan</a> (AWS Security Blog, December 2024, updated April 2026): the four workstreams and what customers need to do.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/aws-kms-or-aws-cloudhsm-choose-the-right-key-management-solution/">AWS KMS or AWS CloudHSM: Choose the right key management solution</a> (AWS Security Blog, July 2026): decision criteria and the cost break-even.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/post-quantum-ml-dsa-code-signing-with-aws-private-ca-and-aws-kms/">Post-quantum (ML-DSA) code signing with AWS Private CA and AWS KMS</a> (AWS Security Blog, November 2025): an ML-DSA CA chain and signing with a KMS key.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/how-to-build-a-ca-hierarchy-across-multiple-aws-accounts-and-regions-for-global-organization/">How to build a CA hierarchy across multiple AWS accounts and Regions for global organization</a> (AWS Security Blog, July 2024): a shared Private CA design.</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>At rest: customer managed keys for anything shared across accounts, key policy plus IAM policy, <code>kms:ViaService</code> and encryption context to narrow use, automatic rotation 90 to 2,560 days plus on-demand rotation; quotas are charged to the caller.</li>
+				<li>In transit: TLS 1.3 policies set explicitly in IaC, ACM managed renewal as validity shrinks, Private CA hierarchy shared by RAM, short-lived mode for certificates of up to 7 days.</li>
+				<li>HSMs: KMS is already FIPS 140-3 Level 3; CloudHSM for single-tenant control and HSM interfaces, at least 2 HSMs in 2 AZs, backups copied for DR, a CloudHSM key store to keep service integrations.</li>
+				<li>Post-quantum: transit first with hybrid ML-KEM (automatic on many AWS endpoints, opt-in on ELB and API Gateway, updated clients), ML-DSA for long-lived signatures, ML-KEM keys for shared secrets, verify with CloudTrail <code>tlsDetails</code>.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d2-task-2-1.html"><small>Previous</small>Task 2.1: Design identity security architectures</a>
+				<span class="next"><small>Next</small>Task 2.3: Design multi-account governance and compliance solutions (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026; checked on 12 November 2026.</div>
+</footer>
+
+</body>
+</html>
