@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.2: Optimize Data Transfer and Network Costs | AWS SAP-C03 Notes</title>
+	<meta name="description" content="SAP-C03 Task 3.2 study guide: CloudFront delivery, cache policies, Origin Shield, price classes, flat-rate plans and origin failover, cutting data transfer with VPC endpoints, NAT gateway placement and AZ-aware design, cost-aware S3 Cross-Region Replication and DynamoDB global tables, Transit Gateway, VPC peering and PrivateLink pricing trade-offs, and data transfer for AI workloads with cross-Region inference.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="sap.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SAP-C03</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Cost-Optimized Architecture Design &middot; 15%</span>
+		<h1>Task 3.2: Optimize data transfer and network costs</h1>
+		<p>Where the network bill comes from and how to shrink it: serving from the edge, keeping traffic private and inside one Availability Zone where possible, replicating only what DR needs, choosing peering, Transit Gateway or PrivateLink by traffic pattern, and keeping AI data and models close together.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">CloudFront</span><span class="tag">VPC endpoints</span><span class="tag">NAT gateway</span><span class="tag">Transit Gateway</span><span class="tag">PrivateLink</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Content delivery and caching</a></li>
+				<li><a href="#s2">Private, Regional and AZ-aware traffic</a></li>
+				<li><a href="#s3">Cost-aware multi-Region replication</a></li>
+				<li><a href="#s4">Network architecture pricing</a></li>
+				<li><a href="#s5">Data transfer for AI workloads</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.2</span>
+				<p><strong>Optimize data transfer and network costs.</strong></p>
+			</div>
+			<p>Data transfer is easy to miss in a design and hard to remove later. The rules that drive most answers: inbound is free, internet egress is the most expensive path, traffic between AZs costs $0.01 per GB in each direction, traffic between Regions costs about $0.02 per GB, and every managed hop (NAT gateway, Transit Gateway, interface endpoint) adds a per-GB processing fee. Rates and the full price lists are in the <a href="../aws-saa/d4-task-4-4.html">SAA network cost notes</a>; the network designs themselves are on <a href="d1-task-1-4.html">Task 1.4</a>. Prices on this page are us-east-1 list prices.</p>
+			<p><strong>Running example.</strong> Product images and the web app are served worldwide from S3 and ALB origins in us-east-1; dozens of workload VPCs reach each other and on premises through a shared Transit Gateway; private subnets pull container images and S3 data through NAT gateways; customer data is copied to us-west-2 for DR; and the support assistant's RAG pipeline reads documents from S3 and calls Bedrock.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> New: CloudFront <strong>flat-rate plans</strong> (Free, Pro, Business and Premium per distribution, with no overage charges), Transit Gateway <strong>flexible cost allocation</strong> through metering policies (November 2025), the <strong>Regional NAT gateway</strong> (one resource, still billed per AZ), cross-Region PrivateLink (with no premium beyond inter-Region transfer), Direct Connect flat-rate billing for dedicated connections (September 2026), and public IPv4 addresses are charged at $0.005 per hour each.</p></div>
+
+			<!-- Skill 3.2.1 -->
+			<h2 id="s1">Content delivery and caching</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.1</span><span class="skill-text">Design content delivery architectures, origin selection strategies, caching strategies, and failover patterns (for example, by using Amazon CloudFront, Amazon CloudFront Origin Shield).</span></p>
+				<ul>
+					<li><strong>Why CloudFront saves money:</strong> transfer from AWS origins to CloudFront is free, CloudFront's internet rate is below EC2's and falls steeply with volume, and every cache hit is a request the origin doesn't serve. Even uncacheable API traffic gains from connection reuse and the AWS backbone.</li>
+					<li><strong>Raise the cache hit ratio:</strong> cache policies with the smallest cache key (only the headers, cookies and query strings that change the response), origin request policies to forward other values without caching on them, long TTLs with versioned file names, and compression.</li>
+					<li><strong>Origin Shield</strong> adds a central caching layer in one Region in front of the origin: all edge locations fetch through it, so the origin sees far fewer requests. It costs per request that reaches it, so it pays off for viewers spread across many regions, expensive origins (on premises, or video packaging) and multi-CDN setups. Choose the Origin Shield Region closest to the origin.</li>
+					<li><strong>Origin selection:</strong> S3 with origin access control for static content, ALB or VPC origins (private ALB, NLB or EC2 with no public IP) for dynamic content, and cache behaviours by path so each part goes to the right origin.</li>
+					<li><strong>Failover:</strong> an <strong>origin group</strong> retries a secondary origin (for example the DR Region's bucket) when the primary returns chosen status codes or times out. It works only for GET, HEAD and OPTIONS, so writes need Route 53 or application failover.</li>
+					<li><strong>Pricing choices:</strong>
+						<ul>
+							<li><strong>Price classes</strong> leave out the most expensive edge regions. Viewers there are still served, from a cheaper region, with more latency.</li>
+							<li><strong>Flat-rate plans</strong> include WAF, DDoS protection and DNS for a fixed monthly price, with no overage charges.</li>
+							<li>The <strong>Security Savings Bundle</strong> gives up to 30% off for a 1-year commitment.</li>
+							<li><strong>S3 Transfer Acceleration</strong> speeds large uploads from distant clients, but it is a charge on top of normal transfer.</li>
+						</ul>
+					</li>
+				</ul>
+				<span class="file">CloudFront distribution (part): Origin Shield in front of S3, failover to the DR bucket</span>
+<pre><code>{
+  "Origins": {
+    "Quantity": 2,
+    "Items": [
+      {
+        "Id": "images-us-east-1",
+        "DomainName": "example-images-use1.s3.us-east-1.amazonaws.com",
+        "OriginAccessControlId": "E2EXAMPLEOAC01",
+        "S3OriginConfig": { "OriginAccessIdentity": "" },
+        "OriginShield": { "Enabled": true, "OriginShieldRegion": "us-east-1" }
+      },
+      {
+        "Id": "images-us-west-2",
+        "DomainName": "example-images-usw2.s3.us-west-2.amazonaws.com",
+        "OriginAccessControlId": "E2EXAMPLEOAC01",
+        "S3OriginConfig": { "OriginAccessIdentity": "" }
+      }
+    ]
+  },
+  "OriginGroups": {
+    "Quantity": 1,
+    "Items": [
+      {
+        "Id": "images-failover",
+        "FailoverCriteria": {
+          "StatusCodes": { "Quantity": 3, "Items": [500, 502, 503] }
+        },
+        "Members": {
+          "Quantity": 2,
+          "Items": [
+            { "OriginId": "images-us-east-1" },
+            { "OriginId": "images-us-west-2" }
+          ]
+        }
+      }
+    ]
+  }
+}</code></pre>
+				<div class="callout trap"><p>A cache key that includes every header or cookie makes nearly every request a miss, and you pay origin load and requests for nothing. Global Accelerator never lowers cost (its premium is added on top of normal transfer); choose it for static IPs, non-HTTP traffic or fast failover, and CloudFront for cheaper delivery of HTTP content.</p></div>
+			</div>
+
+			<!-- Skill 3.2.2 -->
+			<h2 id="s2">Private, Regional and AZ-aware traffic</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.2</span><span class="skill-text">Optimize data transfer costs by using strategies such as private connectivity, Regional traffic patterns, and inter-Availability Zone/inter-Region strategies (for example, by using VPC endpoints, NAT gateways, Availability Zone-aware architectures).</span></p>
+				<ul>
+					<li><strong>Keep AWS service traffic off NAT:</strong> a NAT gateway charges $0.045 per GB processed on top of its hourly fee. <strong>Gateway endpoints</strong> for S3 and DynamoDB are free; <strong>interface endpoints</strong> ($0.01 per AZ-hour plus $0.01 per GB) for ECR, CloudWatch, STS and others are cheaper than NAT once traffic is meaningful. IPv6 traffic can use a free egress-only internet gateway instead of NAT.</li>
+					<li><strong>NAT placement:</strong> one NAT gateway per AZ with each subnet routed to its local gateway avoids cross-AZ charges and survives an AZ failure. A single shared gateway saves about $33 a month per AZ dropped but adds $0.01 per GB each way, which suits only low-volume dev and test.</li>
+					<li><strong>AZ-aware design:</strong>
+						<ul>
+							<li><strong>Same-AZ traffic over private IPs is free; cross-AZ costs $0.01 per GB each way.</strong> So keep chatty tiers in one AZ path (zonal service discovery, AZ-aware routing in the mesh or load balancer) while still deploying across AZs for resilience.</li>
+							<li><strong>Read from replicas in the same AZ.</strong></li>
+							<li><strong>Compare AZ IDs, not AZ names, across accounts.</strong> The names map to different physical AZs in each account.</li>
+						</ul>
+					</li>
+					<li><strong>Use private IPs:</strong> traffic to a public or Elastic IP inside the Region is charged like cross-AZ, even in the same AZ, and every public IPv4 address costs $0.005 per hour.</li>
+					<li><strong>Load balancers:</strong> ALB cross-zone traffic is free; NLB and Gateway Load Balancer cross-zone is off by default and charged when turned on.</li>
+					<li><strong>Regional patterns:</strong> keep compute in the same Region as its data (S3 to any service in the same Region is free), process data where it lands and move only results, and don't route Regional traffic through another Region's inspection VPC unless policy requires it.</li>
+				</ul>
+				<span class="file">Free S3 gateway endpoint for the private subnets' route tables</span>
+<pre><code>aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-0a1b2c3d4e5f60001 \
+  --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --route-table-ids rtb-0a1b2c3d4e5f60001 rtb-0a1b2c3d4e5f60002 rtb-0a1b2c3d4e5f60003</code></pre>
+				<div class="callout trap"><p>Gateway endpoints can't be used from on premises, through a Transit Gateway or from a peered VPC; those paths need interface endpoints. With both S3 endpoint types and private DNS on, VPC traffic can silently use the paid interface endpoint: enable private DNS only for the inbound Resolver endpoint so VPC traffic stays on the free gateway. Cost Explorer shows cross-AZ traffic as <code>DataTransfer-Regional-Bytes</code>, with one line for each direction.</p></div>
+			</div>
+
+			<!-- Skill 3.2.3 -->
+			<h2 id="s3">Cost-aware multi-Region replication</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.3</span><span class="skill-text">Configure cost-aware, multi-Region data replication (for example, by using Amazon S3 Cross-Region Replication, Amazon DynamoDB global tables).</span></p>
+				<ul>
+					<li><strong>S3 Cross-Region Replication</strong> costs inter-Region transfer (priced by the source Region, about $0.02 per GB from us-east-1), PUT requests and storage in the destination, and extra for Replication Time Control. Cut it by:
+						<ul>
+							<li>replicating only the prefixes or tags DR really needs;</li>
+							<li>writing replicas to a cheaper storage class (Standard-IA or Glacier Instant Retrieval);</li>
+							<li>not replicating short-lived or easily regenerated data;</li>
+							<li>using Batch Replication only once, for existing objects.</li>
+						</ul>
+					</li>
+					<li><strong>DynamoDB global tables:</strong> each write is charged again as a replicated write in every replica Region, plus storage in each Region, so cost grows with the number of Regions. Add Regions for latency or recovery needs, not by default; consider Standard-IA table class for large, rarely read replicas; and remember TTL deletes are free on one table but replicated TTL deletes are charged.</li>
+					<li><strong>Aurora Global Database</strong> charges replicated write I/O in each secondary Region plus inter-Region transfer, on top of the secondary cluster's instances.</li>
+					<li><strong>Match replication to recovery objectives:</strong> backups copied with AWS Backup (cheapest, hours to restore), pilot light with replicated data only, or full active-active (most expensive). Recovery design is covered in Domain 4.</li>
+				</ul>
+				<span class="file">S3 replication rule: only the customer-records prefix, stored as Standard-IA in us-west-2</span>
+<pre><code>{
+  "Role": "arn:aws:iam::111111111111:role/s3-replication-dr",
+  "Rules": [
+    {
+      "ID": "dr-customer-records",
+      "Priority": 1,
+      "Status": "Enabled",
+      "Filter": { "Prefix": "customer-records/" },
+      "DeleteMarkerReplication": { "Status": "Disabled" },
+      "Destination": {
+        "Bucket": "arn:aws:s3:::example-customer-data-usw2",
+        "StorageClass": "STANDARD_IA"
+      }
+    }
+  ]
+}</code></pre>
+				<div class="callout tip"><p>"Reduce replication cost without losing DR for critical data" points to prefix or tag filters and a cheaper replica storage class. "Global table bill grew after adding a fourth Region" is the replicated write charge per Region. "Strict 15-minute replication SLA" is Replication Time Control, at extra cost.</p></div>
+			</div>
+
+			<!-- Skill 3.2.4 -->
+			<h2 id="s4">Network architecture pricing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.4</span><span class="skill-text">Design cost-effective network architectures (for example, by using AWS Transit Gateway data processing charges, AWS PrivateLink pricing models).</span></p>
+				<ul>
+					<li><strong>Transit Gateway:</strong> $0.05 per attachment-hour plus $0.02 per GB processed, charged by default to the sender's account. It's the simplest hub for many VPCs and on premises, but heavy VPC-to-VPC flows pay the processing fee on every GB. Transit Gateway peering attachments add no processing charge for data entering from the peer.</li>
+					<li><strong>VPC peering</strong> has no hourly or processing fee: same-AZ traffic is free, cross-AZ is $0.01 per GB each way, and inter-Region pays normal transfer. Add a direct peering for the few VPC pairs that exchange a lot of data, and keep the TGW for everything else.</li>
+					<li><strong>PrivateLink</strong> ($0.01 per endpoint per AZ-hour plus $0.01 per GB, falling at petabyte volumes) exposes one service to many consumers without routing whole networks; consumers pay the endpoint fees. For cross-Region PrivateLink the consumer also pays inter-Region transfer, and the provider pays $0.05 per hour per remote Region.</li>
+					<li><strong>VPC Lattice</strong> charges per service-hour, per GB and per request (with a free allowance), and includes cross-AZ transfer in its processing fee.</li>
+					<li><strong>Shared VPCs</strong> (RAM subnet sharing) avoid attachments and processing between accounts in the same VPC, and centralize NAT and endpoints so each is paid once.</li>
+					<li><strong>Who pays:</strong> Transit Gateway metering policies can charge data processing to the source, the destination or the TGW owner (not attachment hours), so a central network team can show each business unit its own cost.</li>
+					<li><strong>Hybrid:</strong> Direct Connect transfer out is cheaper per GB than internet egress, so heavy on-premises flows usually justify it; flat-rate billing for dedicated connections makes cost predictable. Centralized interface endpoints in a shared-services VPC, reached through the TGW, trade per-VPC endpoint hours for TGW processing.</li>
+				</ul>
+				<div class="callout trap"><p>A centralized inspection or egress VPC behind a Transit Gateway pays TGW processing (and often cross-AZ) on every GB in both directions; that may be worth it for security, but count it. Interface endpoints are billed per AZ per hour even when idle, and Trusted Advisor flags idle NAT gateways and endpoints.</p></div>
+			</div>
+
+			<!-- Skill 3.2.5 -->
+			<h2 id="s5">Data transfer for AI workloads</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2.5</span><span class="skill-text">Optimize data transfer costs for AI/ML workloads by using strategies such as cross-Region inference routing.</span></p>
+				<ul>
+					<li><strong>Cross-Region inference</strong> spreads Bedrock requests across Regions in a geography (or globally) for capacity, billed at the source Region's price with no routing fee; global profiles cost about 10% less than geographic ones. It's usually cheaper than buying provisioned capacity for peaks, within the residency limits in <a href="d2-task-2-4.html#s4">Task 2.4</a>.</li>
+					<li><strong>Keep the RAG pipeline in one Region:</strong> source documents in S3, the knowledge base, the vector store and the model calls in the same Region avoid inter-Region transfer on every ingestion and query. Replicate the source data or embeddings to a second Region only if DR needs it.</li>
+					<li><strong>Training data next to compute:</strong> run SageMaker training in the Region where the data lives (S3 to SageMaker in the same Region is free), use FSx for Lustre linked to S3 for repeated epochs, and keep checkpoints in the same Region.</li>
+					<li><strong>Batch and summarize at the source:</strong> Bedrock batch jobs read and write S3 in the source Region; aggregate or summarize where data is produced and move only results, not raw logs or media.</li>
+					<li><strong>Private access:</strong> interface endpoints for Bedrock and SageMaker runtime keep traffic off NAT gateways, which charge per GB.</li>
+				</ul>
+				<div class="callout tip"><p>"Throttling at peak, lowest cost, data may be processed elsewhere in the US" points to a <code>us.</code> cross-Region inference profile, not Provisioned Throughput. "Knowledge base in us-east-1 but documents in eu-west-1" is paying inter-Region transfer on every sync; move one to the other's Region if residency allows.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/architecture/overview-of-data-transfer-costs-for-common-architectures/">Overview of Data Transfer Costs for Common Architectures</a> (AWS Architecture Blog, June 2021): where transfer charges arise in common designs (older post; check current prices, NAT options and public IPv4 charges).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/powering-predictable-costs-with-aws-direct-connect-flat-rate-pricing/">Powering predictable costs with AWS Direct Connect flat-rate pricing</a> (AWS Networking and Content Delivery Blog, September 2026): flat-rate billing for dedicated connections.</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Edge: CloudFront for cheaper egress and fewer origin requests, small cache keys, Origin Shield for spread-out viewers and costly origins, origin groups for read failover, price classes or flat-rate plans for predictable bills.</li>
+				<li>Private and AZ-aware: gateway endpoints are free, interface endpoints beat NAT at volume, one NAT per AZ, same-AZ private-IP paths, no public or Elastic IP hops inside a Region.</li>
+				<li>Replication: filter what you replicate, cheaper replica storage classes, fewer global table Regions, recovery tier matched to objectives.</li>
+				<li>Network design: TGW for many-to-many with $0.02 per GB, direct peering for heavy pairs, PrivateLink for service exposure, shared VPCs, metering policies for chargeback.</li>
+				<li>AI: cross-Region inference at source-Region prices for peaks, RAG and training data in the same Region as the model or compute, move results not raw data.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-1.html"><small>Previous</small>Task 3.1: Design architectures based on AWS pricing models</a>
+				<a class="next" href="d3-task-3-3.html"><small>Next</small>Task 3.3: Design cost allocation and visibility solutions</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026; checked on 12 November 2026.</div>
+</footer>
+
+</body>
+</html>
