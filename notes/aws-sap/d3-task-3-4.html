@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Task 3.4: Optimize Storage and Database Costs | AWS SAP-C03 Notes</title>
+	<meta name="description" content="SAP-C03 Task 3.4 study guide: S3 Intelligent-Tiering, lifecycle rules and Glacier classes, EFS lifecycle, EBS gp3 versus gp2 and Provisioned IOPS, DynamoDB capacity modes and table classes, RDS reserved instances, Aurora Serverless v2 and I/O-Optimized, Database Savings Plans, cost-optimized retention with AWS Backup and Data Lifecycle Manager, and cheaper observability through log classes, log filtering, metric aggregation and retention.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="sap.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="index.html">SAP-C03</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">Task 3.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Cost-Optimized Architecture Design &middot; 15%</span>
+		<h1>Task 3.4: Optimize storage and database costs</h1>
+		<p>Paying for data by how it's used: storage that tiers itself as it cools, volumes sized for the IOPS they actually need, databases on the right capacity mode and commitment, backups kept only as long as the rules require, and logs and metrics that don't cost more than the systems they watch.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">S3 Lifecycle</span><span class="tag">EBS gp3</span><span class="tag">Aurora</span><span class="tag">AWS Backup</span><span class="tag">CloudWatch Logs</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Storage tiering and lifecycle</a></li>
+				<li><a href="#s2">Block storage</a></li>
+				<li><a href="#s3">Database capacity and commitments</a></li>
+				<li><a href="#s4">Backup and retention</a></li>
+				<li><a href="#s5">Cost-effective observability</a></li>
+				<li><a href="#reading">Further reading</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 3.4</span>
+				<p><strong>Optimize storage and database costs.</strong></p>
+			</div>
+			<p>Storage and database costs grow quietly: data is rarely deleted, volumes are sized for a peak that never comes, and logs are kept forever by default. The detailed prices are in the <a href="../aws-saa/d4-task-4-1.html">SAA cost-optimized storage notes</a> and <a href="../aws-saa/d4-task-4-3.html">SAA cost-optimized database notes</a>; this page is about the decisions. Prices are us-east-1 list prices.</p>
+			<p><strong>Running example.</strong> Order documents and images build up in S3 and are rarely read after a month; shared files sit on EFS; EC2 still has gp2 volumes from the original build; Aurora PostgreSQL carries the order database with a heavy, steady I/O load; dev databases sit idle overnight; DynamoDB holds a large order-history table that is mostly stored, not read; backups are kept seven years for regulators; and CloudWatch Logs is now one of the biggest lines on the bill.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> The vault-based <strong>Amazon Glacier</strong> service no longer accepts new customers (use the S3 Glacier storage classes). Since September 2024, S3 Lifecycle doesn't transition objects under 128 KB by default. The CloudWatch Logs Infrequent Access class is now <strong>Essentials</strong> (read APIs return the new name from December 2026). The X-Ray SDKs and daemon entered <strong>maintenance mode</strong> in February 2026 (use OpenTelemetry). New: <strong>Database Savings Plans</strong> (December 2025), Aurora Serverless v2 <strong>auto-pause</strong> to zero capacity, gp3 volumes up to 80,000 IOPS (September 2025), the AWS Backup low-cost warm tier for S3 backups, Lambda logs billed at tiered vended-log rates (May 2025), and CloudWatch Logs <strong>Intelligent Tiering</strong> for log storage (2026).</p></div>
+
+			<!-- Skill 3.4.1 -->
+			<h2 id="s1">Storage tiering and lifecycle</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.1</span><span class="skill-text">Implement intelligent storage tiering and lifecycle policies (for example, by using Amazon S3 Intelligent-Tiering, S3 Lifecycle policies, S3 Glacier storage classes, Amazon EFS lifecycle policies).</span></p>
+				<ul>
+					<li><strong>Unknown or changing access: S3 Intelligent-Tiering.</strong> It moves objects to Infrequent Access after 30 days without access and Archive Instant Access after 90, with no retrieval fees and no minimum duration, for a small monitoring fee per object. Turn on the optional Archive Access and Deep Archive Access tiers only if hours of restore time are acceptable.</li>
+					<li><strong>Known patterns: Lifecycle rules.</strong> For example Standard, then Standard-IA at 30 days, Glacier Flexible Retrieval at 90, Deep Archive at 180, and expire at the retention limit. Expire noncurrent versions and abort incomplete multipart uploads too. Storage Class Analysis and S3 Storage Lens show where rules would pay off.</li>
+					<li><strong>Choosing a Glacier class:</strong>
+						<ul>
+							<li><strong>Glacier Instant Retrieval:</strong> millisecond reads for data read about once a quarter. It charges per GB retrieved, so it costs more if read often.</li>
+							<li><strong>Glacier Flexible Retrieval:</strong> minutes to hours, with free bulk restores.</li>
+							<li><strong>Glacier Deep Archive:</strong> the cheapest at about $1 per TB-month, with restores in 12 to 48 hours.</li>
+						</ul>
+					</li>
+					<li><strong>Small objects:</strong> each transition is a billed request, IA classes bill at least 128 KB per object, and Glacier Flexible Retrieval and Deep Archive add 40 KB per object. Aggregate small files before archiving; Lifecycle skips objects under 128 KB by default.</li>
+					<li><strong>Minimum durations:</strong> 30 days (IA), 90 days (Glacier Instant and Flexible), 180 days (Deep Archive). Deleting earlier still bills the remainder.</li>
+					<li><strong>EFS lifecycle</strong> moves files not accessed for a set time to Infrequent Access (default 30 days) and Archive (default 90 days), and can move them back on first access. EFS One Zone costs about half of Regional storage when multi-AZ resilience isn't needed.</li>
+				</ul>
+				<span class="file">S3 Lifecycle: tier order documents larger than 128 KB, keep 3 old versions, expire after 7 years</span>
+<pre><code>{
+  "Rules": [
+    {
+      "ID": "tier-order-documents",
+      "Status": "Enabled",
+      "Filter": { "And": { "Prefix": "orders/", "ObjectSizeGreaterThan": 131072 } },
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "GLACIER" },
+        { "Days": 180, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "NoncurrentVersionTransitions": [
+        { "NoncurrentDays": 30, "StorageClass": "GLACIER_IR", "NewerNoncurrentVersions": 3 }
+      ],
+      "Expiration": { "Days": 2555 }
+    }
+  ]
+}</code></pre>
+				<span class="file">EFS: tier cold files, bring them back when read</span>
+<pre><code>aws efs put-lifecycle-configuration \
+  --file-system-id fs-0a1b2c3d4e5f60001 \
+  --lifecycle-policies '[{"TransitionToIA":"AFTER_30_DAYS"},
+    {"TransitionToArchive":"AFTER_90_DAYS"},
+    {"TransitionToPrimaryStorageClass":"AFTER_1_ACCESS"}]'</code></pre>
+				<div class="callout trap"><p>Lifecycle only moves data down the chain: One Zone-IA can't go to Glacier Instant Retrieval, and Deep Archive is one-way. Intelligent-Tiering never tiers objects under 128 KB. Restoring an archived object bills a temporary copy at Standard rates as well as the archive copy. EFS Archive needs Elastic Throughput, and EFS IA costs more with Bursting or Provisioned Throughput than with Elastic.</p></div>
+			</div>
+
+			<!-- Skill 3.4.2 -->
+			<h2 id="s2">Block storage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.2</span><span class="skill-text">Optimize block storage costs by selecting appropriate volume types and provisioning appropriate input/output operations per second (IOPS) (for example, Amazon EBS gp3 volumes, EBS gp2 volumes, Provisioned IOPS).</span></p>
+				<ul>
+					<li><strong>gp3 by default:</strong> 20% cheaper per GB than gp2 ($0.08 vs $0.10 per GB-month), with 3,000 IOPS and 125 MiB/s included at any size. Extra IOPS (up to 80,000) and throughput (up to 2,000 MiB/s) are bought separately, so you don't over-buy capacity to get speed.</li>
+					<li><strong>gp2</strong> ties IOPS to size (3 IOPS per GB with burst credits), so large gp2 volumes were often bought only for IOPS. Migrating to gp3 with Elastic Volumes needs no downtime.</li>
+					<li><strong>io2 Block Express</strong> (Provisioned IOPS) only when you need more than gp3 offers, sub-millisecond consistency, or higher durability for critical databases; IOPS are charged per provisioned IOPS-month whether used or not.</li>
+					<li><strong>Throughput HDD:</strong> st1 for large sequential reads (logs, data processing) and sc1 for cold sequential data are far cheaper per GB, but can't be boot volumes.</li>
+					<li><strong>Find waste:</strong> Compute Optimizer recommends volume type, size, IOPS and throughput; Cost Optimization Hub and Trusted Advisor flag unattached and idle volumes.</li>
+					<li><strong>Snapshots:</strong> Data Lifecycle Manager or AWS Backup for retention; snapshot archive ($0.0125 vs $0.05 per GB-month) for snapshots kept 90 days or more, such as monthly or yearly copies.</li>
+				</ul>
+				<span class="file">Move a gp2 volume to gp3 in place, with the included baseline performance</span>
+<pre><code>aws ec2 modify-volume \
+  --volume-id vol-0a1b2c3d4e5f60001 \
+  --volume-type gp3 \
+  --iops 3000 \
+  --throughput 125</code></pre>
+				<div class="callout trap"><p>EBS volumes can grow but not shrink in place; downsizing means a new volume and a copy. Archiving a snapshot turns an incremental snapshot into a full one and has a 90-day minimum, so archiving daily snapshots costs more, not less. Deleted volumes and snapshots held in Recycle Bin keep billing until retention ends.</p></div>
+			</div>
+
+			<!-- Skill 3.4.3 -->
+			<h2 id="s3">Database capacity and commitments</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.3</span><span class="skill-text">Optimize database costs by selecting appropriate capacity modes and reserved capacity (for example, DynamoDB capacity modes, Amazon RDS reserved DB instances, Amazon Aurora serverless, Aurora I/O-Optimized, Database Savings Plans).</span></p>
+				<ul>
+					<li><strong>DynamoDB:</strong>
+						<ul>
+							<li><strong>On-demand</strong> is AWS's default recommendation and suits spiky or unknown traffic.</li>
+							<li><strong>Provisioned with auto scaling</strong> is much cheaper per request for steady, predictable load. Fully used, it costs about a third of on-demand per write.</li>
+							<li><strong>Reserved capacity</strong> (up to 77% off for 3 years) applies only to provisioned mode on the Standard table class in a single Region.</li>
+							<li><strong>Standard-IA table class</strong> pays off when storage is more than half the table's throughput cost.</li>
+						</ul>
+					</li>
+					<li><strong>RDS:</strong>
+						<ul>
+							<li><strong>Reserved DB instances:</strong> 1 or 3 years; No Upfront only on 1-year terms. Size flexibility within a family, except SQL Server and Oracle License Included.</li>
+							<li><strong>Multi-AZ:</strong> a Multi-AZ instance costs about twice Single-AZ, and a Multi-AZ cluster about 2.8 times.</li>
+							<li><strong>Dev and test:</strong> stop idle databases; they restart automatically after 7 days.</li>
+						</ul>
+					</li>
+					<li><strong>Aurora:</strong>
+						<ul>
+							<li><strong>Standard</strong> charges per I/O request.</li>
+							<li><strong>I/O-Optimized</strong> charges nothing for I/O, but about 30% more per instance-hour and 2.25 times more for storage. It pays for I/O-heavy clusters such as the order database.</li>
+							<li><strong>Serverless v2</strong> scales in fine steps for variable load, and can now auto-pause to zero capacity for idle dev clusters. Auto-pause doesn't happen with RDS Proxy, Global Database, replication or zero-ETL attached, or while connections are open.</li>
+						</ul>
+					</li>
+					<li><strong>Database Savings Plans</strong> (up to 35%, 1-year No Upfront only) cover Aurora, RDS, DynamoDB, ElastiCache, DocumentDB, Neptune, Keyspaces and others across engines. They cover newer instance generations and serverless usage only, and don't stack with RIs or reserved capacity on the same usage. Use RIs for 3-year terms and older generations.</li>
+					<li><strong>Other levers:</strong> Graviton instance classes, ElastiCache and MemoryDB for Valkey (cheaper than Redis OSS), caching to shrink the database, Aurora cloning instead of full copies for test, and Compute Optimizer recommendations for RDS, Aurora and DynamoDB.</li>
+				</ul>
+				<span class="file">Idle dev cluster: let Aurora Serverless v2 pause after an hour without connections</span>
+<pre><code>aws rds modify-db-cluster \
+  --db-cluster-identifier orders-dev \
+  --serverless-v2-scaling-configuration MinCapacity=0,MaxCapacity=16,SecondsUntilAutoPause=3600</code></pre>
+				<span class="file">Order-history table: storage-heavy, so switch to the Standard-IA table class</span>
+<pre><code>aws dynamodb update-table \
+  --table-name order-history \
+  --table-class STANDARD_INFREQUENT_ACCESS
+<span class="c"># At most two table class changes in 30 days; reads and writes cost more on IA</span></code></pre>
+				<div class="callout tip"><p>"Aurora bill dominated by I/O charges on a steady workload" points to I/O-Optimized. "Dev databases idle at night and weekends" points to Serverless v2 auto-pause (or stopping instances). "Commit across RDS, Aurora and DynamoDB in one purchase" is a Database Savings Plan; "3-year commitment on db.r6g" still needs RIs.</p></div>
+			</div>
+
+			<!-- Skill 3.4.4 -->
+			<h2 id="s4">Backup and retention</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.4</span><span class="skill-text">Implement backup and disaster recovery mechanisms that use cost-optimized retention policies (for example, by using AWS Backup, Amazon Data Lifecycle Manager).</span></p>
+				<ul>
+					<li><strong>Retention by rule, not by habit:</strong> daily backups kept for weeks, monthly for a year, yearly for the regulatory period, each with its own lifecycle in AWS Backup plans, deployed organization-wide with backup policies.</li>
+					<li><strong>Cold storage</strong> (AWS Backup lifecycle) for EFS, DynamoDB (with advanced features), EBS (through snapshot archive) and others: cheaper per GB, but backups must stay at least 90 days in cold storage. RDS, Aurora, DocumentDB and Neptune backups can't move to cold storage. For long-term database archives, export snapshots to S3 as Parquet and tier them with Lifecycle, knowing that an export can't be restored as a database.</li>
+					<li><strong>S3 backups</strong> can move to a low-cost warm tier after at least 60 days (up to 30% cheaper). Expire old versions and delete markers, because each counts as at least 128 KB.</li>
+					<li><strong>Data Lifecycle Manager</strong> (no extra charge) automates EBS snapshots and EBS-backed AMIs by tag, with retention by count or age, archiving and cross-Region copies; its default policies back up any volume without a recent backup, kept 2 to 14 days.</li>
+					<li><strong>Database-native retention:</strong> RDS automated backups up to 35 days (point-in-time recovery). Manual and final snapshots outlive the instance and keep billing. Aurora backup storage beyond the free amount is cheaper than RDS ($0.021 vs $0.095 per GB-month).</li>
+					<li><strong>Cross-Region copies</strong> pay inter-Region transfer plus storage in the DR Region, so copy only what the recovery plan needs and keep shorter retention there.</li>
+				</ul>
+				<span class="file">AWS Backup plan rule: daily EFS backups, cold after 30 days, deleted after a year</span>
+<pre><code>{
+  "BackupPlan": {
+    "BackupPlanName": "efs-daily",
+    "Rules": [
+      {
+        "RuleName": "daily-1y",
+        "TargetBackupVaultName": "regulated-vault",
+        "ScheduleExpression": "cron(0 3 ? * * *)",
+        "Lifecycle": {
+          "MoveToColdStorageAfterDays": 30,
+          "DeleteAfterDays": 365
+        }
+      }
+    ]
+  }
+}</code></pre>
+				<div class="callout trap"><p><code>DeleteAfterDays</code> must be at least 90 days after the move to cold storage. A cold-storage setting in a plan has no effect on RDS or Aurora backups. Backing up S3 objects in IA or Glacier Instant Retrieval incurs retrieval charges, and backing up Intelligent-Tiering objects moves them back to the frequent tier.</p></div>
+			</div>
+
+			<!-- Skill 3.4.5 -->
+			<h2 id="s5">Cost-effective observability</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.4.5</span><span class="skill-text">Design cost-effective observability solutions that include features such as log filtering, metric aggregation, and retention optimization.</span></p>
+				<ul>
+					<li><strong>Logs cost three ways:</strong> ingestion ($0.50 per GB on the Standard class), storage ($0.03 per GB-month, compressed) and queries ($0.005 per GB scanned).
+						<ul>
+							<li><strong>Essentials log class</strong> halves ingestion ($0.25 per GB). It has no subscription or metric filters, embedded metrics, field indexes or Live Tail, and the class is fixed when the log group is created.</li>
+							<li><strong>Logs Intelligent Tiering</strong> (an account and Region setting) moves stored logs to $0.018 and then $0.006 per GB-month when they go unread.</li>
+						</ul>
+					</li>
+					<li><strong>Filter at the source:</strong>
+						<ul>
+							<li><strong>Lambda:</strong> set JSON log format and log levels, so DEBUG lines aren't ingested in production.</li>
+							<li><strong>CloudWatch agent:</strong> include and exclude filters drop noise before it's sent.</li>
+							<li><strong>Fluent Bit (FireLens):</strong> filters do the same for containers.</li>
+						</ul>
+					</li>
+					<li><strong>Route by purpose:</strong>
+						<ul>
+							<li><strong>Audit-only logs:</strong> send VPC Flow Logs and Lambda logs straight to S3 or Firehose ($0.25 per GB at the first tier). Vended and Lambda log tiers are pooled, so volume lowers the rate.</li>
+							<li><strong>Continuous archive:</strong> use a subscription filter to Firehose and S3, not repeated export tasks.</li>
+							<li><strong>Centralization:</strong> the first centralized copy is free; extra copies cost $0.05 per GB.</li>
+						</ul>
+					</li>
+					<li><strong>Retention:</strong> log groups never expire by default; set retention on every group, enforce it with an account-level retention policy or a Config rule, and keep long-term archives in S3 with Lifecycle instead of CloudWatch.</li>
+					<li><strong>Metric aggregation:</strong>
+						<ul>
+							<li><strong>Price:</strong> custom metrics cost $0.30 per metric-month for the first 10,000, and every unique dimension combination is a separate metric. Never use request IDs or user IDs as dimensions; put them in log fields instead.</li>
+							<li><strong>CloudWatch agent:</strong> send only roll-ups with <code>aggregation_dimensions</code> plus <code>drop_original_metrics</code>.</li>
+							<li><strong>Embedded metric format:</strong> metrics come from logs, so you pay for both the log ingestion and the metrics.</li>
+							<li><strong>New custom metrics:</strong> AWS now recommends OpenTelemetry, billed per GB.</li>
+							<li><strong>Third-party tools:</strong> metric streams are cheaper than polling with <code>GetMetricData</code>, which is always charged.</li>
+						</ul>
+					</li>
+					<li><strong>Alarms and traces:</strong> standard alarms ($0.10) unless 10-second evaluation is needed ($0.30); composite alarms to cut alert noise. Sample traces at the entry service (default 1 request per second plus 5%), and index only a small share of spans in Transaction Search.</li>
+					<li><strong>Containers:</strong> Container Insights with enhanced observability for EKS is billed per observation, and the OpenTelemetry-based version per GB; compare with Amazon Managed Service for Prometheus (billed per sample ingested, with per-label-set series limits).</li>
+				</ul>
+				<span class="file">Production function: JSON logs, only errors from the code and warnings from the platform</span>
+<pre><code>aws lambda update-function-configuration \
+  --function-name order-validator \
+  --logging-config LogFormat=JSON,ApplicationLogLevel=ERROR,SystemLogLevel=WARN</code></pre>
+				<span class="file">Let stored logs tier down automatically in this account and Region</span>
+<pre><code>aws logs put-storage-tier-policy --storage-tier INTELLIGENT_TIERING
+<span class="c"># Separate from the Essentials log class, which only lowers ingestion cost</span></code></pre>
+				<div class="callout trap"><p>Lambda log levels work only with JSON format (text is still the default), and a level set in code overrides the setting. Setting retention on an existing log group deletes older events at once. The CloudWatch agent's aggregation without <code>drop_original_metrics</code> doubles the metric count. Trace sampling rules apply only where no upstream decision exists, so set them on the entry service.</p></div>
+			</div>
+
+			<!-- Further reading -->
+			<h2 id="reading">Further reading</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/mt/a-practical-guide-to-amazon-cloudwatch-logs-cost-optimization/">A Practical Guide to Amazon CloudWatch Logs Cost Optimization</a> (AWS Cloud Operations Blog, August 2026): log classes, retention enforcement and the new storage tiers (it still uses the old name Infrequent Access).</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/aws-lambda-introduces-tiered-pricing-for-amazon-cloudwatch-logs-and-additional-logging-destinations/">AWS Lambda introduces tiered pricing for Amazon CloudWatch logs and additional logging destinations</a> (AWS Compute Blog, May 2025): Lambda log tiers and direct delivery to S3 and Firehose.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/container-insights-with-enhanced-observability-now-available-in-amazon-ecs/">Container Insights with enhanced observability now available in Amazon ECS</a> (AWS News Blog, December 2024): pricing and enablement for ECS.</li>
+			</ul>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Storage: Intelligent-Tiering for unknown access, Lifecycle for known patterns with expiration and noncurrent-version rules, aggregate small objects, mind minimum durations; EFS lifecycle and One Zone.</li>
+				<li>Block: gp3 everywhere with IOPS and throughput bought separately, io2 only when needed, Compute Optimizer for sizing, snapshot archive only for long-kept snapshots.</li>
+				<li>Databases: DynamoDB on-demand vs provisioned plus reserved capacity, Standard-IA when storage dominates; RDS RIs; Aurora I/O-Optimized for I/O-heavy and Serverless v2 auto-pause for idle; Database Savings Plans for 1-year cross-engine commitments.</li>
+				<li>Backups: tiered retention in AWS Backup plans, cold storage where supported (not RDS or Aurora), snapshot export to S3 for long-term data, DLM for EBS, short retention for DR copies.</li>
+				<li>Observability: filter and set log levels at the source, Essentials and Intelligent Tiering for logs, retention on every group, S3 for audit logs, low-cardinality aggregated metrics, sampled traces.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d3-task-3-3.html"><small>Previous</small>Task 3.3: Design cost allocation and visibility solutions</a>
+				<span class="next"><small>Next</small>Task 4.1: Design migration strategies by using AWS frameworks (coming next)</span>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026; checked on 12 November 2026.</div>
+</footer>
+
+</body>
+</html>
