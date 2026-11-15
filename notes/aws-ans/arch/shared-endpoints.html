@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Shared Interface Endpoints and a Data Perimeter | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: centralized interface VPC endpoints in a shared services VPC with private DNS disabled, one private hosted zone per service (wildcard for dkr.ecr), zones distributed by a Route 53 Profile, S3 gateway endpoints per VPC plus an S3 interface endpoint for on premises, endpoint, bucket and KMS key policies and SCPs for a data perimeter, CloudTrail network activity events, cost and quota trade-offs, VPC Lattice and cross-Region PrivateLink alternatives.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Shared endpoints</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Shared interface endpoints and a data perimeter</h1>
+		<p>The travel company's 300 VPCs all call the same handful of AWS APIs. One set of interface endpoints per Region in the shared services VPC serves every spoke and both data centers through private hosted zones; free S3 gateway endpoints stay in every VPC; endpoint, bucket and key policies together keep the company's data inside its own organization and network.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">AWS PrivateLink</span><span class="tag">Private hosted zones</span><span class="tag">Route 53 Profiles</span><span class="tag">Transit Gateway</span><span class="tag">AWS CloudTrail</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Endpoints in the shared services VPC</a></li>
+				<li class="sub"><a href="#b2">2. A private zone per service</a></li>
+				<li class="sub"><a href="#b3">3. Zones to every spoke and on premises</a></li>
+				<li class="sub"><a href="#b4">4. S3: gateway in every VPC, interface for the data centers</a></li>
+				<li class="sub"><a href="#b5">5. Endpoint policies for one perimeter</a></li>
+				<li class="sub"><a href="#b6">6. Resource policies and SCP guardrails</a></li>
+				<li class="sub"><a href="#b7">7. See the denied calls</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs about 300 VPCs across <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, attached to the Transit Gateways described in <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a>. Most subnets have no internet route, yet every VPC needs the same APIs: Systems Manager for patching and Session Manager, ECR for the container images of the EKS booking platform, KMS and Secrets Manager for keys and database credentials, STS for IAM roles, CloudWatch Logs, and S3. The PCI DSS assessor wants evidence that card data is readable only from company networks by company identities.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Private access to AWS APIs from 300 VPCs without paying for 300 copies of each endpoint</td><td data-label="Design choice">One interface endpoint per service per Region in the network account's shared services VPC, private DNS disabled</td></tr>
+						<tr><td data-label="Requirement">Applications keep the normal service names and SDK defaults</td><td data-label="Design choice">A private hosted zone named after each service, aliased to the endpoint, carried to every spoke by the Route 53 Profile</td></tr>
+						<tr><td data-label="Requirement">Data centers reach the same APIs privately</td><td data-label="Design choice">Conditional forwarders to the Resolver inbound endpoint, which sees the same zones</td></tr>
+						<tr><td data-label="Requirement">Cheap, high-volume S3 access</td><td data-label="Design choice">An S3 gateway endpoint in every VPC; one S3 interface endpoint per Region for on premises only</td></tr>
+						<tr><td data-label="Requirement">Only company identities, only company resources, only company networks</td><td data-label="Design choice">Organization conditions in endpoint policies, network conditions in bucket and key policies, SCPs as the backstop</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Values used on this page:</p>
+			<ul>
+				<li><strong>Accounts</strong>: network account <code>111111111111</code> owns the shared services VPCs, the endpoints and the zones; the bookings account <code>222222222222</code> owns the production booking VPC <code>vpc-bookings-prod</code>; the log archive account <code>777777777777</code> holds the trail bucket. The organization ID is <code>o-travel1234</code>.</li>
+				<li><strong>us-east-1</strong>: shared services VPC <code>vpc-shared-services</code> (<code>10.41.0.0/16</code>), endpoint subnets <code>subnet-shared-az1</code> to <code>az3</code>, Resolver inbound endpoint at <code>10.41.0.10</code> and <code>10.41.1.10</code>, Route 53 Profile <code>rp-travel-dns-01</code> from <a href="hybrid-dns.html">Hybrid and multi-account DNS</a>. The other Regions repeat the pattern in <code>10.45.0.0/16</code> and <code>10.49.0.0/16</code>.</li>
+				<li><strong>Services per Region</strong>: <code>ssm</code>, <code>ssmmessages</code> and <code>ec2messages</code> (Session Manager and older agents), <code>ecr.api</code>, <code>ecr.dkr</code>, <code>kms</code>, <code>secretsmanager</code>, <code>sts</code> and <code>logs</code>: nine interface endpoints, plus the S3 interface endpoint for on premises.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions of a client you run.</p>
+			<ol class="flow">
+				<li class="group">A pod in a spoke reads a secret</li>
+				<li><span class="name">Name lookup<span class="who">Booking pod</span></span><span class="desc">A pod in <code>vpc-bookings-prod</code> calls Secrets Manager. The SDK resolves <code>secretsmanager.us-east-1.amazonaws.com</code> through the VPC +2 resolver; the VPC keeps AmazonProvidedDNS.</span></li>
+				<li class="auto"><span class="name">Private zone from the Profile<span class="who auto">AWS</span></span><span class="desc">The Profile <code>rp-travel-dns-01</code> carries a private hosted zone named exactly <code>secretsmanager.us-east-1.amazonaws.com</code>. Its apex alias A record returns the private IPs of the central endpoint's interfaces in <code>10.41.0.0/16</code>, not public addresses.</span></li>
+				<li class="auto"><span class="name">Route to the hub<span class="who auto">AWS</span></span><span class="desc">The subnet route <code>10.0.0.0/8</code> sends the HTTPS connection to the Transit Gateway. The <code>prod</code> route table holds the shared services CIDR, so the packet reaches the endpoint subnet.</span></li>
+				<li class="auto"><span class="name">Endpoint checks<span class="who auto">AWS</span></span><span class="desc">The endpoint security group allows TCP 443 from the company ranges. The endpoint policy allows the call because the caller is in <code>o-travel1234</code> and the secret is too.</span></li>
+				<li class="auto"><span class="name">Service and resource policy<span class="who auto">AWS</span></span><span class="desc">Secrets Manager evaluates IAM, the secret's resource policy and the KMS key policy. The request context carries <code>aws:SourceVpce</code> of the central endpoint and <code>aws:SourceVpc</code> of the shared services VPC, which the key policy requires.</span></li>
+				<li class="group">The same pod pulls an image</li>
+				<li class="auto"><span class="name">Registry calls through the hub<span class="who auto">AWS</span></span><span class="desc">Authentication and the manifest go to <code>api.ecr</code> and <code>222222222222.dkr.ecr.us-east-1.amazonaws.com</code>, matching the <code>dkr.ecr</code> wildcard record.</span></li>
+				<li class="auto"><span class="name">Layers through the local gateway endpoint<span class="who auto">AWS</span></span><span class="desc">The image layers come from S3. S3 names are not overridden, so they resolve to public S3 addresses and the route table sends them to the VPC's own free gateway endpoint; the heavy bytes never cross the Transit Gateway.</span></li>
+				<li class="group">A data center job writes to S3 and reads a key</li>
+				<li><span class="name">Conditional forwarder<span class="who">US data center DNS</span></span><span class="desc">A batch server resolves <code>s3.us-east-1.amazonaws.com</code> and <code>kms.us-east-1.amazonaws.com</code>; data center DNS forwards both names to <code>10.41.0.10</code> and <code>10.41.1.10</code> over Direct Connect.</span></li>
+				<li class="auto"><span class="name">Inbound endpoint answers<span class="who auto">AWS</span></span><span class="desc">The KMS zone is associated with the shared services VPC, so the answer is the KMS endpoint IPs. The S3 interface endpoint has "private DNS only for inbound endpoints", so queries arriving through the inbound endpoint get the S3 interface endpoint IPs, while queries from inside the VPC still get public S3 addresses.</span></li>
+				<li class="auto"><span class="name">Private path<span class="who auto">AWS</span></span><span class="desc">The traffic enters the shared services VPC through the Direct Connect gateway and Transit Gateway and reaches the interface endpoints. A gateway endpoint could not serve it.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Interface endpoints in the shared services VPC, private DNS off</h3>
+				<p>The network account creates each endpoint once per Region, with interfaces in three Availability Zones so that one zone's failure leaves two answers in the Regional DNS name. <strong>Private DNS must be disabled</strong>: the private zone that AWS manages for an endpoint is associated only with the endpoint's own VPC, so it would never reach the spokes, and it would block the company's own zone of the same name in the shared services VPC.</p>
+				<p>The security group is the network-layer gate for every spoke. It allows TCP 443 from the three Regional summaries and both data centers. It cannot reference spoke security groups: security group referencing across a Transit Gateway does not cover PrivateLink endpoints, so CIDRs (or a managed prefix list of them) are the tool.</p>
+				<span class="file">Create the nine central endpoints in us-east-1 with private DNS off and the shared policy attached (AWS CLI, network account)</span>
+<pre><code><span class="c"># sg-shared-endpoints allows TCP 443 from 10.40.0.0/14, 10.44.0.0/14, 10.48.0.0/14, 10.100.0.0/16 and 10.200.0.0/16</span>
+for svc in ssm ssmmessages ec2messages ecr.api ecr.dkr kms secretsmanager sts logs; do
+  aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface \
+    --vpc-id vpc-shared-services \
+    --service-name com.amazonaws.us-east-1.$svc \
+    --subnet-ids subnet-shared-az1 subnet-shared-az2 subnet-shared-az3 \
+    --security-group-ids sg-shared-endpoints \
+    --no-private-dns-enabled \
+    --policy-document file://endpoint-policy-org.json \
+    --tag-specifications "ResourceType=vpc-endpoint,Tags=[{Key=service,Value=$svc}]"
+done</code></pre>
+				<p>Nine interface endpoints plus the S3 interface endpoint of Step 4 is ten of the <strong>50 interface endpoints per VPC</strong> quota (interface and Gateway Load Balancer endpoints together, adjustable). Check it before adding services; beyond it, raise the quota or add a second endpoint VPC.</p>
+				<div class="callout note"><p>Each endpoint scales from 10 Gbps per Availability Zone towards 100 Gbps, with an 8,500-byte MTU and no path MTU discovery: irrelevant for API calls, relevant if a bulk-data service is ever centralized.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>A private hosted zone per service, named after the service</h3>
+				<p>For each endpoint the network team creates a private hosted zone whose name is the service's Regional hostname, associated first with <code>vpc-shared-services</code>, and an alias A record at the apex that points at the endpoint's Regional DNS name (the first entry in <code>DnsEntries</code>; the zonal names would pin clients to one Availability Zone). The shapes are on <a href="../d2-task-2-2.html#s4">Task 2.2</a>.</p>
+				<span class="file">Read the Regional DNS name and its hosted zone ID for the Secrets Manager endpoint (AWS CLI, network account)</span>
+<pre><code>aws ec2 describe-vpc-endpoints \
+  --filters Name=vpc-id,Values=vpc-shared-services Name=service-name,Values=com.amazonaws.us-east-1.secretsmanager \
+  --query "VpcEndpoints[0].DnsEntries[0]"</code></pre>
+				<p>Zone names follow each service's hostname, which is not always the endpoint service name. <code>com.amazonaws.us-east-1.ecr.api</code> becomes the zone <code>api.ecr.us-east-1.amazonaws.com</code>, and the other seven are <code>ssm.</code>, <code>ssmmessages.</code>, <code>ec2messages.</code>, <code>kms.</code>, <code>secretsmanager.</code>, <code>sts.</code> and <code>logs.us-east-1.amazonaws.com</code>. STS works only for clients using the Regional STS endpoint, so the account baseline sets the SDKs to Regional mode.</p>
+				<p>ECR's Docker endpoint is the exception. Image pulls use account-specific names such as <code>222222222222.dkr.ecr.us-east-1.amazonaws.com</code>, so the <code>dkr.ecr.us-east-1.amazonaws.com</code> zone needs a <strong>wildcard record</strong>; an apex record alone would leave every pull resolving to public addresses and failing in subnets without internet access.</p>
+				<span class="file">The dkr.ecr zone with a wildcard alias to the central endpoint (AWS CLI, network account; DNS name and zone ID from describe-vpc-endpoints)</span>
+<pre><code>aws route53 create-hosted-zone \
+  --name dkr.ecr.us-east-1.amazonaws.com \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-shared-services \
+  --caller-reference dkr-ecr-use1-2026-11-15 \
+  --hosted-zone-config PrivateZone=true
+
+aws route53 change-resource-record-sets --hosted-zone-id Z0DKRSHARED456 \
+  --change-batch '{"Changes":[{"Action":"CREATE","ResourceRecordSet":{
+    "Name":"*.dkr.ecr.us-east-1.amazonaws.com","Type":"A",
+    "AliasTarget":{"HostedZoneId":"Z7HUB4ULQPZ6S",
+      "DNSName":"vpce-0ecrdkr1234567890-e5f6g7h8.dkr.ecr.us-east-1.vpce.amazonaws.com",
+      "EvaluateTargetHealth":true}}}]}'</code></pre>
+				<div class="callout trap"><p>A zone named <code>amazonaws.com</code> or <code>us-east-1.amazonaws.com</code> would capture every AWS hostname in the Region, including S3 and services with no central endpoint, and return NXDOMAIN for them (a private zone has no fallback to public DNS). One narrowly named zone per service is the only safe shape.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Deliver the zones to every spoke and to the data centers</h3>
+				<p>The Profile <code>rp-travel-dns-01</code> is already associated with every spoke VPC by the VPC template (<a href="hybrid-dns.html#b4">Hybrid DNS, Step 4</a>), so adding the nine zones to it reaches all 300 VPCs in the Region at once, with no per-VPC authorization and no 300-VPCs-per-zone ceiling. Without Profiles, nine zones in 300 VPCs means about 2,700 cross-account authorize-then-associate pairs.</p>
+				<span class="file">Add the endpoint zones to the Regional Profile (AWS CLI, network account; one call per zone)</span>
+<pre><code>aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name vpce-secretsmanager \
+  --resource-arn arn:aws:route53:::hostedzone/Z0SECRETSSHARED789
+
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name vpce-ecr-dkr \
+  --resource-arn arn:aws:route53:::hostedzone/Z0DKRSHARED456</code></pre>
+				<p>Endpoints are Regional, so Frankfurt has its own zones (<code>kms.eu-central-1.amazonaws.com</code> and so on) aliased to its endpoints and added to the Frankfurt Profile.</p>
+				<p>For the data centers, the zones are associated directly with the shared services VPC (they were created with it in Step 2), which is all the inbound endpoint needs. Data center DNS gets one conditional forwarder per service hostname, pointing at the inbound endpoint IPs, as the hybrid DNS page describes for <code>aws.example.com</code>.</p>
+				<span class="file">US data center forwarders for two of the service names (Windows DNS PowerShell; repeat per service)</span>
+<pre><code>Add-DnsServerConditionalForwarderZone -Name "kms.us-east-1.amazonaws.com" `
+  -MasterServers 10.41.0.10,10.41.1.10 -ReplicationScope Forest
+Add-DnsServerConditionalForwarderZone -Name "s3.us-east-1.amazonaws.com" `
+  -MasterServers 10.41.0.10,10.41.1.10 -ReplicationScope Forest</code></pre>
+				<p>These list only the us-east-1 inbound IPs: the Frankfurt inbound endpoint has no zone for a us-east-1 name.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>S3: a gateway endpoint in every VPC, one interface endpoint for the data centers</h3>
+				<p>S3 is deliberately <strong>not</strong> centralized for VPC clients. A gateway endpoint is free but works only from inside its own VPC, never through a Transit Gateway, peering, VPN or Direct Connect (<a href="../d3-task-3-1.html#s7">Task 3.1</a>); centralizing S3 would add $0.03 per GB to traffic that is free today. So the VPC template adds a gateway endpoint to every route table, with the policy of Step 5.</p>
+				<span class="file">The S3 gateway endpoint in the booking VPC, created by the VPC template (AWS CLI, bookings account)</span>
+<pre><code>aws ec2 create-vpc-endpoint --vpc-endpoint-type Gateway \
+  --vpc-id vpc-bookings-prod \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --route-table-ids rtb-bookings-app rtb-bookings-data \
+  --policy-document file://s3-gateway-policy-org.json</code></pre>
+				<p>The data centers need an S3 interface endpoint. The shared services VPC gets one with private DNS on and <code>PrivateDnsOnlyForInboundResolverEndpoint=true</code>, exactly as on <a href="../d3-task-3-1.html#s7">Task 3.1</a>: on-premises queries arriving through the inbound endpoint get the interface endpoint IPs, and the shared services VPC's own clients keep using its gateway endpoint, which must exist first and must stay while the option is on. No custom zone is built for S3 and nothing S3-related goes into the Profile, so spokes are unaffected.</p>
+				<div class="callout trap"><p>The option is available only for services with both gateway and interface endpoints (S3 and DynamoDB). Creating a gateway endpoint resets open connections to S3 in that VPC, so the template adds it before workloads start, not during peak hours.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Endpoint policies that form one perimeter</h3>
+				<p>A central endpoint has <strong>one policy for every spoke</strong>, capped at 20,480 characters including whitespace. Listing 300 account IDs or per-team rules would not fit and would change every week, so the policy states organization-level facts instead: the caller is in the organization (<code>aws:PrincipalOrgID</code>, trusted identities) and the resource is in the organization (<code>aws:ResourceOrgID</code>, trusted resources). The concepts and the S3 gateway version are on <a href="../d4-task-4-1.html#s5">Task 4.1</a>. Fine-grained permission stays in IAM and resource policies, because an endpoint policy only limits and never grants.</p>
+				<span class="file">endpoint-policy-org.json, attached to the KMS, Secrets Manager, Logs, STS and ECR endpoints (JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "OrgPrincipalsToOrgResources",
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {
+      "StringEquals": {
+        "aws:PrincipalOrgID": "o-travel1234",
+        "aws:ResourceOrgID": "o-travel1234"
+      }
+    }
+  }]
+}</code></pre>
+				<p>The resource condition needs exceptions where AWS itself owns the resource. Systems Manager runs AWS-owned documents, so the three SSM endpoints get a principal-only version of the policy. ECR layers come from an AWS-owned S3 bucket, so the S3 gateway policy adds a statement allowing <code>s3:GetObject</code> on that Regional layer bucket.</p>
+				<span class="file">The extra statement in s3-gateway-policy-org.json that keeps ECR image pulls working (JSON fragment)</span>
+<pre><code>{
+  "Sid": "EcrLayersInAwsOwnedBucket",
+  "Effect": "Allow",
+  "Principal": "*",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::prod-us-east-1-starport-layer-bucket/*"
+}</code></pre>
+				<div class="callout trap"><p>An endpoint policy does nothing for calls that do not pass through it. A spoke that sends a KMS call to another Region's hostname leaves through the NAT gateway (where one exists) and skips the policy; the egress firewall's domain allow list and the SCPs of Step 6 cover that path.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Bucket and key policies that require the network, and SCP guardrails</h3>
+				<p>The third perimeter question is the network: did the request come through the company's endpoints? Resource policies check it with <code>aws:SourceVpce</code> (an endpoint ID) or <code>aws:SourceVpc</code> (a VPC ID). Centralization simplifies this: every spoke's call to a us-east-1 key arrives through <code>vpce-0kmsuse1shared</code> in the shared services VPC, so the key policy names one endpoint, not 300 VPCs. S3 is the opposite, with a gateway endpoint per VPC, so the card-data bucket names only the payment VPC's gateway endpoint and the on-premises S3 interface endpoint (bucket form on <a href="../d4-task-4-1.html#s5">Task 4.1</a>).</p>
+				<span class="file">A statement in the booking platform's KMS key policy: deny use of the key unless the call arrives through the central KMS endpoint, except for AWS services acting for the company (JSON)</span>
+<pre><code>{
+  "Sid": "DenyOutsideCentralKmsEndpoint",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:Encrypt"],
+  "Resource": "*",
+  "Condition": {
+    "StringNotEquals": {"aws:SourceVpce": "vpce-0kmsuse1shared"},
+    "Bool": {"aws:ViaAWSService": "false"}
+  }
+}</code></pre>
+				<p>The <code>aws:ViaAWSService</code> exception matters: for SSE-KMS objects, S3 calls KMS on the caller's behalf with no VPC endpoint in that hop. Add a break-glass role exception too.</p>
+				<p>SCPs set the outer fence for all member accounts. One statement denies data access to resources outside the organization (<code>aws:ResourceOrgID</code>), which covers the paths endpoint policies cannot see. Another stops anyone but the network account from using cross-Region PrivateLink to AWS services (Alternatives), because that permission, <code>vpce:AllowMultiRegion</code>, must be allowed by both IAM and the SCP.</p>
+				<span class="file">SCP attached to the workload OUs (JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NoDataToForeignResources",
+      "Effect": "Deny",
+      "Action": ["s3:*", "kms:*", "secretsmanager:*"],
+      "Resource": "*",
+      "Condition": {"StringNotEqualsIfExists": {"aws:ResourceOrgID": "o-travel1234"}}
+    },
+    {
+      "Sid": "CrossRegionEndpointsOnlyByNetworkTeam",
+      "Effect": "Deny",
+      "Action": "vpce:AllowMultiRegion",
+      "Resource": "*",
+      "Condition": {"StringNotEquals": {"aws:PrincipalAccount": "111111111111"}}
+    }
+  ]
+}</code></pre>
+				<p>SCPs do not apply to service-linked roles or service principals, so exceptions for AWS services go in endpoint policies, not here. Resource control policies (RCPs) can apply the identity and network checks to resources organization-wide.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>See what the perimeter denies</h3>
+				<p>CloudTrail network activity events record API calls that pass through VPC endpoints, delivered to the endpoint owner, which here is the network account, so one team sees every spoke's traffic through the central endpoints. They are off by default and charged separately. Filtering on <code>errorCode</code> <code>VpceAccessDenied</code> (the only valid value) records only calls an endpoint policy refused: a misconfigured new service, or stolen credentials from another organization being used inside the network.</p>
+				<span class="file">Record endpoint-policy denials for KMS and Secrets Manager on the organization trail, keeping management events (AWS CLI, management or delegated administrator account)</span>
+<pre><code><span class="c"># put-event-selectors replaces all selectors, so the management selector is repeated</span>
+aws cloudtrail put-event-selectors --trail-name org-trail \
+  --advanced-event-selectors '[
+    {"Name": "Management events",
+     "FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}]},
+    {"Name": "KMS denied through VPC endpoints",
+     "FieldSelectors": [
+       {"Field": "eventCategory", "Equals": ["NetworkActivity"]},
+       {"Field": "eventSource", "Equals": ["kms.amazonaws.com"]},
+       {"Field": "errorCode", "Equals": ["VpceAccessDenied"]}]},
+    {"Name": "Secrets Manager denied through VPC endpoints",
+     "FieldSelectors": [
+       {"Field": "eventCategory", "Equals": ["NetworkActivity"]},
+       {"Field": "eventSource", "Equals": ["secretsmanager.amazonaws.com"]},
+       {"Field": "errorCode", "Equals": ["VpceAccessDenied"]}]}
+  ]'</code></pre>
+				<p>Each event source needs its own selector, and events carry the <code>vpcEndpointId</code> for per-endpoint alarms. Denials by bucket or key policies are ordinary <code>AccessDenied</code> errors, not network activity events. Flow logs on the endpoint subnets add source IPs and bytes per spoke (<a href="../d4-task-4-2.html">Task 4.2</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Centralized endpoints: the cost case</h4>
+				<p>Interface endpoints cost $0.01 per hour for each Availability Zone interface plus $0.01 per GB processed (first petabyte), and partial hours count as full. Nine endpoints in 300 VPCs over two zones is 5,400 interfaces: 5,400 &times; $0.01 &times; 730 &asymp; $39,420 a month before any data. Centrally, nine endpoints in three zones in three Regions is 81 interfaces, about $591 a month, plus about $66 for the three on-premises S3 interface endpoints.</p>
+				<p>The price of centralizing is Transit Gateway data processing, $0.02 per GB in the example rate, charged on traffic entering the Transit Gateway in each direction, on top of the same $0.01 per GB endpoint charge. The saving of roughly $38,700 a month would only be used up by about 1,900 TB a month of API traffic through the hub. API calls are small; the bulk bytes (S3 objects, ECR layers) stay on free gateway endpoints, which is why this split works. Detail: <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Blast radius</h4>
+				<p>One endpoint, policy or zone now serves 300 VPCs: a bad policy or a deleted alias record stops patching, image pulls and secret retrieval across a Region at once. Mitigations: three zones, every change through infrastructure as code with a canary Region (ap-northeast-1 first), and per-Region resources so a mistake stays in one Region.</p>
+			</div>
+			<div class="entry">
+				<h4>One policy for everyone</h4>
+				<p>A shared endpoint cannot carry per-team least privilege, so it holds organization conditions and per-team rules live in IAM and resource policies. The PCI DSS payment VPCs are the exception worth paying for: their own KMS and Secrets Manager endpoints, a policy naming only the payment accounts, and zones for them in the higher-priority <code>travel-dns-pci</code> Profile, which wins for the same name.</p>
+			</div>
+			<div class="entry">
+				<h4>Profile, not cross-account association</h4>
+				<p>Cross-account association (the whitepaper's method) is one pair per zone per VPC and stops at 300 VPCs per zone. The Profile is already associated for hybrid DNS, so each new zone is one API call.</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas to plan for</h4>
+				<ul>
+					<li>50 interface plus Gateway Load Balancer endpoints per VPC (adjustable); the central VPC uses ten.</li>
+					<li>Endpoint policy 20,480 characters, not adjustable.</li>
+					<li>Gateway endpoints: 20 per Region per account (adjustable); 300 VPCs spread over many accounts stay well inside it.</li>
+					<li>Profile limits (5,000 zones, 1,000 VPCs per Profile) leave ample room for nine zones per Region.</li>
+				</ul>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Endpoints in every VPC</h4>
+				<p>Private DNS on, a policy per VPC, no Transit Gateway in the path and no shared blast radius. Right for a few or regulated VPCs; at 300 VPCs it is about 60 times the hourly cost and 2,700 endpoints.</p>
+			</div>
+			<div class="entry">
+				<h4>VPC Lattice resource configurations and service network endpoints</h4>
+				<p>The central endpoints can be exposed as resource configurations in a Lattice service network shared through RAM, reached from spokes through a <strong>service network endpoint</strong>. Traffic no longer depends on Transit Gateway routes, so it works when spoke CIDRs overlap (after an acquisition, say). The endpoint takes a contiguous /28 per zone from the spoke and, unlike a VPC association, is reachable from on premises. Pricing is per resource configuration hour plus per GB; the September 2026 blog below compares it with the Transit Gateway model. Resource configurations are TCP only, fine for HTTPS APIs.</p>
+			</div>
+			<div class="entry">
+				<h4>Cross-Region PrivateLink to AWS services (November 2025)</h4>
+				<p>An interface endpoint created with <code>--service-region</code> can reach some AWS services in another Region; the current list includes S3, IAM, ECR (api and dkr), KMS, ECS, Lambda, Data Firehose, Managed Service for Apache Flink and Route 53, but not SSM, Secrets Manager, STS or CloudWatch Logs. It supports Regional DNS names only, needs <code>vpce:AllowMultiRegion</code> in IAM and the SCP, fails over between zones but not Regions, and the endpoint owner pays inter-Region data transfer on every GB in both directions. AWS recommends staying in-Region where possible.</p>
+			</div>
+			<div class="entry">
+				<h4>Associating the endpoints themselves with the Profile</h4>
+				<p>Route 53 Profiles also list interface VPC endpoints as a supported resource type. Its exact behaviour was not confirmed here, so the design keeps the documented zone-per-service pattern.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Resolution from a spoke</span><span class="desc">From a booking pod, <code>dig +short kms.us-east-1.amazonaws.com</code> and <code>dig +short 222222222222.dkr.ecr.us-east-1.amazonaws.com</code> must return addresses in <code>10.41.0.0/16</code>. A public address means the VPC lacks the Profile, or the wildcard record is missing. <code>dig +short s3.us-east-1.amazonaws.com</code> must return public S3 addresses: S3 stays on the gateway endpoint.</span></li>
+				<li><span class="name">Resolution from the data center</span><span class="desc"><code>dig @10.41.0.10 s3.us-east-1.amazonaws.com</code> must return the S3 interface endpoint IPs, and the same name queried from an instance inside the shared services VPC must return public S3 addresses, proving "private DNS only for inbound endpoints".</span></li>
+				<li><span class="name">Path analysis</span><span class="desc">Reachability Analyzer from a booking instance to the Secrets Manager endpoint interface on TCP 443 shows the Transit Gateway hop and security group decision, or names the blocking component.</span></li>
+				<li><span class="name">Perimeter denial</span><span class="desc">From a company test instance, use credentials of a test account outside <code>o-travel1234</code> to call <code>aws kms describe-key</code> through the central endpoint. It must fail, and a <code>VpceAccessDenied</code> network activity event with the endpoint ID must appear in the trail. Then copy an object from a company bucket to a bucket outside the organization from a spoke: the gateway endpoint policy must refuse it.</span></li>
+				<li><span class="name">Gateway path for bytes</span><span class="desc">Pull a large image on a test node and check VPC flow logs: the layer download goes to S3 public addresses via the gateway endpoint, and Transit Gateway <code>BytesIn</code> for the attachment barely moves.</span></li>
+				<li><span class="name">Zone failure</span><span class="desc">In a game day, block one endpoint subnet with a network ACL and confirm calls continue through the other two zones.</span></li>
+			</ol>
+			<div class="callout trap"><p><strong>Troubleshooting checklist.</strong> Timeouts to a service name usually mean it resolved publicly (no zone, no Profile, or private DNS still on in the shared services VPC hiding the custom zone). NXDOMAIN for an AWS hostname means an over-broad private zone. AccessDenied with a <code>VpceAccessDenied</code> event is the endpoint policy; plain AccessDenied without it is IAM, a bucket policy or a key policy. Pulls that stall on layers point to the S3 gateway endpoint or its policy.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design DNS solutions</td><td data-label="What this architecture demonstrates">Private zones named after service hostnames, wildcard records, private zone override without fallback, Profiles as the distribution method</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Centralized versus distributed endpoints, cost and blast radius, Lattice and cross-Region PrivateLink options</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Endpoints with private DNS disabled in the shared services VPC, reached over the Transit Gateway</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Implement hybrid and multi-account DNS</td><td data-label="What this architecture demonstrates">Endpoint zones on the shared Profile, on-premises forwarders per service name to the inbound endpoint</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Endpoint policies with organization conditions, SourceVpce and SourceVpc in resource policies, SCP guardrails</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Validate and audit security with monitoring and logging</td><td data-label="What this architecture demonstrates">CloudTrail network activity events filtered on VpceAccessDenied</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Hundreds of VPCs connected by a Transit Gateway need private access to AWS service APIs at the lowest cost, using the default service DNS names" is <strong>interface endpoints in a shared services VPC with private DNS disabled, a private hosted zone per service with an alias to the endpoint, associated with every VPC (through a Route 53 Profile), and S3 or DynamoDB gateway endpoints kept in each VPC</strong>. Options that leave private DNS enabled on the central endpoints, or route spoke S3 traffic to another VPC's gateway endpoint, are wrong.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/centralize-access-using-vpc-interface-endpoints/">Centralize access using VPC interface endpoints to access AWS services across multiple VPCs</a> (March 2021): the shared services VPC and private hosted zone pattern of Steps 1 to 3 (predates Route 53 Profiles).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/when-and-how-to-centralize-aws-privatelink-interface-endpoints-with-amazon-vpc-lattice/">When and how to centralize AWS PrivateLink Interface endpoints with Amazon VPC Lattice</a> (September 2026): when centralizing pays off and the Lattice alternative.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/secure-hybrid-access-to-amazon-s3-using-aws-privatelink/">Secure hybrid access to Amazon S3 using AWS PrivateLink</a> (October 2021): S3 interface endpoints for on-premises clients, as in Step 4.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/using-amazon-route-53-profiles-for-scalable-multi-account-aws-environments/">Using Amazon Route 53 Profiles for scalable multi-account AWS environments</a> (April 2024): one association per VPC for the endpoint zones.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-cross-region-connectivity-for-aws-privatelink/">Introducing Cross-Region Connectivity for AWS PrivateLink</a> (December 2024): native cross-Region PrivateLink for endpoint services, the base of the November 2025 extension to AWS services.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/welcome.html">Building a Scalable and Secure Multi-VPC AWS Network Infrastructure</a> (AWS whitepaper): centralized interface endpoints and their trade-offs.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-limits-endpoints.html">AWS PrivateLink quotas</a> (AWS documentation): endpoints per VPC, policy size, bandwidth and MTU.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/aws-services-cross-region-privatelink-support.html">AWS services that support cross-Region PrivateLink</a> (AWS documentation): the current service list and requirements for the cross-Region option.</li>
+				<li><a href="https://docs.aws.amazon.com/awscloudtrail/latest/userguide/logging-network-events-with-cloudtrail.html">Logging network activity events</a> (AWS documentation): selectors and the VpceAccessDenied filter used in Step 7.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

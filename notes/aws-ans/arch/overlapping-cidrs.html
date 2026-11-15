@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Connecting Overlapping Networks | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: connecting an acquired hotel startup whose VPCs use 10.0.0.0/16 to a company network that already uses it. A flow-by-flow requirement matrix, PrivateLink endpoint services with proxy protocol v2, VPC Lattice resource configurations and service network endpoints, Transit Gateway 1:1 NAT on both overlapping attachments, private NAT gateway and tunnel endpoint alternatives, DNS for translated addresses, security groups, testing with flow logs and cost, and the IPAM re-addressing exit.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Overlapping networks</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Connecting overlapping networks</h1>
+		<p>The travel company bought a hotel booking startup whose VPCs use 10.0.0.0/16, a range one of the company's own development VPCs already uses. No single tool covers every flow. Service-level links (PrivateLink and VPC Lattice) carry the application calls and don't care about addresses. Transit Gateway 1:1 NAT gives operations staff and the migration full two-way routing. Re-addressing from IPAM pools then removes the overlap for good.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Transit Gateway 1:1 NAT</span><span class="tag">AWS PrivateLink</span><span class="tag">VPC Lattice</span><span class="tag">Private NAT gateway</span><span class="tag">Amazon VPC IPAM</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Payment API to the hotel over PrivateLink</a></li>
+				<li class="sub"><a href="#b2">2. Hotel APIs to the company over Lattice</a></li>
+				<li class="sub"><a href="#b3">3. 1:1 NAT on both overlapping attachments</a></li>
+				<li class="sub"><a href="#b4">4. Routes and filters for the NAT CIDRs</a></li>
+				<li class="sub"><a href="#b5">5. DNS for translated addresses</a></li>
+				<li class="sub"><a href="#b6">6. The exit: re-address from IPAM</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The startup's booking platform runs in <code>vpc-hotel-app</code> (<code>10.0.0.0/16</code>, its primary CIDR) in <code>us-east-1</code>. The startup's account has joined the travel company's organization. The company's network, described in <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a>, uses <code>10.40.0.0/14</code> in this Region and doesn't overlap the startup. But one legacy development VPC, <code>vpc-dev-legacy</code>, was created long before IPAM and also uses <code>10.0.0.0/16</code>. It is already attached to <code>tgw-use1</code>, so the Transit Gateway won't propagate the hotel VPC's CIDR, peering would be refused, and neither VPC can send to an address inside its own CIDR (<a href="../d1-task-1-6.html#s3">Task 1.6</a>).</p>
+			<p>The first step is listing the flows, because each overlap tool works in only some directions:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Flow needed</th><th>Pattern chosen</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Flow needed">Company booking apps (EKS pods, data center batch jobs) call two hotel APIs, availability and rates, on TCP 443</td><td data-label="Pattern chosen">VPC Lattice resource configurations in a service network, reached through a service network endpoint in the shared services VPC</td></tr>
+						<tr><td data-label="Flow needed">The hotel booking engine calls the company's payment API</td><td data-label="Pattern chosen">A PrivateLink endpoint service in front of the payment API, with an interface endpoint in the hotel VPC</td></tr>
+						<tr><td data-label="Flow needed">Operations staff in the US data center and the shared services VPC reach any hotel host (SSH, database clients, monitoring)</td><td data-label="Pattern chosen">Transit Gateway 1:1 NAT: the hotel VPC appears as <code>100.65.0.0/16</code></td></tr>
+						<tr><td data-label="Flow needed">For the migration period, full two-way routing between the hotel VPC and the company, including integration tests against <code>vpc-dev-legacy</code></td><td data-label="Pattern chosen">1:1 NAT on both overlapping attachments: the development VPC appears as <code>100.66.0.0/16</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The first two flows are permanent; the last two end after re-addressing (Step 6). Values used on this page:</p>
+			<ul>
+				<li><strong>Accounts</strong>: network account <code>111111111111</code> owns <code>tgw-use1</code> (AS 64521), the shared services VPC (<code>10.41.0.0/16</code>), the Route 53 Profile <code>rp-travel-dns-01</code> and the service network. Hotel startup account <code>888888888888</code> owns <code>vpc-hotel-app</code> and its attachment <code>tgw-attach-hotel-app</code>. The development VPC's attachment is <code>tgw-attach-dev-legacy</code>.</li>
+				<li><strong>Payment API</strong>: in the payments VPC <code>vpc-0payment01</code> (<code>10.40.48.0/21</code>), published as <code>payments-api.example.com</code>.</li>
+				<li><strong>Hotel APIs</strong>: <code>availability.hotels.example.com</code> and <code>rates.hotels.example.com</code>, names in the startup's private hosted zone for <code>vpc-hotel-app</code>.</li>
+				<li><strong>NAT CIDRs</strong>: <code>100.65.0.0/16</code> for the hotel VPC and <code>100.66.0.0/16</code> for the development VPC. Both come from <code>100.64.0.0/10</code>, outside the company's IPAM plan, and avoid the <code>100.64.0.0/16</code> that the EKS booking VPC reuses for pods (<a href="../d3-task-3-3.html#s8">Task 3.3</a>).</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions of a client or operator.</p>
+			<ol class="flow">
+				<li class="group">A booking pod calls the hotel availability API (service level)</li>
+				<li><span class="name">Name lookup<span class="who">Booking pod</span></span><span class="desc">The pod resolves <code>availability.hotels.example.com</code>. The company's copy of the <code>hotels.example.com</code> zone, carried by the Profile, returns a CNAME to the service network endpoint's DNS name for that resource, which answers with addresses in the shared services VPC.</span></li>
+				<li class="auto"><span class="name">Ordinary routing to the endpoint<span class="who auto">AWS</span></span><span class="desc">The connection crosses <code>tgw-use1</code> to a company address in <code>10.41.0.0/16</code>.</span></li>
+				<li class="auto"><span class="name">Lattice to the resource gateway<span class="who auto">AWS</span></span><span class="desc">Lattice carries the connection to the resource gateway in <code>vpc-hotel-app</code>. The gateway source-NATs it to its own address, so the hotel VPC replies locally and needs no route to the company.</span></li>
+				<li class="group">An operator in the US data center opens SSH to a hotel database host</li>
+				<li><span class="name">Translated name<span class="who">Operator</span></span><span class="desc">Data center DNS forwards <code>hotels.example.com</code> to the inbound endpoint (<code>10.41.0.10</code>, <code>10.41.1.10</code>). The company zone returns <code>pms-db.hotels.example.com</code> as <code>100.65.20.15</code>; the host's real address is <code>10.0.20.15</code>.</span></li>
+				<li class="auto"><span class="name">Direct Connect to the hub<span class="who auto">AWS</span></span><span class="desc">The data center learned <code>100.65.0.0/16</code> as an allowed prefix on the Direct Connect gateway association. The packet (source <code>10.100.20.5</code>) enters <code>tgw-use1</code> and hits the <code>system</code> route for <code>100.65.0.0/16</code> in the <code>onprem</code> table.</span></li>
+				<li class="auto"><span class="name">DNAT on the hotel attachment<span class="who auto">AWS</span></span><span class="desc">The packet leaves on <code>tgw-attach-hotel-app</code>, whose rule maps <code>10.0.0.0/16</code> to <code>100.65.0.0/16</code>. The destination becomes <code>10.0.20.15</code>; host bits are kept. The source stays <code>10.100.20.5</code>, which doesn't overlap.</span></li>
+				<li class="auto"><span class="name">Stateless return<span class="who auto">AWS</span></span><span class="desc">The reply enters on the same attachment and the same rule rewrites its source to <code>100.65.20.15</code>. No session table is involved, so connections can start from either side.</span></li>
+				<li class="group">A hotel test runner calls a service in the overlapping development VPC</li>
+				<li class="auto"><span class="name">Both sides translated<span class="who auto">AWS</span></span><span class="desc">A host at <code>10.0.5.9</code> in <code>vpc-dev-legacy</code> appears as <code>100.66.5.9</code>, and the hotel host <code>10.0.20.15</code> appears as <code>100.65.20.15</code>. Each VPC routes the other side's NAT CIDR to the Transit Gateway, and neither ever sees a destination inside its own <code>10.0.0.0/16</code>.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The payment API to the hotel as a PrivateLink endpoint service</h3>
+				<p>The hotel only ever calls the payment API, never the reverse: PrivateLink's one-way model. The payments team publishes an NLB in front of the API as an endpoint service and allows only the hotel account. The hotel's interface endpoint gets a <code>10.0.x.x</code> address in its own subnets, and nothing is routed between the VPCs (<a href="../d1-task-1-6.html#s1">Task 1.6, PrivateLink</a>).</p>
+				<span class="file">Publish the payment API and allow only the hotel startup account (AWS CLI, payments account; NLB ARN as a placeholder)</span>
+<pre><code><span class="c"># acceptance required: the payments team approves each new endpoint</span>
+aws ec2 create-vpc-endpoint-service-configuration --region us-east-1 \
+  --network-load-balancer-arns PAYMENT_NLB_ARN \
+  --acceptance-required \
+  --private-dns-name payments-api.example.com
+
+aws ec2 modify-vpc-endpoint-service-permissions --region us-east-1 \
+  --service-id vpce-svc-0payments123456789 \
+  --add-allowed-principals arn:aws:iam::888888888888:root
+
+<span class="c"># fraud checks need the caller's address: turn on proxy protocol v2 on the target group</span>
+aws elbv2 modify-target-group-attributes --target-group-arn PAYMENT_TG_ARN \
+  --attributes Key=proxy_protocol_v2.enabled,Value=true</code></pre>
+				<p>The private DNS name (verified once with a public TXT record) lets hotel code call <code>payments-api.example.com</code>.</p>
+				<p>Without proxy protocol v2 the payment API sees only NLB node addresses. With it, each connection carries a header with the client address and the consumer's VPC endpoint ID, which targets must parse (health checks included). The client address, such as <code>10.0.31.7</code>, also exists in the development VPC, so fraud and audit logs key on the <strong>endpoint ID</strong>.</p>
+				<span class="file">The hotel's interface endpoint for the payment API (AWS CLI, hotel account)</span>
+<pre><code>aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface \
+  --vpc-id vpc-hotel-app \
+  --service-name com.amazonaws.vpce.us-east-1.vpce-svc-0payments123456789 \
+  --subnet-ids subnet-hotel-app-az1 subnet-hotel-app-az2 \
+  --security-group-ids sg-hotel-pay-clients \
+  --private-dns-enabled</code></pre>
+				<div class="callout trap"><p>PrivateLink never lets the provider start connections. Company-to-hotel calls need their own mechanism (Step 2).</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The hotel APIs to the company through a Lattice service network</h3>
+				<p>Booking pods in several VPCs and data center batch jobs call the two hotel APIs. The hotel shares them as <strong>resource configurations</strong>, which need no load balancer, behind a <strong>resource gateway</strong> whose security group controls traffic to the APIs. The API names live in the startup's private hosted zone, so the gateway uses <code>IN_VPC</code> DNS resolution (UDP only, fixed at creation).</p>
+				<span class="file">Resource gateway and one resource configuration per API (AWS CLI, hotel account; repeat the second command for rates.hotels.example.com)</span>
+<pre><code>aws vpc-lattice create-resource-gateway --name hotel-api-gw \
+  --vpc-identifier vpc-hotel-app \
+  --subnet-ids subnet-hotel-app-az1 subnet-hotel-app-az2 \
+  --security-group-ids sg-hotel-rgw \
+  --resource-config-dns-resolution IN_VPC
+
+aws vpc-lattice create-resource-configuration --name hotel-availability \
+  --type SINGLE \
+  --resource-gateway-identifier rgw-0hotelapi1234567 \
+  --resource-configuration-definition 'dnsResource={domainName=availability.hotels.example.com,ipAddressType=IPV4}' \
+  --port-ranges 443</code></pre>
+				<p>The hotel shares both configurations with the network account through AWS RAM. The network account adds them to its service network and creates one <strong>service network endpoint</strong> in the shared services VPC, because:</p>
+				<ul>
+					<li>A VPC association allows only one service network per VPC.</li>
+					<li>An association can't serve traffic that arrives over the Transit Gateway, Direct Connect or VPN.</li>
+					<li>The endpoint takes ordinary addresses from <code>10.41.0.0/16</code>, which every spoke and both data centers already route to.</li>
+				</ul>
+				<p>The endpoint needs a free, contiguous /28 in each Availability Zone's subnet.</p>
+				<span class="file">Service network, resource associations and the endpoint in the shared services VPC (AWS CLI, network account)</span>
+<pre><code>aws vpc-lattice create-service-network --name hotel-apis
+
+aws vpc-lattice create-service-network-resource-association \
+  --service-network-identifier sn-0hotelapis123456 \
+  --resource-configuration-identifier rcfg-0hotelavail12345
+
+aws vpc-lattice create-service-network-resource-association \
+  --service-network-identifier sn-0hotelapis123456 \
+  --resource-configuration-identifier rcfg-0hotelrates12345
+
+<span class="c"># sg-hotel-api-clients allows TCP 443 from 10.40.0.0/14 and 10.100.0.0/16</span>
+aws ec2 create-vpc-endpoint --vpc-endpoint-type ServiceNetwork \
+  --vpc-id vpc-shared-services \
+  --subnet-ids subnet-shared-az1 subnet-shared-az2 subnet-shared-az3 \
+  --service-network-arn arn:aws:vpc-lattice:us-east-1:111111111111:servicenetwork/sn-0hotelapis123456 \
+  --security-group-ids sg-hotel-api-clients</code></pre>
+				<p>Resource configurations are TCP only and Lattice auth policies don't apply to them, so access control is the RAM share and the two security groups.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Transit Gateway 1:1 NAT on both overlapping attachments</h3>
+				<p>Operations and the migration need any host, any port, and connections from either side. Transit Gateway 1:1 NAT (October 2026) is a static, stateless, two-way CIDR-to-CIDR translation on an attachment, with no NAT resource or load balancer to deploy. Rules are configured only by the <strong>Transit Gateway owner</strong> (the network account, though the hotel owns the attachment):</p>
+				<ul>
+					<li><code>MatchSourceCidr</code> is the real range behind the attachment; <code>NatCidr</code> is its translated range.</li>
+					<li>Both must have the same prefix length, and host bits are kept.</li>
+					<li>NAT CIDRs must come from RFC 1918 or <code>100.64.0.0/10</code>. IPv4 only, up to 50 rules per attachment.</li>
+					<li>NAT can't be enabled on an attachment that uses appliance mode.</li>
+				</ul>
+				<p>Because the hotel VPC and <code>vpc-dev-legacy</code> are identical, <strong>both sides are translated</strong>. If only the hotel were translated, a development host would reply to <code>10.0.20.15</code>, an address inside its own CIDR, and the VPC would deliver the reply locally.</p>
+				<span class="file">One rule per attachment, each matching the full VPC CIDR (AWS CLI, network account)</span>
+<pre><code>aws ec2 modify-transit-gateway-attachment-nat-configuration \
+  --transit-gateway-attachment-id tgw-attach-dev-legacy \
+  --nat-gateway-support enable \
+  --nat-gateway-rules '[{"RuleNumber":100,"MatchSourceCidr":"10.0.0.0/16","NatCidr":"100.66.0.0/16"}]'
+
+aws ec2 modify-transit-gateway-attachment-nat-configuration \
+  --transit-gateway-attachment-id tgw-attach-hotel-app \
+  --nat-gateway-support enable \
+  --nat-gateway-rules '[{"RuleNumber":100,"MatchSourceCidr":"10.0.0.0/16","NatCidr":"100.65.0.0/16"}]'
+
+<span class="c"># asynchronous: wait for NatGatewaySupport enabled and each rule activated</span>
+aws ec2 get-transit-gateway-attachment-nat-configuration \
+  --transit-gateway-attachment-id tgw-attach-hotel-app</code></pre>
+				<p>Each rule's <code>MatchSourceCidr</code> exactly equals the VPC CIDR, so the Transit Gateway replaces the VPC's propagated <code>10.0.0.0/16</code> route with a <strong><code>system</code> route</strong> for the NAT CIDR. This happens in every route table the attachment propagates to. For the same prefix, system routes rank below static routes and above propagated ones. A rule for only part of a VPC translates but installs no route.</p>
+				<p>Order matters. The development VPC goes first, in a maintenance window: engineers reaching it by real addresses lose that route at once, so its DNS records and data center routes move to <code>100.66.0.0/16</code> in the same window. Then the hotel attachment can be propagated with nothing left to conflict with.</p>
+				<span class="file">Associate the hotel attachment with its own table and propagate it where the NAT CIDR should appear (AWS CLI, network account; repeat the propagation for tgw-rtb-shared, tgw-rtb-onprem and tgw-rtb-dev)</span>
+<pre><code>aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-hotel \
+  --transit-gateway-attachment-id tgw-attach-hotel-app
+
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --transit-gateway-attachment-id tgw-attach-hotel-app</code></pre>
+				<p><code>tgw-rtb-hotel</code> receives propagations from production, shared services, on premises and <code>tgw-attach-dev-legacy</code>, whose propagated route is now <code>100.66.0.0/16</code>. Production and development still never meet: the hotel VPC doesn't forward between them.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>VPC routes, data center routes and filters for the NAT CIDRs</h3>
+				<p>Translation happens only inside the Transit Gateway, so every VPC and router must send the translated ranges to it. Company spokes route <code>10.0.0.0/8</code> to the hub, which doesn't cover <code>100.65.0.0/16</code>, so the VPC template adds the NAT CIDRs.</p>
+				<span class="file">Routes in a company spoke and in the hotel VPC (AWS CLI; one command per route table)</span>
+<pre><code><span class="c"># company production spoke: the hotel's translated range goes to the hub</span>
+aws ec2 create-route --route-table-id rtb-bookings-app \
+  --destination-cidr-block 100.65.0.0/16 --transit-gateway-id tgw-use1
+
+<span class="c"># hotel workload subnets: company Regional summaries, the US data center and the development VPC's NAT CIDR</span>
+aws ec2 create-route --route-table-id rtb-hotel-workloads \
+  --destination-cidr-block 10.32.0.0/11 --transit-gateway-id tgw-use1
+aws ec2 create-route --route-table-id rtb-hotel-workloads \
+  --destination-cidr-block 10.100.0.0/16 --transit-gateway-id tgw-use1
+aws ec2 create-route --route-table-id rtb-hotel-workloads \
+  --destination-cidr-block 100.66.0.0/16 --transit-gateway-id tgw-use1</code></pre>
+				<p>For the data centers, the Transit Gateway's association with the Direct Connect gateway <code>dxgw-travel-global</code> gets <code>100.65.0.0/16</code> and <code>100.66.0.0/16</code> as extra allowed prefixes. On a Transit Gateway association, the allowed prefixes themselves are what is advertised to the data center (<a href="../d1-task-1-5.html">Task 1.5</a>). The data center firewalls then need rules for the new ranges.</p>
+				<p>Security groups and network ACLs must allow the <strong>translated</strong> addresses, because that's what the other side sees:</p>
+				<ul>
+					<li>Hotel hosts see company sources by their real addresses, which don't overlap, and see development hosts as <code>100.66.x.x</code>.</li>
+					<li>Company production servers receiving migration traffic see hotel hosts as <code>100.65.x.x</code>.</li>
+				</ul>
+				<p>Security group references across the Transit Gateway weren't confirmed to work with translated traffic, so the rules use CIDRs.</p>
+				<span class="file">Hotel database security group: operations SSH from the data center and the shared services VPC, test traffic from the translated development VPC (AWS CLI, hotel account)</span>
+<pre><code>aws ec2 authorize-security-group-ingress --group-id sg-hotel-db \
+  --ip-permissions 'IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=10.100.0.0/16,Description="ops from US data center"},{CidrIp=10.41.0.0/16,Description="ops from shared services"}]' \
+  'IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=100.66.0.0/16,Description="vpc-dev-legacy via TGW 1:1 NAT"}]'</code></pre>
+				<div class="callout trap"><p>Network ACLs are stateless too. The Transit Gateway attachment subnets and the workload subnets need inbound and outbound entries for both NAT CIDRs, including the return ephemeral ports 1024&ndash;65535. A missing outbound entry looks exactly like a missing route.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>DNS that answers with the translated addresses</h3>
+				<p>A host now has two correct addresses, depending on who asks. The startup's own <code>hotels.example.com</code> zone, associated with <code>vpc-hotel-app</code>, keeps the real <code>10.0.x.x</code> answers for hotel clients. The network account creates a second private zone of the same name for the company side. It holds CNAMEs for the two APIs (pointing at the Lattice endpoint names from Step 2) and A records in <code>100.65.0.0/16</code> for the hosts operations staff use. The zone goes onto the Profile <code>rp-travel-dns-01</code>, so every company spoke gets it, and it is associated with the shared services VPC so that data center forwarders to the inbound endpoint get the same answers (<a href="hybrid-dns.html">Hybrid and multi-account DNS</a>).</p>
+				<span class="file">A translated host record in the company's copy of hotels.example.com (AWS CLI, network account)</span>
+<pre><code><span class="c"># real address 10.0.20.15; same host bits in the NAT CIDR</span>
+aws route53 change-resource-record-sets --hosted-zone-id Z0HOTELSNAT1234 \
+  --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{
+    "Name":"pms-db.hotels.example.com","Type":"A","TTL":300,
+    "ResourceRecords":[{"Value":"100.65.20.15"}]}}]}'</code></pre>
+				<p>Because host bits are kept, these records are generated from the startup's zone by replacing <code>10.0</code> with <code>100.65</code>. In reverse, a small zone of development names with answers in <code>100.66.0.0/16</code> is associated with <code>vpc-hotel-app</code> through cross-account authorization.</p>
+				<div class="callout note"><p>Application-level addresses aren't rewritten. A protocol that embeds IP addresses in its payload, or a configuration file that lists <code>10.0.20.15</code>, still carries the real address after translation. Names, not literal IPs, are what make 1:1 NAT workable.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>The exit: re-address from IPAM pools and remove the NAT</h3>
+				<p>Translation is a bridge: it adds a per-GB charge, a second set of DNS records and logs where one address means two hosts. The real fix is unique addresses from the company's IPAM pools.</p>
+				<p><code>10.0.0.0/16</code> is the hotel VPC's <strong>primary</strong> CIDR, and a primary CIDR can't be disassociated. So the hotel platform moves into a new VPC created from the production pool, which gives it the next free block inside <code>10.40.0.0/16</code>. A VPC whose overlapping range is only a secondary CIDR can instead add a new pool allocation, move its subnets and disassociate the old range.</p>
+				<span class="file">The hotel's replacement VPC from the shared production pool, then retire the translation (AWS CLI; pool ID as a placeholder)</span>
+<pre><code><span class="c"># hotel account: IPAM picks a free, non-overlapping block</span>
+aws ec2 create-vpc --ipv4-ipam-pool-id PROD_POOL_ID \
+  --ipv4-netmask-length 20 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=env,Value=prod},{Key=origin,Value=hotel}]'
+
+<span class="c"># network account, after the old VPC is empty: clear the rules and disable NAT in one call</span>
+aws ec2 modify-transit-gateway-attachment-nat-configuration \
+  --transit-gateway-attachment-id tgw-attach-hotel-app \
+  --nat-gateway-support disable \
+  --reset-nat-gateway-rules</code></pre>
+				<p>Consumers of Steps 1 and 2 keep the same names; the hotel recreates its resource gateway and interface endpoint in the new VPC. <code>vpc-dev-legacy</code> gets the same treatment from the development pool, after which <code>100.66.0.0/16</code> and its DNS records are removed.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Service level first, network level only where it's needed</h4>
+				<p>PrivateLink and Lattice are immune to overlap, expose only the named ports and outlive the migration, so every client-calls-service flow goes that way. Only flows needing arbitrary hosts or two-way initiation use translation, which keeps the translated estate small and easy to delete.</p>
+			</div>
+			<div class="entry">
+				<h4>1:1 NAT rather than private NAT gateways for two-way traffic</h4>
+				<p>A private NAT gateway covers only connections started from its own VPC, so operations SSH to arbitrary hotel hosts would need a load balancer per target. 1:1 NAT keeps host bits and lets either side start connections. Its constraints: IPv4 only, no appliance mode on the same attachment, and asynchronous changes that can drop traffic briefly.</p>
+			</div>
+			<div class="entry">
+				<h4>Choosing NAT CIDRs</h4>
+				<p>The NAT CIDRs must not overlap anything else the hub routes. The Transit Gateway checks overlap only between rules on one attachment, not against other attachments or connected networks, so that check is the network team's job. <code>100.64.0.0/10</code> sits outside the company's <code>10.0.0.0/8</code> plan. The /16s avoid the EKS pod range <code>100.64.0.0/16</code>, reused in several VPCs. Recording the NAT CIDRs in IPAM keeps future VPCs off them.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Example rates from the facts used throughout this guide:</p>
+				<ul>
+					<li><strong>Lattice</strong>: the service network endpoint has no hourly charge. Each resource configuration associated with a service network costs about $0.10 per hour, so the two APIs come to about $146 a month, plus about $0.01 per GB for the consumer (lower at volume) and $0.006 per GB for the provider.</li>
+					<li><strong>PrivateLink</strong>: the hotel's payment endpoint in two zones is about $14.60 a month plus $0.01 per GB, and the payments team pays for the NLB.</li>
+					<li><strong>1:1 NAT</strong>: billed at standard NAT gateway hourly and data processing rates, and the processing charge applies only to translated traffic. With the example NAT gateway rate of $0.045 per GB and Transit Gateway processing of $0.02 per GB, moving 50 TB of hotel data through the translation costs about 50,000 &times; $0.065 &asymp; $3,250.</li>
+				</ul>
+				<p>The Transit Gateway pricing page gives no dollar figure for the hourly part, so check it before budgeting.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Private NAT gateway with a routable secondary CIDR</h4>
+				<p>This was the standard answer before 1:1 NAT, and it still appears on the exam. The setup:</p>
+				<ol class="flow">
+					<li><b>Routable range</b>Each overlapping VPC keeps its workloads in the overlapping, non-routable range and adds a small, unique, routable secondary CIDR from IPAM.</li>
+					<li><b>Outbound</b>A private NAT gateway (<code>--connectivity-type private</code>, no Elastic IP) in a routable subnet translates outbound connections to its own routable address and sends them to the Transit Gateway.</li>
+					<li><b>Inbound</b>Traffic into an overlapping VPC arrives at an internal ALB or NLB in its routable subnet, with targets in the non-routable range.</li>
+					<li><b>Hub</b>The Transit Gateway attaches through the routable subnets and carries static routes for the routable ranges only.</li>
+				</ol>
+				<p>Each NAT address supports 55,000 simultaneous connections per unique destination, and a gateway can have up to 8 addresses. The gateways are zonal, one per Availability Zone; the regional NAT gateway doesn't support private mode. Traffic from a private NAT gateway to an internet gateway is dropped. The CLI is on <a href="../d1-task-1-6.html#s6">Task 1.6</a> and the EKS variant on <a href="../d3-task-3-3.html#s8">Task 3.3</a>. It still fits where 1:1 NAT can't go: behind a virtual private gateway, or on an attachment that needs appliance mode.</p>
+			</div>
+			<div class="entry">
+				<h4>PrivateLink endpoint services in both directions</h4>
+				<p>The hotel could instead run an endpoint service per API, with an NLB in its VPC and interface endpoints on the company side. That costs an NLB per API and endpoints per consumer VPC and zone. Resource configurations need no load balancer and reach every consumer through one service network.</p>
+			</div>
+			<div class="entry">
+				<h4>PrivateLink tunnel endpoints (November 2026)</h4>
+				<p>A <code>Tunnel</code> endpoint reaches a <code>CIDR</code> resource configuration: up to 10 ranges in the provider VPC, including hosts created later, overlap allowed. It could give operations one-way access to the whole hotel VPC without NAT, but clients must wrap traffic in GENEVE (UDP 6081) and only consumers start connections. It's too new to expect on the exam.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">NAT state and routes</span><span class="desc"><code>get-transit-gateway-attachment-nat-configuration</code> must show <code>NatGatewaySupport</code> <code>enabled</code> and each rule <code>activated</code> on both attachments. Then <code>aws ec2 search-transit-gateway-routes --transit-gateway-route-table-id tgw-rtb-onprem --filters "Name=route-search.subnet-of-match,Values=100.64.0.0/10"</code> must list <code>100.65.0.0/16</code> and <code>100.66.0.0/16</code> as type <code>system</code>. No route table may still hold a propagated <code>10.0.0.0/16</code>.</span></li>
+				<li><span class="name">The one-side trap, on purpose</span><span class="desc">From a development host, a connection to the real <code>10.0.20.15</code> must fail (the address is local there) while <code>100.65.20.15</code> succeeds.</span></li>
+				<li><span class="name">Flow logs show the translated view</span><span class="desc">With a custom flow log format that includes <code>pkt-srcaddr</code> and <code>pkt-dstaddr</code> on the hotel VPC, a session from the development VPC must appear with <code>pkt-srcaddr</code> <code>100.66.5.9</code>, and an operator session with <code>10.100.20.5</code>. On Transit Gateway interfaces <code>srcaddr</code> is the interface itself, so filter on <code>pkt-srcaddr</code>.</span></li>
+				<li><span class="name">Path analysis per leg</span><span class="desc">Run Reachability Analyzer (one Region, accounts in the organization) from the operations jump host's interface to the hotel attachment, and from the hotel database interface back. Whether it models 1:1 NAT wasn't confirmed, so the end-to-end proof is the flow logs.</span></li>
+				<li><span class="name">Service-level links</span><span class="desc">From a booking pod, <code>curl https://availability.hotels.example.com</code> must succeed and <code>dig</code> must return addresses in <code>10.41.0.0/16</code>. From the hotel VPC, a payment test transaction must appear in the payment API's log with the hotel's VPC endpoint ID from the proxy protocol header.</span></li>
+				<li><span class="name">DNS views</span><span class="desc"><code>dig @10.41.0.10 pms-db.hotels.example.com</code> must return <code>100.65.20.15</code>. The same query from inside <code>vpc-hotel-app</code> must return <code>10.0.20.15</code>.</span></li>
+			</ol>
+			<div class="callout trap"><p><strong>Troubleshooting checklist.</strong> SYN out but no reply usually means a missing return route or ACL entry for a NAT CIDR. Broken development access right after Step 3 means clients still use real addresses. A hotel API timing out through Lattice points to the resource gateway's security group or name resolution, not routing.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design DNS solutions</td><td data-label="What this architecture demonstrates">Two private zones of one name giving real and translated answers to different VPCs, delivered by a Profile and the inbound endpoint</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">pkt-srcaddr in flow logs and Reachability Analyzer per leg to prove translated paths</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Choosing between PrivateLink, Lattice, private NAT gateways and Transit Gateway 1:1 NAT by flow direction; IPAM to prevent the next overlap</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">NAT rules configured by the Transit Gateway owner, system routes, association and propagation for a new segment</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Secondary CIDRs and their limits, re-addressing from IPAM pools, per-GB cost of translation compared with service-level links</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Two VPCs with the same CIDR must reach each other through a Transit Gateway, and connections start from both sides" is <strong>Transit Gateway 1:1 NAT with both attachments translated to different NAT CIDRs</strong>. On older questions it's private NAT gateways in routable subnets plus internal load balancers for inbound traffic. "Only one service must be consumed, one way, despite overlapping CIDRs" is <strong>PrivateLink</strong> (or a Lattice resource configuration). VPC peering and plain Transit Gateway routing are always wrong for identical ranges.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/how-united-airlines-solved-ip-exhaustion-with-private-nat-gateway/">How United Airlines solved IP exhaustion with Private NAT Gateway</a> (July 2026): the routable and non-routable range pattern with private NAT gateways and Transit Gateway in production; written before Transit Gateway 1:1 NAT.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/when-and-how-to-centralize-aws-privatelink-interface-endpoints-with-amazon-vpc-lattice/">When and how to centralize AWS PrivateLink Interface endpoints with Amazon VPC Lattice</a> (September 2026): why the Lattice pattern is preferred when CIDRs overlap.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/vpc-resource-gateways-implementation-patterns-and-use-cases/">VPC resource gateways: Implementation patterns and use cases</a> (June 2026): resource gateways and resource configurations as used in Step 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-tunnel-endpoints-for-private-access-to-network-segments/">Introducing tunnel endpoints for private access to network segments</a> (November 2026): CIDR resource configurations and GENEVE clients, the newest overlap-proof option.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/amazon-vpc-ip-address-manager-best-practices/">Amazon VPC IP Address Manager Best Practices</a> (December 2022): the pool hierarchy that keeps re-addressed VPCs unique.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/tgw-nat.html">Transit Gateway 1:1 NAT</a> (AWS documentation): rules, both-sides translation, system routes and limits.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-scenarios.html">NAT gateway scenarios</a> (AWS documentation): the private NAT gateway design for overlapping networks.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/privatelink-access-service-networks.html">Access service networks through VPC endpoints</a> (AWS documentation): service network endpoints, address use and reachability from on premises.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
