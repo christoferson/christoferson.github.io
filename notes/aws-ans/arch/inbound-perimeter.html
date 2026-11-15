@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Inbound Perimeter with CloudFront, WAF, ALB and Inspection | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: CloudFront in front of the booking site and API with an ACM certificate in us-east-1 and TLSv1.2_2025; origin protection with CloudFront VPC origins or a public ALB locked to the origin-facing prefix list and a secret header; a global AWS WAF web ACL with managed rules, ATP, rate-based rules and the Anti-DDoS rule group; Shield Advanced protections, proactive engagement and cost protection; partner TCP through Global Accelerator to an NLB; logging and VPC Block Public Access.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Inbound perimeter</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Inbound perimeter: CloudFront, WAF, ALB and inspection</h1>
+		<p>Travellers all over the world search fares and book trips on the travel company's site and API. Every one of those requests now enters through Amazon CloudFront, is filtered by AWS WAF at the edge, is covered by AWS Shield Advanced, and reaches a load balancer that the internet cannot reach directly. Partners that need raw TCP enter through Global Accelerator instead, and everything is logged where the security team can find it.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 4</span><span class="tag">Amazon CloudFront</span><span class="tag">AWS WAF</span><span class="tag">AWS Shield Advanced</span><span class="tag">Application Load Balancer</span><span class="tag">Global Accelerator</span><span class="tag">VPC Block Public Access</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Distribution and VPC origin</a></li>
+				<li class="sub"><a href="#b2">2. Public ALB origin (the alternative)</a></li>
+				<li class="sub"><a href="#b3">3. The WAF web ACL</a></li>
+				<li class="sub"><a href="#b4">4. Shield Advanced</a></li>
+				<li class="sub"><a href="#b5">5. Partner TCP through Global Accelerator</a></li>
+				<li class="sub"><a href="#b6">6. Logging and alarms</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs its booking platform on Amazon EKS in the booking account <code>222222222222</code>, in the production booking VPC <code>10.40.8.0/21</code> in <code>us-east-1</code> (with the same build in <code>10.44.8.0/21</code> in <code>eu-central-1</code>). An Application Load Balancer (ALB) fronts the pods. The site <code>www.example.com</code> and the API <code>api.example.com</code> serve travellers on every continent, and the login and checkout pages attract credential-stuffing bots and holiday-sale floods. Card data flows behind the platform, so the path is in PCI DSS scope.</p>
+			<p>The network account <code>111111111111</code> already runs the <a href="tgw-hub-spoke.html">Transit Gateway hub</a> and the <a href="gwlb-inspection.html">GWLB inspection fleet</a>; this page adds the <strong>edge</strong>.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Fast pages and API calls for travellers worldwide</td><td data-label="Design choice">One CloudFront distribution for the site and the API, with caching for static content and the API passed through</td></tr>
+						<tr><td>Modern TLS only, encrypted end to end</td><td data-label="Design choice">ACM certificate in us-east-1, redirect HTTP to HTTPS, TLSv1.2_2025 viewer policy, HTTPS-only to the origin</td></tr>
+						<tr><td>Nobody can bypass the edge and hit the load balancer</td><td data-label="Design choice">CloudFront VPC origins with an internal ALB in private subnets (preferred), or a public ALB locked to CloudFront</td></tr>
+						<tr><td>Block web attacks, bad bots, credential stuffing and HTTP floods</td><td data-label="Design choice">An AWS WAF web ACL on CloudFront with managed rules, ATP on the login, rate-based rules and the Anti-DDoS rule group</td></tr>
+						<tr><td>DDoS response team, attack visibility and protection against attack-driven bills</td><td data-label="Design choice">Shield Advanced on CloudFront, the Route 53 hosted zone and Global Accelerator, with health checks and proactive engagement</td></tr>
+						<tr><td>Partners send non-HTTP traffic to static IP addresses</td><td data-label="Design choice">Global Accelerator to an NLB in the partner API VPC</td></tr>
+											</tbody>
+				</table>
+			</div>
+			<p>The booking VPC gets three private subnets for the internal ALB, one per AZ: <code>10.40.9.0/26</code>, <code>10.40.9.64/26</code> and <code>10.40.9.128/26</code>. The partner API VPC <code>10.40.56.0/22</code> and its internet-facing NLB are the ones from the GWLB page.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>A request passes three layers: the CloudFront edge (TLS, caching, WAF, Shield), the origin path, and the ALB. Each removes a class of attack.</p>
+			<ol class="flow">
+				<li class="group">A traveller in Tokyo searches for flights</li>
+				<li class="auto"><span class="name">DNS answer<span class="who auto">AWS</span></span><span class="desc">The resolver asks Route 53 for <code>www.example.com</code>. An alias record returns CloudFront addresses near the traveller.</span></li>
+				<li class="auto"><span class="name">TLS at the edge<span class="who auto">AWS</span></span><span class="desc">The browser connects to a Tokyo edge location over TCP 443. CloudFront presents the ACM certificate and negotiates TLS 1.2 or 1.3; Shield absorbs SYN floods and other layer 3 and 4 attacks here.</span></li>
+				<li class="auto"><span class="name">WAF evaluates the request<span class="who auto">AWS</span></span><span class="desc">The web ACL runs its rules in priority order (Step 3). A blocked request gets a 403 from the edge and never reaches the origin.</span></li>
+				<li class="auto"><span class="name">Cache or origin<span class="who auto">AWS</span></span><span class="desc">Static pages, images and scripts are served from cache. A fare search under <code>/api/*</code> is not cacheable, so CloudFront opens (or reuses) an HTTPS connection to the origin.</span></li>
+				<li class="auto"><span class="name">VPC origin into the private subnet<span class="who auto">AWS</span></span><span class="desc">CloudFront reaches the internal ALB through a service-managed ENI in the ALB's private subnet. There is no public address to attack.</span></li>
+				<li class="auto"><span class="name">ALB to the pods<span class="who auto">AWS</span></span><span class="desc">The ALB terminates TLS and forwards to the EKS pod IP target group; the pod sees the traveller's address in <code>X-Forwarded-For</code>.</span></li>
+				<li class="group">A partner sends a booking feed over TCP</li>
+				<li class="auto"><span class="name">Static anycast IPs<span class="who auto">AWS</span></span><span class="desc">The partner connects to a Global Accelerator static IP; the nearest edge carries the TCP connection over the AWS backbone to us-east-1.</span></li>
+				<li class="auto"><span class="name">NLB with client IP preserved<span class="who auto">AWS</span></span><span class="desc">The NLB sees the partner's real source address, and its security group allows only partner ranges. TLS passes through to the targets.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The distribution, its certificate and a VPC origin</h3>
+				<p>CloudFront accepts viewer certificates only from <strong>ACM in us-east-1</strong>, whatever Region the origin is in. The ALB keeps its own certificate in its Region (an ELB origin's certificate can come from any Region). The <strong>viewer protocol policy</strong> is <code>redirect-to-https</code> and the security policy is <strong>TLSv1.2_2025</strong>, which allows TLS 1.2 and 1.3 and drops CHACHA20 and the SHA224 signature schemes.</p>
+				<p>A <strong>VPC origin</strong> (November 2024) lets CloudFront reach an ALB, an NLB or an EC2 instance in a <strong>private subnet</strong>. CloudFront creates a service-managed ENI in that subnet and a security group named <code>CloudFront-VPCOrigins-Service-SG</code>. There is no extra charge, and origin fetches from AWS origins are free. Prerequisites: the VPC must still have an <strong>internet gateway attached</strong> (it is not used for routing the traffic), the subnet needs a free IPv4 address (and an IPv6 one for dual-stack), and deployment takes up to 15 minutes. GWLBs, NLBs with TLS listeners and NLBs without a security group cannot be VPC origins.</p>
+				<span class="file">VPC origin for the internal booking ALB (CloudFormation YAML, booking account)</span>
+<pre><code>BookingVpcOrigin:
+  Type: AWS::CloudFront::VpcOrigin
+  Properties:
+    VpcOriginEndpointConfig:
+      Name: booking-alb-use1
+      # the internal ALB in the three private /26 subnets of 10.40.8.0/21
+      Arn: arn:aws:elasticloadbalancing:us-east-1:222222222222:loadbalancer/app/booking-alb-use1/ALB_ID
+      HTTPSPort: 443
+      # CloudFront to ALB is encrypted too, which PCI DSS expects across the whole path
+      OriginProtocolPolicy: https-only
+      OriginSSLProtocols:
+        - TLSv1.2</code></pre>
+				<span class="file">The distribution's origin, default behavior and viewer certificate (CloudFormation YAML, created in us-east-1)</span>
+<pre><code>BookingDistribution:
+  Type: AWS::CloudFront::Distribution
+  Properties:
+    DistributionConfig:
+      Enabled: true
+      Aliases:
+        - www.example.com
+        - api.example.com
+      # global web ACL from Step 3 (scope CLOUDFRONT, created in us-east-1)
+      WebACLId: arn:aws:wafv2:us-east-1:222222222222:global/webacl/booking-edge/WEBACL_ID
+      Origins:
+        - Id: booking-alb-use1
+          # the origin domain is the ALB's DNS name; the ALB certificate must cover it or the forwarded Host
+          DomainName: internal-booking-alb-use1-ALB_DNS.us-east-1.elb.amazonaws.com
+          VpcOriginConfig:
+            VpcOriginId: !GetAtt BookingVpcOrigin.Id
+      DefaultCacheBehavior:
+        TargetOriginId: booking-alb-use1
+        ViewerProtocolPolicy: redirect-to-https
+        # AWS managed CachingOptimized policy for static content; /api/* gets a no-cache behavior
+        CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+      ViewerCertificate:
+        AcmCertificateArn: arn:aws:acm:us-east-1:222222222222:certificate/CERT_ID
+        SslSupportMethod: sni-only
+        MinimumProtocolVersion: TLSv1.2_2025</code></pre>
+				<p>On the ALB side, the security group allows TCP 443 only from <code>CloudFront-VPCOrigins-Service-SG</code>. That is tighter than the CloudFront prefix list, which admits every customer's distributions. Inbound network ACL rules are <strong>not evaluated</strong> for this traffic, but outbound rules are, so the subnet NACL must allow responses to ephemeral ports 1024-65535; and Lambda@Edge origin request and response triggers and gRPC are not supported on a VPC origin.</p>
+				<div class="callout trap"><p>"Origin protocol policy https-only" protects CloudFront to origin; "viewer protocol policy redirect-to-https" protects viewer to CloudFront. A question about end-to-end encryption needs both. And a certificate requested in eu-central-1 cannot be attached to the distribution, even if the origin is in Frankfurt.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The alternative origin: a public ALB locked to CloudFront</h3>
+				<p>Teams that still need a Lambda@Edge origin trigger keep a public ALB with two locks. The first: the ALB security group allows TCP 443 only from the AWS managed prefix list <code>com.amazonaws.global.cloudfront.origin-facing</code> (and <code>com.amazonaws.global.ipv6.cloudfront.origin-facing</code> for IPv6). That list has a <strong>weight of 55</strong>: one rule that references it counts as 55 of the default 60 rules per security group, leaving room for only five more.</p>
+				<p>The prefix list admits every customer's distributions, including an attacker's, so the second lock is that CloudFront adds a <strong>secret custom origin header</strong> that only the company's distribution knows, and the ALB forwards only requests that carry it. The default action becomes a fixed 403.</p>
+				<span class="file">Security group limited to CloudFront, and an ALB rule that requires the secret header (AWS CLI, booking account)</span>
+<pre><code><span class="c"># find this Region's ID for the CloudFront origin-facing list</span>
+aws ec2 describe-managed-prefix-lists --region us-east-1 \
+  --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing
+
+<span class="c"># one rule, weight 55 of the 60 rules a security group allows by default</span>
+aws ec2 authorize-security-group-ingress --group-id sg-0bookingalb \
+  --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,PrefixListIds=[{PrefixListId=PREFIX_LIST_ID,Description=cloudfront-origin-facing}]'
+
+<span class="c"># forward only requests carrying the header CloudFront adds; the default action returns 403</span>
+aws elbv2 create-rule --listener-arn LISTENER_ARN --priority 1 \
+  --conditions 'Field=http-header,HttpHeaderConfig={HttpHeaderName=X-Origin-Verify,Values=[HEADER_SECRET]}' \
+  --actions Type=forward,TargetGroupArn=TG_ARN
+aws elbv2 modify-listener --listener-arn LISTENER_ARN \
+  --default-actions 'Type=fixed-response,FixedResponseConfig={StatusCode=403,ContentType=text/plain,MessageBody=Access denied}'</code></pre>
+				<p>In the distribution, the header goes into the origin's <code>OriginCustomHeaders</code> (up to 30 per origin). Rotate it with an overlap of two accepted values.</p>
+				<p>A public ALB also collides with <strong>VPC Block Public Access</strong>. In bidirectional mode, internet-facing ALBs stop receiving traffic, so the ALB's public subnets need exclusions. Exclude <strong>all</strong> of the load balancer's subnets: AWS warns that excluding only one subnet still lets the ALB accept public traffic there and route it privately to targets in the others.</p>
+				<span class="file">Exclude the public ALB subnets from Block Public Access; repeat for each AZ (AWS CLI, booking account)</span>
+<pre><code>aws ec2 create-vpc-block-public-access-exclusion --region us-east-1 \
+  --subnet-id subnet-0bookingpub1a --internet-gateway-exclusion-mode allow-bidirectional
+
+<span class="c"># the exclusion should show as active before Block Public Access is enforced</span>
+aws ec2 describe-vpc-block-public-access-exclusions --region us-east-1</code></pre>
+				<div class="callout note"><p>The VPC documentation lists <strong>CloudFront VPC origins</strong> among the traffic that Block Public Access blocks, alongside internet-facing ALBs and Global Accelerator. So the VPC origin design is not automatically exempt: if Block Public Access is enforced in the booking account, the ALB's private subnets need exclusions too. Create them before turning it on; the subnet still has no public address.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The WAF web ACL on CloudFront</h3>
+				<p>A web ACL for CloudFront has the <strong>global scope</strong> (<code>--scope CLOUDFRONT</code>) and must be created in <strong>us-east-1</strong>; its IP sets, regex sets and rule groups must be there too, and a CloudFront web ACL cannot also be associated with regional resources. At CloudFront the body inspection limit is <strong>16 KB by default</strong> (configurable to 64 KB at extra cost) against a fixed 8 KB on an ALB.</p>
+				<p>The rule order:</p>
+				<ol class="flow">
+					<li><b>Anti-DDoS managed rule group (priority 0)</b><code>AWSManagedRulesAntiDDoSRuleSet</code> (June 2025, 50 WCU) baselines normal traffic within about 15 minutes, then detects HTTP floods in seconds and challenges or blocks suspicious requests. Since March 26, 2026 it is the default layer 7 flood protection, superseding Shield Advanced's automatic application layer mitigation. Run it first (the console adds it at the bottom); only GET requests can be challenged.</li>
+					<li><b>Amazon IP reputation list</b><code>AWSManagedRulesAmazonIpReputationList</code> (25 WCU) blocks addresses Amazon threat intelligence has seen attacking or scanning.</li>
+					<li><b>Core rule set</b><code>AWSManagedRulesCommonRuleSet</code> (700 WCU) covers XSS, file inclusion and metadata SSRF. Its <code>SizeRestrictions_BODY</code> rule blocks bodies larger than 8 KB, which breaks the passport scan upload on the booking page. The company overrides that rule to Count and adds its own size rule excluding the upload path.</li>
+					<li><b>Known bad inputs</b><code>AWSManagedRulesKnownBadInputsRuleSet</code> (200 WCU) blocks Log4j and Java deserialization exploits.</li>
+					<li><b>Account takeover prevention on the login</b><code>AWSManagedRulesATPRuleSet</code> inspects POST requests to <code>/api/login</code> for stolen credentials and, on CloudFront only, login responses to count failures. Bot Control fits fare scraping instead; both are paid.</li>
+					<li><b>Rate-based rules</b>A per-IP limit for the whole site and a much lower one for the login path.</li>
+				</ol>
+				<span class="file">Create the global web ACL (AWS CLI, booking account, us-east-1)</span>
+<pre><code>aws wafv2 create-web-acl --region us-east-1 --scope CLOUDFRONT \
+  --name booking-edge --default-action Allow={} \
+  --visibility-config SampledRequestsEnabled=true,CloudWatchMetricsEnabled=true,MetricName=booking-edge \
+  --rules file://booking-edge-rules.json</code></pre>
+				<span class="file">booking-edge-rules.json, abridged: Anti-DDoS, core rules with the body-size override, ATP on the login, and a login rate limit (the IP reputation, bad inputs and per-IP rules follow the same pattern)</span>
+<pre><code>[
+  {"Name": "anti-ddos", "Priority": 0,
+   "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": "AWSManagedRulesAntiDDoSRuleSet"}},
+   "OverrideAction": {"None": {}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "anti-ddos"}},
+  {"Name": "core", "Priority": 2,
+   "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": "AWSManagedRulesCommonRuleSet",
+     "RuleActionOverrides": [{"Name": "SizeRestrictions_BODY", "ActionToUse": {"Count": {}}}]}},
+   "OverrideAction": {"None": {}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "core"}},
+  {"Name": "atp-login", "Priority": 4,
+   "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": "AWSManagedRulesATPRuleSet",
+     "ManagedRuleGroupConfigs": [{"AWSManagedRulesATPRuleSet": {"LoginPath": "/api/login",
+       "RequestInspection": {"PayloadType": "JSON",
+         "UsernameField": {"Identifier": "/email"}, "PasswordField": {"Identifier": "/password"}}}}]}},
+   "OverrideAction": {"Count": {}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "atp-login"}},
+  {"Name": "login-rate", "Priority": 6,
+   "Statement": {"RateBasedStatement": {"Limit": 20, "EvaluationWindowSec": 60, "AggregateKeyType": "IP",
+     "ScopeDownStatement": {"ByteMatchStatement": {"SearchString": "/api/login", "FieldToMatch": {"UriPath": {}},
+       "TextTransformations": [{"Priority": 0, "Type": "LOWERCASE"}], "PositionalConstraint": "STARTS_WITH"}}}},
+   "Action": {"Block": {}},
+   "VisibilityConfig": {"SampledRequestsEnabled": true, "CloudWatchMetricsEnabled": true, "MetricName": "login-rate"}}
+]</code></pre>
+				<p><strong>Rate-based rules</strong> take a limit from <strong>10 to 2,000,000,000</strong> requests per evaluation window of <strong>60, 120, 300 (default) or 600 seconds</strong>. The aggregation key can be the source IP, a forwarded IP header, everything (with a scope-down), or up to <strong>five custom keys</strong> such as a header, cookie, query argument, URI path, JA3 or JA4 fingerprint, label namespace or ASN. An API rule keyed on the API key header plus IP stops one agency using up the limit for others behind its NAT. Rate-based rules can use any action except Allow, and a <strong>blocking</strong> rate-based rule is one of the prerequisites for Shield Advanced cost protection.</p>
+				<p><strong>Count first, then Block.</strong> The ATP group above is deployed with the override set to Count. After a week of reading WAF logs and fixing false positives, the override changes to <code>None</code> so the group's Block actions apply.</p>
+				<p>Capacity and cost: the base price includes 1,500 WCU per web ACL (the core rule set alone is 700), up to 5,000 at extra cost. The web ACL is $5 per month plus $1 per rule and $0.60 per million requests; ATP and Bot Control cost extra.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Shield Advanced protections, health checks and cost protection</h3>
+				<p>Shield Standard protects CloudFront, Route 53 and Global Accelerator against layer 3 and 4 attacks at no charge. The company adds <strong>Shield Advanced</strong> ($3,000 per month for the organization's payer account, one-year commitment, plus data transfer usage fees) for the <strong>Shield Response Team</strong>, <strong>proactive engagement</strong>, attack metrics, health-based detection and <strong>cost protection</strong>; it also covers WAF fees for protected resources up to 1,500 WCU.</p>
+				<p>Protections are not automatic: each resource must be added, here or through a Firewall Manager policy. The company protects the CloudFront distribution, the <code>example.com</code> hosted zone and the partner accelerator. An ALB that only receives CloudFront traffic needs no separate protection.</p>
+				<span class="file">Subscribe and protect the three edge resources (AWS CLI, booking account)</span>
+<pre><code>aws shield create-subscription
+
+aws shield create-protection --name booking-cloudfront \
+  --resource-arn arn:aws:cloudfront::222222222222:distribution/DIST_ID
+aws shield create-protection --name example-com-zone \
+  --resource-arn arn:aws:route53:::hostedzone/ZONE_ID
+aws shield create-protection --name partner-accelerator \
+  --resource-arn arn:aws:globalaccelerator::222222222222:accelerator/ACCELERATOR_ID</code></pre>
+				<p>With <strong>proactive engagement</strong> the Shield Response Team calls the company when a protected resource is attacked and its health check fails. It needs Business or Enterprise Support, WAF v2 web ACLs, one to ten emergency contacts and a <strong>Route 53 health check associated with each protected resource</strong>. It is <strong>not</strong> triggered by events the Anti-DDoS managed rule group detects.</p>
+				<span class="file">A health check on the booking API, associated with the CloudFront protection, and proactive engagement (AWS CLI)</span>
+<pre><code><span class="c"># checks the real user path through CloudFront</span>
+aws route53 create-health-check --caller-reference booking-edge-1 \
+  --health-check-config Type=HTTPS,FullyQualifiedDomainName=api.example.com,Port=443,ResourcePath=/health,RequestInterval=30,FailureThreshold=3
+
+aws shield associate-health-check --protection-id PROTECTION_ID \
+  --health-check-arn arn:aws:route53:::healthcheck/HEALTH_CHECK_ID
+
+aws shield associate-proactive-engagement-details \
+  --emergency-contact-list EmailAddress=soc@example.com,PhoneNumber=+15555550100
+aws shield enable-proactive-engagement</code></pre>
+				<p><strong>Cost protection</strong> returns Shield Advanced service credits for charges an attack causes: CloudFront requests and data transfer, Route 53 queries, Global Accelerator data transfer, ALB LCUs, and EKS nodes that Auto Scaling added during the attack. The prerequisites are what the exam tests: the resource was <strong>protected before</strong> the attack; for CloudFront and ALB, its web ACL has a <strong>rate-based rule in Block</strong> mode (Count is not enough); the DDoS best practices were followed; and the request is made within 15 days after the billing month, in a billing case with "DDoS Concession" in the subject.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Partner TCP traffic through Global Accelerator to an NLB</h3>
+				<p>Some airline partners push feeds over TLS on TCP 443 that they terminate themselves, to fixed addresses. CloudFront is for HTTP, so this traffic goes through <strong>Global Accelerator</strong>: two static anycast IPs and failover in seconds without DNS caching. The full edge comparison is on the Global edge architecture page (to come).</p>
+				<span class="file">Accelerator, TCP listener and endpoint group with the partner NLB (AWS CLI; the Global Accelerator API is in us-west-2)</span>
+<pre><code>aws globalaccelerator create-accelerator --name partner-feed --ip-address-type IPV4 --region us-west-2
+
+aws globalaccelerator create-listener --accelerator-arn ACCELERATOR_ARN \
+  --protocol TCP --port-ranges FromPort=443,ToPort=443 --client-affinity SOURCE_IP --region us-west-2
+
+<span class="c"># the NLB must have a security group for client IP preservation</span>
+aws globalaccelerator create-endpoint-group --listener-arn LISTENER_ARN \
+  --endpoint-group-region us-east-1 \
+  --endpoint-configurations EndpointId=NLB_ARN,Weight=128,ClientIPPreservationEnabled=true \
+  --region us-west-2</code></pre>
+				<p>Client IP preservation has a side effect: traffic with the client IP preserved <strong>bypasses GWLB inspection, Network Firewall and network ACLs</strong>, because it does not enter through the internet gateway that the <a href="gwlb-inspection.html#b6">ingress routing on the GWLB page</a> depends on. Partners on the NLB's Elastic IPs are still inspected; accelerator partners rely on the security group and TLS client authentication. Partners who need IPS stay on the Elastic IP path.</p>
+				<p>Global Accelerator inbound traffic is also blocked by VPC Block Public Access, so the partner VPC's NLB subnets need exclusions if the partner account enforces it.</p>
+				<div class="callout tip"><p>For optional IDS/IPS on inbound HTTP as well, the company can put a perimeter VPC with GWLB endpoints or Network Firewall endpoints between the internet gateway and a public ALB, using a gateway route table. That design is built on the <a href="gwlb-inspection.html">GWLB inspection page</a>; with Block Public Access, the <strong>workload</strong> (ALB) subnet is excluded, not the appliance subnet.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Logging and alarms</h3>
+				<p>The regional rules for global services are the trap. A CloudFront web ACL lives in us-east-1, so its log destination must too. The company streams <strong>WAF logs</strong> to an Amazon Data Firehose stream whose name starts with <code>aws-waf-logs-</code>, created in us-east-1 in the same account as the web ACL, with Direct PUT as its source (not a Kinesis data stream). One WAF log is one Firehose record, so size the stream for the request rate.</p>
+				<span class="file">WAF logs to Firehose (AWS CLI, booking account, us-east-1)</span>
+<pre><code>aws wafv2 put-logging-configuration --region us-east-1 --logging-configuration \
+  ResourceArn=arn:aws:wafv2:us-east-1:222222222222:global/webacl/booking-edge/WEBACL_ID,LogDestinationConfigs=arn:aws:firehose:us-east-1:222222222222:deliverystream/aws-waf-logs-booking-edge</code></pre>
+				<p><strong>CloudFront standard logs v2</strong> (November 2024) are vended logs delivered to CloudWatch Logs, Firehose or S3 (with Parquet output to S3 at extra CloudWatch cost) and configured in us-east-1; CloudFront does not charge for them. <strong>Real-time logs</strong> go only to a Kinesis data stream, within seconds, with a sampling rate of 1 to 100 percent and a configuration attached per cache behavior. The SOC samples 10 percent of <code>/api/*</code>.</p>
+				<span class="file">Standard logs v2 to S3 as Parquet, and a sampled real-time log for the API (AWS CLI, us-east-1)</span>
+<pre><code>aws logs put-delivery-source --region us-east-1 --name booking-cf \
+  --resource-arn arn:aws:cloudfront::222222222222:distribution/DIST_ID --log-type ACCESS_LOGS
+aws logs put-delivery-destination --region us-east-1 --name booking-cf-s3 --output-format parquet \
+  --delivery-destination-configuration destinationResourceArn=arn:aws:s3:::example-edge-logs
+aws logs create-delivery --region us-east-1 --delivery-source-name booking-cf \
+  --delivery-destination-arn DELIVERY_DESTINATION_ARN
+
+<span class="c"># then set RealtimeLogConfigArn on the /api/* cache behavior</span>
+aws cloudfront create-realtime-log-config --name booking-api-rt --sampling-rate 10 \
+  --fields timestamp c-ip x-forwarded-for sc-status cs-uri-stem x-edge-request-id asn c-country \
+  --end-points 'StreamType=Kinesis,KinesisStreamConfig={RoleARN=KINESIS_ROLE_ARN,StreamARN=KINESIS_STREAM_ARN}'</code></pre>
+				<p><strong>ALB access logs</strong> are off by default. They go to an S3 bucket in the <strong>same Region</strong> as the ALB, encrypted with SSE-S3 only (no SSE-KMS). The <code>x-edge-request-id</code> in CloudFront logs equals the <code>X-Amz-Cf-Id</code> header, which the application can log, so one booking can be traced from edge to pod.</p>
+				<span class="file">ALB access logs, and an alarm on any DDoS event against the distribution (AWS CLI)</span>
+<pre><code>aws elbv2 modify-load-balancer-attributes --region us-east-1 --load-balancer-arn ALB_ARN \
+  --attributes Key=access_logs.s3.enabled,Value=true Key=access_logs.s3.bucket,Value=example-alb-logs-use1 Key=access_logs.s3.prefix,Value=booking
+
+<span class="c"># Shield metrics for CloudFront, Route 53 and protection groups exist only in us-east-1</span>
+aws cloudwatch put-metric-alarm --region us-east-1 \
+  --alarm-name booking-ddos-detected \
+  --namespace AWS/DDoSProtection --metric-name DDoSDetected \
+  --dimensions Name=ResourceArn,Value=arn:aws:cloudfront::222222222222:distribution/DIST_ID \
+  --statistic Maximum --period 60 --evaluation-periods 1 \
+  --threshold 0 --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:222222222222:security-oncall</code></pre>
+				<p>The Anti-DDoS rule group reports <code>DDoSAttackRequests</code> in the <code>AWS/WAFV2</code> namespace, and WAF's <code>BlockedRequests</code> per rule shows which layer is doing the work. Global Accelerator's own metrics are viewed in us-west-2.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>VPC origins rather than a locked public ALB</h4>
+				<p>With a VPC origin the ALB has no public address, so there is nothing to scan or flood directly, no header secret to rotate, and the security group can name CloudFront's service security group instead of a 55-weight prefix list. It costs nothing extra. The trade-offs are the feature limits (no Lambda@Edge origin triggers, no gRPC) and slow deployment. See <a href="../d1-task-1-1.html">Task 1.1</a> and <a href="../d1-task-1-3.html">Task 1.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>WAF on CloudFront, not on the ALB</h4>
+				<p>Filtering at the edge stops attacks near their source, inspects more of the body (16 KB against 8 KB) and lets ATP inspect login responses, which only works on CloudFront. A second web ACL on an ALB reachable only from CloudFront would double fees for little gain. See <a href="../d4-task-4-1.html">Task 4.1</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Shield Advanced for a business-critical, attack-prone site</h4>
+				<p>$3,000 a month is easy to justify for a site whose holiday sales would be the target, because it brings the response team, proactive engagement and cost protection credits that can exceed the fee in one attack. A smaller site could stop at Shield Standard plus the Anti-DDoS rule group.</p>
+			</div>
+			<div class="entry">
+				<h4>TLS policy and certificates</h4>
+				<p>TLSv1.2_2025 keeps TLS 1.2 for older clients while removing weak ciphers; TLSv1.3_2025 is stricter. Both certificates come from ACM, so they renew automatically. See <a href="../d4-task-4-3.html">Task 4.3</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Regional ALB with WAF and no CloudFront</h4>
+				<p>Cheaper for a single-Region audience, but attacks land in the Region, body inspection stops at 8 KB, there is no caching and the ALB is public.</p>
+			</div>
+			<div class="entry">
+				<h4>Global Accelerator in front of the ALB</h4>
+				<p>Static IPs and fast regional failover for HTTP too, with WAF on the regional ALB. It gives up caching and edge WAF. It suits customers who must allowlist IP addresses.</p>
+			</div>
+			<div class="entry">
+				<h4>Perimeter VPC with IDS/IPS in front of a public ALB</h4>
+				<p>When the security team needs signature-based inspection of inbound flows, ingress routing sends traffic through GWLB or Network Firewall endpoints before the ALB, as on the <a href="gwlb-inspection.html">GWLB page</a>. With CloudFront in front, the firewall sees CloudFront's addresses, not travellers'. See <a href="../d4-task-4-1.html">Task 4.1</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Central ingress VPC behind Transit Gateway</h4>
+				<p>One shared ingress VPC holds the public load balancers and forwards to application VPCs over the hub. It adds Transit Gateway charges and a shared failure domain; VPC origins (shareable through RAM since November 2025) reduce the need.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Bypass attempts</span><span class="desc">From outside AWS, resolve the ALB's DNS name and connect directly. With a VPC origin it resolves to private addresses and cannot be reached. With the public pattern, a direct connection times out and a test distribution without the header gets the 403.</span></li>
+				<li><span class="name">TLS checks</span><span class="desc">Request <code>http://www.example.com</code> and expect a 301 to HTTPS. Force TLS 1.1 with a client such as <code>openssl s_client -tls1_1</code> and expect a handshake failure; TLS 1.2 and 1.3 should succeed.</span></li>
+				<li><span class="name">WAF in Count</span><span class="desc">Send a test SQL injection string, a Log4j pattern and a 20 KB upload. Confirm in the WAF logs which rule matched and that the upload only counted on <code>SizeRestrictions_BODY</code>.</span></li>
+				<li><span class="name">Rate limits</span><span class="desc">From one test address, send 30 login attempts in a minute: after about 20, requests should get 403. <code>GetRateBasedStatementManagedKeys</code> should list the address for a few minutes.</span></li>
+				<li><span class="name">Load test with warning</span><span class="desc">In staging, and only with an approved load-testing setup, a sustained GET flood from many sources should show the Anti-DDoS group labelling and challenging requests within seconds, and <code>DDoSAttackRequests</code> rising.</span></li>
+				<li><span class="name">Health check and alarm wiring</span><span class="desc">Fail the <code>/health</code> endpoint in staging and confirm the Route 53 health check turns unhealthy. Confirm the <code>DDoSDetected</code> alarm exists in us-east-1, not in the ALB's Region.</span></li>
+				<li><span class="name">Partner path</span><span class="desc">Connect from a partner test range to the accelerator's static IPs and from an unlisted address; only the first should succeed, and the NLB target should log the partner's real address. Run Reachability Analyzer from the internet gateway to the NLB to confirm Block Public Access exclusions and security groups.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Edge network services for global architectures</td><td data-label="What this architecture demonstrates">CloudFront with VPC origins, viewer and origin protocol policies, Global Accelerator for TCP partners with client IP preservation</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Load balancing for availability, scale and security</td><td data-label="What this architecture demonstrates">Internal ALB as a VPC origin, public ALB locked with the prefix list and a header rule, NLB with a security group</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">WAF logs to Firehose, CloudFront standard v2 and real-time logs, ALB access logs, us-east-1 metrics</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Global web ACL, managed rules, ATP, rate-based rules, Anti-DDoS, Shield Advanced and VPC Block Public Access</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Validate and audit security with monitoring and logging</td><td data-label="What this architecture demonstrates">Count-then-Block tuning from WAF logs, DDoSDetected alarm, bypass and rate limit tests</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-3.html">4.3</a> Confidentiality of data and communications</td><td data-label="What this architecture demonstrates">ACM certificate in us-east-1, TLSv1.2_2025, HTTPS-only to the origin</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Ensure users can reach the ALB only through CloudFront, with the least operational overhead" is <strong>a CloudFront VPC origin with the ALB in private subnets</strong> (the VPC still needs an internet gateway attached). If the ALB must stay public, it is <strong>the com.amazonaws.global.cloudfront.origin-facing prefix list in the security group plus a secret custom header checked by an ALB listener rule</strong>. "Protect against HTTP floods and get credits for scaling costs" is <strong>Shield Advanced on the distribution before the attack, with a rate-based rule in Block mode in the web ACL</strong>, which must be created with global scope in us-east-1.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/migrate-amazon-cloudfront-public-origins-to-private-vpc-origins/">Migrate Amazon CloudFront public origins to private VPC origins</a> (March 2026): moving a public ALB origin to a private-subnet VPC origin, as in Steps 1 and 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/building-your-first-aws-waf-web-acl-to-protect-against-evolving-threats/">Building your first AWS WAF web ACL to protect against evolving threats</a> (May 2025): managed rule groups, rate-based rules and logging for a baseline web ACL.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-the-aws-waf-application-layer-ddos-protection/">Introducing new application layer (L7) DDoS protections for AWS WAF and AWS Shield Advanced customers</a> (June 2025): the Anti-DDoS managed rule group and how it fits with Shield.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/configuring-the-aws-waf-anti-ddos-managed-rule-group-for-your-resources-and-clients/">Configuring the AWS WAF Anti-DDoS managed rule group for your resources and clients</a> (November 2025): sensitivity, challenge actions, exemptions and rule placement.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/enhanced-security-with-dmz-architecture-using-amazon-vpc-block-public-access/">Enhanced security with DMZ architecture using Amazon VPC Block Public Access</a> (May 2026): excluding only the designated public subnets from Block Public Access.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/design-your-firewall-deployment-for-internet-ingress-traffic-flows/">Design your firewall deployment for Internet ingress traffic flows</a> (February 2022): where IDS/IPS fits relative to CloudFront, WAF and load balancers for inbound flows.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/restrict-access-to-load-balancer.html">Restrict access to Application Load Balancers</a> (AWS documentation): the custom header and prefix list pattern.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/aws-best-practices-ddos-resiliency/aws-best-practices-ddos-resiliency.html">AWS Best Practices for DDoS Resiliency</a> (AWS whitepaper): the edge-first DDoS architecture behind this design.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

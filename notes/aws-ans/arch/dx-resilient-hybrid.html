@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Resilient Hybrid Connectivity with Direct Connect | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: the Direct Connect maximum resiliency model for two data centers, 10 Gbps dedicated connections on separate devices at two locations each, optional LAGs with minimum links, transit VIFs to one Direct Connect gateway with Region summaries as allowed prefixes, BGP communities, BFD, prefix limits, BGP VPN backup, SiteLink, maintenance, monitoring, failover testing with FIS and cost.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Resilient Direct Connect</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Resilient hybrid connectivity with Direct Connect</h1>
+		<p>The travel company connects both data centers to all three Regions with the Direct Connect maximum resiliency model: four 10 Gbps dedicated connections per data center, at two locations, on separate AWS devices, all carrying transit VIFs to one Direct Connect gateway. A BGP VPN is the last resort and SiteLink joins the data centers.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Direct Connect</span><span class="tag">Direct Connect gateway</span><span class="tag">Transit Gateway</span><span class="tag">Site-to-Site VPN</span><span class="tag">SiteLink</span><span class="tag">AWS FIS</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Eight connections, two models</a></li>
+				<li class="sub"><a href="#b2">2. Transit VIFs and allowed prefixes</a></li>
+				<li class="sub"><a href="#b3">3. BGP: communities, BFD, prefixes</a></li>
+				<li class="sub"><a href="#b4">4. BGP VPN as the last resort</a></li>
+				<li class="sub"><a href="#b5">5. SiteLink between data centers</a></li>
+				<li class="sub"><a href="#b6">6. Monitoring and maintenance</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a> in <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, joined as described on the <a href="multi-region-network.html">multi-Region network</a> page. Booking and payment systems still run partly in the two data centers, so a lost path means failed bookings. The business asks for the 99.99% Direct Connect SLA, at least 10 Gbps to each data center after a failure, failover in about a second, and no outage during AWS maintenance.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>99.99% SLA per data center</td><td data-label="Design choice">Maximum resiliency: four 10 Gbps dedicated connections per data center, two at each of two locations, each on its own AWS device; Enterprise Support and a Well-Architected Review</td></tr>
+						<tr><td>One set of links reaches every Region</td><td data-label="Design choice">Transit VIFs to Direct Connect gateway <code>dxgw-travel-global</code> (AS 64512), associated with the three Transit Gateways</td></tr>
+						<tr><td>Small, stable route exchange</td><td data-label="Design choice">One summary per Region as allowed prefixes; one summary per data center advertised by the routers</td></tr>
+						<tr><td>Use every link, fail over in about a second</td><td data-label="Design choice">Equal BGP communities for ECMP, BFD at 300 ms &times; 3</td></tr>
+						<tr><td>A path even if Direct Connect fails completely</td><td data-label="Design choice">BGP Site-to-Site VPN from each data center to its nearest Transit Gateway</td></tr>
+						<tr><td>Data center to data center without a leased line</td><td data-label="Design choice">SiteLink on the transit VIFs</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The numbers used on this page, consistent with the hub pages:</p>
+			<ul>
+				<li><strong>US data center</strong>: <code>10.100.0.0/16</code>, AS 65010; connections <code>dxcon-us1a</code> and <code>dxcon-us1b</code> at US location 1, <code>dxcon-us2a</code> and <code>dxcon-us2b</code> at US location 2, both locations associated with <code>us-east-1</code>.</li>
+				<li><strong>European data center</strong>: <code>10.200.0.0/16</code>, AS 65020; connections <code>dxcon-eu1a</code>, <code>dxcon-eu1b</code>, <code>dxcon-eu2a</code> and <code>dxcon-eu2b</code> at two locations associated with <code>eu-central-1</code>.</li>
+				<li><strong>Direct Connect gateway</strong> <code>dxgw-travel-global</code>, AS 64512, associated with <code>tgw-use1</code> (ASN 64521), <code>tgw-euc1</code> (64522) and <code>tgw-apne1</code> (64523).</li>
+				<li><strong>Allowed prefixes</strong> (the Region summaries): <code>10.40.0.0/14</code>, <code>10.44.0.0/14</code> and <code>10.48.0.0/14</code>.</li>
+			</ul>
+			<p><a href="../d1-task-1-5.html#s7">Task 1.5</a> sketches one connection per location; this page doubles that, as the 99.99% SLA requires.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>A booking pod in Virginia calls the US data center's card vault, through normal operation and two failures.</p>
+			<ol class="flow">
+				<li class="group">Normal operation</li>
+				<li class="auto"><span class="name">Into the hub<span class="who auto">AWS</span></span><span class="desc">The pod at <code>10.40.12.30</code> sends to <code>10.100.20.5</code>. The VPC route table sends <code>10.0.0.0/8</code> to <code>tgw-use1</code>, where the <code>prod</code> table holds <code>10.100.0.0/16</code> propagated from the Direct Connect gateway attachment.</span></li>
+				<li class="auto"><span class="name">Four equal paths<span class="who auto">AWS</span></span><span class="desc">All four US transit VIFs advertise <code>10.100.0.0/16</code> with the same community and AS_PATH length, so AWS spreads flows across them with ECMP.</span></li>
+				<li class="auto"><span class="name">Into the data center<span class="who">Network team</span></span><span class="desc">The packet arrives on one of the two US routers. Equal local preference on all four sessions makes traffic toward AWS use all four links too.</span></li>
+				<li class="group">One AWS device fails</li>
+				<li class="auto"><span class="name">BFD detects it<span class="who auto">AWS</span></span><span class="desc">With BFD configured on the routers, the session on <code>dxvif-us1a</code> drops after about 900 ms instead of the 90-second hold time.</span></li>
+				<li class="auto"><span class="name">Routes withdrawn<span class="who auto">AWS</span></span><span class="desc">The path through that VIF is removed and ECMP continues over the three survivors, still 30 Gbps of capacity.</span></li>
+				<li class="group">All US Direct Connect paths fail</li>
+				<li class="auto"><span class="name">VPN route appears<span class="who auto">AWS</span></span><span class="desc">When the last Direct Connect gateway route for <code>10.100.0.0/16</code> is withdrawn, the BGP route from the VPN attachment becomes the best route in the <code>prod</code> table. It was hidden until then, because Direct Connect gateway routes beat VPN routes for the same prefix.</span></li>
+				<li class="auto"><span class="name">Degraded path<span class="who auto">AWS</span></span><span class="desc">Traffic now crosses IPsec over the internet at a few Gbps, with an MTU of about 1400 bytes instead of 8500.</span></li>
+				<li class="group">Data center to data center</li>
+				<li class="auto"><span class="name">Across SiteLink<span class="who auto">AWS</span></span><span class="desc">A packet from <code>10.100.40.8</code> to <code>10.200.40.8</code> enters on a US transit VIF and leaves on a European transit VIF across the AWS backbone, without entering any Region or Transit Gateway.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Eight connections in the maximum resiliency model</h3>
+				<p>The Resiliency Toolkit (the console's Connection wizard) with <strong>Maximum resiliency</strong> orders equal-speed connections at two locations and keeps them off shared AWS devices. The 99.99% SLA conditions:</p>
+				<ul>
+					<li>At least four connections, across at least two locations, with at least two per location, each on its own AWS device (the console shows the device ID).</li>
+					<li>Enterprise Support and a completed Well-Architected Review with an AWS solutions architect.</li>
+					<li>Private endpoints span two or more Availability Zones.</li>
+					<li>Dedicated connections only. Hosted connections and hosted VIFs from partners are not covered by the SLA, and a LAG counts as a single connection.</li>
+				</ul>
+				<p>Port hours begin when a port goes active or 90 days after its LOA-CFA is issued, so order shortly before the cross connects can be installed.</p>
+				<span class="file">Order the four US connections; the location codes are placeholders for the two chosen Direct Connect locations (AWS CLI, network account, us-east-1)</span>
+<pre><code><span class="c"># location 1, two ports; the Resiliency Toolkit would also keep them on separate devices</span>
+aws directconnect create-connection --location LOC-US-1 \
+  --bandwidth 10Gbps --connection-name us-dc1-loc1-a --request-mac-sec
+aws directconnect create-connection --location LOC-US-1 \
+  --bandwidth 10Gbps --connection-name us-dc1-loc1-b --request-mac-sec
+
+<span class="c"># location 2, a different building and carrier path</span>
+aws directconnect create-connection --location LOC-US-2 \
+  --bandwidth 10Gbps --connection-name us-dc1-loc2-a --request-mac-sec
+aws directconnect create-connection --location LOC-US-2 \
+  --bandwidth 10Gbps --connection-name us-dc1-loc2-b --request-mac-sec
+
+<span class="c"># repeat for the European data center at its two locations</span></code></pre>
+				<p>Check that the two connections at each location report different <code>awsDeviceV2</code> values, or they are maintained and fail together. MACsec is requested because card data crosses these links and Direct Connect is not encrypted (<a href="../d1-task-1-5.html">Task 1.5</a>).</p>
+				<p><strong>Optional LAGs.</strong> If a path later needs more than 10 Gbps, each connection can grow into a LAG of up to four 10 Gbps members. All members sit on one device, so a LAG adds bandwidth, not resilience, and the SLA counts it as one connection. <strong>Minimum links</strong> defaults to 0, so a two-member LAG with one member down keeps its routes and squeezes its traffic onto 10 Gbps. With minimum links 2, the whole LAG goes down and ECMP moves the traffic to healthy paths.</p>
+				<span class="file">A two-member LAG at US location 1 that goes down as a whole if a member fails (AWS CLI)</span>
+<pre><code><span class="c"># new LAG with two 10 Gbps members on one device</span>
+aws directconnect create-lag --location LOC-US-1 \
+  --number-of-connections 2 --connections-bandwidth 10Gbps \
+  --lag-name us-dc1-loc1-a-lag --request-mac-sec
+
+<span class="c"># both members must be up, or the LAG is down and BGP fails over</span>
+aws directconnect update-lag --lag-id dxlag-us1a --minimum-links 2</code></pre>
+				<div class="callout trap"><p>Adding an existing connection to a new LAG (<code>create-lag --connection-id</code>) interrupts that connection while it is re-established as a member. Do it while other paths carry the traffic, and never set minimum links above the members currently up.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Transit VIFs to one Direct Connect gateway, Region summaries as allowed prefixes</h3>
+				<p>Each connection carries one transit VIF to <code>dxgw-travel-global</code>. One gateway is recommended: it is a distributed set of route reflectors outside the data path, not a single point of failure, and ECMP across transit VIFs needs them on the same gateway. Limits: four transit VIFs per dedicated connection, 30 VIFs and six Transit Gateways per Direct Connect gateway.</p>
+				<span class="file">The fourth US transit VIF, at location 2 on the second device, with jumbo frames (AWS CLI; the router uses AS 65010)</span>
+<pre><code>aws directconnect create-transit-virtual-interface \
+  --connection-id dxcon-us2b \
+  --new-transit-virtual-interface '{
+    "virtualInterfaceName": "us-dc1-transit-d",
+    "vlan": 104,
+    "asn": 65010,
+    "mtu": 8500,
+    "authKey": "REPLACE_WITH_MD5_KEY",
+    "addressFamily": "ipv4",
+    "amazonAddress": "169.254.20.13/30",
+    "customerAddress": "169.254.20.14/30",
+    "directConnectGatewayId": "dxgw-travel-global"
+  }'
+<span class="c"># the other US VIFs: us-dc1-transit-a/b/c on dxcon-us1a/us1b/us2a, VLANs 101-103</span></code></pre>
+				<p>The gateway is associated with all three Transit Gateways, as built on the <a href="tgw-hub-spoke.html#b4">hub page, Step 4</a>. For a Transit Gateway association the allowed prefixes are <strong>advertised</strong> as they are, must not overlap between Transit Gateways, and stay far below the 200 prefixes per Transit Gateway a transit VIF carries toward on premises.</p>
+				<span class="file">Associate the Tokyo Transit Gateway with its Region summary as the allowed prefix (AWS CLI, network account)</span>
+<pre><code><span class="c"># one summary per Region; adding a VPC in Tokyo changes nothing here</span>
+aws directconnect create-direct-connect-gateway-association \
+  --direct-connect-gateway-id dxgw-travel-global \
+  --gateway-id tgw-apne1 \
+  --add-allowed-prefixes-to-direct-connect-gateway cidr=10.48.0.0/14</code></pre>
+				<p>Jumbo frames (8500 on transit VIFs) need every device in the data center path to support them; an MTU change can interrupt all VIFs on the connection for up to 30 seconds.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>BGP: communities, AS_PATH, MED, BFD and prefix limits</h3>
+				<p>Each direction is steered from a different side. Toward the data centers, AWS picks by longest prefix, then local preference (communities 7224:7100 low, 7224:7200 medium, 7224:7300 high), then shortest AS_PATH, then lowest MED, then ECMP across up to 16 paths. Toward AWS, the routers' own local preference decides (<a href="../d1-task-1-5.html">Task 1.5</a>).</p>
+				<p><strong>Active/active within a data center</strong> is the choice here. All four US VIFs advertise <code>10.100.0.0/16</code> with the same community and AS_PATH, so AWS load-shares across them. AWS already gives locations associated with the same Region medium preference; tagging 7224:7200 everywhere makes that explicit. Communities are evaluated before AS_PATH, so a stray prepend does not unbalance the links; MED is honored but not recommended.</p>
+				<p><strong>Active/passive</strong> is the fallback if stateful firewalls drop traffic returning on the other router: tag location 1 with 7224:7300 and location 2 with 7224:7100, and mirror it with higher local preference on location 1.</p>
+				<span class="file">us-dc1-r1: equal preference on both of its sessions, BFD, and no AWS routes advertised back (Cisco IOS-style; r1 holds VIF a at location 1 and VIF c at location 2, r2 holds b and d)</span>
+<pre><code>ip prefix-list DC-SUMMARY permit 10.100.0.0/16
+ip as-path access-list 10 permit ^$
+!
+route-map TO-AWS permit 10
+ match ip address prefix-list DC-SUMMARY
+ match as-path 10
+ <span class="c">! same community on all four US paths: ECMP at AWS</span>
+ set community 7224:7200
+!
+route-map FROM-AWS permit 10
+ <span class="c">! equal on every session: ECMP toward AWS too</span>
+ set local-preference 150
+!
+interface TenGigabitEthernet0/0/0.101
+ encapsulation dot1Q 101
+ ip address 169.254.20.2 255.255.255.252
+ bfd interval 300 min_rx 300 multiplier 3
+!
+router bgp 65010
+ neighbor 169.254.20.1 remote-as 64512
+ neighbor 169.254.20.1 password REPLACE_WITH_MD5_KEY
+ neighbor 169.254.20.1 fall-over bfd
+ neighbor 169.254.20.9 remote-as 64512
+ neighbor 169.254.20.9 password REPLACE_WITH_MD5_KEY
+ neighbor 169.254.20.9 fall-over bfd
+ address-family ipv4
+  network 10.100.0.0 mask 255.255.0.0
+  maximum-paths 2
+  neighbor 169.254.20.1 send-community
+  neighbor 169.254.20.1 route-map TO-AWS out
+  neighbor 169.254.20.1 route-map FROM-AWS in
+  neighbor 169.254.20.9 send-community
+  neighbor 169.254.20.9 route-map TO-AWS out
+  neighbor 169.254.20.9 route-map FROM-AWS in</code></pre>
+				<p>The <code>as-path ^$</code> filter advertises only locally originated routes. It stops a router re-advertising the European summary learned over SiteLink back to AWS.</p>
+				<ul>
+					<li><strong>Timers</strong>: defaults are hold 90 s and keepalive 30 s, set on your router. BFD runs on the AWS side at 300 ms &times; 3 but does nothing until the router is configured.</li>
+					<li><strong>MD5</strong> is always on; the key comes from the downloaded router configuration (<a href="../d2-task-2-1.html">Task 2.1</a>).</li>
+					<li><strong>Prefix limits</strong>: private and transit VIFs accept 100 prefixes per address family from on premises by default. Exceeding it puts the session into idle. Since August 2026, prefix controls allow up to 1,000 per VIF, from a pool per connection (5,000 per family on 10 Gbps ports) and 10,000 per Direct Connect gateway. One summary per data center needs only the default.</li>
+				</ul>
+				<span class="file">Allocate 300 IPv4 prefixes to one VIF from its connection's pool, before a migration that advertises more specifics (AWS CLI)</span>
+<pre><code>aws directconnect update-virtual-interface-attributes \
+  --virtual-interface-id dxvif-us1a \
+  --prefix-pool-allocated-count-ipv4 300</code></pre>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>A BGP Site-to-Site VPN as the last resort</h3>
+				<p>The VPN covers the case of all four paths of one data center lost at once, and costs little. Each data center terminates a VPN on its nearest Transit Gateway, the US on <code>tgw-use1</code> and Europe on <code>tgw-euc1</code>, associated with the <code>onprem</code> table and propagated like the Direct Connect gateway attachment (<a href="tgw-hub-spoke.html#b4">hub page</a>).</p>
+				<span class="file">The European data center's backup VPN on the Frankfurt Transit Gateway, BGP and IKEv2 (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-vpn-connection --region eu-central-1 \
+  --type ipsec.1 \
+  --customer-gateway-id cgw-eu-dc1 \
+  --transit-gateway-id tgw-euc1 \
+  --options '{
+    "StaticRoutesOnly": false,
+    "TunnelOptions": [
+      { "TunnelInsideCidr": "169.254.30.0/30",
+        "IKEVersions": [{"Value": "ikev2"}],
+        "StartupAction": "start",
+        "DPDTimeoutAction": "restart" },
+      { "TunnelInsideCidr": "169.254.30.4/30",
+        "IKEVersions": [{"Value": "ikev2"}],
+        "StartupAction": "start",
+        "DPDTimeoutAction": "restart" }
+    ]
+  }'</code></pre>
+				<p>Four rules keep it a backup:</p>
+				<ul>
+					<li><strong>BGP, never static.</strong> A static route to the VPN attachment beats every propagated route and pulls all traffic onto the tunnels. With BGP, the Direct Connect gateway route wins for the same prefix.</li>
+					<li><strong>Same prefix, not a more specific one.</strong> A longer prefix over the VPN would win before attachment type is compared.</li>
+					<li><strong>MTU.</strong> The path drops from 8500 bytes to at most 1446 inside the tunnel (MSS 1406, less with NAT traversal or CBC ciphers) with no Path MTU Discovery. Clamp TCP MSS on the routers, or large DF-bit packets are dropped after failover.</li>
+					<li><strong>Capacity.</strong> A standard tunnel carries up to 1.25 Gbps; with ECMP on the Transit Gateway both tunnels are used, so about 2.5 Gbps against 40 Gbps of Direct Connect. The runbook sheds bulk replication; Large Bandwidth Tunnels (5 Gbps each) cost more per hour.</li>
+				</ul>
+				<div class="callout note"><p>The VPN lands in one Region only. Transit Gateway peering carries static routes for VPC summaries only, so during a total US Direct Connect outage Frankfurt and Tokyo lose the US data center unless they get their own VPNs. The company accepts this rare case.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>SiteLink between the data centers</h3>
+				<p>SiteLink sends traffic between Direct Connect locations over the AWS backbone by the shortest path, bypassing Regions. It needs VIFs at two or more locations on the same Direct Connect gateway, and works on transit VIFs and on private VIFs on a Direct Connect gateway, not on public VIFs or private VIFs attached to a virtual private gateway. It is off by default, can be toggled at any time, preserves DSCP markings without managed QoS, and is billed separately. It replaces the leased line between the data centers.</p>
+				<span class="file">Turn SiteLink on for every transit VIF in both data centers (AWS CLI)</span>
+<pre><code><span class="c"># eight VIFs; SiteLink only carries traffic between VIFs that have it enabled</span>
+for vif in dxvif-us1a dxvif-us1b dxvif-us2a dxvif-us2b \
+           dxvif-eu1a dxvif-eu1b dxvif-eu2a dxvif-eu2b; do
+  aws directconnect update-virtual-interface-attributes \
+    --virtual-interface-id "$vif" --enable-site-link
+done</code></pre>
+				<p>With SiteLink on, the US routers learn <code>10.200.0.0/16</code> from the Direct Connect gateway alongside the three Region summaries, and the European routers learn <code>10.100.0.0/16</code>. Two effects need planning:</p>
+				<ul>
+					<li><strong>Path selection changes.</strong> With SiteLink on, AWS prefers the shortest AS_PATH from any location instead of locations associated with the same Region, so keep AS_PATH equal on all paths of a data center.</li>
+					<li><strong>Loop prevention.</strong> Routes learned over SiteLink must never be re-advertised to AWS, which the <code>^$</code> filter from Step 3 enforces.</li>
+				</ul>
+				<p>This traffic avoids Transit Gateway charges; the SiteLink rate was not confirmed for this page, so check the pricing page before comparing it with the leased line.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Monitoring and maintenance handling</h3>
+				<p>Direct Connect publishes <code>AWS/DX</code> metrics every five minutes. Layer 1 and BGP are separate signals: a connection can be up with BGP down.</p>
+				<ul>
+					<li><code>ConnectionState</code> (1 up, 0 down) per <code>ConnectionId</code>.</li>
+					<li><code>ConnectionLightLevelTx</code> and <code>ConnectionLightLevelRx</code> in dBm, per <code>ConnectionId</code> and <code>OpticalLaneNumber</code>; alarm on a falling trend.</li>
+					<li><code>ConnectionErrorCount</code> (Sum statistic) for MAC-level errors, including CRC.</li>
+					<li><code>VirtualInterfaceBgpStatus</code> (1 up, 0 down), <code>VirtualInterfaceBgpPrefixesAccepted</code> and <code>VirtualInterfaceBgpPrefixesAdvertised</code>, with the <code>IpAddressFamily</code> dimension, since March 2026.</li>
+				</ul>
+				<span class="file">Alarm when a transit VIF's BGP session drops, and when the US routers send more than 80 prefixes (AWS CLI)</span>
+<pre><code><span class="c"># use the exact dimension set the metric is published with (shown in the CloudWatch console)</span>
+aws cloudwatch put-metric-alarm \
+  --alarm-name dx-us-dc1-transit-a-bgp-down \
+  --namespace AWS/DX --metric-name VirtualInterfaceBgpStatus \
+  --dimensions Name=ConnectionId,Value=dxcon-us1a Name=VirtualInterfaceId,Value=dxvif-us1a Name=IpAddressFamily,Value=ipv4 \
+  --statistic Minimum --period 300 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator LessThanThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:111111111111:network-oncall
+
+<span class="c"># early warning well before the default allocation of 100</span>
+aws cloudwatch put-metric-alarm \
+  --alarm-name dx-us-dc1-transit-a-prefixes-high \
+  --namespace AWS/DX --metric-name VirtualInterfaceBgpPrefixesAccepted \
+  --dimensions Name=ConnectionId,Value=dxcon-us1a Name=VirtualInterfaceId,Value=dxvif-us1a Name=IpAddressFamily,Value=ipv4 \
+  --statistic Maximum --period 300 --evaluation-periods 1 \
+  --threshold 80 --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:111111111111:network-oncall</code></pre>
+				<p>A third alarm watches <code>VirtualInterfaceBgpPrefixesAdvertised</code>: each US VIF should send four prefixes (three Region summaries plus the European data center over SiteLink). Zero with the session up is a silent withdrawal. The <code>ListVirtualInterfaceRoutes</code> API (July 2026) shows the routes with AS paths and communities.</p>
+				<span class="file">What AWS accepted from the US data center on one VIF, and what it advertises back (AWS CLI)</span>
+<pre><code><span class="c"># expect 10.100.0.0/16 with community 7224:7200</span>
+aws directconnect list-virtual-interface-routes \
+  --virtual-interface-id dxvif-us1a \
+  --filters routeDirection=accepted,addressFamily=ipv4
+
+<span class="c"># expect 10.40.0.0/14, 10.44.0.0/14, 10.48.0.0/14 and 10.200.0.0/16</span>
+aws directconnect list-virtual-interface-routes \
+  --virtual-interface-id dxvif-us1a \
+  --filters routeDirection=advertised,addressFamily=ipv4</code></pre>
+				<p><strong>Maintenance.</strong> Planned Direct Connect maintenance is announced 14 days ahead, with reminders 7 days and 1 day before, usually in a 4-hour low-traffic window. AWS drains the device and never schedules redundant connections together, but connections on one logical device are maintained together, hence the device check in Step 1. Emergency maintenance can start at short notice, typically in a 2-hour window, and neither can be postponed. Notices also go to AWS Health, so an EventBridge rule can open a change ticket.</p>
+				<p>The runbook for a window on <code>dxcon-us1b</code>: confirm the other three paths are healthy, drain the path early with 7224:7100 and lower local preference on that session, watch the metrics, and restore afterwards. Three paths remain, still 30 Gbps; high resiliency would be down to one link.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Maximum resiliency instead of high resiliency</h4>
+				<p>High resiliency (one connection at each of two locations, 99.9%) leaves a single link during every maintenance window or device failure. Maximum resiliency doubles ports and cross connects and turns maintenance into a non-event; with Enterprise Support already in place, the extra cost is four ports. See <a href="../d1-task-1-5.html">Task 1.5</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Size every failure state, not the normal one</h4>
+				<p>The requirement is 10 Gbps after a failure. Losing a location leaves 20 Gbps; losing a location during maintenance at the other still leaves 10 Gbps, against a planned US peak under 15 Gbps.</p>
+			</div>
+			<div class="entry">
+				<h4>One Direct Connect gateway for both data centers and all Regions</h4>
+				<p>One gateway gives ECMP across all VIFs, makes SiteLink possible and keeps one set of allowed prefixes. Every association receives both data center ranges, so segmentation lives in the Transit Gateway route tables (<a href="tgw-hub-spoke.html#b2">hub page</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Active/active with communities, not prepending</h4>
+				<p>Equal communities use every paid port, and communities beat AS_PATH, so they are the reliable lever on transit VIFs. Asymmetry-sensitive firewalls would force active/passive.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Port hours for a 10 Gbps dedicated connection are $2.25 an hour, charged even with no traffic: 8 &times; $2.25 &times; 730 &asymp; $13,140 a month. Data transfer out over Direct Connect is charged by source Region and location, for example $0.02 per GB from a US Region to a US location; data in is free. Sending 100 TB a month from <code>us-east-1</code> to the US data center costs 102,400 GB &times; $0.02 &asymp; $2,048. Traffic entering the Transit Gateway from a VPC attachment also pays $0.02 per GB processing. The two backup VPNs cost $0.05 per connection-hour each, about $73 a month together, and the Direct Connect gateway is free.</p>
+				<p>Flat-rate pricing (September 2026) offers a fixed hourly fee for 10 and 100 Gbps dedicated port pairs that includes data transfer out within the chosen tier (metro or continent), with the effective bandwidth of one port. It is converted with <code>UpdateConnectionsBillingMode</code>, location-wide per account; tier prices were not confirmed here, so compare against measured transfer first. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>High resiliency with VPN backup</h4>
+				<p>Two connections per data center at two locations (99.9%) plus a BGP VPN. Half the port cost, but during maintenance or a device failure the data center runs on one 10 Gbps link, and a second failure in that window drops it to the VPN.</p>
+			</div>
+			<div class="entry">
+				<h4>Hosted connections from a Direct Connect Partner</h4>
+				<p>Faster to deliver, 50 Mbps to 25 Gbps, but one VIF, no LAG or MACsec, and no SLA coverage.</p>
+			</div>
+			<div class="entry">
+				<h4>AWS Interconnect &ndash; last mile</h4>
+				<p>An AWS-managed connection from the premises to a Direct Connect gateway (GA April 2026, US only at launch), with BGP, VLANs and MACsec configured by AWS. Kept for future offices.</p>
+			</div>
+			<div class="entry">
+				<h4>Direct Connect gateway attached to Cloud WAN</h4>
+				<p>If the company moves to Cloud WAN, the same connections can carry transit VIFs to a Direct Connect gateway attached to the core network. Allowed prefixes disappear and routing policies take their place (<a href="multi-region-network.html#b6">multi-Region page, Step 6</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>VPN only, with ECMP</h4>
+				<p>Two customer gateways with a VPN each give four tunnels on the Transit Gateway, about 5 Gbps standard or 20 Gbps with Large Bandwidth Tunnels. Cheap and quick, but latency varies with the internet.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check the routes before breaking anything</span><span class="desc">Run <code>list-virtual-interface-routes</code> on all eight VIFs: each US VIF must accept exactly <code>10.100.0.0/16</code> with 7224:7200 and advertise the four expected prefixes. In the <code>prod</code> table, <code>10.100.0.0/16</code> must point at the Direct Connect gateway attachment.</span></li>
+				<li><span class="name">Fail one VIF with the BGP failover test</span><span class="desc"><code>aws directconnect start-bgp-failover-test --virtual-interface-id dxvif-us1a --test-duration-in-minutes 60</code> puts the VIF in <code>testing</code> and its BGP peers down (default 180 minutes, maximum 72 hours, stoppable early, logged in CloudTrail). Expect the BGP alarm, traffic shifting to three VIFs in <code>VirtualInterfaceBpsEgress</code>, and no failed synthetic checks. Not during maintenance.</span></li>
+				<li><span class="name">Fail a whole location</span><span class="desc">Run the test on <code>dxvif-us1a</code> and <code>dxvif-us1b</code> together. Location 2 should carry all US traffic.</span></li>
+				<li><span class="name">Run it as an FIS experiment</span><span class="desc">The AWS FIS action <code>aws:directconnect:virtual-interface-disconnect</code> targets resources of type <code>aws:directconnect:virtual-interface</code> (selected by tag, for example all four US VIFs), with a <code>duration</code> from 10 minutes to 12 hours (ISO 8601, such as <code>PT30M</code>). FIS first checks that every targeted VIF is <code>available</code> with BGP up; the experiment role needs <code>directconnect:StartBgpFailoverTest</code>, <code>StopBgpFailoverTest</code> and related read permissions. A stop condition on a booking error-rate alarm ends the experiment if the VPN cannot cope.</span></li>
+				<li><span class="name">Prove the VPN takes over</span><span class="desc">During the four-VIF experiment, the VPN-propagated route must appear in the <code>prod</code> table, <code>TunnelDataIn</code> and <code>TunnelDataOut</code> must rise, and a DF-bit ping of 1410 bytes from the data center must succeed while 1500 fails.</span></li>
+				<li><span class="name">Test SiteLink and the edges of the design</span><span class="desc">From the US data center, trace to <code>10.200.40.8</code> over SiteLink. Reachability Analyzer from a booking instance to the Direct Connect gateway attachment, destination <code>10.100.20.5</code>, checks the AWS side only.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-5.html">1.5</a> Hybrid routing and connectivity design</td><td data-label="What this architecture demonstrates">Resiliency models and SLA conditions, LAG with minimum links, communities for active/active and active/passive, allowed prefixes, VPN backup, SiteLink</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">Connection, light level and BGP metrics, route visibility</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">Ordering connections, transit VIFs, router BGP with MD5 and BFD, BGP VPN on the Transit Gateway, alarms</td></tr>
+						<tr><td><a href="../d3-task-3-1.html">3.1</a> Maintain routing and connectivity</td><td data-label="What this architecture demonstrates">Maintenance notices and draining, prefix limits and prefix controls, loop prevention, failover testing</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Port hours, data transfer out, flat-rate pricing, sizing every failure state, VPN capacity and MTU</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"The company needs the highest Direct Connect availability and must survive the loss of a device or a whole Direct Connect location" is <strong>the maximum resiliency model: at least four dedicated connections, two at each of two locations, on separate devices, with Enterprise Support and a Well-Architected Review for the 99.99% SLA</strong>. If two connections at one location are offered, or a LAG of four, they fail a location loss. "Direct Connect primary, VPN backup, but all traffic is using the VPN" is <strong>a static route to the VPN attachment; use BGP on the VPN</strong>. "A BGP session went idle after the data center added routes" is <strong>the 100-prefix default on the VIF: summarize, or raise the allocation with prefix controls</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/building-resiliency-for-aws-direct-connect-maintenance-events-to-mitigate-downtime/">Building Resiliency For AWS Direct Connect Maintenance Events To Mitigate Downtime</a> (December 2025): redundancy, BGP tuning and failover testing for maintenance windows.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-cloudwatch-metrics-for-aws-direct-connect-virtual-interface-bgp-health-and-prefix-count/">Introducing CloudWatch Metrics for AWS Direct Connect Virtual Interface BGP Health and Prefix Count</a> (March 2026): the BGP status and prefix metrics behind Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-to-optimize-failover-times-for-overlay-tunnels-on-aws-direct-connect/">Best Practices to Optimize Failover Times for Overlay Tunnels on AWS Direct Connect</a> (August 2025): BGP timers, BFD and symmetric routing.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/advanced-routing-scenarios-with-aws-direct-connect-sitelink/">Advanced Routing scenarios with AWS Direct Connect SiteLink</a> (December 2021): how SiteLink changes path selection between sites (predates prefix controls and the BGP metrics).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/powering-predictable-costs-with-aws-direct-connect-flat-rate-pricing/">Powering predictable costs with AWS Direct Connect flat-rate pricing</a> (October 2026): the fixed-fee port-pair model.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/explore-the-aws-direct-connect-resiliency-toolkit/">Explore the AWS Direct Connect Resiliency Toolkit</a> (April 2021): ordering to the maximum, high and development models (predates 400 Gbps ports and FIS testing).</li>
+				<li><a href="https://docs.aws.amazon.com/directconnect/latest/UserGuide/resiliency_toolkit.html">AWS Direct Connect Resiliency Toolkit</a> (AWS documentation): resiliency models and the failover test.</li>
+				<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/hybrid-networking-lens/hybrid-networking-lens.html">Hybrid Networking Lens &ndash; AWS Well-Architected</a> (AWS whitepaper, February 2026): resilience and operations guidance for Direct Connect and VPN.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

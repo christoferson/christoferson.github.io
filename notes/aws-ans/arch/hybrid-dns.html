@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Hybrid and Multi-Account DNS | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: Route 53 Resolver inbound and outbound endpoints per Region in a shared services VPC, forwarding, system and reverse rules, Route 53 Profiles compared with RAM-shared rules and private hosted zone authorization, on-premises conditional forwarders, loop avoidance, multi-Region failover, DNS over HTTPS, DNS Firewall, query logging, troubleshooting, capacity and cost.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Hybrid DNS</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Hybrid and multi-account DNS</h1>
+		<p>The travel company resolves names in both directions between its data centers and hundreds of VPCs in many accounts. One inbound and one outbound Resolver endpoint per Region, in the network account's shared services VPC, carry all hybrid DNS; a Route 53 Profile hands every VPC the same zones, rules, firewall and logging with a single association.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Route 53 Resolver</span><span class="tag">Route 53 Profiles</span><span class="tag">Private hosted zones</span><span class="tag">AWS RAM</span><span class="tag">DNS Firewall</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Endpoints in the DNS VPC</a></li>
+				<li class="sub"><a href="#b2">2. Forward, reverse and system rules</a></li>
+				<li class="sub"><a href="#b3">3. Zones the inbound endpoint can answer</a></li>
+				<li class="sub"><a href="#b4">4. A Profile for every VPC</a></li>
+				<li class="sub"><a href="#b5">5. Data center forwarders and Regions</a></li>
+				<li class="sub"><a href="#b6">6. DNS Firewall and query logs</a></li>
+				<li class="sub"><a href="#b7">7. Capacity and alarms</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs about 300 VPCs in <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, connected through the Transit Gateway hub described in <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a>. Its names fall into three zones: <code>example.com</code> is public (booking site, partner API, mail); <code>aws.example.com</code> is a private hosted zone for AWS workloads, with team subzones such as <code>bookings.aws.example.com</code> owned by the workload accounts; <code>corp.example.com</code> is the on-premises Active Directory domain, served by the DNS servers <code>10.100.0.53</code> (US data center) and <code>10.200.0.53</code> (European data center).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Data center servers resolve <code>aws.example.com</code> and its subzones</td><td data-label="Design choice">Inbound endpoint per Region in the shared services VPC; every private zone associated with that VPC; conditional forwarders on premises</td></tr>
+						<tr><td data-label="Requirement">Workloads resolve <code>corp.example.com</code> and on-premises reverse names</td><td data-label="Design choice">Outbound endpoint per Region with forward rules to both data center DNS servers</td></tr>
+						<tr><td data-label="Requirement">Hundreds of VPCs, many accounts, one configuration</td><td data-label="Design choice">A Route 53 Profile per Region, shared to the organization through AWS RAM</td></tr>
+						<tr><td data-label="Requirement">Survive an Availability Zone or a whole Region</td><td data-label="Design choice">Endpoint IPs in two or more AZs; data center forwarders list two Regions</td></tr>
+						<tr><td data-label="Requirement">Block malicious domains, keep evidence for PCI DSS</td><td data-label="Design choice">DNS Firewall rule groups in the Profile (fail closed); Resolver query logs to the log archive account</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Values used on this page:</p>
+			<ul>
+				<li><strong>us-east-1</strong>: shared services VPC <code>vpc-shared-services</code>, inbound endpoint <code>dns-inbound-use1</code> at <code>10.41.0.10</code> and <code>10.41.1.10</code>, outbound endpoint <code>dns-outbound-use1</code> (<code>rslvr-out-use1shared</code>). The protocol-level DNS background is on <a href="../d1-task-1-2.html">Task 1.2</a>.</li>
+				<li><strong>eu-central-1</strong>: <code>vpc-shared-services-eu</code>, inbound endpoint at <code>10.45.0.10</code> and <code>10.45.1.10</code>; <strong>ap-northeast-1</strong> the same pattern at <code>10.49.0.10</code> and <code>10.49.1.10</code>.</li>
+				<li><strong>Rules</strong>: <code>rslvr-rr-corpfwd01</code> (forward <code>corp.example.com</code>), <code>rslvr-rr-corprev01</code> (forward <code>100.10.in-addr.arpa</code>), <code>rslvr-rr-awssys01</code> (system rule for <code>aws.example.com</code>); Profile <code>rp-travel-dns-01</code>.</li>
+				<li><strong>Private zones</strong>: <code>aws.example.com</code> (<code>Z0AWSEXAMPLE1234</code>, network account <code>111111111111</code>) and <code>bookings.aws.example.com</code> (<code>Z0BOOKINGS5678</code>, bookings account).</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions of a client or a server you run.</p>
+			<ol class="flow">
+				<li class="group">A data center server looks up an AWS name</li>
+				<li><span class="name">Conditional forwarder<span class="who">US data center DNS</span></span><span class="desc">A batch server asks <code>10.100.0.53</code> for <code>search.bookings.aws.example.com</code>. The server has a conditional forwarder for <code>aws.example.com</code> listing <code>10.41.0.10</code>, <code>10.41.1.10</code> and then the Frankfurt IPs, so it forwards the query over Direct Connect.</span></li>
+				<li class="auto"><span class="name">Inbound endpoint<span class="who auto">AWS</span></span><span class="desc">The query arrives on the endpoint interface <code>10.41.0.10</code> in the shared services VPC. The security group allows TCP and UDP 53 (and 443 for DoH) from <code>10.100.0.0/16</code> and <code>10.200.0.0/16</code>.</span></li>
+				<li class="auto"><span class="name">VPC Resolver of the DNS VPC<span class="who auto">AWS</span></span><span class="desc">The Resolver answers as if the query came from inside <code>vpc-shared-services</code>. DNS Firewall checks the name, the most specific private zone associated with that VPC (<code>bookings.aws.example.com</code>) answers, and the query is logged.</span></li>
+				<li class="group">A workload looks up an on-premises name</li>
+				<li><span class="name">Query to the VPC Resolver<span class="who">Booking pod</span></span><span class="desc">A pod in the booking VPC asks the VPC +2 address for <code>sql01.corp.example.com</code>. The VPC keeps AmazonProvidedDNS in its DHCP options.</span></li>
+				<li class="auto"><span class="name">Rule match from the Profile<span class="who auto">AWS</span></span><span class="desc">The booking VPC is associated with <code>rp-travel-dns-01</code>, which carries the shared rule <code>rslvr-rr-corpfwd01</code>. The most specific matching domain wins, so <code>corp.example.com</code> is forwarded.</span></li>
+				<li class="auto"><span class="name">Outbound endpoint<span class="who auto">AWS</span></span><span class="desc">The Resolver sends the query from the outbound endpoint interfaces in the shared services VPC (in the network account, although the pod is in the bookings account) to <code>10.100.0.53</code> or <code>10.200.0.53</code> across the Transit Gateway and Direct Connect.</span></li>
+				<li><span class="name">Answer and cache<span class="who">Data center DNS</span></span><span class="desc">Active Directory DNS answers; the Resolver returns the record to the pod and caches it for its TTL. Cached answers are not logged again.</span></li>
+				<li class="group">A public name</li>
+				<li class="auto"><span class="name">Recursive resolution<span class="who auto">AWS</span></span><span class="desc">A query for a partner's public API name matches no forward or system rule, so the built-in recursive rule resolves it on the internet; no endpoint is involved, so there is no endpoint query charge.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>One inbound and one outbound endpoint in the DNS VPC</h3>
+				<p>Only the VPC owner can create endpoints, and not in subnets shared from another account, so the DNS VPC belongs to the network account. Each endpoint gets at least two IPs in different Availability Zones; they stay fixed for the endpoint's life, so forwarders can hard-code them.</p>
+				<p>An endpoint's security group <strong>cannot be changed after creation</strong>. Inbound allows TCP and UDP 53, plus TCP 443 for DoH, from both data center ranges; outbound allows the same to <code>10.100.0.53</code> and <code>10.200.0.53</code>. Rules that force connection tracking cut inbound capacity (Step 7; <a href="../d2-task-2-1.html#s7">Task 2.1</a>).</p>
+				<span class="file">Inbound and outbound endpoints in the us-east-1 shared services VPC, both accepting DoH (AWS CLI, network account)</span>
+<pre><code><span class="c"># fixed IPs that the data center forwarders will point at</span>
+aws route53resolver create-resolver-endpoint --creator-request-id in-use1-1 \
+  --name dns-inbound-use1 --direction INBOUND \
+  --security-group-ids sg-dns-inbound \
+  --ip-addresses SubnetId=subnet-shared-az1,Ip=10.41.0.10 SubnetId=subnet-shared-az2,Ip=10.41.1.10 \
+  --protocols Do53 DoH
+
+<span class="c"># outbound IPs can be picked by the service; Do53 plus DoH lets a rule use either per target</span>
+aws route53resolver create-resolver-endpoint --creator-request-id out-use1-1 \
+  --name dns-outbound-use1 --direction OUTBOUND \
+  --security-group-ids sg-dns-outbound \
+  --ip-addresses SubnetId=subnet-shared-az1 SubnetId=subnet-shared-az2 \
+  --protocols Do53 DoH</code></pre>
+				<p>Repeat in <code>eu-central-1</code> and <code>ap-northeast-1</code>: endpoints, rules and Profiles are all Regional. The Transit Gateway and Direct Connect gateway give each DNS VPC its path to the data centers.</p>
+				<div class="callout note"><p>You cannot switch an inbound endpoint straight from Do53 to DoH: enable both, move the forwarders, then remove Do53. DoH-FIPS is inbound only.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Forward, reverse and system rules</h3>
+				<p>Each rule is tied to one outbound endpoint and takes up to six target IPs, so each Region has its own copy. The us-east-1 set:</p>
+				<ul>
+					<li><strong>Forward <code>corp.example.com</code></strong> to both data center servers, so a US outage still leaves the European one.</li>
+					<li><strong>Forward the reverse zones</strong> <code>100.10.in-addr.arpa</code> and <code>200.10.in-addr.arpa</code>; a forward rule for a reverse domain overrides the autodefined reverse rule.</li>
+					<li><strong>Forward <code>example.com</code></strong> for legacy hosts that live only in data center DNS, with a <strong>system rule for <code>aws.example.com</code></strong> so the VPC Resolver answers that subtree from the private zone. The most specific domain wins.</li>
+				</ul>
+				<span class="file">The rule set for us-east-1 (AWS CLI, network account); the European reverse zone and the example.com rule follow the same shape</span>
+<pre><code>aws route53resolver create-resolver-rule --creator-request-id corp-fwd-1 \
+  --name corp-forward --rule-type FORWARD --domain-name corp.example.com \
+  --resolver-endpoint-id rslvr-out-use1shared \
+  --target-ips "Ip=10.100.0.53" "Ip=10.200.0.53"
+
+aws route53resolver create-resolver-rule --creator-request-id corp-rev-1 \
+  --name corp-reverse --rule-type FORWARD --domain-name 100.10.in-addr.arpa \
+  --resolver-endpoint-id rslvr-out-use1shared \
+  --target-ips "Ip=10.100.0.53" "Ip=10.200.0.53"
+
+<span class="c"># carve the AWS subtree out of the legacy example.com forward rule</span>
+aws route53resolver create-resolver-rule --creator-request-id aws-sys-1 \
+  --name aws-local --rule-type SYSTEM --domain-name aws.example.com</code></pre>
+				<p>When the data center servers support DoH, each target can carry its own port, protocol and Server Name Indication; the outbound endpoint must allow DoH (Step 1).</p>
+				<span class="file">A DoH variant of the corp.example.com rule; the SNI names are this example's on-premises DoH servers (AWS CLI)</span>
+<pre><code>aws route53resolver create-resolver-rule --creator-request-id corp-fwd-doh-1 \
+  --name corp-forward-doh --rule-type FORWARD --domain-name corp.example.com \
+  --resolver-endpoint-id rslvr-out-use1shared \
+  --target-ips "Ip=10.100.0.53,Port=443,Protocol=DoH,ServerNameIndication=dns1.corp.example.com" "Ip=10.200.0.53,Port=443,Protocol=DoH,ServerNameIndication=dns2.corp.example.com"</code></pre>
+				<p><strong>Delegation instead of forwarding</strong> (June 2025): a <code>DELEGATE</code> rule (with <code>--delegation-record</code> and no target IPs) makes the Resolver follow NS referrals from a private zone to on-premises name servers, and an <code>INBOUND_DELEGATION</code> endpoint (Do53 only) can be the name server for a subdomain that on-premises DNS delegates. The company keeps forwarders, which its Active Directory team already manages (<a href="../d2-task-2-3.html#s2">Task 2.3</a>).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Private zones the inbound endpoint can answer</h3>
+				<p>An inbound endpoint answers only from private zones associated with <strong>the VPC that holds it</strong>. A zone associated only with the bookings VPC is invisible to the data centers, so every zone on premises needs is associated with the DNS VPC in each Region. Private zones are global, so one zone can serve all three.</p>
+				<p>The network account creates <code>aws.example.com</code> with the DNS VPCs (<a href="../d2-task-2-3.html#s1">Task 2.3</a>). The bookings account owns <code>bookings.aws.example.com</code> so it manages its own records; across accounts, the zone owner authorizes the VPC and the VPC owner associates it (CLI or API only).</p>
+				<span class="file">Let the network account's DNS VPC see the bookings zone, in every Region with an inbound endpoint (AWS CLI)</span>
+<pre><code><span class="c"># bookings account (zone owner): authorize the DNS VPCs</span>
+aws route53 create-vpc-association-authorization --hosted-zone-id Z0BOOKINGS5678 \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-shared-services
+aws route53 create-vpc-association-authorization --hosted-zone-id Z0BOOKINGS5678 \
+  --vpc VPCRegion=eu-central-1,VPCId=vpc-shared-services-eu
+
+<span class="c"># network account (VPC owner): associate them</span>
+aws route53 associate-vpc-with-hosted-zone --hosted-zone-id Z0BOOKINGS5678 \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-shared-services
+aws route53 associate-vpc-with-hosted-zone --hosted-zone-id Z0BOOKINGS5678 \
+  --vpc VPCRegion=eu-central-1,VPCId=vpc-shared-services-eu
+
+<span class="c"># bookings account: tidy up; the associations stay</span>
+aws route53 delete-vpc-association-authorization --hosted-zone-id Z0BOOKINGS5678 \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-shared-services</code></pre>
+				<p><code>enableDnsSupport</code> and <code>enableDnsHostnames</code> must be true in every VPC that uses the zones. The account pipeline runs the authorization for each new team zone.</p>
+				<div class="callout trap"><p>Overlapping zones are fine, and the most specific answers. But a name only in the parent <code>aws.example.com</code> zone, under <code>bookings.aws.example.com</code>, returns NXDOMAIN, not a fallback.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>A Route 53 Profile for every VPC</h3>
+				<p>Without Profiles, every account associates every shared rule with every VPC and each zone needs a per-VPC authorization: over a thousand associations for 300 VPCs, and a zone stops at 300 VPCs. A Profile bundles private zones, rules, DNS Firewall rule groups, interface endpoints and query logging; it is shared through RAM within a Region and needs <strong>one</strong> association per VPC. Changes reach every VPC.</p>
+				<span class="file">Build the us-east-1 Profile and put the zones and rules in it (AWS CLI, network account)</span>
+<pre><code>aws route53profiles create-profile --name travel-dns-use1
+
+<span class="c"># the private zone for AWS workloads</span>
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name aws-example-com \
+  --resource-arn arn:aws:route53:::hostedzone/Z0AWSEXAMPLE1234
+
+<span class="c"># the forward and system rules from Step 2</span>
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name corp-forward \
+  --resource-arn arn:aws:route53resolver:us-east-1:111111111111:resolver-rule/rslvr-rr-corpfwd01
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name aws-local \
+  --resource-arn arn:aws:route53resolver:us-east-1:111111111111:resolver-rule/rslvr-rr-awssys01</code></pre>
+				<p>The RAM share on <a href="../d2-task-2-3.html#s6">Task 2.3</a> shares <code>rp-travel-dns-01</code> with the organization; the VPC template then associates it.</p>
+				<span class="file">The bookings account attaches the shared Profile to its production VPC (AWS CLI)</span>
+<pre><code>aws route53profiles associate-profile \
+  --profile-id rp-travel-dns-01 \
+  --resource-id vpc-bookings-prod \
+  --name bookings-prod-dns</code></pre>
+				<p>A VPC can carry <strong>up to two Profiles</strong>, each with a priority from 100 to 9900 (lower wins). Payment VPCs in PCI DSS scope add <code>travel-dns-pci</code> with a stricter firewall group at a lower number. For rules and zones the Resolver uses the first Profile with a match, ignoring later ones, then compares it with local VPC settings; for the same domain the local setting wins. Queries are logged to every associated Profile's configurations.</p>
+				<div class="callout trap"><p>Profiles distribute rules; they do not create endpoints. Forwarded queries still use the outbound endpoint, so capacity and query charges are unchanged.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Data center forwarders, loop avoidance and the second Region</h3>
+				<p>Data center DNS servers forward <code>aws.example.com</code> to <strong>inbound endpoint IPs</strong>, never to the VPC +2 address (unsupported from outside the VPC), listing the nearest Region first and a second Region after it.</p>
+				<span class="file">US data center forwarders: us-east-1 first, eu-central-1 as fallback (Windows DNS PowerShell and BIND)</span>
+<pre><code># Windows DNS, replicated to every domain controller in the forest
+Add-DnsServerConditionalForwarderZone -Name "aws.example.com" `
+  -MasterServers 10.41.0.10,10.41.1.10,10.45.0.10,10.45.1.10 -ReplicationScope Forest
+
+# BIND named.conf on the non-Windows resolvers
+zone "aws.example.com" {
+  type forward;
+  forward only;
+  forwarders { 10.41.0.10; 10.41.1.10; 10.45.0.10; 10.45.1.10; };
+};</code></pre>
+				<p>The European data center lists Frankfurt first. Inbound load balancing is up to the client, so a forwarder that always uses the first IP makes a hot spot; watch per-IP <code>InboundQueryVolume</code>. How fast a forwarder moves to the next IP depends on the DNS software (see the high-availability blog below). Fallback only works because Step 3 associated every zone with each Region's DNS VPC; otherwise Frankfurt returns NXDOMAIN, which forwarders cache rather than retry.</p>
+				<p><strong>Loop avoidance.</strong> AWS advises never associating a forward rule with the VPC holding the inbound endpoint that rule can reach, directly or through on-premises DNS. If <code>vpc-shared-services</code> had the <code>example.com</code> rule and data center DNS sent an <code>example.com</code> name back to the inbound endpoint, the query would bounce between the endpoints. So the DNS VPCs <strong>do not get the Profile</strong>: zones by direct association, no forward rules. Directory tooling that needs <code>corp.example.com</code> sits in <code>vpc-shared-ad</code>, which does.</p>
+				<p>To let on-premises clients use central interface endpoints by their normal names, also forward those service names (for example <code>s3.us-east-1.amazonaws.com</code>) to the inbound endpoint.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>DNS Firewall and query logging in the Profile</h3>
+				<p>DNS Firewall matches query names against domain lists in rule groups. The baseline group blocks an AWS managed malware list and DNS tunneling (an exfiltration path for card data). New block rules run as ALERT first.</p>
+				<span class="file">A rule group with a managed-list block and a tunneling detector, added to the Profile with priority 200 (AWS CLI, network account)</span>
+<pre><code>aws route53resolver create-firewall-rule-group --creator-request-id frg-use1-1 \
+  --name travel-dns-baseline
+
+<span class="c"># the domain list ID is the AWS managed malware list in this Region</span>
+aws route53resolver create-firewall-rule --name block-malware \
+  --firewall-rule-group-id rslvr-frg-0travelbase1 \
+  --firewall-domain-list-id rslvr-fdl-0awsmalware1 \
+  --priority 100 --action BLOCK --block-response NXDOMAIN
+
+<span class="c"># DNS Firewall Advanced: ALLOW is not available, a confidence threshold is required</span>
+aws route53resolver create-firewall-rule --name block-tunneling \
+  --firewall-rule-group-id rslvr-frg-0travelbase1 \
+  --dns-threat-protection DNS_TUNNELING --confidence-threshold MEDIUM \
+  --priority 200 --action BLOCK --block-response NXDOMAIN
+
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name dns-firewall-baseline \
+  --resource-arn arn:aws:route53resolver:us-east-1:111111111111:firewall-rule-group/rslvr-frg-0travelbase1 \
+  --resource-properties "{\"priority\": 200}"</code></pre>
+				<p>DNS Firewall <strong>fails closed</strong> by default (SERVFAIL when it cannot evaluate a query). The company keeps that: a DNS outage is visible, exfiltration is silent. The fail mode can be set on the Profile, so it is one setting, not 300. Data center queries through the inbound endpoint are filtered by groups associated with the DNS VPC, so the baseline group is also associated directly there. Clients using their own DNS servers bypass DNS Firewall.</p>
+				<p>Resolver query logs cover VPC queries, inbound and outbound endpoint queries and firewall actions. A configuration serves VPCs in its own Region, so there is one per Region, each writing to a log archive account bucket (cross-account needs a bucket policy for <code>delivery.logs.amazonaws.com</code>); AWS recommends S3 for high query rates.</p>
+				<span class="file">One logging configuration per Region, delivered to the log archive bucket and carried by the Profile (AWS CLI, network account)</span>
+<pre><code>aws route53resolver create-resolver-query-log-config --creator-request-id qlog-use1-1 \
+  --name dns-query-logs-use1 \
+  --destination-arn arn:aws:s3:::travel-dns-query-logs-use1
+
+<span class="c"># every VPC with the Profile logs here</span>
+aws route53profiles associate-resource-to-profile \
+  --profile-id rp-travel-dns-01 --name dns-query-logs \
+  --resource-arn arn:aws:route53resolver:us-east-1:111111111111:resolver-query-log-config/rqlc-0use1central123
+
+<span class="c"># the DNS VPC has no Profile, so associate it directly to capture on-premises queries</span>
+aws route53resolver associate-resolver-query-log-config \
+  --resolver-query-log-config-id rqlc-0use1central123 \
+  --resource-id vpc-shared-services</code></pre>
+				<p>Cached answers are not logged, DoH inbound queries show the wrong source IP (a known issue), and CloudWatch vended-log charges apply even for S3.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Capacity, alarms and adding interfaces</h3>
+				<p>Each endpoint IP handles about 10,000 UDP queries per second, but an inbound interface can drop to about 1,500 with connection tracking or behind an NLB. Add interfaces when any one passes 50%. <code>ResolverEndpointCapacityStatus</code> (June 2025) reports 0 OK, 1 above 50%, 2 above 75%, and accounts for latency, protocol, packet size and tracking, so it beats a raw query count.</p>
+				<span class="file">Alarm when any inbound interface passes 50%, ignoring maintenance gaps (AWS CLI, us-east-1)</span>
+<pre><code><span class="c"># Maximum is the valid statistic; data arrives every 5 minutes</span>
+aws cloudwatch put-metric-alarm \
+  --alarm-name dns-inbound-use1-capacity \
+  --namespace AWS/Route53Resolver --metric-name ResolverEndpointCapacityStatus \
+  --dimensions Name=EndpointId,Value=rslvr-in-use1shared \
+  --statistic Maximum --period 300 --evaluation-periods 2 \
+  --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data ignore \
+  --alarm-actions arn:aws:sns:us-east-1:111111111111:network-oncall</code></pre>
+				<p>Missing data is ignored because the metric has gaps during interface maintenance. On an inbound alarm, look for a hot spot first; on an outbound alarm, check the target servers, since slow ones fill interfaces that more interfaces will not fix. Real growth gets a new interface.</p>
+				<span class="file">Add a third inbound IP in another AZ (AWS CLI); one call per address, then add it to the forwarders</span>
+<pre><code>aws route53resolver associate-resolver-endpoint-ip-address \
+  --resolver-endpoint-id rslvr-in-use1shared \
+  --ip-address SubnetId=subnet-shared-az3,Ip=10.41.2.10</code></pre>
+				<p>Also alarm on <code>EndpointHealthyENICount</code> below the IP count. Opt-in detailed metrics (December 2025) add per-interface P90 latency and error counts, and per-target latency outbound.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Centralized endpoints in the network account</h4>
+				<p>Two endpoints per Region serve every account: 12 IPs instead of endpoints in 300 VPCs, and one team owns forwarders, rules and capacity. The cost is a shared dependency, and spoke queries cross the Transit Gateway. Distributed endpoints suit isolated units without Transit Gateway access (<a href="../d2-task-2-3.html#s8">Task 2.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Profiles rather than per-VPC associations</h4>
+				<p>One association per VPC replaces per-rule associations and per-zone authorizations and lifts the 300-VPCs-per-zone ceiling (a Profile serves 1,000 VPCs, 5,000 zones, 1,000 rules). RAM-shared rules remain the tool for a VPC needing an exception, since a local rule wins for the same domain. Three Regional Profiles are kept identical by infrastructure as code.</p>
+			</div>
+			<div class="entry">
+				<h4>Zones associated directly with the DNS VPC</h4>
+				<p>The DNS VPC holds zones by direct association, not through the Profile, so that it never inherits forward rules (the loop rule in Step 5). The cost is one authorization per team zone per Region, automated in the account pipeline.</p>
+			</div>
+			<div class="entry">
+				<h4>Fail closed for DNS Firewall</h4>
+				<p>Fail closed favours security, fail open availability. A unit without sensitive data could use a fail-open Profile; the highest-priority Profile that sets the value applies.</p>
+			</div>
+			<div class="entry">
+				<h4>DNS over HTTPS on the hybrid path</h4>
+				<p>AWS says encrypting DNS inside a VPC is not needed; DoH matters where DNS crosses Direct Connect. That path is already encrypted (<a href="encrypted-hybrid.html">Encrypted hybrid connectivity</a>), so DoH is adopted as data center servers gain support, keeping Do53 until every forwarder has moved.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Endpoints cost $0.125 per IP address per hour plus $0.40 per million queries through them. Two endpoints with two IPs each in three Regions is 12 &times; $0.125 &times; 730 &asymp; $1,095 a month; a third us-east-1 inbound IP adds about $91. If the endpoints carry 1.5 billion queries a month, that is 1,500 &times; $0.40 = $600. Queries to private zones from VPCs and recursive public lookups need no endpoint, which is why the design forwards only what must leave AWS. Detail: <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas to plan for</h4>
+				<ul>
+					<li>4 endpoints per Region per account (adjustable), 6 target IPs per rule, 1,000 rules and 2,000 rule-to-VPC associations per Region.</li>
+					<li>5 Profiles per account per Region (adjustable), 2 Profiles per VPC, 5 DNS Firewall rule groups per Profile, 2 query logging configurations per Profile.</li>
+					<li>5 DNS Firewall rule groups per VPC, 100 rules per group; 20 query logging configurations per Region.</li>
+					<li>Resolver API at 5 requests per second per account per Region, which matters when automation associates hundreds of VPCs: add retries with backoff.</li>
+				</ul>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>RAM-shared rules and zone authorizations without Profiles</h4>
+				<p>The pre-2024 pattern still works, but every account associates every rule with every VPC, an account moved to an OU outside the share silently loses its associations, and zones stop at 300 VPCs.</p>
+			</div>
+			<div class="entry">
+				<h4>Self-managed DNS servers on EC2</h4>
+				<p>BIND or Windows servers in the DNS VPC forwarding AWS zones to the VPC +2 address. You patch, scale and make them highly available, and instances using them through DHCP options bypass DNS Firewall and Resolver query logging.</p>
+			</div>
+			<div class="entry">
+				<h4>Delegation instead of conditional forwarders</h4>
+				<p>Inbound delegation endpoints let data center DNS delegate <code>aws.example.com</code> with NS records instead of maintaining forwarders on every server, and DELEGATE rules follow referrals the other way. Fewer forwarder entries to keep in sync, but Do53 only on the inbound side.</p>
+			</div>
+			<div class="entry">
+				<h4>Route 53 Global Resolver (outside the exam guide)</h4>
+				<p>An internet-reachable anycast resolver for sites, branches and remote clients, resolving private zone and public names over Do53, DoH or DoT with token or IP allowlist authentication. It is newer than the ANS-C01 outline, so treat it as background only.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Resolve AWS names from each data center</span><span class="desc">From a US server, <code>dig @10.41.0.10 search.bookings.aws.example.com</code> and the same against <code>10.41.1.10</code>, <code>10.45.0.10</code> and <code>10.45.1.10</code> should return the same answer; any NXDOMAIN from Frankfurt means a zone is missing its association with <code>vpc-shared-services-eu</code>.</span></li>
+				<li><span class="name">Resolve on-premises names from a spoke</span><span class="desc">From a booking instance, <code>dig sql01.corp.example.com</code> and a PTR lookup for <code>10.100.20.5</code> should succeed, and the query log should show the query leaving through <code>rslvr-out-use1shared</code>. A spoke that fails while the shared services VPC works usually has no Profile association.</span></li>
+				<li><span class="name">Fail over the forwarders</span><span class="desc">In a maintenance window, block <code>10.41.0.0/16</code> on port 53 for one test DNS server in the US data center. Lookups should continue through Frankfurt, and its <code>InboundQueryVolume</code> should rise.</span></li>
+				<li><span class="name">Prove there is no loop</span><span class="desc">Query a legacy <code>example.com</code> name at the inbound endpoint; the query log should show one query, not a chain between the endpoints.</span></li>
+				<li><span class="name">Test DNS Firewall</span><span class="desc">Add a test domain to a custom list with ALERT, check the log, switch to BLOCK and confirm NXDOMAIN from a spoke and through the inbound endpoint.</span></li>
+				<li><span class="name">Load test capacity</span><span class="desc">Replay peak query rates from a test forwarder; the Step 7 alarm should fire before timeouts appear.</span></li>
+			</ol>
+			<div class="callout trap"><p><strong>Troubleshooting checklist.</strong> NXDOMAIN inside the VPC for a name that resolves on the internet usually means a private zone with the same name or a parent (split-view) matches but lacks that record: there is no fallback to the public zone. A name forwarded when it should be local, or local when it should be forwarded, is rule precedence: the most specific rule wins, a rule beats a private zone for the same name, and a local VPC rule beats the Profile. Intermittent failures from one busy EKS node, with no endpoint involved, often mean the 1,024 packets per second per interface limit to link-local services (DNS, metadata and time sync together, not adjustable); the ENA counter <code>linklocal_allowance_exceeded</code> confirms it, and caching DNS on the node fixes it.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design DNS solutions</td><td data-label="What this architecture demonstrates">Inbound and outbound endpoints, rule types and precedence, private zone behaviour, Profiles, DNS Firewall and query logging choices</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">Resolver query logs to a central bucket, endpoint capacity and health metrics</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">The shared services VPC reached over the Transit Gateway, Regional DNS resources repeated per Region</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">Conditional forwarders on Windows and BIND to inbound endpoint IPs, DHCP options kept on AmazonProvidedDNS</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Implement hybrid and multi-account DNS</td><td data-label="What this architecture demonstrates">Endpoint creation, forward, reverse and system rules, RAM sharing, cross-account zone association, loop avoidance, DoH</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-4.html">2.4</a> Automate and configure network infrastructure</td><td data-label="What this architecture demonstrates">Profile association in the VPC template, zone authorization in the account pipeline</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"On-premises servers cannot resolve records in a private hosted zone, and workloads in many accounts must resolve the on-premises Active Directory domain, with the least operational overhead" is <strong>Resolver inbound and outbound endpoints in a central VPC, the private zones associated with that VPC, on-premises conditional forwarders to the inbound endpoint IPs, and the forwarding rules distributed with a Route 53 Profile shared through RAM</strong>. If an option forwards on-premises queries to the VPC +2 address, or associates the forward rule with the VPC that holds the inbound endpoint, it is wrong.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/how-to-achieve-dns-high-availability-with-route-53-resolver-endpoints/">How to achieve DNS high availability with Route 53 Resolver endpoints</a> (July 2024): interfaces per AZ, on-premises forwarder behaviour and failover testing for Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/using-amazon-route-53-profiles-for-scalable-multi-account-aws-environments/">Using Amazon Route 53 Profiles for scalable multi-account AWS environments</a> (April 2024): one DNS configuration shared to many VPCs, the core of Step 4.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/migrating-your-multi-account-dns-environment-to-amazon-route-53-profiles/">Migrating your multi-account DNS environment to Amazon Route 53 Profiles</a> (August 2024): moving from RAM-shared rules and zone authorizations to Profiles.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/scaling-your-hybrid-dns-setup-with-amazon-route-53-resolver-endpoint-metrics/">Scaling your hybrid DNS setup with Amazon Route 53 Resolver endpoint metrics</a> (July 2025): using the capacity metric to decide when to add interfaces.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/encrypt-dns-queries-using-dns-over-https-doh-with-amazon-route-53-resolver-endpoints/">Encrypt DNS queries using DNS-over-HTTPS (DoH) with Amazon Route 53 Resolver Endpoints</a> (December 2024): DoH on inbound and outbound endpoints.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/securing-hybrid-workloads-using-amazon-route-53-resolver-dns-firewall/">Securing hybrid workloads using Amazon Route 53 Resolver DNS Firewall</a> (August 2025): filtering on-premises queries that arrive through inbound endpoints.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/implementing-consistent-dns-query-logging-with-amazon-route-53-profiles/">Implementing consistent DNS Query Logging with Amazon Route 53 Profiles</a> (January 2026): query logging applied across VPCs through Profiles, as in Step 6.</li>
+				<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/best-practices-resolver.html">Resolver best practices</a> (AWS documentation): loop avoidance, high availability and endpoint capacity.</li>
+				<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/profiles.html">Route 53 Profiles</a> (AWS documentation): supported resources, precedence and multiple Profiles per VPC.</li>
+				<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/monitoring-resolver-with-cloudwatch.html">Monitoring Route 53 VPC Resolver endpoints with Amazon CloudWatch</a> (AWS documentation): capacity status, per-IP and detailed metrics, alarm advice.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

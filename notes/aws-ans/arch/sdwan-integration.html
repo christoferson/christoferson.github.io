@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: SD-WAN Integration with Transit Gateway Connect and Cloud WAN | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: 60 sales offices on a vendor SD-WAN reaching AWS through Marketplace headend appliances in a transport VPC, Transit Gateway Connect attachments and GRE Connect peers with two BGP sessions each, Transit Gateway CIDR blocks, inside /29s, ECMP, MTU, an on-premises SD-WAN appliance over Direct Connect, Cloud WAN GRE and Tunnel-less Connect, VPN Concentrator for small sites, monitoring and failover testing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">SD-WAN integration</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>SD-WAN integration with Transit Gateway Connect and Cloud WAN</h1>
+		<p>The travel company's 60 sales offices already run on a vendor SD-WAN. Instead of 60 VPNs, headend appliances in a transport VPC join the fabric and exchange routes with the Transit Gateway over GRE and BGP, so offices and VPCs learn each other dynamically. A Cloud WAN variant and a VPN Concentrator for the smallest sites complete the picture.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Transit Gateway Connect</span><span class="tag">AWS Cloud WAN</span><span class="tag">AWS Marketplace</span><span class="tag">Direct Connect gateway</span><span class="tag">VPN Concentrator</span><span class="tag">Network Manager</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Transport VPC and headends</a></li>
+				<li class="sub"><a href="#b2">2. Connect attachment and peers</a></li>
+				<li class="sub"><a href="#b3">3. Headend BGP and GRE</a></li>
+				<li class="sub"><a href="#b4">4. Route tables for the offices</a></li>
+				<li class="sub"><a href="#b5">5. Data center SD-WAN over Direct Connect</a></li>
+				<li class="sub"><a href="#b6">6. The Cloud WAN variant</a></li>
+				<li class="sub"><a href="#b7">7. BGP monitoring</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) sells holidays through 60 sales offices: 35 in North America and 25 in Europe. Each office has two internet links and a branch appliance from one SD-WAN vendor, which builds encrypted overlays and picks the best link per application. The network team in account <code>111111111111</code> wants offices to reach the <a href="tgw-hub-spoke.html">Transit Gateway hub</a> in <code>us-east-1</code> and <code>eu-central-1</code> directly, without a VPN per office and without static routes to maintain.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Offices join AWS through the SD-WAN they already run</td><td data-label="Design choice">Vendor headend appliances from AWS Marketplace in a transport VPC, two Availability Zones per Region</td></tr>
+						<tr><td>Dynamic routes, more than VPN throughput</td><td data-label="Design choice">Transit Gateway Connect: GRE tunnels with BGP from each headend, ECMP across headends</td></tr>
+						<tr><td>Offices reach production and shared services, never development</td><td data-label="Design choice">A new <code>branch</code> Transit Gateway route table and controlled propagation</td></tr>
+						<tr><td>Offices keep working if a Region's headends fail</td><td data-label="Design choice">The US data center's SD-WAN appliance peers over Direct Connect as a backup path, with a longer AS path</td></tr>
+						<tr><td>Small sites with no SD-WAN appliance</td><td data-label="Design choice">A VPN Concentrator on the Transit Gateway, or plain Site-to-Site VPN</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Numbers used on this page, consistent with the other architecture pages:</p>
+			<ul>
+				<li><strong>Transit Gateways</strong>: <code>tgw-use1</code> (ASN 64521) and <code>tgw-euc1</code> (ASN 64522), route tables <code>prod</code>, <code>dev</code>, <code>shared</code> and <code>onprem</code> as on the <a href="tgw-hub-spoke.html#b2">hub page</a>. <code>tgw-use1</code> already has the Transit Gateway CIDR block <code>10.255.10.0/24</code> from the <a href="encrypted-hybrid.html#b3">encrypted hybrid page</a>, already in the allowed prefixes of <code>dxgw-travel-global</code> (AS 64512).</li>
+				<li><strong>New on this page</strong>: the SD-WAN fabric uses private AS 65030, distinct from every other ASN in the company plan. Offices use <code>10.120.0.0/16</code>, one /24 each: North America in <code>10.120.0.0/17</code>, Europe in <code>10.120.128.0/17</code>.</li>
+				<li><strong>Transport VPC</strong> <code>vpc-0sdwanuse1</code>, <code>10.41.232.0/22</code> inside the shared services range. Headend <code>sdwan-1a</code> has its inside interface at <code>10.41.233.10</code> in <code>us-east-1a</code>, <code>sdwan-1b</code> at <code>10.41.233.74</code> in <code>us-east-1b</code>. Frankfurt mirrors it (<code>10.45.232.0/22</code>, block <code>10.255.20.0/24</code>); only Virginia is shown.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>A sales agent in the Chicago office (<code>10.120.14.0/24</code>) opens the booking console, served by the production booking VPC at <code>10.40.8.0/21</code>.</p>
+			<ol class="flow">
+				<li class="group">Office to AWS</li>
+				<li><span class="name">Branch appliance picks a path<span class="who">SD-WAN</span></span><span class="desc">The Chicago appliance has learned <code>10.40.0.0/14</code> from both Virginia headends through the vendor's controller. It encrypts the packet into its IPsec overlay and sends it over the better internet link to the public address of <code>sdwan-1a</code> or <code>sdwan-1b</code>.</span></li>
+				<li><span class="name">Headend decrypts and routes<span class="who">SD-WAN</span></span><span class="desc">The headend ends the overlay, looks up <code>10.40.8.0/21</code> in its BGP table and finds it behind its Connect peer to <code>tgw-use1</code>.</span></li>
+				<li><span class="name">GRE inside the transport VPC<span class="who">SD-WAN</span></span><span class="desc">The headend wraps the clear packet in GRE from <code>10.41.233.10</code> to the Transit Gateway address <code>10.255.10.100</code>. The subnet route table sends <code>10.255.10.0/24</code> to the Transit Gateway, so the GRE packet enters through the transport VPC attachment.</span></li>
+				<li class="auto"><span class="name">Connect recognises the tunnel<span class="who auto">AWS</span></span><span class="desc">The Transit Gateway matches the outer source and destination to a Connect peer, removes the GRE header and treats the inner packet as arriving on the Connect attachment.</span></li>
+				<li class="auto"><span class="name">Lookup in the branch table<span class="who auto">AWS</span></span><span class="desc">The Connect attachment is associated with the <code>branch</code> table, which holds the propagated production and shared services VPC routes. The packet leaves on the booking VPC attachment.</span></li>
+				<li class="group">AWS back to the office</li>
+				<li class="auto"><span class="name">Production table<span class="who auto">AWS</span></span><span class="desc">The booking VPC's attachment uses the <code>prod</code> table, where the Connect attachment propagated the office /24s learned over BGP. Both headends advertise them with the same AS path, so the Transit Gateway spreads flows over both peers (ECMP).</span></li>
+				<li class="auto"><span class="name">GRE to the headend<span class="who auto">AWS</span></span><span class="desc">The Transit Gateway encapsulates the reply in GRE to the chosen headend's inside address. The headend re-encrypts it into the overlay toward Chicago.</span></li>
+				<li class="group">When both Virginia headends fail</li>
+				<li class="auto"><span class="name">Backup over Direct Connect<span class="who auto">AWS</span></span><span class="desc">The BGP sessions drop after the 30-second hold time and the office routes from the headends are withdrawn. The same /24s are still advertised, with a longer AS path, by the US data center's SD-WAN appliance through a second Connect attachment over Direct Connect. That path becomes active, and the offices reach AWS through the data center.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The transport VPC, its attachment and the headends</h3>
+				<p>The transport VPC lives in the network account, because Connect attachments are created in the Transit Gateway owner's account. It has three subnet tiers per Availability Zone: an outside subnet with a route to an internet gateway, where each headend's outside interface has an Elastic IP for the branch overlays; an inside subnet for the GRE side; and a small attachment subnet used only by the Transit Gateway. The headends come from the vendor's AWS Marketplace listing, one per Availability Zone.</p>
+				<span class="file">Attach the transport VPC to tgw-use1, using the dedicated /28 attachment subnets (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-use1 \
+  --vpc-id vpc-0sdwanuse1 \
+  --subnet-ids subnet-0sdwtgw1a subnet-0sdwtgw1b \
+  --options DnsSupport=enable \
+  --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=sdwan-transport}]'</code></pre>
+				<p>Two route details make or break the tunnels. The inside subnets need a route from the Transit Gateway CIDR block to the Transit Gateway, otherwise the headend's GRE packets for <code>10.255.10.100</code> have nowhere to go. And the headends forward packets that are neither from nor to their own addresses, so source/destination checking must be off on every interface that carries transit traffic.</p>
+				<span class="file">Reach the Connect peer addresses and let the appliances forward (AWS CLI)</span>
+<pre><code><span class="c"># GRE from the headends to 10.255.10.0/24 goes to the Transit Gateway</span>
+aws ec2 create-route --route-table-id rtb-0sdwaninside \
+  --destination-cidr-block 10.255.10.0/24 --transit-gateway-id tgw-use1
+
+<span class="c"># repeat for sdwan-1b; extra interfaces use modify-network-interface-attribute</span>
+aws ec2 modify-instance-attribute \
+  --instance-id i-0sdwan1a --no-source-dest-check
+aws ec2 modify-network-interface-attribute \
+  --network-interface-id eni-0sdwan1aout --no-source-dest-check</code></pre>
+				<p>The transport VPC attachment is associated with the <code>shared</code> table. It carries GRE only, so it needs no propagation into the workload tables; the branch prefixes arrive through the Connect attachment instead. The internet gateway is a deliberate second internet edge, so the outside interfaces' security groups allow only the vendor's overlay ports.</p>
+				<div class="callout trap"><p>Forgetting the route to the Transit Gateway CIDR block is the classic "Connect peer created, BGP never comes up" fault. The block is not part of any VPC, so nothing adds a route to it automatically.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The Connect attachment and one GRE peer per headend</h3>
+				<p>A Connect attachment rides on a transport attachment, here the VPC attachment from Step 1. Each <strong>Connect peer</strong> is one GRE tunnel with two BGP sessions to AWS-managed endpoints for redundancy, and AWS strongly recommends configuring both. The addressing has three parts:</p>
+				<ul>
+					<li><strong>Transit Gateway GRE address</strong> from a Transit Gateway CIDR block. Without a value, the first free address is taken; fixing <code>10.255.10.100</code> and <code>.101</code> keeps them clear of the private IP VPN endpoints in the same block. Blocks are /24 or larger for IPv4, at most five per gateway, and must not overlap VPC or on-premises ranges.</li>
+					<li><strong>Peer GRE address</strong>: the headend's inside interface, any address in the same IP family.</li>
+					<li><strong>Inside CIDR</strong>: a /29 from <code>169.254.0.0/16</code>, unique on the Transit Gateway, carrying the BGP sessions. The blocks <code>169.254.0.0/29</code> to <code>169.254.5.0/29</code> and <code>169.254.169.248/29</code> are reserved. The appliance uses the first address; the Transit Gateway uses the second and third.</li>
+				</ul>
+				<span class="file">One Connect attachment on the transport attachment, then a peer per headend (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-connect \
+  --transport-transit-gateway-attachment-id tgw-attach-sdwan-vpc \
+  --options Protocol=gre
+
+<span class="c"># sdwan-1a: appliance BGP address 169.254.100.1, AWS side .2 and .3</span>
+aws ec2 create-transit-gateway-connect-peer \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect \
+  --transit-gateway-address 10.255.10.100 \
+  --peer-address 10.41.233.10 \
+  --inside-cidr-blocks 169.254.100.0/29 \
+  --bgp-options PeerAsn=65030 \
+  --tag-specifications 'ResourceType=transit-gateway-connect-peer,Tags=[{Key=Name,Value=sdwan-1a}]'
+
+<span class="c"># sdwan-1b: appliance BGP address 169.254.100.9, AWS side .10 and .11</span>
+aws ec2 create-transit-gateway-connect-peer \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect \
+  --transit-gateway-address 10.255.10.101 \
+  --peer-address 10.41.233.74 \
+  --inside-cidr-blocks 169.254.100.8/29 \
+  --bgp-options PeerAsn=65030 \
+  --tag-specifications 'ResourceType=transit-gateway-connect-peer,Tags=[{Key=Name,Value=sdwan-1b}]'</code></pre>
+				<p>The output of each peer shows two <code>BgpConfigurations</code> entries, one per AWS-side address, each with <code>BgpStatus</code> <code>down</code> until the appliance is configured. If <code>PeerAsn</code> were left out, the Transit Gateway's own ASN would be used and the sessions would become iBGP.</p>
+				<p>Capacity: up to 5 Gbps and 300,000 packets per second per peer, four peers per Connect attachment (not adjustable), up to 20 Gbps per attachment if the transport allows it. Two peers give 10 Gbps, far more than 60 offices on broadband need. Two more peers raise it to 20 Gbps, and ECMP also works across Connect attachments on the same Transit Gateway.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>GRE and BGP on the headends</h3>
+				<p>Every SD-WAN vendor has its own interface, but the settings Connect needs are the same everywhere:</p>
+				<ul>
+					<li><strong>MP-BGP only</strong>, over IPv4 peering; IPv6 prefixes would ride the same session. eBGP needs <strong>multihop with TTL 2</strong>.</li>
+					<li><strong>Both sessions</strong> per peer: AWS side <code>.2</code> and <code>.3</code> of the /29.</li>
+					<li><strong>No BFD, no graceful restart, no static routes</strong>. Failure detection relies on BGP timers: keepalive 10 seconds, hold 30 seconds.</li>
+					<li><strong>Routes</strong>: at most 1,000 from the appliance to a peer and 5,000 from the peer to the appliance. Sixty office /24s are well inside that; summarize if the fabric grows.</li>
+					<li><strong>MTU</strong>: the Transit Gateway supports 8500 bytes on Connect and VPC attachments. GRE adds 24 bytes (4 GRE plus 20 outer IP), so the tunnel MTU is the outer MTU minus 24.</li>
+				</ul>
+				<span class="file">sdwan-1a: GRE tunnel to tgw-use1 and eBGP to both AWS addresses (Cisco IOS-style; adapt to the vendor's syntax)</span>
+<pre><code>interface Tunnel100
+ description Connect peer to tgw-use1
+ ip address 169.254.100.1 255.255.255.248
+ <span class="c">! 8500 on the transport attachment minus 24 bytes of GRE</span>
+ ip mtu 8476
+ <span class="c">! branch traffic arrives through 1500-byte internet overlays</span>
+ ip tcp adjust-mss 1360
+ tunnel source 10.41.233.10
+ tunnel destination 10.255.10.100
+ tunnel mode gre ip
+!
+router bgp 65030
+ neighbor 169.254.100.2 remote-as 64521
+ neighbor 169.254.100.2 ebgp-multihop 2
+ neighbor 169.254.100.3 remote-as 64521
+ neighbor 169.254.100.3 ebgp-multihop 2
+ address-family ipv4
+  <span class="c">! only the office ranges go to AWS</span>
+  neighbor 169.254.100.2 prefix-list OFFICES-OUT out
+  neighbor 169.254.100.3 prefix-list OFFICES-OUT out
+  neighbor 169.254.100.2 activate
+  neighbor 169.254.100.3 activate</code></pre>
+				<p>Office traffic arrives inside 1500-byte internet overlays, so the vendor's MSS clamping sets the real segment size; 1360 is an example. The Transit Gateway also clamps MSS and supports Path MTU Discovery for traffic entering on VPC and Connect attachments.</p>
+				<p>For ECMP, both headends must advertise the <strong>same prefixes with the same AS_PATH and ASN</strong>. Otherwise one peer carries everything. There is no ECMP between the two BGP sessions of one peer: they are redundancy, not extra bandwidth.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>A branch route table and controlled propagation</h3>
+				<p>Connect routes propagate into a route table like VPN or Direct Connect gateway routes, but the hub runs with default association and propagation off, so the Connect attachment goes nowhere until it is placed. Sales offices need production (the booking console), shared services (DNS, directory) and the data centers, and must never reach development. Associating the Connect attachment with <code>onprem</code> would give them development routes too, so it gets its own <code>branch</code> table.</p>
+				<span class="file">The branch table: associate the Connect attachment and choose who it can reach (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=branch}]'
+
+<span class="c"># office traffic looks up its destinations in branch</span>
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-branch \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect
+
+<span class="c"># production, shared services and the data centers can reach the offices</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-shared \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-onprem \
+  --transit-gateway-attachment-id tgw-attach-sdwan-connect
+
+<span class="c"># offices learn the data center routes; VPC attachments are added the same way</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-branch \
+  --transit-gateway-attachment-id tgw-attach-dxgw</code></pre>
+				<p>Production and shared services VPC attachments are propagated into <code>branch</code> by the same automation that places new spokes on the hub page, driven by the <code>segment</code> tag. <code>branch</code> also gets the <code>10.42.0.0/16</code> blackhole as a backstop.</p>
+				<span class="file">Confirm the office routes arrived from Connect in the production table (AWS CLI)</span>
+<pre><code>aws ec2 search-transit-gateway-routes \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --filters "Name=attachment.resource-type,Values=connect" "Name=route-search.subnet-of-match,Values=10.120.0.0/16"</code></pre>
+				<div class="callout trap"><p>Do not add static routes for <code>10.120.0.0/16</code> on the Transit Gateway peering toward Frankfurt. Static beats propagated for the same prefix, so a static summary would pull European offices' traffic across the Atlantic even though Frankfurt's own headends serve them.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>The data center's SD-WAN appliance over Direct Connect</h3>
+				<p>The SD-WAN fabric also has a hub appliance in the US data center, <code>us-dc1-sdwan</code>, with loopback <code>10.100.255.10</code>. It can join the Transit Gateway with no VPC at all: a Connect attachment whose transport is the <strong>Direct Connect gateway attachment</strong> <code>tgw-attach-dxgw</code>. GRE runs from the loopback across the transit VIFs to a Transit Gateway address. That needs the transit VIF, Direct Connect gateway and association in place, and the Transit Gateway CIDR block in the <strong>allowed prefixes</strong>. Both are in place from the <a href="dx-resilient-hybrid.html">resilient Direct Connect</a> and <a href="encrypted-hybrid.html#b3">encrypted hybrid</a> pages.</p>
+				<span class="file">A second Connect attachment over Direct Connect and its peer (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-connect \
+  --transport-transit-gateway-attachment-id tgw-attach-dxgw \
+  --options Protocol=gre
+
+<span class="c"># the data center loopback must be reachable over the transit VIFs, not through the tunnel itself</span>
+aws ec2 create-transit-gateway-connect-peer \
+  --transit-gateway-attachment-id tgw-attach-dc-connect \
+  --transit-gateway-address 10.255.10.200 \
+  --peer-address 10.100.255.10 \
+  --inside-cidr-blocks 169.254.100.16/29 \
+  --bgp-options PeerAsn=65030</code></pre>
+				<p>This attachment is placed exactly like the first one in Step 4. The data center appliance advertises the same office /24s, prepended twice. Both are Connect routes, and within one attachment type the Transit Gateway prefers the shorter AS_PATH, so the VPC headends carry traffic and the data center path is a hot standby. The 8500-byte transit VIFs allow the same 8476 tunnel MTU.</p>
+				<p>Two rules keep this stable. First, the tunnel's own endpoint (<code>10.255.10.0/24</code>) must stay reachable through the underlay; if the appliance learned it through the tunnel, the tunnel would flap. Second, Connect routes rank below Direct Connect gateway routes for the same prefix. The data center's own <code>10.100.0.0/16</code> stays on the transit VIFs, not in the tunnel.</p>
+				<div class="callout note"><p>GRE adds no encryption, and Direct Connect is private but not encrypted. Office traffic is encrypted only on the internet leg, inside the vendor's IPsec overlay, and travels in clear GRE from the headend to the Transit Gateway and from the data center over Direct Connect. Card data from phone bookings still needs TLS end to end, or the MACsec and private IP VPN layers of the <a href="encrypted-hybrid.html">encrypted hybrid</a> design.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>The Cloud WAN variant: GRE or Tunnel-less Connect</h3>
+				<p>When the company moves to the <a href="multi-region-network.html#b3">Cloud WAN core network</a>, the headends attach to the core network edge instead. Cloud WAN Connect attachments are created in the core network owner's account, use a <strong>VPC attachment</strong> as transport (the documentation lists only VPC transport), and offer two protocols:</p>
+				<ul>
+					<li><strong>GRE</strong>: the same model as Transit Gateway Connect, with two BGP sessions per peer, 5 Gbps per peer, 4 peers per attachment and 1,000 routes in, 5,000 out per peer.</li>
+					<li><strong>Tunnel-less Connect</strong> (October 2023, <code>NO_ENCAP</code>): the appliance peers BGP directly with the edge, with no GRE or IPsec. That removes the 24-byte overhead and the 5 Gbps per-peer limit: up to 100 Gbps per Availability Zone, 1,000 routes in and 10,000 out per peer, and 8500-byte MTU. There is no inside CIDR to choose and at most one Tunnel-less attachment per VPC.</li>
+				</ul>
+				<p>Segmentation is the main reason to move. The SD-WAN carries two VRFs: <code>sales</code> for office users and <code>cardpay</code> for the phone-payment terminals in scope for PCI DSS. Each VRF maps one to one to a new Cloud WAN segment, <code>branch</code> and <code>branchpci</code>, so separation runs from the office to the VPC. With GRE, the transport VPC attachment sits in a transport segment and one Connect attachment per VRF sits in its own segment. With Tunnel-less, the Connect attachment and its transport VPC attachment must be in the <strong>same segment</strong>, so each segment needs its own transport VPC attachment and the headend needs one interface per segment (a multi-VPC ENI).</p>
+				<span class="file">Tunnel-less Connect for the sales VRF in us-east-1 (AWS CLI, network account, Network Manager home Region)</span>
+<pre><code><span class="c"># the transport VPC attachment carries the tag segment=branch, so both land in branch</span>
+aws networkmanager create-connect-attachment --region us-west-2 \
+  --core-network-id core-network-0travel123456 \
+  --edge-location us-east-1 \
+  --transport-attachment-id attachment-0sdwanbranch01 \
+  --options Protocol=NO_ENCAP \
+  --tags Key=segment,Value=branch
+
+<span class="c"># the subnet is the one holding the headend's branch interface; BGP options apply only to GRE</span>
+aws networkmanager create-connect-peer --region us-west-2 \
+  --connect-attachment-id attachment-0sdwanconnect1 \
+  --peer-address 10.41.233.10 \
+  --subnet-arn arn:aws:ec2:us-east-1:111111111111:subnet/subnet-0sdwin1a</code></pre>
+				<p>For the GRE protocol, the same command takes <code>--inside-cidr-blocks</code>, an optional <code>--core-network-address</code> and <code>--bgp-options PeerAsn=65030</code>, mirroring Step 2.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>BGP monitoring through Network Manager</h3>
+				<p>The Transit Gateways are already registered in the global network. Network Manager then emits Connect events to EventBridge in <code>us-west-2</code>: topology changes such as <code>CONNECT_ATTACHMENT_CREATED</code> and <code>TGW-CONNECT-PEER-CREATED</code>, and status updates <code>CONNECT_PEER_BGP_DOWN</code> and <code>CONNECT_PEER_BGP_UP</code>.</p>
+				<span class="file">Page the network team when any Connect peer loses BGP (AWS CLI; the rule must be in us-west-2)</span>
+<pre><code>aws events put-rule --region us-west-2 \
+  --name connect-peer-bgp-down \
+  --event-pattern '{
+    "source": ["aws.networkmanager"],
+    "detail-type": ["Network Manager Status Update"],
+    "detail": {"changeType": ["CONNECT_PEER_BGP_DOWN"]}
+  }'
+
+aws events put-targets --region us-west-2 --rule connect-peer-bgp-down \
+  --targets Id=oncall,Arn=arn:aws:sns:us-west-2:111111111111:network-oncall</code></pre>
+				<span class="file">Check both BGP sessions of every peer on the Connect attachment (AWS CLI)</span>
+<pre><code>aws ec2 describe-transit-gateway-connect-peers \
+  --filters Name=transit-gateway-attachment-id,Values=tgw-attach-sdwan-connect \
+  --query "TransitGatewayConnectPeers[].ConnectPeerConfiguration.BgpConfigurations[].[PeerAddress,TransitGatewayAddress,BgpStatus]"</code></pre>
+				<p>Transit Gateway flow logs record Connect traffic on the <strong>transport attachment</strong>, not the Connect attachment, so office flows appear under <code>tgw-attach-sdwan-vpc</code> or <code>tgw-attach-dxgw</code>. Alarm on a single session down: it silently removes redundancy.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Connect instead of a VPN per office or per headend</h4>
+				<p>Sixty office VPNs would mean 120 tunnels and losing the SD-WAN's path selection; VPN from each headend gives 1.25 Gbps per standard tunnel. Connect gives 5 Gbps per peer, 1,000 routes in per peer and no IPsec to manage between two devices that are both inside AWS. See <a href="../d1-task-1-5.html#s9">Task 1.5</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Two headends in two Availability Zones, one AS, no prepending</h4>
+				<p>Identical prefixes and AS paths make the Transit Gateway load-share across both and fail over by withdrawal. Prepending on one gives active/standby at half the capacity. Without BFD, failover takes up to the 30-second hold time.</p>
+			</div>
+			<div class="entry">
+				<h4>A separate branch route table</h4>
+				<p>Offices are not data centers: they are many, less trusted and in public places. A <code>branch</code> table keeps them out of development and lets the network team change their reach without touching the data center paths. The cost is one more table out of the 20 per gateway (adjustable).</p>
+			</div>
+			<div class="entry">
+				<h4>Small sites without an appliance</h4>
+				<p>About 40 airport ticket desks have only a basic router and need under 50 Mbps each. A <strong>VPN Concentrator</strong> (November 2025) gives them one Transit Gateway attachment for up to 100 sites, at up to 100 Mbps and 10,000 packets per second per site and 5 Gbps in total. It is BGP only, has no ECMP, works only on Transit Gateways (not Cloud WAN or virtual private gateways), and its routes rank below normal VPN routes. The price is $1.95 an hour plus $0.01 per site-hour: for 40 desks about $1,423.50 + $292 = $1,715.50 a month plus its attachment, compared with about $2,920 for 40 separate VPNs: $1,460 for the connections at $0.05 an hour, plus $1,460 for their 40 Transit Gateway attachments at $0.05 an hour. For a few sites, or ECMP or static routing, plain Site-to-Site VPN stays the answer.</p>
+			</div>
+			<div class="entry">
+				<h4>Costs</h4>
+				<p>The headends are EC2 instances plus the vendor's Marketplace licence, usually the largest line item. The transport VPC attachment is billed like any VPC attachment ($0.05 an hour in the published example); check the Transit Gateway pricing page for the Connect attachment and data processing rates in each Region. Cloud WAN adds $0.50 an hour per core network edge. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Site-to-Site VPN from each office</h4>
+				<p>Managed by AWS with no appliances, but it ignores the fabric the company pays for and adds two tunnels per office.</p>
+			</div>
+			<div class="entry">
+				<h4>Connect over Direct Connect only</h4>
+				<p>Backhaul every office to the data centers and enter AWS only through the data center appliance from Step 5. Fewer components in AWS, but every office then depends on the data centers.</p>
+			</div>
+			<div class="entry">
+				<h4>Cloud WAN with Tunnel-less Connect</h4>
+				<p>Best when the SD-WAN carries several VRFs that should stay separate end to end across Regions, or when throughput above 20 Gbps per attachment matters. It costs the core network edges and needs one interface and transport attachment per segment. See <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Both sessions on every peer are up</span><span class="desc"><code>describe-transit-gateway-connect-peers</code> should show four <code>BgpConfigurations</code> with <code>BgpStatus</code> <code>up</code> for the two headend peers, and two more for the data center peer.</span></li>
+				<li><span class="name">Routes and ECMP in the tables</span><span class="desc"><code>search-transit-gateway-routes</code> on <code>prod</code> with <code>attachment.resource-type=connect</code> should list all 35 North American office /24s on <code>tgw-attach-sdwan-connect</code>, not on the data center attachment. On <code>branch</code>, the same search should show no development route.</span></li>
+				<li><span class="name">Reachability Analyzer up to the boundary</span><span class="desc">Reachability Analyzer does not support Connect attachments, and analysis stops there. Test the AWS half instead: from a booking ENI to the inside interface of each headend, which proves the VPC routes, security groups and Transit Gateway tables up to the appliance. Prove the office leg with the vendor's own path tools and a synthetic test from an office.</span></li>
+				<li><span class="name">Fail one headend</span><span class="desc">Stop <code>sdwan-1a</code> in a maintenance window. Within the 30-second hold time, a <code>CONNECT_PEER_BGP_DOWN</code> event should reach the on-call topic, office routes should remain in <code>prod</code> through <code>sdwan-1b</code> only, and a continuous test from the Chicago office to the booking console should show a short pause, not an outage.</span></li>
+				<li><span class="name">Fail both headends</span><span class="desc">Shut BGP on both Virginia peers. The office /24s should switch to <code>tgw-attach-dc-connect</code> (longer AS path, still Connect), and the transport attachment's flow logs should go quiet while flows appear on <code>tgw-attach-dxgw</code>.</span></li>
+				<li><span class="name">MTU</span><span class="desc">From a booking pod, send large packets with the do-not-fragment bit to an office host. Check that MSS clamping keeps TCP sessions working and that no flow log entries count <code>packets-lost-mtu-exceeded</code>.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-5.html">1.5</a> Routing strategy and connectivity between on premises and AWS</td><td data-label="What this architecture demonstrates">SD-WAN headends with Transit Gateway Connect, GRE overlays, Direct Connect as Connect transport, VPN Concentrator for small sites</td></tr>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">A branch route table on the hub, keeping office routes off Transit Gateway peering, VRF-to-segment mapping on Cloud WAN</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">Connect peer BGP events, flow logs on the transport attachment, Reachability Analyzer limits</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Implement routing and connectivity between on premises and AWS</td><td data-label="What this architecture demonstrates">Transit Gateway CIDR block, Connect attachment and peers, inside /29s, eBGP multihop, MTU and source/destination check</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Cloud WAN Connect attachments, GRE and Tunnel-less, segment placement by tag</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"SD-WAN appliances in a VPC must exchange routes dynamically with the Transit Gateway at higher throughput than VPN, without IPsec between them" is <strong>a Transit Gateway Connect attachment on the VPC attachment, with GRE Connect peers and BGP</strong>. "Highest throughput and no tunnel overhead with Cloud WAN, keeping SD-WAN VRFs separate" is <strong>Tunnel-less Connect with one segment per VRF</strong>. "BGP never establishes on a new Connect peer" usually means <strong>no route to the Transit Gateway CIDR block, a missing ebgp-multihop, or a reserved inside CIDR</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/simplify-sd-wan-connectivity-with-aws-transit-gateway-connect/">Simplify SD-WAN connectivity with AWS Transit Gateway Connect</a> (December 2020): the launch post for the GRE and BGP model in Steps 2 and 3.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/integrate-sd-wan-devices-with-aws-transit-gateway-and-aws-direct-connect/">Integrate SD-WAN devices with AWS Transit Gateway and AWS Direct Connect</a> (August 2021): Connect over Direct Connect, as in Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/segmenting-hybrid-networks-with-aws-transit-gateway-connect/">Segmenting hybrid networks with AWS Transit Gateway connect</a> (July 2023): VRFs mapped to Connect attachments and route tables.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/build-global-sd-wans-with-aws-cloud-wan-tunnel-less-connect/">Build Global SD-WANs with AWS Cloud WAN Tunnel-less Connect</a> (October 2023): the Tunnel-less design in Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/extending-sd-wan-segmentation-into-aws-cloud-wan-part-1/">Extending SD-WAN Segmentation into AWS Cloud WAN - Part 1</a> (June 2026): VRF-to-segment mapping with GRE and Tunnel-less Connect.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-to-optimize-failover-times-for-overlay-tunnels-on-aws-direct-connect/">Best Practices to Optimize Failover Times for Overlay Tunnels on AWS Direct Connect</a> (August 2025): BGP timers and path design for tunnels over Direct Connect.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/tgw-connect.html">Transit gateway Connect attachments and Connect peers</a> (AWS documentation): addressing, BGP rules, ECMP, limits and MTU.</li>
+				<li><a href="https://docs.aws.amazon.com/network-manager/latest/cloudwan/cloudwan-connect-attachment.html">Connect attachments in AWS Cloud WAN</a> (AWS documentation): GRE and Tunnel-less options and their segment rules.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

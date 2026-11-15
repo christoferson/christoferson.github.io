@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Encrypted Hybrid Connectivity with MACsec and Private IP VPN | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: encrypting card data on every hop between a data center and a payment VPC. MACsec on dedicated 10 Gbps Direct Connect connections with static CAK keys and must_encrypt, private IP VPN over transit VIFs to a Transit Gateway CIDR block, separate route tables that fail closed, ECMP, MTU and MSS, VPN over a public VIF, application TLS, VPC Encryption Controls monitor mode, the encryption-status flow log field, ConnectionEncryptionState, cost and testing.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Encrypted hybrid</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Encrypted hybrid connectivity: MACsec and private IP VPN</h1>
+		<p>PCI DSS requires card data between the US data center and the payment VPC to be encrypted on every hop. The travel company layers three controls: MACsec on every dedicated Direct Connect link, a private IP VPN over the transit VIFs that ends on the Transit Gateway, and TLS from the payment service to the card vault. Separate route tables make the card path fail closed, and Encryption Controls and CloudWatch provide the evidence.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">Direct Connect</span><span class="tag">MACsec</span><span class="tag">Site-to-Site VPN</span><span class="tag">Transit Gateway</span><span class="tag">VPC Encryption Controls</span><span class="tag">CloudWatch</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. MACsec keys on the connections</a></li>
+				<li class="sub"><a href="#b2">2. must_encrypt and the router side</a></li>
+				<li class="sub"><a href="#b3">3. Transit Gateway CIDR block</a></li>
+				<li class="sub"><a href="#b4">4. Private IP VPN connections</a></li>
+				<li class="sub"><a href="#b5">5. A card-data route table</a></li>
+				<li class="sub"><a href="#b6">6. Proof: metrics and flow logs</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) connects its US data center to <code>us-east-1</code> with the four 10 Gbps dedicated connections built on the <a href="dx-resilient-hybrid.html">resilient Direct Connect</a> page, ordered with MACsec requested. Payment services run in the payments VPC <code>vpc-0payment01</code> (<code>10.40.48.0/21</code>), attached to <code>tgw-use1</code>. The card vault stays in the data center at <code>10.100.20.5</code>. Direct Connect is private but not encrypted, and the PCI DSS assessor wants encryption on every hop that carries card data, with evidence (<a href="../d4-task-4-3.html">Task 4.3</a>).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Encrypt the physical links at line rate</td><td data-label="Design choice">MACsec on all four US connections, static CAK keys, encryption mode <code>must_encrypt</code></td></tr>
+						<tr><td>Card data encrypted until it is inside AWS</td><td data-label="Design choice">Two private IP VPN connections over the transit VIFs, ending on <code>tgw-use1</code></td></tr>
+						<tr><td>Card data never falls back to a clear path</td><td data-label="Design choice">A <code>pci</code> Transit Gateway route table that only the VPN attachments and the payments VPC use</td></tr>
+						<tr><td>Hops inside AWS and inside the data center</td><td data-label="Design choice">TLS 1.2 or later from the payment service to the vault</td></tr>
+						<tr><td>Evidence for the assessor</td><td data-label="Design choice">Encryption Controls in monitor mode, the <code>encryption-status</code> flow log field, <code>ConnectionEncryptionState</code> and tunnel alarms</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The numbers used on this page, consistent with the hub and Direct Connect pages:</p>
+			<ul>
+				<li><strong>Connections</strong> <code>dxcon-us1a</code>, <code>dxcon-us1b</code> (US location 1) and <code>dxcon-us2a</code>, <code>dxcon-us2b</code> (US location 2), with transit VIFs <code>dxvif-us1a</code> to <code>dxvif-us2b</code> to <code>dxgw-travel-global</code> (AS 64512). Routers <code>us-dc1-r1</code> and <code>us-dc1-r2</code>, AS 65010.</li>
+				<li><strong>Transit Gateway</strong> <code>tgw-use1</code> (ASN 64521); its Direct Connect gateway attachment is <code>tgw-attach-dxgw</code>, associated with <code>onprem</code> and propagated into <code>prod</code> (<a href="tgw-hub-spoke.html#b4">hub page</a>).</li>
+				<li><strong>New on this page</strong>: Transit Gateway CIDR block <code>10.255.10.0/24</code>, router loopbacks <code>10.100.255.1</code> (r1) and <code>10.100.255.2</code> (r2), and the vault subnet <code>10.100.20.0/24</code>. The European data center follows the same pattern and is not repeated.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>The payment service at <code>10.40.50.20</code> sends a card number to the vault, then two other cases.</p>
+			<ol class="flow">
+				<li class="group">A card payment</li>
+				<li class="auto"><span class="name">TLS session<span class="who">Payments team</span></span><span class="desc">The service opens TLS 1.2 or later to <code>vault.dc.example.com</code> (<code>10.100.20.5</code>). The payload is encrypted from here to the vault, whatever the network does.</span></li>
+				<li class="auto"><span class="name">Into the pci table<span class="who auto">AWS</span></span><span class="desc">The VPC route table sends <code>10.0.0.0/8</code> to <code>tgw-use1</code>. The payments attachment is associated with the <code>pci</code> table, where <code>10.100.20.0/24</code> points to the two private IP VPN attachments (ECMP). There is no route to the Direct Connect gateway attachment in this table.</span></li>
+				<li class="auto"><span class="name">IPsec on the Transit Gateway<span class="who auto">AWS</span></span><span class="desc">The Transit Gateway encrypts the packet into ESP. The outer header runs from a tunnel address in <code>10.255.10.0/24</code> to the router loopback <code>10.100.255.1</code>.</span></li>
+				<li class="auto"><span class="name">Over the transit VIFs<span class="who auto">AWS</span></span><span class="desc">The outer packet leaves through the transport attachment <code>tgw-attach-dxgw</code> and the Direct Connect gateway, on one of the four transit VIFs chosen by ECMP.</span></li>
+				<li class="auto"><span class="name">MACsec on the cross connect<span class="who auto">AWS</span></span><span class="desc">The AWS Direct Connect device encrypts the whole Ethernet frame, VLAN tag included, with GCM-AES-XPN-256. The router decrypts it at line rate.</span></li>
+				<li class="auto"><span class="name">Into the data center<span class="who">Network team</span></span><span class="desc">The router ends the IPsec tunnel on its loopback and forwards the inner packet to the vault, where TLS ends.</span></li>
+				<li class="group">A booking flow that is not card data</li>
+				<li class="auto"><span class="name">Direct Connect only<span class="who auto">AWS</span></span><span class="desc">A booking pod at <code>10.40.12.30</code> uses the <code>prod</code> table, where <code>10.100.0.0/16</code> points to <code>tgw-attach-dxgw</code>. Its traffic gets MACsec on the cross connect and no IPsec, at full 10 Gbps per link and 8500-byte MTU.</span></li>
+				<li class="group">A MACsec key mismatch on one link</li>
+				<li class="auto"><span class="name">The link stops<span class="who auto">AWS</span></span><span class="desc">With <code>must_encrypt</code>, <code>dxcon-us1b</code> carries no traffic until the keys match. BGP on <code>dxvif-us1b</code> drops, ECMP continues over the other three links, and the IPsec tunnels move with it.</span></li>
+				<li class="auto"><span class="name">The alarm fires<span class="who auto">AWS</span></span><span class="desc"><code>ConnectionEncryptionState</code> for <code>dxcon-us1b</code> drops to 0 and the network on-call is paged.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>MACsec keys on the four dedicated connections</h3>
+				<p>MACsec (IEEE 802.1AE) encrypts at layer 2 between the router and the AWS device on the cross connect. It needs dedicated 10, 100 or 400 Gbps connections at a location that supports it, so <strong>1 Gbps and hosted connections are out</strong>. The connections were ordered with <code>--request-mac-sec</code>, so check <code>macSecCapable</code> first (<a href="../d1-task-1-5.html#s3">Task 1.5</a>).</p>
+				<ul>
+					<li><strong>Ciphers</strong>: 256-bit keys only. At 10 Gbps, GCM-AES-256 or GCM-AES-XPN-256. At 100 and 400 Gbps, XPN (64-bit packet numbers) is required. The company uses XPN everywhere so a later 100 Gbps upgrade keeps the same router template.</li>
+					<li><strong>Keys</strong>: static CAK mode only. You supply a CKN/CAK pair, each exactly 64 hexadecimal characters. AWS stores the pair in Secrets Manager under an AWS managed key and derives and rotates the SAK automatically.</li>
+					<li><strong>Keychain</strong>: up to three CKN/CAK pairs per connection or LAG, for manual rotation. The device tries the newest key and falls back to the previous one.</li>
+				</ul>
+				<span class="file">Generate one key pair per connection and associate it with dxcon-us1a (bash on a secured admin host, AWS CLI, network account, us-east-1)</span>
+<pre><code><span class="c"># 32 random bytes = 64 hex characters; keep them out of shell history and tickets</span>
+CKN=$(openssl rand -hex 32)
+CAK=$(openssl rand -hex 32)
+
+<span class="c"># AWS stores the pair in Secrets Manager; the response returns its secretARN</span>
+aws directconnect associate-mac-sec-key \
+  --connection-id dxcon-us1a \
+  --ckn "$CKN" --cak "$CAK"
+
+<span class="c"># hand the same pair to the router team over the approved secure channel,</span>
+<span class="c"># then repeat for dxcon-us1b, dxcon-us2a and dxcon-us2b with their own pairs</span></code></pre>
+				<span class="file">Check all four connections before changing the mode (AWS CLI)</span>
+<pre><code><span class="c"># expect macSecCapable true, key state associated, and "Encryption Up" once the router matches</span>
+for c in dxcon-us1a dxcon-us1b dxcon-us2a dxcon-us2b; do
+  aws directconnect describe-connections --connection-id "$c" \
+    --query "connections[0].[connectionId,macSecCapable,encryptionMode,portEncryptionStatus,macSecKeys[].state]" \
+    --output text
+done</code></pre>
+				<p>The <code>--secret-arn</code> option associates an existing MACsec secret instead of a new pair. <strong>LAG</strong>: if a path later grows into a LAG, the key is associated with the LAG ID (<code>dxlag-...</code>). Every member must be MACsec-capable and the same speed, one key is active across all members, and a connection added to the LAG loses its own keys and takes the LAG key.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Encryption mode must_encrypt, and the router side</h3>
+				<p>The encryption mode decides what happens when MACsec cannot come up:</p>
+				<ul>
+					<li><code>should_encrypt</code> (the default) falls back to <strong>unencrypted</strong> traffic. The link stays up and nobody notices, unless the metrics are watched.</li>
+					<li><code>must_encrypt</code> passes no traffic without MACsec. The link fails closed and BGP fails over to the other paths.</li>
+					<li><code>no_encrypt</code> is the third API value; it is not used here.</li>
+				</ul>
+				<p>Order: associate the key, configure the router, confirm <code>Encryption Up</code>, then set <code>must_encrypt</code>. One connection at a time.</p>
+				<span class="file">Switch one connection to must_encrypt after MACsec is up on it (AWS CLI)</span>
+<pre><code><span class="c"># only after portEncryptionStatus shows "Encryption Up" for this connection</span>
+aws directconnect update-connection \
+  --connection-id dxcon-us1a \
+  --encryption-mode must_encrypt
+
+<span class="c"># confirm, then move on to dxcon-us1b, us2a and us2b one by one</span>
+aws directconnect describe-connections --connection-id dxcon-us1a \
+  --query "connections[0].encryptionMode"</code></pre>
+				<div class="callout trap"><p>Disassociating the last CKN from a connection in <code>must_encrypt</code> silently changes the mode to <code>should_encrypt</code>. A careless key rotation can turn the control off, so always add the new key before removing the old one, and alarm on the mode as well as the state.</p></div>
+				<p><strong>The router.</strong> For MACsec-enabled VIFs the downloaded router configuration includes MACsec for Cisco Nexus 9K and later on NX-OS 9.3 or later, and Juniper M/MX on JunOS 9.5 or later. Other platforms are configured by hand with the parameters below. SCI must be on, and the VLAN tag cannot be left outside the encrypted payload.</p>
+				<span class="file">MACsec parameters for us-dc1-r1 on the dxcon-us1a port (parameter sheet for the router team, not vendor syntax)</span>
+<pre><code><span class="c"># pre-shared key, static CAK mode (no dynamic CAK)</span>
+CKN                     = &lt;64 hex characters, same value as associated in Step 1&gt;
+CAK                     = &lt;64 hex characters, same value as associated in Step 1&gt;
+key algorithm           = AES_256_CMAC
+SAK cipher              = GCM_AES_XPN_256   <span class="c"># GCM_AES_256 also allowed at 10 Gbps</span>
+key server cipher suite = 16
+confidentiality offset  = 0
+ICV indicator           = No
+SCI                     = on (required)
+SAK rekey               = on packet number rollover
+VLAN tag in clear       = no (dot1q-in-clear not supported)</code></pre>
+				<p><strong>Key rotation</strong> uses the keychain: associate the new pair, add it to the router, confirm the newest key is in use, then remove the old pair from both sides.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>A Transit Gateway CIDR block in the allowed prefixes</h3>
+				<p>MACsec ends at the AWS device at the Direct Connect location, so the next layer must end inside AWS. A private IP VPN runs IPsec over the transit VIFs to the Transit Gateway, with private addresses on both ends of each tunnel (RFC 1918 or RFC 6598). The AWS tunnel endpoints come from a <strong>Transit Gateway CIDR block</strong>: /24 or larger for IPv4, up to five blocks per Transit Gateway (not adjustable). The pool is shared with Connect peers and Client VPN endpoints. The block must not overlap any other attachment's addresses.</p>
+				<span class="file">Add a CIDR block for the private IP VPN endpoints to the Virginia Transit Gateway (AWS CLI, network account)</span>
+<pre><code><span class="c"># 10.255.10.0/24 is outside every VPC and data center range in the company plan</span>
+aws ec2 modify-transit-gateway --region us-east-1 \
+  --transit-gateway-id tgw-use1 \
+  --options AddTransitGatewayCidrBlocks=10.255.10.0/24</code></pre>
+				<p>The data center routers must learn that block over the transit VIFs. For a Transit Gateway association, the Direct Connect gateway advertises the <strong>allowed prefixes</strong>, not the attachments behind them. So the block is added next to the Region summary <code>10.40.0.0/14</code>. Without it, the routers have no route to the tunnel endpoints and the tunnels never come up.</p>
+				<span class="file">Advertise the Transit Gateway CIDR block to the data centers (AWS CLI; the association ID is a placeholder)</span>
+<pre><code><span class="c"># the association between dxgw-travel-global and tgw-use1</span>
+aws directconnect update-direct-connect-gateway-association \
+  --association-id a1b2c3d4-0000-0000-0000-dxgwtgwuse1 \
+  --add-allowed-prefixes-to-direct-connect-gateway cidr=10.255.10.0/24
+
+<span class="c"># afterwards each US transit VIF should advertise 10.255.10.0/24 too</span>
+aws directconnect list-virtual-interface-routes \
+  --virtual-interface-id dxvif-us1a \
+  --filters routeDirection=advertised,addressFamily=ipv4</code></pre>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Two private IP VPN connections, one per router</h3>
+				<p>Each router gets its own customer gateway whose IP address is a <strong>private loopback</strong>, not the VIF's point-to-point address. AWS recommends a loopback or LAN interface as the tunnel source. A loopback is reachable over all four VIFs (<code>10.100.0.0/16</code> is advertised on each), so when a VIF fails the outer packets take another path; a point-to-point address would tie the tunnel to one link.</p>
+				<span class="file">Customer gateways on the router loopbacks and the first private IP VPN (AWS CLI, network account, us-east-1)</span>
+<pre><code><span class="c"># private loopback addresses, BGP AS of the US data center</span>
+aws ec2 create-customer-gateway --type ipsec.1 \
+  --ip-address 10.100.255.1 --bgp-asn 65010
+aws ec2 create-customer-gateway --type ipsec.1 \
+  --ip-address 10.100.255.2 --bgp-asn 65010
+
+<span class="c"># VPN over the Direct Connect gateway attachment, private outside IPs, BGP, IKEv2, AES-GCM</span>
+aws ec2 create-vpn-connection \
+  --type ipsec.1 \
+  --customer-gateway-id cgw-us-dc1-r1-pip \
+  --transit-gateway-id tgw-use1 \
+  --pre-shared-key-storage SecretsManager \
+  --options '{
+    "OutsideIpAddressType": "PrivateIpv4",
+    "TransportTransitGatewayAttachmentId": "tgw-attach-dxgw",
+    "TunnelBandwidth": "standard",
+    "StaticRoutesOnly": false,
+    "TunnelOptions": [
+      { "TunnelInsideCidr": "169.254.40.0/30",
+        "IKEVersions": [{"Value": "ikev2"}],
+        "Phase1EncryptionAlgorithms": [{"Value": "AES256-GCM-16"}],
+        "Phase2EncryptionAlgorithms": [{"Value": "AES256-GCM-16"}],
+        "Phase1DHGroupNumbers": [{"Value": 20}],
+        "Phase2DHGroupNumbers": [{"Value": 20}],
+        "StartupAction": "start",
+        "DPDTimeoutAction": "restart" },
+      { "TunnelInsideCidr": "169.254.40.4/30",
+        "IKEVersions": [{"Value": "ikev2"}],
+        "Phase1EncryptionAlgorithms": [{"Value": "AES256-GCM-16"}],
+        "Phase2EncryptionAlgorithms": [{"Value": "AES256-GCM-16"}],
+        "Phase1DHGroupNumbers": [{"Value": 20}],
+        "Phase2DHGroupNumbers": [{"Value": 20}],
+        "StartupAction": "start",
+        "DPDTimeoutAction": "restart" }
+    ]
+  }'
+<span class="c"># the second VPN uses cgw-us-dc1-r2-pip and inside CIDRs 169.254.40.8/30 and .12/30</span></code></pre>
+				<p><code>TransportTransitGatewayAttachmentId</code> is required with <code>PrivateIpv4</code>: it names the Direct Connect gateway attachment the tunnels ride on. Acceleration does not apply, and VPN Concentrators are not supported.</p>
+				<p><strong>Capacity.</strong> A standard tunnel carries up to 1.25 Gbps. With BGP and <code>VpnEcmpSupport</code> on the Transit Gateway, both connections' four tunnels share the load, about 5 Gbps in total. ECMP balances flows, not packets, so one flow stays within one tunnel. Card traffic peaks well below 1 Gbps, so standard is enough; <code>"large"</code> gives up to 5 Gbps per tunnel, works with private IP VPN, and since May 2026 can be set on an existing VPN.</p>
+				<span class="file">us-dc1-r1: tunnel sourced from the loopback, MTU and MSS for IPsec (Cisco IOS-style; the IKE and IPsec profiles come from the downloaded VPN configuration)</span>
+<pre><code>ip prefix-list VAULT-ONLY permit 10.100.20.0/24
+!
+interface Loopback10
+ description private IP VPN source, inside 10.100.0.0/16
+ ip address 10.100.255.1 255.255.255.255
+!
+interface Tunnel1
+ description to tgw-use1 tunnel 1 (outside address from 10.255.10.0/24)
+ ip address 169.254.40.2 255.255.255.252
+ <span class="c">! IPsec allows at most 1446 bytes inside, even over an 8500-byte VIF</span>
+ ip mtu 1446
+ ip tcp adjust-mss 1406
+ tunnel source Loopback10
+ <span class="c">! AWS outside address for tunnel 1, from the VPN configuration (inside 10.255.10.0/24)</span>
+ tunnel destination 10.255.10.10
+ tunnel mode ipsec ipv4
+!
+router bgp 65010
+ neighbor 169.254.40.1 remote-as 64521
+ address-family ipv4
+  <span class="c">! advertise only the vault subnet into the tunnel</span>
+  network 10.100.20.0 mask 255.255.255.0
+  neighbor 169.254.40.1 prefix-list VAULT-ONLY out</code></pre>
+				<p>The 1446/1406 values are the maximum, with AES-GCM and no NAT traversal. CBC ciphers lower them, and there is no Path MTU Discovery inside the tunnel, so clamp MSS rather than rely on ICMP.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>A card-data route table that fails closed</h3>
+				<p>The Transit Gateway prefers a Direct Connect gateway route over a VPN route for the same prefix (static, then VPC, Direct Connect gateway, Connect, private IP VPN, VPN). A longer prefix still wins first. If the payments VPC stayed in <code>prod</code>, the VPN's <code>10.100.20.0/24</code> would beat the <code>10.100.0.0/16</code> from Direct Connect, so the card path would look right. But when both VPNs dropped, it would fall back to the unencrypted Direct Connect route without any error. So the design keeps the two paths in different tables. The private IP VPN documentation calls this out: the VPN attachment's table can differ from the Direct Connect attachment's table, so encrypted and unencrypted traffic flow side by side.</p>
+				<span class="file">The pci table: payments VPC and the two private IP VPN attachments only (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=pci}]'
+
+<span class="c"># the payments VPC and both VPN attachments look up their destinations here</span>
+for a in tgw-attach-payment tgw-attach-pci-vpn1 tgw-attach-pci-vpn2; do
+  aws ec2 associate-transit-gateway-route-table \
+    --transit-gateway-route-table-id tgw-rtb-pci \
+    --transit-gateway-attachment-id "$a"
+  aws ec2 enable-transit-gateway-route-table-propagation \
+    --transit-gateway-route-table-id tgw-rtb-pci \
+    --transit-gateway-attachment-id "$a"
+done
+<span class="c"># the payments attachment must first be disassociated from prod (one table per attachment)</span></code></pre>
+				<p>The return direction needs the same care. If the payments VPC still propagated into <code>onprem</code>, a data center host could reach it over plain Direct Connect. Removing that propagation means a packet arriving on <code>tgw-attach-dxgw</code> for <code>10.40.48.0/21</code> finds no route and is dropped. The routers learn <code>10.40.48.0/21</code> over the tunnels and only the summary <code>10.40.0.0/14</code> over Direct Connect, so longest prefix match sends vault traffic into the tunnels as well.</p>
+				<span class="file">Stop the payments VPC being reachable over the unencrypted path (AWS CLI)</span>
+<pre><code><span class="c"># onprem is the table the Direct Connect gateway attachment uses</span>
+aws ec2 disable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-onprem \
+  --transit-gateway-attachment-id tgw-attach-payment
+
+<span class="c"># then check tgw-rtb-pci in the console (or with search-transit-gateway-routes):</span>
+<span class="c"># 10.100.20.0/24 via the two VPN attachments, nothing via tgw-attach-dxgw</span></code></pre>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Proof: MACsec and tunnel alarms, Encryption Controls and flow logs</h3>
+				<p>Three signals cover the three layers. <code>AWS/DX</code> <code>ConnectionEncryptionState</code> is 1 when MACsec is up and 0 when it is down (for a LAG, 0 means at least one member is down). <code>AWS/VPN</code> <code>TunnelState</code> is 1 when up; for a connection, a value between 0 and 1 means one tunnel is down (<a href="../d1-task-1-4.html">Task 1.4</a>). Inside the VPC, VPC Encryption Controls in <strong>monitor</strong> mode adds the <code>encryption-status</code> flow log field.</p>
+				<span class="file">Page when MACsec drops on a US connection (AWS CLI; one alarm per connection)</span>
+<pre><code>aws cloudwatch put-metric-alarm \
+  --alarm-name dx-us1a-macsec-down \
+  --namespace AWS/DX --metric-name ConnectionEncryptionState \
+  --dimensions Name=ConnectionId,Value=dxcon-us1a \
+  --statistic Minimum --period 300 --evaluation-periods 1 \
+  --threshold 1 --comparison-operator LessThanThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:111111111111:network-oncall</code></pre>
+				<p>A daily job also flags any connection whose <code>encryptionMode</code> is no longer <code>must_encrypt</code>.</p>
+				<span class="file">Encryption Controls on the payments VPC and a flow log with the encryption-status field (AWS CLI, payments account)</span>
+<pre><code><span class="c"># an existing VPC goes to monitor first; the command takes no mode</span>
+aws ec2 create-vpc-encryption-control --vpc-id vpc-0payment01
+
+<span class="c"># version 10 field: 0 not encrypted, 1 Nitro, 2 application, 3 both, "-" controls off</span>
+aws ec2 create-flow-logs --resource-type VPC --resource-ids vpc-0payment01 \
+  --traffic-type ALL --max-aggregation-interval 60 \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::travel-log-archive/flow-logs/ \
+  --log-format '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${flow-direction} ${traffic-path} ${reject-reason} ${encryption-status}'</code></pre>
+				<p>Read the field carefully. It reports what AWS can see inside the VPC: Nitro encryption between supported instances, and application encryption inferred for TCP 443 to interface and gateway endpoints. Flows from the payment service toward the Transit Gateway are expected to show 0, because IPsec starts at the Transit Gateway and AWS does not inspect TLS. The audit lists every 0 flow: TLS flows to <code>10.100.20.0/24</code> are explained by the design, anything else is a finding. Encryption Controls costs $0.15 per non-empty VPC-hour in <code>us-east-1</code>, about $110 a month for this VPC.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<p>The four options compared, for card data from the US data center:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Option</th><th>Where encryption ends</th><th>Fits when</th></tr></thead>
+					<tbody>
+						<tr><td>1. MACsec</td><td data-label="Where encryption ends">The AWS Direct Connect device, one hop</td><td data-label="Fits when">Dedicated 10, 100 or 400 Gbps; line rate; not 1 Gbps or hosted</td></tr>
+						<tr><td>2. Private IP VPN</td><td data-label="Where encryption ends">The Transit Gateway</td><td data-label="Fits when">Transit VIF to a Transit Gateway; any connection type or speed; 1.25 or 5 Gbps per tunnel</td></tr>
+						<tr><td>3. VPN over a public VIF</td><td data-label="Where encryption ends">The VPN endpoint, on public IPs</td><td data-label="Fits when">Older designs or a virtual private gateway; needs public addresses</td></tr>
+						<tr><td>4. Application TLS</td><td data-label="Where encryption ends">The application, end to end</td><td data-label="Fits when">Every card-data protocol supports TLS; always needed for the hops inside AWS</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="entry">
+				<h4>Why MACsec alone is not enough here</h4>
+				<p>MACsec is hop by hop. It protects the cross connect between the router and the AWS device, then the frame is decrypted. The path from the Direct Connect device to the Transit Gateway, and from the Transit Gateway to the VPC, is outside its reach. AWS encrypts traffic between its facilities and Regions at the physical layer, but this page could not confirm that coverage for the Direct Connect location to Region leg. The assessor also wanted encryption the company controls, ending inside AWS. So MACsec is the baseline for all traffic, and the card path adds IPsec and TLS.</p>
+			</div>
+			<div class="entry">
+				<h4>Why not put all traffic into the private IP VPN</h4>
+				<p>Four standard tunnels give about 5 Gbps, against 40 Gbps of Direct Connect, with an MTU of 1446 instead of 8500. Only card data needs the overlay, and the separate <code>pci</code> table lets the two run side by side.</p>
+			</div>
+			<div class="entry">
+				<h4>Fail closed, even in a total Direct Connect outage</h4>
+				<p>The private IP VPN rides on the transit VIFs, so it goes down with them. The internet backup VPN from the <a href="dx-resilient-hybrid.html#b4">Direct Connect page</a> is associated with <code>onprem</code>, which no longer holds the payments VPC. So card traffic stops instead of moving to another path. With four links at two locations this is a rare case, and the company accepts it.</p>
+			</div>
+			<div class="entry">
+				<h4>Transit Gateway encryption support: not on the shared hub</h4>
+				<p>After IPsec ends at the Transit Gateway, the hop into the payments VPC is protected by TLS. Transit Gateway encryption support, used with VPC Encryption Controls, is the AWS-side option, but it would cost a lot on <code>tgw-use1</code>. Every VPC attached to an encryption-enabled Transit Gateway is billed for Encryption Controls, whatever its mode, even when empty. If 100 VPCs were attached, that would be 100 &times; $0.15 &times; 730 &asymp; $10,950 a month. Enabling it can also take up to 14 days, and it is not supported with Connect attachments (see <a href="../d4-task-4-3.html#s4">Task 4.3</a>). The payments VPC stays in monitor mode; enforce would also be blocked by Network Firewall or Gateway Load Balancer endpoints.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>MACsec has no extra charge; it only needs ports that support it, and these 10 Gbps ports already exist. Two standard VPN connections cost about 2 &times; $0.05 &times; 730 &asymp; $73 a month (the pricing page's US East (Ohio) example rate). With Large tunnels it would be 2 &times; $0.60 &times; 730 &asymp; $876. The VPN attachments add Transit Gateway attachment-hour and data processing charges; those rates were not confirmed here. Direct Connect data transfer out is unchanged apart from the ESP overhead. Encryption Controls on the payments VPC adds about $110 a month.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>VPN over a public VIF</h4>
+				<p>The older pattern: a public VIF carries a standard Site-to-Site VPN to the public endpoints of a virtual private gateway or Transit Gateway. It works with a virtual private gateway, but it needs public IP addresses (more exposure to denial of service), and the public VIF opens all AWS public endpoints to the data center. Acceleration cannot be used over a public VIF. A private IP VPN avoids all three problems and offers more route scale (5,000 routes out and 1,000 in, against 200 and 100 on Direct Connect alone).</p>
+			</div>
+			<div class="entry">
+				<h4>TLS only, no network encryption</h4>
+				<p>If every card-data protocol used TLS 1.2 or later with strong policies and mutual TLS, TLS alone could meet the requirement, and TLS is already mandatory on this page. The overlay exists for the protocols that cannot use TLS easily: a legacy batch transfer to the vault and database replication monitoring. If those move to TLS, the private IP VPN can be retired.</p>
+			</div>
+			<div class="entry">
+				<h4>Hosted connections or a 1 Gbps port</h4>
+				<p>Neither supports MACsec, so private IP VPN is the network-layer option: the classic exam case.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Baseline the encryption state</span><span class="desc">For all four connections, <code>describe-connections</code> must show <code>must_encrypt</code>, <code>Encryption Up</code> and keys <code>associated</code>, and <code>ConnectionEncryptionState</code> must be 1. Both VPNs must show <code>TunnelState</code> 1, and <code>tgw-rtb-pci</code> must hold <code>10.100.20.0/24</code> from both VPN attachments and nothing from <code>tgw-attach-dxgw</code>.</span></li>
+				<li><span class="name">Prove must_encrypt drops traffic, in a lab</span><span class="desc">On a lab connection, set <code>should_encrypt</code> and put a wrong CAK on the router: the link passes traffic in clear and <code>portEncryptionStatus</code> shows <code>Encryption Down</code>. That is why the default is unsafe. Then set <code>must_encrypt</code> with the same mismatch: no traffic, BGP down, and the alarm fires. Restore the right key and traffic returns. Never run this first on a production link.</span></li>
+				<li><span class="name">Rotate a key</span><span class="desc">In a maintenance window on <code>dxcon-us1b</code>, associate a second pair, update the router, and confirm the newest key is in use with no BGP flap. Then remove the old pair, and check that the mode is still <code>must_encrypt</code>.</span></li>
+				<li><span class="name">Fail over between encrypted paths</span><span class="desc">Run <code>start-bgp-failover-test</code> on <code>dxvif-us1a</code>. The tunnels sourced from the loopbacks should stay up while their outer packets move to the other VIFs (watch <code>TunnelState</code> and IKE logs), and card transactions should continue. Then shut <code>Tunnel1</code> and <code>Tunnel2</code> on <code>us-dc1-r1</code>: ECMP must move card flows to r2's VPN within the BGP hold time.</span></li>
+				<li><span class="name">Prove the card path fails closed</span><span class="desc">In a window, take both VPNs down. Card traffic must stop, not move to Direct Connect. <code>search-transit-gateway-routes</code> on <code>tgw-rtb-pci</code> returns no route to <code>10.100.20.0/24</code>. A traceroute from the vault subnet toward <code>10.40.50.20</code> dies at the Transit Gateway, and Reachability Analyzer from the payment service ENI toward <code>tgw-attach-dxgw</code>, destination <code>10.100.20.5</code>, reports no path.</span></li>
+				<li><span class="name">Check MTU and the flow logs</span><span class="desc">From the vault subnet, a DF-bit ping of 1418 bytes of payload (1446 total) to <code>10.40.50.20</code> succeeds, and 1419 fails. A packet capture shows SYNs with MSS 1406. Run the <code>encryption-status</code> audit query from Step 6 and confirm that every 0 flow matches a documented TLS flow.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-5.html">1.5</a> Hybrid routing and connectivity design</td><td data-label="What this architecture demonstrates">MACsec support and ciphers, private IP VPN prerequisites, tunnel capacity and ECMP, MTU 1446, route priority between Direct Connect and VPN</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates"><code>ConnectionEncryptionState</code>, <code>TunnelState</code>, the <code>encryption-status</code> flow log field</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">Associating MACsec keys, encryption modes, Transit Gateway CIDR blocks, customer gateways on loopbacks, private IP VPN creation, MSS clamping</td></tr>
+						<tr><td><a href="../d4-task-4-2.html">4.2</a> Validate and audit security with monitoring and logging</td><td data-label="What this architecture demonstrates">Evidence for an assessor: flow log audits, alarms on mode and state, fail-closed tests</td></tr>
+						<tr><td><a href="../d4-task-4-3.html">4.3</a> Confidentiality of data and communications</td><td data-label="What this architecture demonstrates">Layering MACsec, IPsec over Direct Connect and TLS; Encryption Controls and Transit Gateway encryption support; shared responsibility</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Encrypt all traffic on 10 or 100 Gbps dedicated Direct Connect connections at line rate" is <strong>MACsec with <code>must_encrypt</code></strong>. "Encrypt Direct Connect traffic to a Transit Gateway without public IP addresses", or over a 1 Gbps or hosted connection, is <strong>private IP VPN over a transit VIF, with the Transit Gateway CIDR block in the allowed prefixes</strong>. "The private IP VPN tunnels never come up" points to a Transit Gateway CIDR block missing from the allowed prefixes. "MACsec traffic is flowing but the key does not match" points to <code>should_encrypt</code>. "Encryption on every hop, end to end" adds <strong>TLS</strong>, because MACsec is hop by hop and IPsec ends at the Transit Gateway.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/adding-macsec-security-to-aws-direct-connect-connections/">Adding MACsec security to AWS Direct Connect connections</a> (April 2021): MACsec keys, modes and router setup on dedicated connections (predates 400 Gbps ports).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-aws-site-to-site-vpn-private-ip-vpns/">Introducing AWS Site-to-Site VPN Private IP VPNs</a> (June 2022): IPsec over a transit VIF with private outside addresses (predates Large Bandwidth Tunnels).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-aws-site-to-site-vpn-5-gbps-tunnels-to-support-high-throughput-workloads/">Introducing AWS Site-to-Site VPN 5 Gbps Tunnels to support high throughput workloads</a> (November 2025): when Large tunnels replace ECMP across many standard ones.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/implementing-encryption-in-transit-across-connectivity-patterns-with-vpc-encryption-controls/">Implementing encryption in transit across connectivity patterns with VPC Encryption Controls</a> (August 2026): monitor and enforce across hybrid and inter-VPC paths.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-to-optimize-failover-times-for-overlay-tunnels-on-aws-direct-connect/">Best Practices to Optimize Failover Times for Overlay Tunnels on AWS Direct Connect</a> (August 2025): loopback sourcing, timers and BFD for VPN overlays.</li>
+				<li><a href="https://docs.aws.amazon.com/directconnect/latest/UserGuide/MACsec.html">MAC security in AWS Direct Connect</a> (AWS documentation): supported connections, ciphers, keys and encryption modes.</li>
+				<li><a href="https://docs.aws.amazon.com/vpn/latest/s2svpn/private-ip-dx.html">Private IP AWS Site-to-Site VPN with Direct Connect</a> (AWS documentation): prerequisites, route tables and setup.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-encryption-controls.html">Enforce VPC encryption in transit</a> (AWS documentation): monitor and enforce modes, exclusions and flow log fields.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
