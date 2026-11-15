@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Transit Gateway Hub and Spoke with Segmentation | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: one shared Transit Gateway per Region in a network account, route tables for production, development, shared services and on premises, blackhole routes, Direct Connect gateway and VPN attachments, IPAM-allocated spoke CIDRs, security group referencing, flow logs, Network Manager, quotas, pricing and when to add VPC peering.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">TGW hub and spoke</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Transit Gateway hub and spoke with segmentation</h1>
+		<p>The travel company connects hundreds of VPCs in many accounts, and both data centers, through one Transit Gateway per Region owned by the network account. Route tables keep production, development, shared services and on premises apart, so one router serves everyone without becoming a flat network.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Transit Gateway</span><span class="tag">AWS RAM</span><span class="tag">Direct Connect gateway</span><span class="tag">Site-to-Site VPN</span><span class="tag">VPC IPAM</span><span class="tag">Network Manager</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The Transit Gateway and RAM share</a></li>
+				<li class="sub"><a href="#b2">2. Route tables and blackholes</a></li>
+				<li class="sub"><a href="#b3">3. Spokes from IPAM</a></li>
+				<li class="sub"><a href="#b4">4. Direct Connect and VPN</a></li>
+				<li class="sub"><a href="#b5">5. Security group referencing</a></li>
+				<li class="sub"><a href="#b6">6. Flow logs and Network Manager</a></li>
+				<li class="sub"><a href="#b7">7. Peering for a heavy pair</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) has about 300 VPCs in <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, owned by many accounts in AWS Organizations. The booking platform runs on EKS, partners call a fare search API, and the payment services that handle card data are in scope for PCI DSS. The network team in account <code>111111111111</code> must give every team connectivity without letting a development workload reach production, and without building hundreds of peering connections.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Hundreds of VPCs, transitive routing to the data centers</td><td data-label="Design choice">One Transit Gateway per Region, owned by the network account and shared to the organization with AWS RAM</td></tr>
+						<tr><td>Production and development never talk</td><td data-label="Design choice">Separate Transit Gateway route tables per environment, no cross propagation, plus blackhole routes as a backstop</td></tr>
+						<tr><td>Everyone reaches shared services (DNS, directory, tooling) and on premises</td><td data-label="Design choice">Shared services and on-premises attachments propagate into every environment table</td></tr>
+						<tr><td>Network team controls who joins</td><td data-label="Design choice">Auto accept shared attachments off; each attachment is accepted and associated by automation in the network account</td></tr>
+						<tr><td>No overlapping addresses, summarizable per Region</td><td data-label="Design choice">Spoke CIDRs allocated from VPC IPAM pools carved from one /14 per Region</td></tr>
+						<tr><td>Visibility and cost charge-back</td><td data-label="Design choice">Transit Gateway flow logs to S3, CloudWatch drop metrics, Network Manager topology and events</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The address plan used on this page:</p>
+			<ul>
+				<li><strong>us-east-1</strong>: <code>10.40.0.0/14</code> in IPAM, split into production <code>10.40.0.0/16</code>, shared services <code>10.41.0.0/16</code>, development <code>10.42.0.0/16</code> and <code>10.43.0.0/16</code> held for growth. The production booking VPC is <code>10.40.8.0/21</code>.</li>
+				<li><strong>eu-central-1</strong>: <code>10.44.0.0/14</code> (booking VPC <code>10.44.8.0/21</code>); <strong>ap-northeast-1</strong>: <code>10.48.0.0/14</code>, each split the same way.</li>
+				<li><strong>On premises</strong>: US data center <code>10.100.0.0/16</code> (AS 65010), European data center <code>10.200.0.0/16</code> (AS 65020), reached through transit VIFs on one Direct Connect gateway (AS 64512), with BGP Site-to-Site VPNs as backup.</li>
+				<li><strong>Transit Gateway ASNs</strong>: 64521, 64522 and 64523. They must differ from the Direct Connect gateway's 64512, and AWS recommends unique ASNs for peered Transit Gateways.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; steps marked <span class="who">Network team</span> are actions in the network account.</p>
+			<ol class="flow">
+				<li class="group">A new spoke joins</li>
+				<li><span class="name">Account creates a VPC from IPAM<span class="who">App team</span></span><span class="desc">The development account asks the shared IPAM pool for a /21 and gets the next free block in <code>10.42.0.0/16</code>, so it cannot overlap anything else.</span></li>
+				<li><span class="name">Attachment request<span class="who">App team</span></span><span class="desc">It creates a VPC attachment to the shared Transit Gateway with one small subnet per Availability Zone. The attachment waits in <code>pendingAcceptance</code>.</span></li>
+				<li><span class="name">Accept, associate, propagate<span class="who">Network team</span></span><span class="desc">Automation checks the attachment's tags, accepts it, associates it with the <code>dev</code> route table and propagates its CIDR into the <code>dev</code> and <code>shared</code> tables only.</span></li>
+				<li class="group">A production packet to the data center</li>
+				<li class="auto"><span class="name">VPC route table<span class="who auto">AWS</span></span><span class="desc">A booking pod at <code>10.40.12.30</code> sends to <code>10.100.20.5</code>. The subnet route table matches <code>10.0.0.0/8</code> and sends the packet to the Transit Gateway ENI in the same Availability Zone.</span></li>
+				<li class="auto"><span class="name">Lookup in the associated table<span class="who auto">AWS</span></span><span class="desc">The booking attachment is associated with the <code>prod</code> table. It holds the shared services CIDR, the propagated on-premises routes from the Direct Connect gateway and VPN attachments, and blackholes for development.</span></li>
+				<li class="auto"><span class="name">Best route chosen<span class="who auto">AWS</span></span><span class="desc">Longest prefix wins; for an equal prefix, static routes beat propagated ones, and Direct Connect gateway routes beat VPN routes, so the VPN only carries traffic if Direct Connect fails.</span></li>
+				<li class="auto"><span class="name">Out through the Direct Connect gateway<span class="who auto">AWS</span></span><span class="desc">The packet leaves on a transit VIF. The data center learned the return path as the allowed prefix <code>10.40.0.0/14</code>.</span></li>
+				<li class="auto"><span class="name">Return traffic<span class="who auto">AWS</span></span><span class="desc">The on-premises attachment is associated with the <code>onprem</code> table, which holds production, development and shared services routes, so the reply reaches the booking VPC.</span></li>
+				<li class="group">A development packet to production</li>
+				<li class="auto"><span class="name">Dropped at the hub<span class="who auto">AWS</span></span><span class="desc">The <code>dev</code> table has no production routes and a blackhole for <code>10.40.0.0/16</code>. The Transit Gateway drops the packet, counts it in <code>PacketDropCountBlackhole</code>, and the flow log records it under <code>packets-lost-blackhole</code>.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The Transit Gateway in the network account, shared through RAM</h3>
+				<p>Create one Transit Gateway per Region with the default association and propagation <strong>turned off</strong>. With both defaults on, every new attachment would join the default table and see every other attachment, which is the flat design segmentation is meant to avoid. If both are disabled, no default route table is created. Leave <code>AutoAcceptSharedAttachments</code> disabled (its default) so the network team approves every spoke, and turn on security group referencing at the gateway level, where it is off by default.</p>
+				<span class="file">network-us-east-1.yaml: the Transit Gateway and its organization share (CloudFormation, network account)</span>
+<pre><code><span class="k">TransitGateway:</span>
+  <span class="k">Type:</span> AWS::EC2::TransitGateway
+  <span class="k">Properties:</span>
+    <span class="k">Description:</span> travel-hub-us-east-1
+    <span class="c"># unique per Region; must differ from the Direct Connect gateway (64512)</span>
+    <span class="k">AmazonSideAsn:</span> 64521
+    <span class="c"># the network team accepts each shared attachment</span>
+    <span class="k">AutoAcceptSharedAttachments:</span> disable
+    <span class="c"># no default table: every attachment is placed deliberately</span>
+    <span class="k">DefaultRouteTableAssociation:</span> disable
+    <span class="k">DefaultRouteTablePropagation:</span> disable
+    <span class="k">DnsSupport:</span> enable
+    <span class="c"># ECMP across the BGP VPN tunnels</span>
+    <span class="k">VpnEcmpSupport:</span> enable
+    <span class="c"># off by default at the gateway; attachments default to enable</span>
+    <span class="k">SecurityGroupReferencingSupport:</span> enable
+    <span class="k">Tags:</span>
+      - { Key: Name, Value: tgw-use1 }
+
+<span class="k">TgwShare:</span>
+  <span class="k">Type:</span> AWS::RAM::ResourceShare
+  <span class="k">Properties:</span>
+    <span class="k">Name:</span> tgw-us-east-1-shared
+    <span class="k">ResourceArns:</span>
+      - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway/${TransitGateway}
+    <span class="k">Principals:</span>
+      - arn:aws:organizations::999999999999:organization/o-travel1234
+    <span class="c"># keep the hub inside the organization</span>
+    <span class="k">AllowExternalPrincipals:</span> false</code></pre>
+				<p>Sharing to the organization (with RAM sharing enabled from the management account) means new accounts see the Transit Gateway automatically. Some things stay with the owner: only the Transit Gateway owner can associate it with a Direct Connect gateway, and VPN and Connect attachments are created in the owner's account, so customer gateways and VPNs live with the network team. Either side can delete a VPC attachment.</p>
+				<div class="callout trap"><p>Turning <code>AutoAcceptSharedAttachments</code> on removes the approval step but not the segmentation, because with default association off a new attachment has no route table until someone associates it. In the exam, "the network team must approve each VPC that joins" points to <strong>auto accept off</strong>; "attachments should route automatically" points to default association or automation reacting to the attachment event.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Route tables, associations, propagations and blackholes</h3>
+				<p>Four route tables per Region carry the segmentation. Each attachment is <strong>associated</strong> with exactly one table, which decides where its packets can go. It <strong>propagates</strong> its routes into whichever tables should be able to reach it. Propagation cannot be filtered: a VPC attachment propagates its CIDRs, a VPN or Direct Connect gateway attachment propagates what it learned over BGP.</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Route table (associated attachments)</th><th>Routes in it (from propagation unless noted)</th></tr></thead>
+						<tbody>
+							<tr><td><code>prod</code> (production spokes)</td><td data-label="Routes in it (from propagation unless noted)">Shared services VPCs, Direct Connect gateway and VPN routes, peer Regions' production summaries (static); blackhole <code>10.42.0.0/16</code></td></tr>
+							<tr><td><code>dev</code> (development spokes)</td><td data-label="Routes in it (from propagation unless noted)">Development VPCs, shared services VPCs, on-premises routes; blackhole <code>10.40.0.0/16</code></td></tr>
+							<tr><td><code>shared</code> (shared services VPCs)</td><td data-label="Routes in it (from propagation unless noted)">Every production and development VPC, on-premises routes</td></tr>
+							<tr><td><code>onprem</code> (Direct Connect gateway and VPN attachments)</td><td data-label="Routes in it (from propagation unless noted)">Every production, development and shared services VPC</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>Production spokes do not propagate into <code>prod</code>, so production VPCs cannot reach each other through the hub either. That is deliberate: PCI DSS scope stays small when the payment VPC is reachable only from the services that need it. Teams that must talk get an explicit route, a shared VPC, or a PrivateLink service. Development spokes do propagate into <code>dev</code>, because developers want any-to-any inside their own environment.</p>
+				<span class="file">The development table: associate a spoke, propagate it, and block production (AWS CLI, network account)</span>
+<pre><code><span class="c"># one table per segment</span>
+aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=dev}]'
+
+<span class="c"># the spoke looks up its destinations in dev</span>
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-dev \
+  --transit-gateway-attachment-id tgw-attach-search-dev
+
+<span class="c"># dev spokes see each other, shared services and on premises can reach it</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-dev \
+  --transit-gateway-attachment-id tgw-attach-search-dev
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-shared \
+  --transit-gateway-attachment-id tgw-attach-search-dev
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-onprem \
+  --transit-gateway-attachment-id tgw-attach-search-dev
+
+<span class="c"># backstop: even if someone propagates a production VPC here by mistake, drop it</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-dev \
+  --destination-cidr-block 10.40.0.0/16 --blackhole</code></pre>
+				<p>The blackhole works because of route priority: longest prefix first, and for the same prefix a static (or blackhole) route beats a propagated one. A propagated production <code>/21</code> would still be more specific than the <code>/16</code> blackhole, so the blackhole is a safety net, not a replacement for correct propagation. Blackholes are also how a centralized egress design stops spokes reaching each other through a <code>0.0.0.0/0</code> route.</p>
+				<span class="file">Peer Regions are reached by static summary routes on the Transit Gateway peering attachment (AWS CLI)</span>
+<pre><code><span class="c"># Transit Gateway peering supports static routes only</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.44.0.0/16 \
+  --transit-gateway-attachment-id tgw-attach-peer-euc1</code></pre>
+				<div class="callout note"><p>Managed prefix lists keep long lists tidy: <code>create-transit-gateway-prefix-list-reference</code> turns every entry of a prefix list into a route (active or blackhole), and the same list can be shared through RAM and used in security groups. Each prefix list's maximum entries count toward the route quota.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Spokes with IPAM-allocated CIDRs</h3>
+				<p>The Transit Gateway will not route between overlapping VPCs: when a newly attached VPC overlaps one already attached, its CIDR is not propagated. IPAM prevents that up front. The network account (the delegated IPAM administrator) builds pools per Region and environment with allocation rules and shares them to the organization through RAM. Each spoke takes its CIDR from the pool, which also keeps every environment inside one summary that the blackholes and allowed prefixes can name.</p>
+				<span class="file">A development spoke takes a /21 from the shared pool and attaches to the hub (AWS CLI, development account 444444444444)</span>
+<pre><code><span class="c"># the pool picks a free, non-overlapping /21 inside 10.42.0.0/16</span>
+aws ec2 create-vpc --ipv4-ipam-pool-id ipam-pool-0use1dev12345 \
+  --ipv4-netmask-length 21 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=env,Value=dev}]'
+
+<span class="c"># one /28 attachment subnet per AZ, used only by Transit Gateway ENIs</span>
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-use1 \
+  --vpc-id vpc-0searchdev \
+  --subnet-ids subnet-tgw-az1 subnet-tgw-az2 subnet-tgw-az4 \
+  --options DnsSupport=enable,SecurityGroupReferencingSupport=enable \
+  --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=segment,Value=dev}]'
+
+<span class="c"># send everything internal to the hub</span>
+aws ec2 create-route --route-table-id rtb-search-dev-app \
+  --destination-cidr-block 10.0.0.0/8 --transit-gateway-id tgw-use1</code></pre>
+				<p>The network account then accepts the attachment, and the association and propagation from Step 2 follow. In practice an EventBridge rule on the new attachment, or a StackSet deployed to the OU, runs those commands from the <code>segment</code> tag.</p>
+				<span class="file">Accept the pending attachment (AWS CLI, network account)</span>
+<pre><code>aws ec2 accept-transit-gateway-vpc-attachment \
+  --transit-gateway-attachment-id tgw-attach-search-dev</code></pre>
+				<ul>
+					<li><strong>Availability Zones:</strong> only resources in AZs that have an attachment subnet can reach the Transit Gateway, so give one subnet in every AZ the VPC uses. Use dedicated small subnets with their own route table and network ACL, so filtering on workload subnets never blocks transit traffic.</li>
+					<li><strong>Limits per VPC:</strong> a Transit Gateway cannot have two attachments to the same VPC, and a VPC can attach to at most five Transit Gateways.</li>
+					<li><strong>DNS:</strong> the Transit Gateway does not resolve Route 53 private hosted zones of attached VPCs. Name resolution uses Resolver endpoints and shared rules in the shared services VPC.</li>
+					<li><strong>Shared VPCs cut attachments:</strong> where possible the network account owns per-environment VPCs and shares subnets to application accounts, so one attachment serves many accounts. The VPC owner pays for the attachment.</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Direct Connect gateway and VPN attachments</h3>
+				<p>The data centers reach every Region over transit VIFs on one Direct Connect gateway, associated with the Transit Gateways in all three Regions. The <strong>allowed prefixes</strong> on each association are what AWS advertises to the data centers, so each Region sends one summary instead of hundreds of VPC routes. Allowed prefixes must not overlap between Transit Gateways on the same Direct Connect gateway, and the parameter is required for a Transit Gateway association.</p>
+				<span class="file">Associate the us-east-1 Transit Gateway with the Direct Connect gateway and advertise one summary (AWS CLI, network account)</span>
+<pre><code>aws directconnect create-direct-connect-gateway-association \
+  --direct-connect-gateway-id dxgw-travel-global \
+  --gateway-id tgw-use1 \
+  --add-allowed-prefixes-to-direct-connect-gateway cidr=10.40.0.0/14</code></pre>
+				<p>The association creates a Direct Connect gateway attachment on the Transit Gateway. Associate it with <code>onprem</code> and propagate it into <code>prod</code>, <code>dev</code> and <code>shared</code>, so the data center routes learned over BGP appear in every table. A development-only data center lab could instead be kept out of <code>prod</code> by a separate VIF and attachment.</p>
+				<p>Backup is a BGP Site-to-Site VPN from each data center to its nearest Transit Gateway. Two tunnels per connection, and ECMP across tunnels and connections because <code>VpnEcmpSupport</code> is on. The VPN attachment is associated with <code>onprem</code> and propagated like the Direct Connect gateway attachment.</p>
+				<span class="file">The US data center's backup VPN, terminated on the Transit Gateway (AWS CLI, network account)</span>
+<pre><code><span class="c"># the customer gateway uses AS 65010; dynamic routing is the default when no static option is set</span>
+aws ec2 create-vpn-connection --type ipsec.1 \
+  --transit-gateway-id tgw-use1 \
+  --customer-gateway-id cgw-us-dc1-a
+
+<span class="c"># after the attachment appears, place it like any other</span>
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-onprem \
+  --transit-gateway-attachment-id tgw-attach-us-dc1-vpn
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --transit-gateway-attachment-id tgw-attach-us-dc1-vpn</code></pre>
+				<div class="callout tip"><p>When the same prefix arrives from Direct Connect and from VPN, the Transit Gateway prefers the Direct Connect gateway route, so the VPN is a backup with no extra configuration. Static routes beat both, so a forgotten static route to the VPN attachment silently moves all traffic onto the tunnels.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Security group referencing across the hub</h3>
+				<p>Route tables decide which networks can talk; security groups decide which workloads. Since September 2024, VPCs on the same Transit Gateway can reference each other's security groups in <strong>inbound</strong> rules, so the payment database can allow "the booking service's security group" instead of a list of CIDRs that changes whenever pods move. It must be enabled on the Transit Gateway (done in Step 1) and on the attachment (on by default), and costs nothing extra.</p>
+				<span class="file">Payments database allows PostgreSQL only from the booking service's security group in another VPC (AWS CLI, payments account)</span>
+<pre><code>aws ec2 authorize-security-group-ingress \
+  --group-id sg-0paymentsdb \
+  --ip-permissions 'IpProtocol=tcp,FromPort=5432,ToPort=5432,UserIdGroupPairs=[{GroupId=sg-0bookingsvc,UserId=222222222222,Description=booking-eks-pods}]'</code></pre>
+				<p>Limits to remember: inbound rules only; both VPCs on the same Transit Gateway, so the same Region (not across Transit Gateway peering); not through Gateway Load Balancer or Network Firewall inspection; not for PrivateLink endpoints; not in the <code>use1-az3</code> zone. Across Regions, rules fall back to CIDRs, which is where the IPAM summaries help again.</p>
+				<div class="callout trap"><p>A security group reference does not create a route. If the route tables block the path (or the referenced VPC sits behind an inspection VPC), the rule is accepted but traffic never arrives. Check routing first, then the rule.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Flow logs, metrics and Network Manager</h3>
+				<p>Transit Gateway flow logs are created by the Transit Gateway owner, per gateway or per attachment, to S3, CloudWatch Logs or Firehose. The default format includes the version 2 to 6 fields: source and destination VPC, subnet, account and AZ ID, the attachment and its pair, plus counters of packets lost to no route, a blackhole, MTU exceeded and TTL expired. Multicast is not logged, and Connect traffic appears on its transport attachment.</p>
+				<span class="file">Flow logs for the whole us-east-1 Transit Gateway to the central bucket (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-flow-logs --resource-type TransitGateway \
+  --resource-ids tgw-use1 \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::central-flow-logs-111111111111/tgw/</code></pre>
+				<p>From these logs, Athena queries grouped by <code>tgw-src-vpc-account-id</code> and <code>bytes</code> show which account sends the most data, which is the input for charge-back. Since November 2025, Flexible Cost Allocation metering policies can also bill data processing to the source, destination or owner account directly.</p>
+				<p>CloudWatch publishes <code>BytesIn</code>, <code>BytesOut</code>, <code>PacketDropCountBlackhole</code> and <code>PacketDropCountNoRoute</code> per gateway and attachment (use the Sum statistic). Alarm on blackhole drops from production: they mean someone is trying a path the design forbids.</p>
+				<span class="file">Register all three Transit Gateways in one global network (AWS CLI, Network Manager home Region us-west-2)</span>
+<pre><code>aws networkmanager register-transit-gateway --region us-west-2 \
+  --global-network-id global-network-0travel1234567 \
+  --transit-gateway-arn arn:aws:ec2:us-east-1:111111111111:transit-gateway/tgw-use1
+<span class="c"># repeat for the eu-central-1 and ap-northeast-1 gateways</span></code></pre>
+				<p>The global network is free. It gives a topology tree and map, events (attachments created, routes installed or uninstalled with their <code>route_static</code> or <code>route_propagated</code> type and <code>active</code> or <code>blackhole</code> state, VPN BGP down) delivered to EventBridge in <code>us-west-2</code>, and Route Analyzer for Transit Gateway route tables. Add the data centers as sites and devices with customer gateway associations to see the hybrid edge on the same map.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>A VPC peering for one heavy pair</h3>
+				<p>Every byte a VPC sends into the Transit Gateway costs data processing ($0.02 per GB), billed to the sender's attachment owner. The booking VPC sends about 40 TB a month of search results to the fare cache VPC (<code>10.40.32.0/20</code>), both in production in <code>us-east-1</code>. Through the hub that is roughly 40,960 GB &times; $0.02 &asymp; $820 a month in processing alone, plus an extra hop and a 100 Gbps per-AZ attachment ceiling. A VPC peering has no hourly or processing charge, is free within one AZ (matched by AZ ID) and costs $0.01 per GB each way across AZs.</p>
+				<span class="file">Peer the two VPCs and add the more specific route (AWS CLI)</span>
+<pre><code><span class="c"># same Region, cross-account; the fare cache account accepts</span>
+aws ec2 create-vpc-peering-connection \
+  --vpc-id vpc-0bookingprod \
+  --peer-vpc-id vpc-0farecache \
+  --peer-owner-id 555555555555
+
+<span class="c"># /20 beats the 10.0.0.0/8 route to the Transit Gateway by longest prefix</span>
+aws ec2 create-route --route-table-id rtb-bookings-app \
+  --destination-cidr-block 10.40.32.0/20 \
+  --vpc-peering-connection-id pcx-0bookfare123456789</code></pre>
+				<p>The fare cache VPC adds the mirror route to <code>10.40.8.0/21</code>. Everything else still flows through the hub, so segmentation is unchanged. Peering is not transitive and has no edge-to-edge routing, so the cache cannot reach the data centers or other VPCs through the booking VPC. Same-Region peering also supports security group references in both directions.</p>
+				<div class="callout trap"><p>Keep the peering for a small number of heavy, stable pairs. Ten such pairs are manageable; a mesh needs n(n&minus;1)/2 connections and every new VPC multiplies the routes, which is what the Transit Gateway replaced.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>One Transit Gateway per Region, in a network account</h4>
+				<p>AWS guidance is typically one Transit Gateway per Region, using route tables for isolation; extra gateways are not needed for availability. A second gateway is valid only to limit blast radius or to separate control planes (for example after an acquisition). Keeping it in the network account means one team owns route tables, Direct Connect associations and VPNs, while application teams only create attachments. Detail: <a href="../d1-task-1-6.html">Task 1.6</a> and <a href="../d1-task-1-5.html">Task 1.5</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Route tables as the segmentation boundary</h4>
+				<p>A packet with no route is dropped at the hub, before any security group sees it, and a single table change cannot be undone by an application team. The trade-off is operational: every new segment needs a table and propagation rules, and the 20 route tables per gateway (adjustable) and 10,000 total routes are real ceilings. Summaries from IPAM keep the route count small.</p>
+			</div>
+			<div class="entry">
+				<h4>Auto accept off, with automation</h4>
+				<p>Manual acceptance is a control point, but a human in the loop for 300 VPCs is slow. Accept, associate and propagate from an EventBridge-driven function or StackSet that reads the attachment's <code>segment</code> tag, and reject untagged requests. See <a href="../d2-task-2-4.html">Task 2.4</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Blackholes as a backstop, not the main control</h4>
+				<p>The <code>/16</code> blackholes catch a wrong propagation of a summary-sized route and make forbidden attempts visible in metrics and flow logs. They do not override a more specific propagated route, so propagation discipline is still the real control.</p>
+			</div>
+			<div class="entry">
+				<h4>Costs</h4>
+				<p>Attachments are billed per hour (for example $0.05 per VPC attachment-hour in the published us-east-2 example; partial hours count as full hours) and data processing at $0.02 per GB sent into the gateway from a VPC, Direct Connect or VPN attachment. One hundred VPC attachments cost about 100 &times; $0.05 &times; 730 &asymp; $3,650 a month before data, which is why shared VPCs, which cut the number of attachments, matter. Peering attachments pay their hourly charge on each side but no processing for traffic arriving over the peering; inter-Region data transfer is added. The Direct Connect gateway itself is free. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas to plan for</h4>
+				<ul>
+					<li>5 Transit Gateways per account, 5,000 attachments per gateway, 50 peering attachments (adjustable).</li>
+					<li>20 route tables per gateway (adjustable) and 10,000 routes across all of them (raised through your AWS account team).</li>
+					<li>Up to 100 Gbps and 7.5 million packets per second per VPC attachment per AZ; the same per AZ for Direct Connect gateway and peering attachments.</li>
+					<li>On the VPC side, propagated routes per VPC route table are limited to 100 (not adjustable), another reason to point a single <code>10.0.0.0/8</code> at the gateway.</li>
+				</ul>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Full VPC peering mesh</h4>
+				<p>Lowest latency and cost per GB, no aggregate bandwidth limit, and security group references in both directions. But it is not transitive, gives no shared path to Direct Connect or VPN (hybrid connectivity per VPC), refuses any overlapping CIDR, and stops at 125 peers per VPC. AWS suggests it for fewer than about 10 VPCs; here it is kept only for heavy pairs (Step 7).</p>
+			</div>
+			<div class="entry">
+				<h4>AWS Cloud WAN</h4>
+				<p>Global segments defined in a JSON policy, attachments placed by tag, and dynamic routing between Regions instead of static peering routes. Cloud WAN costs $0.50 an hour per core network edge plus attachments, and suits many Regions and policy as code. The company plans to move later; Transit Gateways can peer with Cloud WAN and route table attachments map each table to a segment during migration. See <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Centralized inspection through the hub</h4>
+				<p>Instead of trusting route tables alone for east-west traffic, send production-to-development or all inter-VPC traffic through AWS Network Firewall (natively attached to the Transit Gateway since June 2025, appliance mode on automatically) or a Gateway Load Balancer inspection VPC with appliance mode. Adds a processing charge and breaks security group referencing for inspected paths.</p>
+			</div>
+			<div class="entry">
+				<h4>PrivateLink or VPC Lattice for service-to-service</h4>
+				<p>When teams need only a service, not network reach, a PrivateLink endpoint service or a VPC Lattice service network gives one-way, application-level access and works with overlapping CIDRs, without any Transit Gateway route.</p>
+			</div>
+			<div class="entry">
+				<h4>Transit VPC with appliances</h4>
+				<p>The legacy hub of VPN overlays to EC2 routers. It needs you to run and scale the routers and has per-tunnel bandwidth limits; Transit Gateway replaces it.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove the allowed paths with Reachability Analyzer</span><span class="desc">From a booking instance to the US data center VPN attachment and <code>10.100.30.15</code> on TCP 1433, the analysis should succeed and list the <code>prod</code> route table. It models configuration and sends no packets.</span></li>
+				<li><span class="name">Prove the forbidden paths</span><span class="desc">From a development ENI to a production ENI, the analysis should fail with the <code>dev</code> Transit Gateway route table (the blackhole) as the blocking component. Network Access Analyzer scopes ("no path from development to production") turn this into a standing audit check.</span></li>
+				<li><span class="name">Check the hub's routes with Route Analyzer</span><span class="desc">In Network Manager, analyze from the European data center VPN attachment to the Frankfurt booking attachment with the return path included. It checks Transit Gateway route tables only, not VPC routes or security groups.</span></li>
+				<li><span class="name">Read the flow logs</span><span class="desc">After a test from development to production, the Transit Gateway flow log should show the flow with a non-zero <code>packets-lost-blackhole</code>, and <code>PacketDropCountBlackhole</code> should rise on the gateway.</span></li>
+				<li><span class="name">Fail Direct Connect over to VPN</span><span class="desc">In a maintenance window, shut the BGP sessions on the transit VIFs (or use the Direct Connect failover test). The <code>prod</code> table should switch to the VPN-propagated routes within the BGP timers, Network Manager should emit routing events, and synthetic checks from the data center should keep passing.</span></li>
+				<li><span class="name">Test attachment governance</span><span class="desc">Create an untagged attachment from a sandbox account and confirm it stays in <code>pendingAcceptance</code> or is rejected, and that a correctly tagged one ends up in exactly one table.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Transit Gateway segmentation, association and propagation, blackholes, IPAM, peering compared with Transit Gateway and Cloud WAN</td></tr>
+						<tr><td><a href="../d1-task-1-5.html">1.5</a> Hybrid routing and connectivity design</td><td data-label="What this architecture demonstrates">Direct Connect gateway with allowed prefixes, VPN backup, RAM sharing and owner-only actions</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">Transit Gateway flow logs, drop metrics, Network Manager</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">Associating the Transit Gateway with the Direct Connect gateway, VPN attachments with ECMP</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">RAM sharing, attachment acceptance, security group referencing, static routes over Transit Gateway peering</td></tr>
+						<tr><td><a href="../d2-task-2-4.html">2.4</a> Automate and configure network infrastructure</td><td data-label="What this architecture demonstrates">CloudFormation for the hub, event-driven attachment placement, IPAM allocation</td></tr>
+						<tr><td><a href="../d3-task-3-1.html">3.1</a> Maintain routing and connectivity</td><td data-label="What this architecture demonstrates">Route priority, summarization, prefix lists</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Monitor and analyze network traffic</td><td data-label="What this architecture demonstrates">Reachability Analyzer, Route Analyzer, flow log analysis</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Attachment-hour and per-GB costs, peering for a heavy pair, quotas</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Hundreds of VPCs in many accounts must reach shared services and the data center, but development must never reach production, with the least operational overhead" is <strong>a Transit Gateway shared through RAM with separate route tables per environment (default association and propagation off) and no propagation between production and development</strong>. If the question adds "two VPCs exchange tens of terabytes and data processing cost must drop", the answer is <strong>a VPC peering between that pair with a more specific route</strong>, keeping the Transit Gateway for everything else.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-security-group-referencing-for-aws-transit-gateway/">Introducing security group referencing for AWS Transit Gateway</a> (September 2024): the prerequisites and limits behind Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-flexible-cost-allocation-for-aws-transit-gateway/">Introducing Flexible Cost Allocation for AWS Transit Gateway</a> (November 2025): choosing which account pays data processing in a shared hub.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-and-considerations-to-migrate-from-vpc-peering-to-aws-transit-gateway/">Best practices and considerations to migrate from VPC Peering to AWS Transit Gateway</a> (April 2023): route tables, MTU, cost and cut-over order when moving a mesh to a hub (predates security group referencing on Transit Gateway).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/understand-your-network-traffic-trends-using-aws-transit-gateway-flow-logs/">Understand your network traffic trends using AWS Transit Gateway Flow Logs</a> (December 2023): Athena and QuickSight analysis of the logs from Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/rivians-proactive-approach-to-identify-unrouteable-traffic-with-aws-transit-gateway-flow-logs/">Rivian's proactive approach to identify unrouteable traffic with AWS Transit Gateway Flow Logs</a> (December 2025): finding blackholed and unrouted traffic across accounts.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/how-to-use-aws-network-manager-to-visualize-transit-gateways-across-all-accounts-in-the-aws-organization/">How to use AWS Network Manager to visualize Transit Gateways across multiple accounts in the AWS Organization</a> (January 2023): one global network for the whole organization.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/how-transit-gateways-work.html">How Transit Gateways work</a> (AWS documentation): route tables, associations, propagation and the segmentation scenarios.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/transit-gateway-quotas.html">Quotas for your transit gateways</a> (AWS documentation): the current attachment, route table, route and bandwidth limits.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/welcome.html">Building a Scalable and Secure Multi-VPC AWS Network Infrastructure</a> (AWS whitepaper, April 2024): peering compared with Transit Gateway and Cloud WAN (predates Transit Gateway security group referencing).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
