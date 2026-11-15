@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Extra: VPC Lattice service network | AWS ANS-C01 Notes</title>
+	<meta name="description" content="Extra ANS-C01 background architecture: the travel company's booking services (fare search on EKS, pricing on Lambda, loyalty on ECS) in one Amazon VPC Lattice service network owned by the network account and shared with AWS RAM. Listeners, rules and target groups, two-level IAM auth policies with SigV4, VPC associations versus service network endpoints, a reporting database as a resource configuration, custom domains with Route 53 alias records, access logs and metrics, and when PrivateLink, Transit Gateway or VPC peering fit better.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">VPC Lattice (extra)</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture &middot; Extra</span>
+		<h1>Extra: VPC Lattice service network</h1>
+		<p>The booking platform is splitting into services owned by different accounts: fare search on EKS, pricing on Lambda, loyalty on ECS, and a shared reporting database. Instead of Transit Gateway routes and per-service PrivateLink endpoints, the network account runs one VPC Lattice service network, shares it with AWS RAM, and lets IAM auth policies decide which caller may invoke which service.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Extra</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">VPC Lattice</span><span class="tag">AWS PrivateLink</span><span class="tag">AWS RAM</span><span class="tag">Route 53</span><span class="tag">Amazon EKS</span><span class="tag">AWS Lambda</span><span class="tag">Amazon ECS</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Service network, shared with RAM</a></li>
+				<li class="sub"><a href="#b2">2. Services, listeners and target groups</a></li>
+				<li class="sub"><a href="#b3">3. Fare search on EKS</a></li>
+				<li class="sub"><a href="#b4">4. Auth policies at two levels</a></li>
+				<li class="sub"><a href="#b5">5. Associations and the endpoint</a></li>
+				<li class="sub"><a href="#b6">6. The reporting database</a></li>
+				<li class="sub"><a href="#b7">7. Custom domains, logs and metrics</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<div class="callout note"><p><strong>Extra page.</strong> Amazon VPC Lattice is not on the ANS-C01 in-scope service list, so this page is background and comparison, not core exam content. The exam-relevant parts are how Lattice compares with PrivateLink, Transit Gateway and VPC peering, and its <strong>resource configurations</strong> (resource gateways and resource endpoints), which PrivateLink shares and which are covered in <a href="../d1-task-1-6.html">Task 1.6</a>.</p></div>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs its booking platform in <code>us-east-1</code> on <code>tgw-use1</code> (AS 64521). The platform is splitting into services owned by separate accounts that call each other on every booking:</p>
+			<ul>
+				<li><strong>Fare search</strong> on EKS in the bookings account <code>222222222222</code>, VPC <code>vpc-bookings-prod</code> (<code>10.40.8.0/21</code>), managed through the <strong>AWS Gateway API Controller</strong>.</li>
+				<li><strong>Pricing</strong> on Lambda, plus a legacy bulk repricing engine on EC2.</li>
+				<li><strong>Loyalty</strong> on ECS, migrating from a stack behind an internal ALB.</li>
+				<li>A shared <strong>reporting database</strong> (Aurora PostgreSQL, TCP 5432).</li>
+			</ul>
+			<p>Callers sit in VPCs in several accounts, including the partner API VPC, where the company's partner gateway calls fare search and loyalty for airlines and hotels. Batch jobs in the US data center (<code>10.100.0.0/16</code>) call pricing.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>No new Transit Gateway routes, no CIDR coordination</td><td data-label="Design choice">One Lattice service network; VPCs join it, and no IP route exists between them</td></tr>
+						<tr><td>Authorization by caller identity</td><td data-label="Design choice">IAM auth policies on the network and each service; SigV4-signed callers</td></tr>
+						<tr><td>Central control, team-owned services</td><td data-label="Design choice">Network account owns and shares the network; teams own services and target groups</td></tr>
+						<tr><td>Data center callers and a shared database</td><td data-label="Design choice">A service network endpoint in shared services; a resource configuration for the database</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>New example values on this page (not used elsewhere in the guide):</p>
+			<ul>
+				<li><strong>Accounts</strong>: pricing <code>232323232323</code>, loyalty <code>242424242424</code>, partner integration <code>252525252525</code> (owner of the partner API VPC), reporting <code>262626262626</code>.</li>
+				<li><strong>VPCs</strong>: <code>vpc-pricing-prod</code> <code>10.40.72.0/21</code>, <code>vpc-loyalty-prod</code> <code>10.40.64.0/21</code>, <code>vpc-reporting-prod</code> <code>10.40.80.0/21</code>; the partner API VPC <code>10.40.56.0/22</code> (from the GWLB and perimeter pages) gets the ID <code>vpc-partner-api</code>.</li>
+				<li><strong>Lattice objects</strong>: service network <code>booking-services</code> (<code>sn-0bookingsvcnet001</code>); services <code>svc-0faresearch000001</code>, <code>svc-0pricing000000001</code>, <code>svc-0loyalty000000001</code>; target groups <code>tg-0pricinglambda001</code>, <code>tg-0pricingbulkec201</code>, <code>tg-0loyaltyalb000001</code>, <code>tg-0loyaltyecsip0001</code>; resource gateway <code>rgw-0reportingdb00001</code> and resource configuration <code>rcfg-0reportingdb00001</code>.</li>
+				<li><strong>Names</strong>: private hosted zone <code>svc.example.com</code> with <code>fares.svc.example.com</code>, <code>pricing.svc.example.com</code> and <code>loyalty.svc.example.com</code>.</li>
+				<li><strong>Existing values reused</strong>: network account <code>111111111111</code>, organization <code>o-travel1234</code> (management account <code>999999999999</code>), shared services VPC <code>vpc-shared-services</code> <code>10.41.0.0/16</code>, Route 53 Profile <code>rp-travel-dns-01</code>, log archive <code>777777777777</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 300" role="img" aria-labelledby="dgL-wide-t">
+<title id="dgL-wide-t">VPC Lattice service network: fare search pods and the partner gateway reach the booking-services service network through VPC associations, and data center jobs through a service network endpoint; the network routes signed requests to the pricing and loyalty services and TCP connections to the reporting database through a resource gateway.</title>
+<path d="M170.0 55.0 L278.0 55.0 Q285.0 55.0 285.0 62.0 L285.0 139.0 Q285.0 146.0 292.0 146.0 L400.0 146.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<text x="228" y="49" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--accent)">VPC association</text>
+<path d="M170.0 160.0 L400.0 160.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 265.0 L210.0 265.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M370.0 265.0 L378.0 265.0 Q385.0 265.0 385.0 258.0 L385.0 181.0 Q385.0 174.0 392.0 174.0 L400.0 174.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M560.0 146.0 L583.0 146.0 Q590.0 146.0 590.0 139.0 L590.0 62.0 Q590.0 55.0 597.0 55.0 L620.0 55.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M560.0 160.0 L620.0 160.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M560.0 174.0 L583.0 174.0 Q590.0 174.0 590.0 181.0 L590.0 258.0 Q590.0 265.0 597.0 265.0 L620.0 265.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<rect x="10" y="32" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="52" class="dg-t dg-sm">Fare search pods</text>
+<text x="90" y="69" class="dg-s dg-sm2">vpc-bookings-prod</text>
+<rect x="10" y="137" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="157" class="dg-t dg-sm">Partner gateway</text>
+<text x="90" y="174" class="dg-s dg-sm2">vpc-partner-api</text>
+<rect x="10" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="262" class="dg-t dg-sm">US data center</text>
+<text x="90" y="279" class="dg-s dg-sm2">batch jobs</text>
+<rect x="210" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="262" class="dg-t dg-sm">Service network endpoint</text>
+<text x="290" y="279" class="dg-s dg-sm2">in shared services</text>
+<rect x="400" y="137" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="480" y="157" class="dg-t dg-sm">booking-services</text>
+<text x="480" y="174" class="dg-s dg-sm2">auth: o-travel1234</text>
+<rect x="620" y="32" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="52" class="dg-t dg-sm">pricing service</text>
+<text x="700" y="69" class="dg-s dg-sm2">Lambda, EC2 targets</text>
+<rect x="620" y="137" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="157" class="dg-t dg-sm">loyalty service</text>
+<text x="700" y="174" class="dg-s dg-sm2">ALB 90%, ECS 10%</text>
+<rect x="620" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="262" class="dg-t dg-sm">Reporting database</text>
+<text x="700" y="279" class="dg-s dg-sm2">resource gateway</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgL-tall-t">
+<title id="dgL-tall-t">VPC Lattice service network: fare search pods and the partner gateway reach the booking-services service network through VPC associations, and data center jobs through a service network endpoint; the network routes signed requests to the pricing and loyalty services and TCP connections to the reporting database through a resource gateway.</title>
+<path d="M20.0 40.0 L14.0 40.0 Q8.0 40.0 8.0 46.0 L8.0 258.0 Q8.0 265.0 15.0 265.0 L120.0 265.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 173.0 L100.0 200.5 Q100.0 207.5 107.0 207.5 L186.0 207.5 Q193.0 207.5 193.0 214.5 L193.0 242.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 127.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M300.0 173.0 L300.0 200.5 Q300.0 207.5 293.0 207.5 L214.0 207.5 Q207.0 207.5 207.0 214.5 L207.0 242.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M193.0 288.0 L193.0 315.5 Q193.0 322.5 186.0 322.5 L107.0 322.5 Q100.0 322.5 100.0 329.5 L100.0 357.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M207.0 288.0 L207.0 315.5 Q207.0 322.5 214.0 322.5 L293.0 322.5 Q300.0 322.5 300.0 329.5 L300.0 357.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M280.0 265.0 L385.0 265.0 Q392.0 265.0 392.0 272.0 L392.0 479.0 Q392.0 485.0 386.0 485.0 L380.0 485.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Fare search pods</text>
+<text x="100" y="54" class="dg-s dg-sm2">vpc-bookings-prod</text>
+<rect x="20" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="147" class="dg-t dg-sm">Partner gateway</text>
+<text x="100" y="164" class="dg-s dg-sm2">vpc-partner-api</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">US data center</text>
+<text x="300" y="54" class="dg-s dg-sm2">batch jobs</text>
+<rect x="220" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="147" class="dg-t dg-sm">Service network endpoint</text>
+<text x="300" y="164" class="dg-s dg-sm2">in shared services</text>
+<rect x="120" y="242" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="200" y="262" class="dg-t dg-sm">booking-services</text>
+<text x="200" y="279" class="dg-s dg-sm2">auth: o-travel1234</text>
+<rect x="20" y="357" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="377" class="dg-t dg-sm">pricing service</text>
+<text x="100" y="394" class="dg-s dg-sm2">Lambda, EC2 targets</text>
+<rect x="220" y="357" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="377" class="dg-t dg-sm">loyalty service</text>
+<text x="300" y="394" class="dg-s dg-sm2">ALB 90%, ECS 10%</text>
+<rect x="220" y="462" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="482" class="dg-t dg-sm">Reporting database</text>
+<text x="300" y="499" class="dg-s dg-sm2">resource gateway</text>
+</svg>
+				<figcaption>Figure: callers on the left, services on the right, and no routes between their VPCs. Fare search pods (green) and the partner gateway (blue) reach <code>booking-services</code> through VPC associations; data center jobs (yellow) use a service network endpoint in the shared services VPC over Direct Connect. Each request is signed with SigV4 and must pass both the network's and the service's auth policy. The reporting database is a resource configuration behind a resource gateway, reached over TCP without an auth policy.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions by the named account or caller.</p>
+			<ol class="flow">
+				<li class="group">A fare search pod calls pricing</li>
+				<li><span class="name">Resolve and sign<span class="who">Fare search pod</span></span><span class="desc">The pod resolves <code>pricing.svc.example.com</code>, an alias to the service's generated Lattice name, which returns link-local Lattice addresses (for example <code>169.254.171.x</code>). Its IAM role signs the HTTPS request with SigV4; no route table entry is involved.</span></li>
+				<li class="auto"><span class="name">Association security group<span class="who auto">AWS</span></span><span class="desc">The booking VPC's association allows HTTPS only from the EKS security groups; other workloads in the VPC never enter the network.</span></li>
+				<li class="auto"><span class="name">Two auth policies<span class="who auto">AWS</span></span><span class="desc">The network policy requires an authenticated principal of <code>o-travel1234</code> (unsigned requests get a 403). The pricing policy allows only the fare search role, only <code>GET</code> on <code>/v1/quotes</code>. Both must allow.</span></li>
+				<li class="auto"><span class="name">Listener, rule, target<span class="who auto">AWS</span></span><span class="desc">The HTTPS listener terminates TLS with the team's ACM certificate, forwards to the Lambda target group by default and sends <code>/v1/bulk</code> to the EC2 target group. DNS prefers the caller's AZ, and Lattice charges no inter-AZ transfer.</span></li>
+				<li class="group">Other callers</li>
+				<li class="auto"><span class="name">Partner gateway to loyalty<span class="who auto">AWS</span></span><span class="desc">The loyalty policy also requires the source VPC <code>vpc-partner-api</code>. The listener sends 90 percent of requests to the old ALB and 10 percent to the new ECS tasks.</span></li>
+				<li><span class="name">Data center to pricing<span class="who">Batch job</span></span><span class="desc">The job resolves the endpoint-specific DNS name to the service network endpoint's addresses in <code>10.41.0.0/16</code> and crosses Direct Connect and <code>tgw-use1</code>. The same policies apply, and connections can only start from the endpoint side.</span></li>
+				<li class="auto"><span class="name">Loyalty to the database<span class="who auto">AWS</span></span><span class="desc">Tasks connect to the cluster's own RDS hostname on 5432; private DNS returns a Lattice address. The resource gateway in <code>vpc-reporting-prod</code> source-NATs the connection to the cluster. No auth policy applies to resources.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The service network in the network account, shared with RAM</h3>
+				<p>Lattice has three owner roles: <strong>service network owner</strong>, <strong>service owner</strong> and <strong>resource owner</strong>. The network account owns the service network, the boundary that holds services and resource configurations; teams own their services. The network team decides who is connected, teams decide what they publish.</p>
+				<p>With <code>AWS_IAM</code> auth, requests are denied until an auth policy allows them. Sharing must be enabled to offer the network through RAM.</p>
+				<span class="file">Create the service network and share it with the organization (AWS CLI, network account 111111111111)</span>
+<pre><code>aws vpc-lattice create-service-network --name booking-services \
+  --auth-type AWS_IAM \
+  --sharing-config enabled=true
+
+<span class="c"># every account in o-travel1234 can associate services and VPCs with it</span>
+aws ram create-resource-share --region us-east-1 \
+  --name booking-services-sn \
+  --resource-arns arn:aws:vpc-lattice:us-east-1:111111111111:servicenetwork/sn-0bookingsvcnet001 \
+  --principals arn:aws:organizations::999999999999:organization/o-travel1234 \
+  --no-allow-external-principals</code></pre>
+				<p>Lattice is Regional. The documentation used here describes no cross-Region service network, so <code>eu-central-1</code> would get its own, and cross-Region calls stay on Transit Gateway peering or cross-Region PrivateLink. Choose subnets by AZ ID: Lattice does not support <code>use1-az3</code>.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Services, listeners, rules and target groups</h3>
+				<p>A Lattice <strong>service</strong> is a small managed load balancer owned by the team: <strong>listeners</strong> (HTTP, HTTPS or TLS passthrough), <strong>rules</strong> matching path, method or headers, and <strong>target groups</strong> of type <code>INSTANCE</code>, <code>IP</code>, <code>LAMBDA</code> or <code>ALB</code>. Target groups live in the service's account; IP and instance targets must be in the target group's VPC. Defaults: two listeners per service, ten rules per listener (adjustable).</p>
+				<span class="file">Pricing service and its two target groups (AWS CLI, pricing account 232323232323)</span>
+<pre><code>aws vpc-lattice create-service --name pricing \
+  --auth-type AWS_IAM \
+  --custom-domain-name pricing.svc.example.com \
+  --certificate-arn arn:aws:acm:us-east-1:232323232323:certificate/CERT_ID
+
+<span class="c"># one Lambda function per LAMBDA target group</span>
+aws vpc-lattice create-target-group --name pricing-quotes --type LAMBDA
+aws vpc-lattice register-targets --target-group-identifier tg-0pricinglambda001 \
+  --targets id=arn:aws:lambda:us-east-1:232323232323:function:pricing-quotes
+
+<span class="c"># the legacy engine on EC2, health-checked on /health</span>
+aws vpc-lattice create-target-group --name pricing-bulk --type INSTANCE \
+  --config 'port=8443,protocol=HTTPS,protocolVersion=HTTP1,vpcIdentifier=vpc-pricing-prod,healthCheck={enabled=true,protocol=HTTPS,path=/health}'
+aws vpc-lattice register-targets --target-group-identifier tg-0pricingbulkec201 \
+  --targets id=i-0bulkpricing0001 id=i-0bulkpricing0002</code></pre>
+				<p>The default action goes to Lambda; a rule catches <code>/v1/bulk</code>. Actions are forward (with weights) or a fixed 404 or 500.</p>
+				<span class="file">Listener and the path rule (AWS CLI, pricing account)</span>
+<pre><code>aws vpc-lattice create-listener --service-identifier svc-0pricing000000001 \
+  --name https-443 --protocol HTTPS --port 443 \
+  --default-action '{"forward":{"targetGroups":[{"targetGroupIdentifier":"tg-0pricinglambda001"}]}}'
+
+aws vpc-lattice create-rule --service-identifier svc-0pricing000000001 \
+  --listener-identifier LISTENER_ID --name bulk-to-ec2 --priority 10 \
+  --match '{"httpMatch":{"pathMatch":{"match":{"prefix":"/v1/bulk"}}}}' \
+  --action '{"forward":{"targetGroups":[{"targetGroupIdentifier":"tg-0pricingbulkec201"}]}}'</code></pre>
+				<p>Loyalty migrates with weights: the old internal ALB is an <code>ALB</code> target group (an internal ALB can sit behind up to two Lattice services), and the new ECS tasks register in an <code>IP</code> target group.</p>
+				<span class="file">Loyalty default action: 90 percent to the old ALB, 10 percent to the new tasks (AWS CLI, loyalty account 242424242424)</span>
+<pre><code>aws vpc-lattice create-listener --service-identifier svc-0loyalty000000001 \
+  --name https-443 --protocol HTTPS --port 443 \
+  --default-action '{"forward":{"targetGroups":[{"targetGroupIdentifier":"tg-0loyaltyalb000001","weight":90},{"targetGroupIdentifier":"tg-0loyaltyecsip0001","weight":10}]}}'
+
+<span class="c"># the owner of a service associates it with the shared network; across accounts use the network's ARN</span>
+aws vpc-lattice create-service-network-service-association \
+  --service-identifier svc-0loyalty000000001 \
+  --service-network-identifier arn:aws:vpc-lattice:us-east-1:111111111111:servicenetwork/sn-0bookingsvcnet001</code></pre>
+				<p>Lattice does not validate target certificates (self-signed is fine), and if every target is unhealthy it <strong>fails open</strong>, so health checks are not a kill switch.</p>
+				<div class="callout trap"><p>Target security groups must allow the managed prefix list <code>com.amazonaws.us-east-1.vpc-lattice</code>. Requests arrive from Lattice, so a rule referencing the caller's security group never matches.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Fare search on EKS with the AWS Gateway API Controller</h3>
+				<p>The fare search team works in Kubernetes. The <strong>AWS Gateway API Controller</strong> implements the Kubernetes Gateway API on Lattice. Its documentation maps the objects:</p>
+				<ul>
+					<li><code>GatewayClass</code>: identifies VPC Lattice as the implementation.</li>
+					<li><code>Gateway</code> (cluster operator): a service network.</li>
+					<li><code>HTTPRoute</code> (developer): a Lattice service with listeners, rules and target groups pointing at the pods behind a Kubernetes service; its target groups can span clusters and VPCs.</li>
+				</ul>
+				<p>The controller's IAM role manages Lattice objects in <code>222222222222</code>, so the service stays owned by the bookings account. Node and pod security groups must allow the Lattice prefix list. The controller covers east-west traffic only; public ingress stays on CloudFront and the ALB (<a href="inbound-perimeter.html">Inbound perimeter</a>).</p>
+				<div class="callout note"><p>App Mesh reaches end of support on September 30, 2026; AWS names ECS Service Connect as the path for ECS. For EKS, Lattice through this controller is one option.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Auth policies at two levels, with SigV4 callers</h3>
+				<p>Auth policies are IAM resource policies for <code>vpc-lattice-svcs:Invoke</code>. A request needs an allow from <strong>both</strong> the network and the service policy, and from the caller's IAM identity policy; an explicit deny wins. Callers sign with SigV4 (the AWS SDKs do this); unsigned requests count as anonymous. The network team writes a coarse guardrail, the teams the fine rules.</p>
+				<span class="file">booking-services-auth.json: the network-level guardrail (applied by the network account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "vpc-lattice-svcs:Invoke",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:PrincipalOrgID": "o-travel1234" },
+        "StringNotEqualsIgnoreCase": { "aws:PrincipalType": "anonymous" }
+      }
+    }
+  ]
+}</code></pre>
+				<span class="file">pricing-auth.json: only the fare search role, only GET on /v1/quotes (applied by the pricing account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::222222222222:role/fare-search-pods" },
+      "Action": "vpc-lattice-svcs:Invoke",
+      "Resource": "arn:aws:vpc-lattice:us-east-1:232323232323:service/svc-0pricing000000001/*",
+      "Condition": {
+        "StringEquals": { "vpc-lattice-svcs:RequestMethod": "GET" },
+        "StringLike": { "vpc-lattice-svcs:RequestPath": "/v1/quotes*" }
+      }
+    }
+  ]
+}</code></pre>
+				<span class="file">Attach both policies (AWS CLI, network account, then pricing account)</span>
+<pre><code>aws vpc-lattice put-auth-policy --resource-identifier sn-0bookingsvcnet001 \
+  --policy file://booking-services-auth.json
+
+aws vpc-lattice put-auth-policy --resource-identifier svc-0pricing000000001 \
+  --policy file://pricing-auth.json</code></pre>
+				<p>The loyalty policy adds <code>vpc-lattice-svcs:SourceVpc</code> = <code>vpc-partner-api</code> for the partner gateway's role in <code>252525252525</code>, so its credentials are useless from any other VPC. Other keys cover port, headers, query strings, service network ARN and source VPC owner. Policies are limited to 10 KB.</p>
+				<div class="callout trap"><p>Auth policies are not evaluated for <strong>resource configurations</strong> such as the reporting database, even at network level. The RAM share and the security groups (association or endpoint, and resource gateway) control resources.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Connect consumers: VPC associations and a service network endpoint</h3>
+				<p>A <strong>VPC association</strong> connects the whole VPC through link-local and AWS-owned non-routable addresses: no CIDR space, no routes. Limits: one service network per VPC this way, and only clients inside the VPC; traffic arriving over peering, Transit Gateway, Direct Connect or VPN cannot use it. Up to five security groups decide which clients may enter; once added, at least one must stay.</p>
+				<span class="file">Associate the booking VPC, with private DNS for resources (AWS CLI, bookings account 222222222222)</span>
+<pre><code><span class="c"># sg-0latticeclients allows HTTPS and 5432 only from the EKS node and pod security groups</span>
+aws vpc-lattice create-service-network-vpc-association \
+  --service-network-identifier arn:aws:vpc-lattice:us-east-1:111111111111:servicenetwork/sn-0bookingsvcnet001 \
+  --vpc-identifier vpc-bookings-prod \
+  --security-group-ids sg-0latticeclients \
+  --private-dns-enabled</code></pre>
+				<p>A <strong>service network endpoint</strong> is the PrivateLink-based mode: a VPC endpoint of type <code>ServiceNetwork</code> with addresses from the consumer's subnets, so anything routed to them can use it, including the data centers. A VPC can have one per service network, at no hourly charge.</p>
+				<span class="file">A second service network endpoint in the shared services VPC, for data center callers (AWS CLI, network account)</span>
+<pre><code><span class="c"># sg-booking-svc-onprem allows HTTPS from 10.100.0.0/16 (US data center) only</span>
+aws ec2 create-vpc-endpoint --vpc-endpoint-type ServiceNetwork \
+  --vpc-id vpc-shared-services \
+  --subnet-ids subnet-shared-az1 subnet-shared-az2 subnet-shared-az4 \
+  --service-network-arn arn:aws:vpc-lattice:us-east-1:111111111111:servicenetwork/sn-0bookingsvcnet001 \
+  --security-group-ids sg-booking-svc-onprem</code></pre>
+				<p>The endpoint takes a <strong>contiguous /28 per AZ</strong> for services, allocated even while the network is empty, plus one IPv4 address per resource configuration per AZ. It sits beside the hotel API endpoint from <a href="overlapping-cidrs.html">Overlapping CIDRs</a>. Its default DNS names are publicly resolvable and return its private addresses, so data center jobs can use them.</p>
+				<div class="callout note"><p>The 2023 "External connectivity" proxy pattern for on-premises and other-Region access has, per an AWS notice on that post, largely been replaced by service network endpoints. Endpoints also avoid the static route that Windows and macOS clients may need on an association.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>The reporting database as a resource configuration</h3>
+				<p>The database joins as a <strong>resource configuration</strong>, the building block PrivateLink uses for VPC resources (<a href="../d1-task-1-6.html">Task 1.6</a>). A <strong>resource gateway</strong> (interfaces across AZs in <code>vpc-reporting-prod</code>) is the entry point. It does not load balance, and the database sees gateway addresses, so its security group allows the gateway's. It keeps <code>PUBLIC</code> DNS resolution, because <code>IN_VPC</code> gateways cannot serve ARN configurations. IPv4 addresses per interface (1 to 62, default 16) cap concurrent connections.</p>
+				<span class="file">Resource gateway and an ARN-type configuration for the Aurora cluster (AWS CLI, reporting account 262626262626)</span>
+<pre><code>aws vpc-lattice create-resource-gateway --name reporting-db-gw \
+  --vpc-identifier vpc-reporting-prod \
+  --subnet-ids subnet-rpt-az1 subnet-rpt-az2 subnet-rpt-az4 \
+  --security-group-ids sg-reporting-rgw \
+  --ipv4-addresses-per-eni 32
+
+<span class="c"># the network is shareable, so the configuration must allow association with a shareable network (default false)</span>
+aws vpc-lattice create-resource-configuration --name reporting-db \
+  --type ARN \
+  --resource-gateway-identifier rgw-0reportingdb00001 \
+  --resource-configuration-definition 'arnResource={arn=arn:aws:rds:us-east-1:262626262626:cluster:reporting-prod}' \
+  --allow-association-to-shareable-service-network</code></pre>
+				<p>The reporting account shares the configuration with the network account through RAM, and the network account adds it to <code>booking-services</code>, as it did for the hotel APIs.</p>
+				<span class="file">Add the shared database to the service network (AWS CLI, network account)</span>
+<pre><code>aws vpc-lattice create-service-network-resource-association \
+  --service-network-identifier sn-0bookingsvcnet001 \
+  --resource-configuration-identifier rcfg-0reportingdb00001</code></pre>
+				<p>RDS is the only ARN type (not publicly accessible clusters), and AWS manages the child configurations. With private DNS, clients keep the cluster's writer and reader hostnames, so certificate name checks pass. Resources are TCP only, and through an association each gets an address from the non-routable <code>129.224.0.0/17</code>. The resource gateway patterns blog adds DNS-type configurations for reaching SaaS or public endpoints through one central VPC with NAT gateways.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Custom domains with Route 53, access logs and metrics</h3>
+				<p>Every service gets a generated name such as <code>pricing-0pricing000000001.HASH.vpc-lattice-svcs.us-east-1.on.aws</code>. The Lattice guide is explicit that the custom domain set in Step 2 only works once DNS maps it to that generated name, and you create that record. A service has one custom domain, it cannot be changed after creation, and it must be unique within the service network. HTTPS on a custom domain needs your own ACM certificate; there is no default certificate fallback.</p>
+				<p>Since June 2025, Route 53 has an <strong>alias to VPC Lattice service</strong> record type. The network account keeps <code>svc.example.com</code> as a private hosted zone on the Route 53 Profile <code>rp-travel-dns-01</code>, so every spoke resolves the same names. It creates A and AAAA alias records, with target health evaluation off, as the Route 53 guide shows.</p>
+				<span class="file">pricing-alias.json: A record alias to the pricing service (apply with change-resource-record-sets in the network account)</span>
+<pre><code>{
+  "Comment": "pricing.svc.example.com to the Lattice service",
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "pricing.svc.example.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "SERVICE_DNS_HOSTED_ZONE_ID",
+          "DNSName": "pricing-0pricing000000001.HASH.vpc-lattice-svcs.us-east-1.on.aws",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The alias target values come from the <code>dnsEntry</code> (domain name and hosted zone ID) that <code>create-service</code> returns. To keep records in step as teams add services, AWS publishes the <strong>Guidance for Amazon VPC Lattice Automated DNS Configuration</strong>, which creates the records automatically.</p>
+				<p><strong>Access logs.</strong> Subscriptions attach to a network, service or resource configuration and deliver to CloudWatch Logs, S3 or Firehose. The network owner sees only traffic of its associated clients and services; it logs services and resources separately, and teams log their own services. Flow logs show Lattice addresses, so access logs identify callers.</p>
+				<span class="file">Network-level access logs for services and for resources (AWS CLI, network account)</span>
+<pre><code>aws vpc-lattice create-access-log-subscription \
+  --resource-identifier sn-0bookingsvcnet001 \
+  --service-network-log-type SERVICE \
+  --destination-arn arn:aws:logs:us-east-1:111111111111:log-group:/lattice/booking-services
+
+aws vpc-lattice create-access-log-subscription \
+  --resource-identifier sn-0bookingsvcnet001 \
+  --service-network-log-type RESOURCE \
+  --destination-arn arn:aws:logs:us-east-1:111111111111:log-group:/lattice/booking-resources</code></pre>
+				<p><strong>Metrics</strong> appear in the <code>AWS/VpcLattice</code> namespace, per service and per target group, each also by AZ. Useful alarms: <code>HTTPCode_5XX_Count</code> and <code>RequestTime</code> (percentiles) per service, <code>HTTPCode_VpcLattice_403_Count</code> for requests Lattice itself rejected (auth denials after a policy change), <code>RequestTimeoutCount</code>, and <code>ConnectionErrorCount</code> per target group.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Who owns what</h4>
+				<p>The network account owns the service network, its guardrail policy, network-level logs and the on-premises endpoint. Teams own services, target groups, certificates and fine policies; consumers own their associations and their security groups. The caller of an association must own one side of it. This mirrors the RAM-shared Transit Gateway on <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Identity at layer 7, security groups at layer 4</h4>
+				<p>Any associated VPC can reach any listener; the real boundary is the pair of auth policies, which a route table cannot offer. Security groups still guard the association and the targets. For PCI DSS, the payments VPC (<code>10.40.48.0/21</code>) is not associated; card data stays on its segmented Transit Gateway path (<a href="../d4-task-4-1.html">Task 4.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Cost model</h4>
+				<p>At the us-east-1 rates on Task 1.6, Lattice charges per service, not per consumer: $0.025 per service-hour, $0.025 per GB, and $0.10 per million requests after 300,000 each hour. Three services cost about 3 &times; $0.025 &times; 730 &asymp; $55 a month before traffic. The database configuration costs about $0.10 per hour (about $73 a month) plus about $0.01 per GB for the consumer and $0.006 for the provider. Associations and endpoints are free.</p>
+				<p>The same three services through PrivateLink to six VPCs need 18 interface endpoints in three AZs: about 18 &times; 3 &times; $0.01 &times; 730 &asymp; $394 a month, plus an NLB each. For bulk flows, $0.025 per GB exceeds Transit Gateway's $0.02, so replication stays on the hub (<a href="../d3-task-3-3.html">Task 3.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Limits that shape the design</h4>
+				<ul>
+					<li>One service network per VPC through associations: a VPC that needs a second network uses an endpoint for it.</li>
+					<li>10 Gbps and 10,000 requests per second per service per AZ (raised through your AWS account team).</li>
+					<li>Service connections live at most 10 minutes, with an idle timeout of 60 to 600 seconds; there is no native WebSocket support. Long-lived streams use a TLS passthrough listener or a resource configuration (resources have a 350-second idle timeout and no lifetime limit).</li>
+					<li>Quotas: 500 services and 500 VPC associations per service network, 10 target groups per service, 1,000 targets per target group, five security groups per association (hard), MTU 8,500.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>Partner traffic</h4>
+				<p>The partner gateway is a company workload, so it joins like any VPC. The airlines still use the PrivateLink endpoint service <code>vpce-svc-0fares1234567890</code> on <a href="../d1-task-1-6.html">Task 1.6</a>: external accounts get one service, not the internal network.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>PrivateLink endpoint services per service</h4>
+				<p>Each team puts its service behind an NLB and publishes an endpoint service; each consumer VPC creates an interface endpoint per service. It is one-way, tolerates overlapping CIDRs and is on the exam. But it grows as services &times; consumers, has no layer 7 routing or IAM authorization (endpoint policies are not caller-level auth for custom services), and the provider sees NLB addresses unless proxy protocol v2 is used. Best for offering one service to external accounts or SaaS customers.</p>
+			</div>
+			<div class="entry">
+				<h4>Transit Gateway with internal ALBs</h4>
+				<p>The company's default network: every VPC on <code>tgw-use1</code>, services behind internal ALBs, authorization in application code. It gives full layer 3: any protocol, UDP, ICMP, connections in both directions, on-premises reach. It needs unique CIDRs, route table segmentation and security group rules by address (Transit Gateway security group referencing works for inbound rules only, within one gateway). Choose it when the need is "connect networks", not "publish services".</p>
+			</div>
+			<div class="entry">
+				<h4>VPC peering</h4>
+				<p>Cheapest for a few heavy pairs (no hourly or processing charge), with security group references in both directions within a Region. It is non-transitive, refuses overlapping CIDRs, and has no service-level authorization. Fine for two or three VPCs, not for a growing service estate.</p>
+			</div>
+			<div class="entry">
+				<h4>Centralized interface endpoints through Lattice</h4>
+				<p>The September 2026 centralization blog applies the same building blocks to AWS service endpoints: the shared services VPC keeps the interface endpoints, each exposed as a resource configuration behind a resource gateway, and consumers reach only what is associated. It suits overlapping CIDRs, tight access scope, or a hub built only for endpoints. If a Transit Gateway or Cloud WAN hub already exists for general connectivity, reusing it remains a valid choice.</p>
+			</div>
+			<div class="entry">
+				<h4>When Lattice does not fit</h4>
+				<ul>
+					<li><strong>Layer 3 needs</strong>: server-initiated connections, ICMP, routing to whole subnets. Use Transit Gateway, Cloud WAN or peering.</li>
+					<li><strong>UDP and other protocols</strong>: services take HTTP, HTTPS or TLS passthrough; resource configurations take TCP. UDP appears only in the new CIDR configuration type, for DNS through tunnel endpoints.</li>
+					<li><strong>Cross-Region</strong>: service networks are Regional; use cross-Region PrivateLink or the existing peered hubs.</li>
+					<li><strong>Bulk data</strong>: per-GB processing above Transit Gateway's rate, and per-service throughput limits.</li>
+					<li><strong>Client IP visibility</strong>: targets see Lattice addresses; identity comes from SigV4 and access logs instead.</li>
+				</ul>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove authorization, not reachability</span><span class="desc">From a fare search pod, a signed <code>GET /v1/quotes</code> to <code>pricing.svc.example.com</code> succeeds. The same request unsigned, a <code>POST</code>, or a call to <code>/v1/admin</code> must return 403, and <code>HTTPCode_VpcLattice_403_Count</code> must rise.</span></li>
+				<li><span class="name">Prove the source VPC condition</span><span class="desc">Run the partner gateway's role from a test instance in the loyalty VPC: loyalty must deny it. From <code>vpc-partner-api</code> it succeeds.</span></li>
+				<li><span class="name">Prove the association security group</span><span class="desc">An instance in the booking VPC that is not in the EKS security groups gets a timeout, not a 403: it never enters the service network.</span></li>
+				<li><span class="name">Check the weights</span><span class="desc">Send 1,000 requests to loyalty and count by target group in the service's access logs: about 900 to the ALB, about 100 to the IP target group.</span></li>
+				<li><span class="name">Test the database path</span><span class="desc">From a loyalty task, connect to the cluster's writer hostname on 5432 with certificate validation on. From a VPC whose association security group lacks 5432, the connection times out. In the reporting VPC, the database logs show resource gateway addresses as clients.</span></li>
+				<li><span class="name">Test the data center path</span><span class="desc">From a batch host in <code>10.100.0.0/16</code>, resolve the endpoint's DNS name for pricing (it must return addresses in <code>10.41.0.0/16</code>) and send a signed request.</span></li>
+				<li><span class="name">Test failure behaviour</span><span class="desc">Scale the new loyalty tasks to unhealthy and watch Lattice fail open; the runbook must set the weight to 0 instead of relying on health checks. Hold a connection open for more than 10 minutes and confirm clients reconnect cleanly.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<p>Lattice itself is an extra; these rows point to the exam tasks where the comparison points and resource configurations are tested.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Service-level (Lattice, PrivateLink) versus network-level (Transit Gateway, peering) connectivity; resource gateways and resource configurations; overlap tolerance</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">RAM sharing to the organization, owner roles across accounts, an endpoint reachable over Direct Connect and the Transit Gateway</td></tr>
+						<tr><td><a href="../d2-task-2-3.html">2.3</a> Implement hybrid and multi-account DNS</td><td data-label="What this architecture demonstrates">Alias records in a private hosted zone shared by a Route 53 Profile, private DNS for resources, endpoint DNS names used from on premises</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Per-service versus per-endpoint cost, per-GB comparison with Transit Gateway, same-AZ preference</td></tr>
+						<tr><td><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">IAM-based authorization in front of services, security groups with managed prefix lists, card data kept off the shared network</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Hundreds of microservices in many accounts call each other over HTTP or gRPC; authorize by IAM identity; teams must not manage routes or coordinate CIDRs" points to <strong>VPC Lattice</strong>. "Offer one service to customer or partner accounts, one way, with overlapping CIDRs" points to <strong>a PrivateLink endpoint service</strong>, and "share a database without a load balancer" to <strong>a resource configuration with a resource endpoint</strong>. "Full two-way routing between many VPCs and on premises, any protocol" points to <strong>Transit Gateway</strong> (or Cloud WAN); "two VPCs, heavy traffic, lowest cost" to <strong>VPC peering</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/when-and-how-to-centralize-aws-privatelink-interface-endpoints-with-amazon-vpc-lattice/">When and how to centralize AWS PrivateLink Interface endpoints with Amazon VPC Lattice</a> (September 2026): a Transit Gateway hub compared with Lattice resource configurations for shared endpoints, including cost and overlapping CIDRs.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/vpc-resource-gateways-implementation-patterns-and-use-cases/">VPC resource gateways: Implementation patterns and use cases</a> (June 2026): private RDS access, overlapping CIDRs, proxying to public domains and centralized endpoints with resource gateways.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/build-secure-multi-account-multi-vpc-connectivity-for-your-applications-with-amazon-vpc-lattice/">Build secure multi-account multi-VPC connectivity for your applications with Amazon VPC Lattice</a> (April 2023): service networks, services and auth policies across accounts (predates resource configurations and service network endpoints).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/external-connectivity-to-amazon-vpc-lattice/">External Connectivity to Amazon VPC Lattice</a> (July 2023): the older proxy pattern for on-premises and other-Region access (predates service network endpoints, which have largely replaced it).</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/privatelink-access-service-networks.html">Access service networks through AWS PrivateLink</a> (AWS documentation): service network endpoints, address use per AZ, DNS names and on-premises access.</li>
+				<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-to-vpc-lattice-service.html">Routing traffic to Amazon VPC Lattice service domain endpoint</a> (Route 53 documentation): alias records for Lattice custom domains.</li>
+				<li><a href="https://aws.amazon.com/solutions/guidance/amazon-vpc-lattice-automated-dns-configuration-on-aws">Guidance for Amazon VPC Lattice Automated DNS Configuration on AWS</a> (AWS Solutions guidance, October 2024): creates DNS records for Lattice services automatically.</li>
+				<li><a href="https://d1.awsstatic.com/architecture-diagrams/ArchitectureDiagrams/lattice-use-cases-ra.pdf">Amazon VPC Lattice Reference Architectures</a> (AWS reference architecture diagrams, October 2023): Lattice use cases (predates resource configurations).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
