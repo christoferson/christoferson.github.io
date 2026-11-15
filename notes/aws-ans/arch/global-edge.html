@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Global Edge with CloudFront and Global Accelerator across Regions | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: a booking platform active in us-east-1, eu-central-1 and ap-northeast-1 behind CloudFront (cache policies, regional edge caches, Origin Shield, origin groups that fail over GET, HEAD and OPTIONS on 5xx and timeouts) and a Global Accelerator standard accelerator with ALB endpoint groups, traffic dials, weights, client affinity and client IP preservation; Route 53 alias records, latency routing as the DNS alternative, ARC Region switch for evacuation, cost and failover drills.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Global edge</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Global edge: CloudFront and Global Accelerator across Regions</h1>
+		<p>The booking platform now runs active in three Regions, and travellers in the Americas, Europe and Asia should reach the closest healthy one. CloudFront caches what can be cached and fails reads over between origins; a Global Accelerator standard accelerator gives the mobile and corporate API two static IP addresses and moves new connections away from a failed Region in under a minute, without waiting for DNS. This page builds both, compares them with Route 53 latency routing, and shows how to evacuate a Region on purpose.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Amazon CloudFront</span><span class="tag">AWS Global Accelerator</span><span class="tag">Amazon Route 53</span><span class="tag">Application Recovery Controller</span><span class="tag">Application Load Balancer</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Cache policies and Origin Shield</a></li>
+				<li class="sub"><a href="#b2">2. Origin groups for read failover</a></li>
+				<li class="sub"><a href="#b3">3. The booking-global accelerator</a></li>
+				<li class="sub"><a href="#b4">4. Weights, affinity and connection behavior</a></li>
+				<li class="sub"><a href="#b5">5. DNS records for both edges</a></li>
+				<li class="sub"><a href="#b6">6. Controlled Region evacuation</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) has finished its <a href="multi-region-network.html">multi-Region network</a>, so the booking platform on Amazon EKS now runs in all three Regions: <code>us-east-1</code> (booking VPC <code>10.40.8.0/21</code>), <code>eu-central-1</code> (<code>10.44.8.0/21</code>) and <code>ap-northeast-1</code> (<code>10.48.8.0/21</code>). Each Region has an internal ALB in front of the pods: <code>booking-alb-use1</code> from the <a href="inbound-perimeter.html">inbound perimeter page</a>, plus <code>booking-alb-euc1</code> and <code>booking-alb-apne1</code> built the same way in the booking account <code>222222222222</code>.</p>
+			<p>The inbound page already covers the distribution's TLS, VPC origins, WAF, Shield Advanced and the <code>partner-feed</code> accelerator; this page adds how requests choose a Region, what happens when one fails, and what it costs.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Fast pages and images for travellers on three continents</td><td data-label="Design choice">The existing CloudFront distribution with cache policies per path, regional edge caches and Origin Shield in one Region</td></tr>
+						<tr><td>Images and fare pages stay up if one origin fails</td><td data-label="Design choice">Origin groups with a primary and a secondary origin, failing over on 5xx and timeouts for GET, HEAD and OPTIONS</td></tr>
+						<tr><td>Mobile app and corporate booking tools need fixed IP addresses for firewall allow lists</td><td data-label="Design choice">A Global Accelerator standard accelerator, <code>booking-global</code>, with two static anycast IPs</td></tr>
+						<tr><td>Bookings (POST) keep working within a minute of a Regional failure, without DNS caching delays</td><td data-label="Design choice">Endpoint groups in three Regions with ALB endpoints; health-based failover at the edge</td></tr>
+						<tr><td>Operations can drain a Region deliberately for maintenance or a suspected fault</td><td data-label="Design choice">Traffic dials, orchestrated by an ARC Region switch plan</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Two public names reach the platform. <code>www.example.com</code> and <code>api.example.com</code> serve browsers through CloudFront, as on the inbound page. A new name, <code>mobile-api.example.com</code>, serves the mobile app and the corporate travel tools of large customers, whose security teams allow outbound traffic only to listed IP addresses.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>Three requests show the two edges and a failure.</p>
+			<ol class="flow">
+				<li class="group">A traveller in Madrid opens a fare page with images</li>
+				<li class="auto"><span class="name">Nearest POP<span class="who auto">AWS</span></span><span class="desc">An alias for <code>www.example.com</code> resolves to a nearby edge location, where TCP and TLS finish.</span></li>
+				<li class="auto"><span class="name">POP, then regional edge cache<span class="who auto">AWS</span></span><span class="desc">An image misses at the POP and is looked up in the larger regional edge cache shared by several POPs.</span></li>
+				<li class="auto"><span class="name">Origin Shield<span class="who auto">AWS</span></span><span class="desc">On a second miss it goes to Origin Shield in us-east-1, which every regional edge cache funnels through, so the bucket sees one request instead of one per regional cache.</span></li>
+				<li class="auto"><span class="name">Origin group<span class="who auto">AWS</span></span><span class="desc">Origin Shield fetches from the primary bucket in us-east-1. If that returns a 500, 502, 503 or 504, or times out, CloudFront retries the same GET on the secondary bucket in eu-central-1.</span></li>
+				<li class="group">A traveller in Osaka books a hotel from the mobile app</li>
+				<li class="auto"><span class="name">Anycast entry<span class="who auto">AWS</span></span><span class="desc"><code>mobile-api.example.com</code> resolves to the accelerator's two static IPs. The nearest edge location terminates TCP and opens a second connection across the AWS backbone.</span></li>
+				<li class="auto"><span class="name">Endpoint group choice<span class="who auto">AWS</span></span><span class="desc">Global Accelerator picks the closest healthy endpoint group, Tokyo, at its traffic dial of 100 percent, and the endpoint by weight within it: <code>booking-alb-apne1</code>.</span></li>
+				<li class="auto"><span class="name">ALB with the client address<span class="who auto">AWS</span></span><span class="desc">The internal ALB receives the request with the phone's real address preserved, terminates TLS and adds it in <code>X-Forwarded-For</code>. The POST goes to a booking pod.</span></li>
+				<li class="group">Tokyo fails</li>
+				<li class="auto"><span class="name">Health turns red<span class="who auto">AWS</span></span><span class="desc">The ALB's target groups lose their healthy targets, so Global Accelerator marks the endpoint unhealthy. It uses the ALB's own target group health checks for this, not its own.</span></li>
+				<li class="auto"><span class="name">New connections move<span class="who auto">AWS</span></span><span class="desc">In under a minute, new connections go to the next closest group. The client still uses the same two IPs, so no DNS record changes.</span></li>
+				<li class="auto"><span class="name">Existing flows<span class="who auto">AWS</span></span><span class="desc">Open connections are not moved; the app retries on a new one.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Cache policies per path, regional edge caches and Origin Shield</h3>
+				<p>The distribution from the inbound page gets one cache behavior per kind of content. The <strong>cache policy</strong> sets the cache key and TTLs, and everything in the cache key is also forwarded to the origin, so a lean key means a higher hit ratio:</p>
+				<ul>
+					<li><code>/images/*</code> and <code>/static/*</code>: managed <strong>CachingOptimized</strong> (no cookies or query strings; TTLs 1 second, 1 day, 1 year).</li>
+					<li><code>/fares/*</code> (public fare pages, GET only): a custom policy with the <code>route</code> and <code>date</code> query strings in the key and a minimum TTL of 0, so the origin's <code>Cache-Control: s-maxage=60</code> decides how long a page lives.</li>
+					<li><code>/api/*</code> (searches with personal prices, logins, bookings): the managed <strong>CachingDisabled</strong> policy, with all TTLs at 0, and an origin request policy that forwards the headers the API needs without adding them to the key.</li>
+				</ul>
+				<p>With a minimum TTL above 0, CloudFront caches for at least that long even if the origin sends <code>no-store</code>, so one traveller's prices could reach another; CachingDisabled removes that risk.</p>
+				<p>Uncached does not mean unaccelerated: handshakes end at the POP, CloudFront keeps persistent origin connections, streams from the first byte and stays on the AWS network. Proxy methods (POST, PUT, PATCH, DELETE, OPTIONS) and requests CloudFront judges dynamic skip the regional edge cache and go from the POP straight to the origin.</p>
+				<p><strong>Origin Shield</strong> is set per origin, in the Region with the lowest latency to that origin. The image bucket is in us-east-1, so its Origin Shield is in us-east-1. It is not enabled on the ALB origins, because dynamic requests through Origin Shield are always charged and never served from it.</p>
+				<span class="file">Image origin with Origin Shield, and the three cache behaviors (CloudFormation YAML, excerpt of the distribution in the booking account)</span>
+<pre><code>Origins:
+  - Id: images-use1
+    DomainName: travel-images-use1.s3.us-east-1.amazonaws.com
+    S3OriginConfig:
+      OriginAccessIdentity: ""
+    OriginAccessControlId: !Ref ImagesOac
+    # one shield layer in the origin's own Region; every regional edge cache funnels through it
+    OriginShield:
+      Enabled: true
+      OriginShieldRegion: us-east-1
+CacheBehaviors:
+  - PathPattern: /images/*
+    # origin group from Step 2
+    TargetOriginId: images-og
+    ViewerProtocolPolicy: redirect-to-https
+    # managed CachingOptimized
+    CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+  - PathPattern: /fares/*
+    TargetOriginId: fares-og
+    ViewerProtocolPolicy: redirect-to-https
+    CachePolicyId: !Ref FaresCachePolicy
+  - PathPattern: /api/*
+    TargetOriginId: booking-alb-use1
+    ViewerProtocolPolicy: redirect-to-https
+    AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+    # managed CachingDisabled: every TTL is 0
+    CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+    OriginRequestPolicyId: !Ref ApiOriginRequestPolicy</code></pre>
+				<p>In standard logs, a hit at Origin Shield shows as <code>OriginShieldHit</code> in <code>x-edge-detailed-result-type</code>, which shows whether the layer earns its fee.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Origin groups for read failover</h3>
+				<p>An <strong>origin group</strong> has exactly two origins, a primary and a secondary, and a list of status codes that trigger failover. When the primary returns one of them, CloudFront retries the same request on the secondary. Two traps in the criteria: a failed connection counts only if <strong>503</strong> is selected, and a timeout only if <strong>504</strong> is selected. The company selects 500, 502, 503 and 504.</p>
+				
+				<ul>
+					<li><code>images-og</code>: the image bucket in us-east-1 (primary) and its replica in eu-central-1 (secondary). Each origin uses its own Origin Shield; the secondary has none.</li>
+					<li><code>fares-og</code>: the VPC origin for <code>booking-alb-use1</code> (primary) and one for <code>booking-alb-euc1</code> (secondary)</li>
+				</ul>
+				<p>Speed is set on each origin. With defaults, a dead primary costs 3 connection attempts of 10 seconds, about 30 seconds, before the secondary is tried. The company sets 1 attempt with a 3-second connection timeout on the primaries, so a dead primary costs a viewer a few seconds; an origin that accepts connections but hangs is governed by the response timeout (default 30 seconds), which the fare origins lower too.</p>
+				<span class="file">Origin groups with failover on 5xx (CloudFormation YAML, excerpt; the primary origins also set ConnectionAttempts: 1 and ConnectionTimeout: 3)</span>
+<pre><code>OriginGroups:
+  Quantity: 2
+  Items:
+    - Id: images-og
+      FailoverCriteria:
+        StatusCodes:
+          # 503 also covers connection failures, 504 covers timeouts
+          Quantity: 4
+          Items: [500, 502, 503, 504]
+      Members:
+        Quantity: 2
+        Items:
+          - OriginId: images-use1
+          - OriginId: images-euc1
+    - Id: fares-og
+      FailoverCriteria:
+        StatusCodes:
+          Quantity: 4
+          Items: [500, 502, 503, 504]
+      Members:
+        Quantity: 2
+        Items:
+          - OriginId: booking-alb-use1
+          - OriginId: booking-alb-euc1</code></pre>
+				<p>The limits are why origin groups do not solve the booking problem:</p>
+				<ul>
+					<li>Failover happens only for <strong>GET, HEAD and OPTIONS</strong> (OPTIONS only when it is a cached method). A POST that fails on the primary returns the error to the traveller.</li>
+					<li>There is <strong>no sticky state</strong>. Every request tries the primary first, so during an outage each request pays the failed attempt before the secondary answers.</li>
+					
+				</ul>
+				<p>For <code>/api/*</code>, the company therefore uses a viewer-request CloudFront Function with a KeyValueStore: it reads a Region cookie set at sign-in and selects the matching ALB origin, so a browser session stays in one Region. A per-Region flag in the KeyValueStore lets operations steer browsers away from a Region (Step 6). The 2026 active-active blog in the references builds this pattern.</p>
+				<div class="callout trap"><p>"Fail over POST requests between Regions through CloudFront" cannot be done with an origin group. Answers that need write failover point to Global Accelerator, to Route 53 failover or latency records with health checks, or to origin selection in a CloudFront Function.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The booking-global accelerator with three endpoint groups</h3>
+				<p>A <strong>standard accelerator</strong> routes each new connection to the optimal endpoint by location, health and weights; custom routing accelerators map ports to specific EC2 addresses and have no health checks, so they do not fit. The accelerator gets two static anycast IPv4 addresses from two independent network zones; if one is unreachable from a client network, the client retries the other. They stay with the accelerator until it is deleted, so customers list them once.</p>
+				<p>The Global Accelerator control plane is called in <strong>us-west-2</strong>, whatever Region the endpoints are in. A listener takes TCP 443; a listener has one endpoint group per Region, and each group here holds that Region's internal ALB.</p>
+				<span class="file">Accelerator, listener and the three endpoint groups (AWS CLI, booking account, control plane in us-west-2)</span>
+<pre><code>aws globalaccelerator create-accelerator --name booking-global --ip-address-type IPV4 --region us-west-2
+
+<span class="c"># source IP affinity keeps one phone on one Region's ALB for the whole booking</span>
+aws globalaccelerator create-listener --accelerator-arn ACCELERATOR_ARN \
+  --protocol TCP --port-ranges FromPort=443,ToPort=443 --client-affinity SOURCE_IP --region us-west-2
+
+<span class="c"># one group per Region; ALBs always have the client IP preserved when internal</span>
+aws globalaccelerator create-endpoint-group --listener-arn LISTENER_ARN \
+  --endpoint-group-region us-east-1 --traffic-dial-percentage 100 \
+  --endpoint-configurations EndpointId=arn:aws:elasticloadbalancing:us-east-1:222222222222:loadbalancer/app/booking-alb-use1/ALB_ID,Weight=128,ClientIPPreservationEnabled=true \
+  --region us-west-2
+aws globalaccelerator create-endpoint-group --listener-arn LISTENER_ARN \
+  --endpoint-group-region eu-central-1 --traffic-dial-percentage 100 \
+  --endpoint-configurations EndpointId=arn:aws:elasticloadbalancing:eu-central-1:222222222222:loadbalancer/app/booking-alb-euc1/ALB_ID,Weight=128,ClientIPPreservationEnabled=true \
+  --region us-west-2
+aws globalaccelerator create-endpoint-group --listener-arn LISTENER_ARN \
+  --endpoint-group-region ap-northeast-1 --traffic-dial-percentage 100 \
+  --endpoint-configurations EndpointId=arn:aws:elasticloadbalancing:ap-northeast-1:222222222222:loadbalancer/app/booking-alb-apne1/ALB_ID,Weight=128,ClientIPPreservationEnabled=true \
+  --region us-west-2</code></pre>
+				<p><strong>Health checks.</strong> For ALB and NLB endpoints, Global Accelerator relies on the load balancer's own target group health checks; the endpoint group's <code>--health-check-*</code> and <code>--threshold-count</code> settings apply only to EC2 and Elastic IP endpoints. An ALB counts as healthy only if <strong>every</strong> target group has a healthy target, so the target group health check should test the real booking path (a <code>/health</code> that checks the database), and an empty spare target group marks the whole Region unhealthy.</p>
+				<p><strong>Failover rules.</strong> When a group has no healthy endpoint with a weight above 0, Global Accelerator sends new connections to another group. If it tries the three closest groups and finds nothing healthy, it fails open and sends traffic to an endpoint in the closest group anyway. Traffic returns about 30 seconds after the endpoint recovers.</p>
+				<p><strong>WAF.</strong> AWS WAF cannot be attached to an accelerator, so each booking ALB gets a Regional web ACL with the same managed rules as the global one on the inbound page. Shield Advanced can protect the accelerator itself, as it does <code>partner-feed</code>.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Weights, client affinity and connection behavior</h3>
+				<p><strong>Endpoint weights</strong> (0 to 255, default 128) share traffic inside a Region in proportion to weight. For a blue/green release, a green ALB joins the us-east-1 group at a low weight; the update call lists both ALBs. Weight 0 stops new connections to an endpoint without removing it.</p>
+				<span class="file">Send about 10 percent of us-east-1 connections to the green ALB (AWS CLI, us-west-2)</span>
+<pre><code><span class="c"># 230 / (230 + 25): roughly 90 percent blue, 10 percent green</span>
+aws globalaccelerator update-endpoint-group --region us-west-2 \
+  --endpoint-group-arn ENDPOINT_GROUP_ARN_USE1 \
+  --endpoint-configurations EndpointId=BLUE_ALB_ARN,Weight=230,ClientIPPreservationEnabled=true EndpointId=GREEN_ALB_ARN,Weight=25,ClientIPPreservationEnabled=true</code></pre>
+				<p><strong>Client affinity.</strong> With affinity <code>NONE</code> (the default), a phone's next connection can land on a different endpoint. <code>SOURCE_IP</code> keeps a client address on the same endpoint, which suits the app's multi-step booking.</p>
+				<p><strong>Client IP preservation</strong> is always on for internal ALBs and on by default for internet-facing ALBs. Security groups see real client addresses, and the traffic bypasses network ACLs and GWLB or Network Firewall inspection in the booking VPC, which the PCI DSS review must accept.</p>
+				<p><strong>Connection behavior</strong> the app team must design for:</p>
+				<ul>
+					<li><strong>Idle timeouts are fixed</strong>: 340 seconds for TCP, 30 seconds for UDP. TCP keepalives do not count; at least one byte of data must flow, so the app's long-polling connection sends a small heartbeat.</li>
+					<li><strong>TCP fragments are dropped</strong> at the edge (UDP fragments are forwarded). Path MTU Discovery must therefore work, and ICMP cannot be blocked at the accelerator, so the endpoint security groups must allow the ICMP "fragmentation needed" message.</li>
+					<li>Pings are answered at the edge, so they say nothing about the path.</li>
+				</ul>
+				<span class="file">Allow ICMP type 3 code 4 (fragmentation needed) for Path MTU Discovery (AWS CLI, booking account, each Region)</span>
+<pre><code>aws ec2 authorize-security-group-ingress --region us-east-1 --group-id sg-0bookingalb \
+  --ip-permissions 'IpProtocol=icmp,FromPort=3,ToPort=4,IpRanges=[{CidrIp=0.0.0.0/0,Description=pmtud}]'</code></pre>
+				<p><strong>Performance</strong> comes from TCP termination at the edge: Global Accelerator ends the client's TCP connection at the edge and almost at once opens a new one to the endpoint, so the slow handshakes over a congested last mile are short, and the long haul runs on the backbone. Before launch, the company ran the Speed Comparison Tool (<code>speedtest.globalaccelerator.aws</code>) from test phones in the three continents to compare direct and accelerated downloads.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>DNS records for both edges</h3>
+				<p>Both edges are reached with Route 53 <strong>alias</strong> records, which work at the zone apex, answer as normal A records, follow changes in the target's addresses, and are free to query. The fixed hosted zone IDs are <strong><code>Z2FDTNDATAQYW2</code></strong> for CloudFront and <strong><code>Z2BJ6XQ5FK7U4H</code></strong> for Global Accelerator. CloudFront needs a separate AAAA alias for IPv6, and cannot be an alias target in a private zone.</p>
+				<span class="file">Alias records for the browser site and the mobile API (Route 53 change batch JSON, public zone example.com)</span>
+<pre><code>{
+  "Comment": "Browsers to CloudFront, apps to Global Accelerator",
+  "Changes": [
+    {"Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "www.example.com", "Type": "A",
+      "AliasTarget": {"HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "DISTRIBUTION_DOMAIN.cloudfront.net", "EvaluateTargetHealth": false}}},
+    {"Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "www.example.com", "Type": "AAAA",
+      "AliasTarget": {"HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "DISTRIBUTION_DOMAIN.cloudfront.net", "EvaluateTargetHealth": false}}},
+    {"Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "mobile-api.example.com", "Type": "A",
+      "AliasTarget": {"HostedZoneId": "Z2BJ6XQ5FK7U4H", "DNSName": "ACCELERATOR_DNS_NAME.awsglobalaccelerator.com", "EvaluateTargetHealth": false}}}
+  ]
+}</code></pre>
+				<span class="file">Apply the change batch (AWS CLI, account that owns the zone)</span>
+<pre><code>aws route53 change-resource-record-sets --hosted-zone-id ZONE_ID --change-batch file://edge-aliases.json</code></pre>
+				<p><code>EvaluateTargetHealth</code> cannot be true for a CloudFront target,. For the accelerator, failover happens behind the same two IPs, so the record never changes and its TTL does not affect availability. That is the key difference from DNS-based failover, where the worst case is health check detection plus the record TTL plus any extra client caching (Alternatives).</p>
+				<p>Corporate customers get the two static IPs for their allow lists. The IPs accept only client-initiated connections; outbound calls leave through the <a href="centralized-egress.html">centralized egress</a> NAT gateways.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Controlled Region evacuation</h3>
+				<p>Health-based failover handles crashes; a degraded but "healthy" Region, maintenance or a drill needs a deliberate move. For the accelerator, the tool is the <strong>traffic dial</strong> on the endpoint group: 0 to 100 percent of the traffic that would normally go to that Region, default 100. The rest goes to the next closest groups. Dial changes apply to new connections only; existing ones finish naturally.</p>
+				<span class="file">Evacuate Tokyo, then bring it back in stages (AWS CLI, us-west-2)</span>
+<pre><code><span class="c"># Tokyo's travellers now go to the next closest healthy group</span>
+aws globalaccelerator update-endpoint-group --region us-west-2 \
+  --endpoint-group-arn ENDPOINT_GROUP_ARN_APNE1 --traffic-dial-percentage 0
+
+<span class="c"># confirm the dial and the endpoint health</span>
+aws globalaccelerator describe-endpoint-group --region us-west-2 \
+  --endpoint-group-arn ENDPOINT_GROUP_ARN_APNE1
+
+<span class="c"># after the work: 25, 50, then 100 while watching error rates</span>
+aws globalaccelerator update-endpoint-group --region us-west-2 \
+  --endpoint-group-arn ENDPOINT_GROUP_ARN_APNE1 --traffic-dial-percentage 25</code></pre>
+				<div class="callout trap"><p>A traffic dial of 0 is not an off switch for failover. Failover ignores the dial: if the other Regions' endpoints become unhealthy, a Region dialed to 0 can still receive traffic. To keep a Region completely out, set its endpoint weights to 0 or remove the endpoints, and remember the fail-open rule when nothing is healthy.</p></div>
+				<p>A real evacuation also touches the KeyValueStore flag for browsers, the database writer Region and EKS capacity elsewhere. The company orchestrates these with an <strong>ARC Region switch</strong> plan (launched August 2025). Plans run execution blocks in parallel or in sequence, including ARC routing controls, Route 53 health checks, Aurora Global Database, EC2 Auto Scaling, EKS, ECS, manual approval and custom Lambda actions. The dial and the KeyValueStore flag are custom Lambda blocks that run after EKS scales up in the receiving Regions. Region switch has a data plane in each Region, so the plan does not depend on the Region being deactivated. It costs $70 per plan per month.</p>
+				<span class="file">Shift traffic away from Tokyo with the Region switch plan (AWS CLI)</span>
+<pre><code>aws arc-region-switch start-plan-execution \
+  --plan-arn PLAN_ARN \
+  --target-region ap-northeast-1 \
+  --action deactivate \
+  --mode graceful \
+  --comment "Tokyo database maintenance, change CHG-REF"</code></pre>
+				<p>ARC readiness checks, the older way to confirm a Region could take traffic, have been closed to new customers since April 2026; Region switch plan evaluation is the recommended replacement.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Two edges with different jobs</h4>
+				<p>CloudFront stays in front of browsers because it caches, runs WAF at the edge with larger body inspection, and accelerates the uncached API. Global Accelerator serves the app and corporate tools because they need fixed addresses and write failover in seconds. See <a href="../d1-task-1-1.html">Task 1.1</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Origin Shield in one Region only, on cacheable origins</h4>
+				<p>One shield in the bucket's Region raises the hit ratio for global viewers. It is billed per 10,000 requests (for example $0.0075 in the US), except those from the regional edge cache in the same Region; on API origins it would only add charges.</p>
+			</div>
+			<div class="entry">
+				<h4>Internal ALBs behind both edges</h4>
+				<p>Global Accelerator accepts internal ALBs and CloudFront reaches them as VPC origins, so no booking ALB has a public address. The DNS alternative below would need public ALBs. See <a href="../d1-task-1-3.html">Task 1.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>The accelerator costs <strong>$0.025 per hour</strong> (about $18 a month), charged even while disabled, plus a <strong>data transfer premium</strong> per GB on the <strong>dominant direction</strong> of each hour's traffic, on top of normal data transfer out. The premium depends on the Region and the edge location, for example $0.015 per GB for North American traffic and $0.035 per GB for some North America and Asia Pacific pairs. Booking traffic is small JSON, so the premium is modest; large downloads belong on CloudFront.</p>
+				<p>On CloudFront, data transfer from AWS origins (the ALBs and buckets) to CloudFront is free, so the Regions pay no internet data transfer out for this traffic. The company compared <strong>pay-as-you-go</strong> pricing with the <strong>flat-rate plans</strong> launched in November 2025 (Business $200 and Premium $1,000 per distribution per month, with no overage charges, and VPC origins included from Business upwards). Flat-rate plans buy predictable bills during sale peaks. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Route 53 latency records with health checks</h4>
+				<p>The DNS-only design gives <code>mobile-api.example.com</code> one latency record per Region, each an alias to that Region's (public) ALB with evaluate target health on, so a Region whose ALB has no healthy targets drops out of the answers. Route 53 picks the Region with the lowest latency from AWS's measurements between user networks and Regions. It costs only queries and health checks.</p>
+				<p>Its weakness is time. Failover takes detection (about 90 seconds with the default 30-second interval and threshold 3, or less with fast 10-second checks) plus the TTL, plus resolvers and clients that cache longer than told. Alias records to an ALB use a fixed 60-second TTL; non-alias records should use 60 seconds or less. Health checks also cannot reach private IPs, so internal endpoints would need CloudWatch alarm-based checks. See <a href="../d1-task-1-2.html">Task 1.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>ARC routing controls on the DNS design</h4>
+				<p>With the DNS design, controlled evacuation uses ARC routing controls: on/off switches that drive Route 53 health checks attached to the records. They are flipped through the cluster's data plane endpoints in five Regions, not by editing records, because the Route 53 control plane runs in us-east-1 while its data plane has a 100 percent SLA. A cluster costs $2.50 per hour, so it fits when DNS failover is already the design.</p>
+			</div>
+			<div class="entry">
+				<h4>CloudFront for everything, with Anycast static IPs</h4>
+				<p>CloudFront Anycast static IPs give a distribution a fixed list of 21 addresses that customers can allow, but only for HTTP(S), only with Price Class All and only after AWS approves the request. Write failover still needs origin selection logic.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Region evacuation drill</span><span class="desc">In a quarterly game day, set the Tokyo traffic dial to 0. The Tokyo ALB's <code>RequestCount</code> should fall toward zero as connections close (allow the 340-second idle timeout) while the others rise and error rates stay flat. Return the dial in steps.</span></li>
+				<li><span class="name">Health-based failover</span><span class="desc">Deregister all staging targets in one Region. <code>describe-endpoint-group</code> should show the endpoint <code>UNHEALTHY</code>, and a client opening new connections should be served elsewhere in under a minute.</span></li>
+				<li><span class="name">Static IP allow list</span><span class="desc">From a test network that allows only the two accelerator IPs, run a booking. Block one IP; the client should retry the other.</span></li>
+				<li><span class="name">CloudFront origin failover</span><span class="desc">Make the staging primary image bucket return 503 (deny CloudFront in its bucket policy) and request an uncached image: it should come from the secondary within the 3-second connection timeout. Send a POST to a failing primary and confirm it does <strong>not</strong> fail over.</span></li>
+				<li><span class="name">Cache behavior</span><span class="desc">Request the same image twice from two continents and check <code>x-edge-detailed-result-type</code> for <code>OriginShieldHit</code> on the second continent.</span></li>
+				<li><span class="name">DNS failover (alternative)</span><span class="desc">If the DNS design is used anywhere, fail its endpoint and read <code>aws route53 get-health-check-status --health-check-id HEALTH_CHECK_ID</code> for the checkers' view, then time how long clients take to follow, including TTL.</span></li>
+				<li><span class="name">Connection limits</span><span class="desc">Open an idle TCP connection through the accelerator with keepalives only and confirm it closes after about 340 seconds; with a one-byte heartbeat it stays.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Edge network services for global architectures</td><td data-label="What this architecture demonstrates">Cache policies, regional edge caches, Origin Shield, origin groups and their GET-only failover; a standard accelerator with endpoint groups, dials, weights and affinity</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> DNS solutions for public, private and hybrid requirements</td><td data-label="What this architecture demonstrates">Alias records to CloudFront and Global Accelerator, latency records with evaluate target health, TTLs in failover time, ARC routing controls and Region switch</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Load balancing for availability, scale and security</td><td data-label="What this architecture demonstrates">Internal ALBs as accelerator endpoints and VPC origins; target group health deciding Regional health</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">TCP termination at the edge, the Speed Comparison Tool, fixed idle timeouts, dropped TCP fragments, accelerator and CloudFront pricing</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Users worldwide, static IP addresses to allowlist, and failover between Regions in seconds that is not affected by DNS caching" is <strong>a Global Accelerator standard accelerator with an endpoint group per Region</strong>. "Move traffic away from one Region for maintenance" adds <strong>its traffic dial set to 0</strong>. "Serve cached images globally and fail over to a second bucket when the first returns errors" is <strong>a CloudFront origin group</strong>, which fails over only GET, HEAD and OPTIONS.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/building-multi-region-active-active-architectures-with-cloudfront-vpc-origins-and-advanced-routing/">Building Multi-Region Active-Active Architectures with CloudFront VPC origins and Advanced Routing</a> (August 2026): origin selection with a CloudFront Function and KeyValueStore.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-for-deployment-with-aws-global-accelerator/">Best practices for deployment with AWS Global Accelerator</a> (July 2024): dials, weights, health checks and affinity.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/deploying-multi-region-applications-in-aws-using-aws-global-accelerator/">Deploying multi-region applications in AWS using AWS Global Accelerator</a> (July 2022): multi-Region failover and traffic shifting with an accelerator.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/charting-the-life-of-an-amazon-cloudfront-request/">Charting the life of an Amazon CloudFront request</a> (October 2025): the POP, regional edge cache and Origin Shield path.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/latency-based-routing-leveraging-amazon-cloudfront-for-a-multi-region-active-active-architecture/">Using latency-based routing with Amazon CloudFront for a multi-Region active-active architecture</a> (April 2024): the DNS-based alternative.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/introducing-amazon-application-recovery-controller-region-switch-a-multi-region-application-recovery-service/">Introducing Amazon Application Recovery Controller Region switch: A multi-Region application recovery service</a> (August 2025): plans and execution blocks.</li>
+				<li><a href="https://docs.aws.amazon.com/global-accelerator/latest/dg/about-endpoint-groups-traffic-dial.html">Global Accelerator traffic dials</a> (AWS documentation): how dials, failover and weights interact.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/high_availability_origin_failover.html">CloudFront origin failover</a> (AWS documentation): origin groups, failover criteria and timeouts.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
