@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Network Observability and Troubleshooting | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: one observability stack for a three-Region Transit Gateway network, used on a real incident. Transit Gateway drop metrics and alarms, VPC flow logs with v11 tag and next-hop fields, Transit Gateway and Cloud WAN flow logs in a log archive account queried with Athena, Network Manager events and Route Analyzer, multi-Region Reachability Analyzer, Network Access Analyzer with Security Hub, Network Flow Monitor and Traffic Mirroring to S3.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Network observability</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Network observability and troubleshooting</h1>
+		<p>The travel company's network team builds one observability stack for its three-Region network: metrics and alarms, flow logs at every layer in a log archive account, Network Manager events, path analysis and on-demand packet capture. Then a change breaks part of the traffic from Frankfurt to Virginia, and each tool narrows the fault down until one attribute on one attachment explains it.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">CloudWatch</span><span class="tag">VPC Flow Logs</span><span class="tag">Network Manager</span><span class="tag">Reachability Analyzer</span><span class="tag">Traffic Mirroring</span><span class="tag">Athena</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Flow logs into the log archive</a></li>
+				<li class="sub"><a href="#b2">2. VPC flow logs with the useful fields</a></li>
+				<li class="sub"><a href="#b3">3. Metrics and alarms</a></li>
+				<li class="sub"><a href="#b4">4. Network Manager events and Route Analyzer</a></li>
+				<li class="sub"><a href="#b5">5. Path analysis and access compliance</a></li>
+				<li class="sub"><a href="#b6">6. Packet capture on demand</a></li>
+				<li class="sub"><a href="#b7">7. The incident: query, fix, prevent</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a> in <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, joined by <a href="multi-region-network.html">inter-Region peering</a> (option A on that page; segments are moving to Cloud WAN one by one). Egress and east-west traffic pass the <a href="centralized-egress.html">central firewall</a> and the <a href="gwlb-inspection.html">Gateway Load Balancer security VPC</a>, and the data centers connect over <a href="dx-resilient-hybrid.html">resilient Direct Connect</a> with backup VPNs. Each page added its own logs and alarms. Nobody could answer a cross-Region question quickly, because the evidence sat in different accounts, Regions and formats.</p>
+			<p>The network team's goal: for any "A cannot reach B" ticket, answer three questions within minutes. Is it the network or the application? Is it routing (control plane) or forwarding (data plane)? Which change caused it?</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Know about drops and link failures before customers do</td><td data-label="Design choice">CloudWatch alarms on Transit Gateway drop counters per production attachment, Direct Connect BGP status and prefix counts, VPN <code>TunnelState</code></td></tr>
+						<tr><td data-label="Requirement">One place to search every flow, kept cheaply for a year</td><td data-label="Design choice">VPC, Transit Gateway and Cloud WAN flow logs as Parquet with hourly Hive partitions, in buckets owned by the log archive account <code>777777777777</code>; Athena for queries</td></tr>
+						<tr><td data-label="Requirement">See every routing and topology change as it happens</td><td data-label="Design choice">All three Transit Gateways in one Network Manager global network; EventBridge rules in <code>us-west-2</code></td></tr>
+						<tr><td data-label="Requirement">Prove paths that must exist, and paths that must not</td><td data-label="Design choice">Reachability Analyzer (chained across Regions, cross-account through Organizations); Network Access Analyzer scopes with findings in Security Hub</td></tr>
+						<tr><td data-label="Requirement">Look inside packets during an incident, without installing anything on production hosts</td><td data-label="Design choice">VPC Traffic Mirroring sessions created on demand, to a capture host writing pcap files to S3 through Mountpoint</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Values used on this page:</p>
+			<ul>
+				<li><strong>The request in the incident</strong> (as on <a href="multi-region-network.html">Multi-Region network</a>): a Frankfurt booking pod <code>10.44.12.30</code> in <code>vpc-0bookingeuc1</code> (bookings account <code>222222222222</code>) calls the fare service <code>10.41.20.15</code> on TCP 443 in the Virginia shared services VPC (network account <code>111111111111</code>), across <code>tgw-euc1</code>, <code>tgw-attach-peer-use1-euc1</code> and <code>tgw-use1</code>.</li>
+				<li><strong>New names</strong>: Frankfurt attachments <code>tgw-attach-bookings-euc1</code> and <code>tgw-attach-dev-euc1</code>; the fare instance interface <code>eni-0fare01</code> behind <code>tgw-attach-shared-services</code>; a capture host interface <code>eni-0capture01</code>; and <code>tgw-attach-inspection-v2</code>, the rebuilt security VPC attachment in the incident.</li>
+				<li><strong>Log buckets</strong> in the log archive account: <code>central-flow-logs-111111111111</code> (us-east-1, the bucket the hub and egress pages already use) and <code>central-flow-logs-111111111111-euc1</code> (eu-central-1, so European flow records stay in Europe), plus <code>travel-pcap-777777777777</code> for captures.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 265" role="img" aria-labelledby="dgM-wide-t">
+<title id="dgM-wide-t">Network observability: the request path from a Frankfurt booking pod through tgw-euc1, tgw-use1 and the inspection firewalls to the Virginia fare service, with the hops each tool covers: Network Flow Monitor end to end, Reachability Analyzer in two chained analyses, Transit Gateway flow logs and Route Analyzer between the gateways, and Traffic Mirroring at the fare service; the fault is asymmetric routing at the firewalls.</title>
+<path d="M135.0 60.0 L167.0 60.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M297.0 60.0 L329.0 60.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M459.0 60.0 L491.0 60.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="475" cy="60" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M471 56l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="475" y="92" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">asymmetric</text>
+<path d="M621.0 60.0 L653.0 60.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M70 140 L718 140" stroke="var(--info)" stroke-width="3"/>
+<path d="M70 133 L70 147" stroke="var(--info)" stroke-width="3"/>
+<path d="M718 133 L718 147" stroke="var(--info)" stroke-width="3"/>
+<text x="394" y="132" class="dg-lbl dg-halo" text-anchor="middle" style="fill:var(--info)">Network Flow Monitor: TCP health end to end</text>
+<path d="M70 175 L313 175" stroke="var(--accent)" stroke-width="3"/>
+<path d="M70 168 L70 182" stroke="var(--accent)" stroke-width="3"/>
+<path d="M313 168 L313 182" stroke="var(--accent)" stroke-width="3"/>
+<text x="191" y="167" class="dg-lbl dg-halo" text-anchor="middle" style="fill:var(--accent)">Reachability Analyzer, Frankfurt</text>
+<path d="M313 175 L718 175" stroke="var(--accent)" stroke-width="3"/>
+<path d="M313 168 L313 182" stroke="var(--accent)" stroke-width="3"/>
+<path d="M718 168 L718 182" stroke="var(--accent)" stroke-width="3"/>
+<text x="515" y="167" class="dg-lbl dg-halo" text-anchor="middle" style="fill:var(--accent)">Reachability Analyzer, Virginia</text>
+<path d="M232 210 L394 210" stroke="var(--warn)" stroke-width="3"/>
+<path d="M232 203 L232 217" stroke="var(--warn)" stroke-width="3"/>
+<path d="M394 203 L394 217" stroke="var(--warn)" stroke-width="3"/>
+<text x="313" y="202" class="dg-lbl dg-halo" text-anchor="middle" style="fill:var(--warn)">Transit Gateway flow logs, Route Analyzer</text>
+<path d="M556 245 L718 245" stroke="var(--text)" stroke-width="3"/>
+<path d="M556 238 L556 252" stroke="var(--text)" stroke-width="3"/>
+<path d="M718 238 L718 252" stroke="var(--text)" stroke-width="3"/>
+<text x="637" y="237" class="dg-lbl dg-halo" text-anchor="middle" style="fill:var(--text)">Traffic Mirroring</text>
+<rect x="5" y="37" width="130" height="46" rx="10" class="dg-box"/>
+<text x="70" y="57" class="dg-t dg-sm">Booking pod</text>
+<text x="70" y="74" class="dg-s dg-sm2">10.44.12.30</text>
+<rect x="167" y="37" width="130" height="46" rx="10" class="dg-hub"/>
+<text x="232" y="57" class="dg-t dg-sm">tgw-euc1</text>
+<text x="232" y="74" class="dg-s dg-sm2">Frankfurt</text>
+<rect x="329" y="37" width="130" height="46" rx="10" class="dg-hub"/>
+<text x="394" y="57" class="dg-t dg-sm">tgw-use1</text>
+<text x="394" y="74" class="dg-s dg-sm2">Virginia</text>
+<rect x="491" y="37" width="130" height="46" rx="10" class="dg-box"/>
+<text x="556" y="57" class="dg-t dg-sm">Firewalls</text>
+<text x="556" y="74" class="dg-s dg-sm2">appliance mode off</text>
+<rect x="653" y="37" width="130" height="46" rx="10" class="dg-box"/>
+<text x="718" y="57" class="dg-t dg-sm">Fare service</text>
+<text x="718" y="74" class="dg-s dg-sm2">10.41.20.15:443</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 440" role="img" aria-labelledby="dgM-tall-t">
+<title id="dgM-tall-t">Network observability: the request path from a Frankfurt booking pod through tgw-euc1, tgw-use1 and the inspection firewalls to the Virginia fare service, with the hops each tool covers: Network Flow Monitor end to end, Reachability Analyzer in two chained analyses, Transit Gateway flow logs and Route Analyzer between the gateways, and Traffic Mirroring at the fare service; the fault is asymmetric routing at the firewalls.</title>
+<path d="M70.0 63.0 L70.0 107.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M70.0 153.0 L70.0 197.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M70.0 243.0 L70.0 287.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="70" cy="265" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M66 261l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="84" y="269" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">asymmetric</text>
+<path d="M70.0 333.0 L70.0 377.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M165 40 L165 400" stroke="var(--info)" stroke-width="3"/>
+<path d="M158 40 L172 40" stroke="var(--info)" stroke-width="3"/>
+<path d="M158 400 L172 400" stroke="var(--info)" stroke-width="3"/>
+<text x="262" y="224" class="dg-lbl dg-halo" style="fill:var(--info)">Network Flow Monitor</text>
+<path d="M195 40 L195 175" stroke="var(--accent)" stroke-width="3"/>
+<path d="M188 40 L202 40" stroke="var(--accent)" stroke-width="3"/>
+<path d="M188 175 L202 175" stroke="var(--accent)" stroke-width="3"/>
+<text x="262" y="111" class="dg-lbl dg-halo" style="fill:var(--accent)">Reachability (Frankfurt)</text>
+<path d="M195 175 L195 400" stroke="var(--accent)" stroke-width="3"/>
+<path d="M188 175 L202 175" stroke="var(--accent)" stroke-width="3"/>
+<path d="M188 400 L202 400" stroke="var(--accent)" stroke-width="3"/>
+<text x="262" y="291" class="dg-lbl dg-halo" style="fill:var(--accent)">Reachability (Virginia)</text>
+<path d="M225 130 L225 220" stroke="var(--warn)" stroke-width="3"/>
+<path d="M218 130 L232 130" stroke="var(--warn)" stroke-width="3"/>
+<path d="M218 220 L232 220" stroke="var(--warn)" stroke-width="3"/>
+<text x="262" y="168" class="dg-lbl dg-halo" style="fill:var(--warn)">TGW flow logs</text>
+<path d="M250 310 L250 400" stroke="var(--text)" stroke-width="3"/>
+<path d="M243 310 L257 310" stroke="var(--text)" stroke-width="3"/>
+<path d="M243 400 L257 400" stroke="var(--text)" stroke-width="3"/>
+<text x="262" y="359" class="dg-lbl dg-halo" style="fill:var(--text)">Traffic Mirroring</text>
+<rect x="5" y="17" width="130" height="46" rx="10" class="dg-box"/>
+<text x="70" y="37" class="dg-t dg-sm">Booking pod</text>
+<text x="70" y="54" class="dg-s dg-sm2">10.44.12.30</text>
+<rect x="5" y="107" width="130" height="46" rx="10" class="dg-hub"/>
+<text x="70" y="127" class="dg-t dg-sm">tgw-euc1</text>
+<text x="70" y="144" class="dg-s dg-sm2">Frankfurt</text>
+<rect x="5" y="197" width="130" height="46" rx="10" class="dg-hub"/>
+<text x="70" y="217" class="dg-t dg-sm">tgw-use1</text>
+<text x="70" y="234" class="dg-s dg-sm2">Virginia</text>
+<rect x="5" y="287" width="130" height="46" rx="10" class="dg-box"/>
+<text x="70" y="307" class="dg-t dg-sm">Firewalls</text>
+<text x="70" y="324" class="dg-s dg-sm2">appliance mode off</text>
+<rect x="5" y="377" width="130" height="46" rx="10" class="dg-box"/>
+<text x="70" y="397" class="dg-t dg-sm">Fare service</text>
+<text x="70" y="414" class="dg-s dg-sm2">10.41.20.15:443</text>
+</svg>
+				<figcaption>Figure: the bars show which hops each tool sees. Network Flow Monitor measures TCP health from the pod's node to the fare service. Reachability Analyzer works in one Region at a time, so the path is checked in two chained analyses that meet at the peering attachment. Transit Gateway flow logs and Route Analyzer cover the gateways and their route tables, and Traffic Mirroring copies packets at the fare service. VPC flow logs run at both ends. In the incident, the replaced inspection attachment had appliance mode off, so the two directions of a flow reached firewalls in different AZs.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions of a person or a host you run.</p>
+			<ol class="flow">
+				<li class="group">Where each tool sees the Frankfurt to Virginia request</li>
+				<li><span class="name">Pod opens a connection<span class="who">Booking pod</span></span><span class="desc"><code>10.44.12.30</code> sends a SYN to <code>10.41.20.15:443</code>. VPC flow logs record it, with <code>pkt-srcaddr</code> showing the pod; Network Flow Monitor's agent on the node counts retransmissions.</span></li>
+				<li class="auto"><span class="name">Frankfurt Transit Gateway<span class="who auto">AWS</span></span><span class="desc">The <code>prod</code> table sends <code>10.41.0.0/16</code> to the peering. Transit Gateway flow logs and CloudWatch drop counters see this hop.</span></li>
+				<li class="auto"><span class="name">Virginia Transit Gateway<span class="who auto">AWS</span></span><span class="desc">The <code>peer</code> table sends shared services traffic through the security VPC. Network Manager records every route change here; Route Analyzer traces the route-table path.</span></li>
+				<li class="auto"><span class="name">Firewall and fare service<span class="who auto">AWS</span></span><span class="desc">Firewalls behind the Gateway Load Balancer inspect the flow. Flow logs show what arrived at <code>eni-0fare01</code>; a mirror session copies the packets.</span></li>
+				<li class="group">The incident</li>
+				<li><span class="name">The change<span class="who">Network engineer</span></span><span class="desc">At 14:00 a pipeline replaces the Virginia security VPC attachment with <code>tgw-attach-inspection-v2</code> and moves the routes. Its module leaves appliance mode off.</span></li>
+				<li class="auto"><span class="name">First signals<span class="who auto">AWS</span></span><span class="desc">Network Manager events at 14:02 show the new attachment and routes. From 14:05 Network Flow Monitor shows retransmissions toward <code>us-east-1</code> with its health indicator at 0 (not AWS), and a third of fare calls fail.</span></li>
+				<li><span class="name">Rule out routing<span class="who">On-call engineer</span></span><span class="desc">Production drop alarms are quiet; the blackhole drops behind a gateway-wide alarm come from development. Route Analyzer and Reachability Analyzer report the path reachable.</span></li>
+				<li><span class="name">Find the data-plane fault<span class="who">On-call engineer</span></span><span class="desc">Flow logs show repeated SYNs with no reply; Virginia Transit Gateway flow logs show request and reply entering the security VPC in <em>different</em> AZs; mirroring proves the fare service answers.</span></li>
+				<li><span class="name">Fix and prevent<span class="who">Network engineer</span></span><span class="desc">Appliance mode goes on and errors stop. An EventBridge check and a Network Access Analyzer scope guard against a repeat.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Flow logs into the log archive, partitioned for Athena</h3>
+				<p>Flow logs are collected outside the traffic path, so they never affect throughput, but they are not real time (about 10 minutes to S3, best effort) and are billed as CloudWatch vended logs even when delivered to S3. The team chose:</p>
+				<ul>
+					<li><strong>S3 in the log archive account</strong>, one bucket per Region, written directly through the bucket policy (principal <code>delivery.logs.amazonaws.com</code>, conditioned on the organization). Network and workload accounts cannot delete the evidence.</li>
+					<li><strong>Parquet with Hive-compatible prefixes and hourly partitions.</strong> AWS states Parquet queries run 10 to 100 times faster with about 20% less storage; hourly partitions let a query read only the incident hour, and Athena bills by data scanned.</li>
+				</ul>
+				<p>Transit Gateway flow logs are created by the gateway owner, per gateway or per attachment. Their <strong>default format already includes every version 2 to 6 field</strong> (source and destination VPC, subnet, account, interface and AZ ID, the pair attachment and the four <code>packets-lost-*</code> counters), unlike VPC flow logs, whose default is version 2 only. The aggregation interval must be 60 seconds.</p>
+				<span class="file">Flow logs for the Frankfurt Transit Gateway as hourly Parquet in the European log bucket (AWS CLI, network account; repeat for tgw-use1 and tgw-apne1 with their Regional buckets)</span>
+<pre><code>aws ec2 create-flow-logs --region eu-central-1 \
+  --resource-type TransitGateway \
+  --resource-ids tgw-euc1 \
+  --max-aggregation-interval 60 \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::central-flow-logs-111111111111-euc1/tgw/ \
+  --destination-options FileFormat=parquet,HiveCompatiblePartitions=true,PerHourPartition=true</code></pre>
+				<p>AWS's Athena integration templates create a Glue database, a partitioned table, a partition-loading Lambda function and named queries such as top talkers; the 2023 Transit Gateway walkthrough expects all fields, Parquet, Hive prefixes and <em>daily</em> partitions. With hourly partitions, the team defines its own tables with partition projection over year, month, day and hour. Columns are the field names with underscores (<code>packets_lost_blackhole</code>).</p>
+				<p>Segments already on Cloud WAN get <strong>Cloud WAN flow logs</strong> (November 2026), created in the home Region with segment and Region fields (<a href="multi-region-network.html#b7">Multi-Region network, Step 7</a>), at no Cloud WAN charge beyond vended logs.</p>
+				<div class="callout note"><p>A flow log cannot be edited: a new format or destination means a new flow log, so settle the field list before rolling it out to hundreds of VPCs.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>VPC flow logs with the fields that answer questions</h3>
+				<p>The default version 2 record cannot tell a pod from its node, a request from a reply, or which workload an interface belongs to. A <strong>custom format</strong> adds:</p>
+				<ul>
+					<li><code>pkt-srcaddr</code> and <code>pkt-dstaddr</code>: the original addresses behind NAT gateways, Transit Gateway interfaces and EKS pods.</li>
+					<li><code>tcp-flags</code>: SYN 2, SYN-ACK 18, FIN 1, RST 4, OR-ed over the interval. Repeated 2s with no 18 back is a lost reply.</li>
+					<li><code>flow-direction</code>, <code>traffic-path</code> (egress only) and <code>az-id</code>.</li>
+					<li><strong>Version 11 fields</strong> (September 2026): <code>instance-tag</code>, <code>interface-tag</code> and <code>asg-tag</code> (each with a <code>-2</code> partner) hold tag values chosen with <code>--tag-field-specifications</code>, at most two keys per resource type; the <code>next-hop-*</code> fields show the next interface, subnet, AZ and VPC. Tags need <code>ec2:DescribeTags</code> and a service-linked role (Auto Scaling group tags also a CloudTrail trail); next-hop is not filled for internet gateways, cross-Region traffic or ingress from a Transit Gateway.</li>
+				</ul>
+				<span class="file">The Frankfurt booking VPC's flow log: audit and troubleshooting fields, node tags, next hop, to the European log bucket (AWS CLI, bookings account)</span>
+<pre><code><span class="c"># the instance tags are the EKS node's Name and Application tags</span>
+aws ec2 create-flow-logs --region eu-central-1 \
+  --resource-type VPC --resource-ids vpc-0bookingeuc1 \
+  --traffic-type ALL --max-aggregation-interval 60 \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::central-flow-logs-111111111111-euc1/vpc/ \
+  --destination-options FileFormat=parquet,HiveCompatiblePartitions=true,PerHourPartition=true \
+  --log-format '${version} ${account-id} ${vpc-id} ${subnet-id} ${az-id} ${instance-id} ${interface-id} ${srcaddr} ${dstaddr} ${pkt-srcaddr} ${pkt-dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${tcp-flags} ${flow-direction} ${traffic-path} ${instance-tag} ${instance-tag-2} ${next-hop-interface-type} ${next-hop-az-id} ${log-status}' \
+  --tag-field-specifications 'ResourceType=instance,TagKeys=Name,Application'</code></pre>
+				<p>Flow logs never contain traffic to the Amazon DNS server, instance metadata, Time Sync, DHCP or ARP, so "no record" does not always mean "no packet". StackSets deploy the same format to every production VPC, so one table definition fits all.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Metrics and alarms that point at a layer</h3>
+				<p><code>AWS/TransitGateway</code> publishes every 60 seconds, per gateway and per attachment; use <code>Sum</code>:</p>
+				<ul>
+					<li><code>PacketDropCountBlackhole</code>: matched a <strong>blackhole</strong> route, usually a deliberate block.</li>
+					<li><code>PacketDropCountNoRoute</code>: matched <strong>no</strong> route, usually a missing propagation or static route. <code>PacketDropCountTTLExpired</code> points at a loop.</li>
+					<li><code>BytesIn</code>, <code>BytesOut</code>, <code>PacketsIn</code>, <code>PacketsOut</code>, also per AZ for VPC attachments.</li>
+				</ul>
+				<p>All attachment metrics go to the gateway owner's account. The team alarms <strong>per production attachment</strong>: development is blackholed from production by design, so a gateway-wide counter is never quiet.</p>
+				<span class="file">Page the network team when production traffic in Frankfurt hits a blackhole or finds no route (AWS CLI, network account)</span>
+<pre><code><span class="c"># any blackholed packet from the booking attachment in five minutes is unexpected</span>
+aws cloudwatch put-metric-alarm --region eu-central-1 \
+  --alarm-name tgw-euc1-bookings-blackhole \
+  --namespace AWS/TransitGateway --metric-name PacketDropCountBlackhole \
+  --dimensions Name=TransitGatewayAttachment,Value=tgw-attach-bookings-euc1 \
+  --statistic Sum --period 300 --evaluation-periods 1 \
+  --threshold 0 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:eu-central-1:111111111111:network-oncall
+
+<span class="c"># no-route drops on the peering show a missing summary route between Regions</span>
+aws cloudwatch put-metric-alarm --region eu-central-1 \
+  --alarm-name tgw-euc1-peer-use1-noroute \
+  --namespace AWS/TransitGateway --metric-name PacketDropCountNoRoute \
+  --dimensions Name=TransitGatewayAttachment,Value=tgw-attach-peer-use1-euc1 \
+  --statistic Sum --period 300 --evaluation-periods 2 \
+  --threshold 100 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions arn:aws:sns:eu-central-1:111111111111:network-oncall</code></pre>
+				<p>The dimension set must match the published metric exactly (<code>aws cloudwatch list-metrics</code> shows it). Alarms live in the metric's Region, so each Region has its own set.</p>
+				<p>The hybrid edge keeps its alarms from the <a href="dx-resilient-hybrid.html#b6">Direct Connect page</a>: <code>VirtualInterfaceBgpStatus</code> (March 2026; Minimum below 1 is BGP down, sampled every five minutes), <code>VirtualInterfaceBgpPrefixesAccepted</code> and <code>...Advertised</code> (Maximum, below the prefix quota), and VPN <code>TunnelState</code>, where a connection-level value between 0 and 1 means one tunnel is down.</p>
+				<p><strong>Network Flow Monitor</strong> shows TCP performance as the workloads see it. Its eBPF agent on EC2 instances and EKS nodes (here the Frankfurt booking nodes) publishes <code>Retransmissions</code>, <code>Timeouts</code>, <code>RoundTripTime</code> and a <code>HealthIndicator</code> in <code>AWS/NetworkFlowMonitor</code>. It measures flows only to the edge of another Region, so it can say "flows to us-east-1 are retransmitting" but not where.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Network Manager: one topology, events and Route Analyzer</h3>
+				<p>The three Transit Gateways are registered in the global network <code>global-network-0travel1234567</code> (<a href="tgw-hub-spoke.html#b6">hub page, Step 6</a>). The global network is free and its home Region is always <code>us-west-2</code>, so <strong>every Network Manager event arrives in EventBridge in us-west-2</strong>, whichever Region changed:</p>
+				<ul>
+					<li><strong>Topology Change</strong>: attachments, peerings, VPNs, Connect peers and firewall attachments created or deleted.</li>
+					<li><strong>Routing Update</strong>: <code>TGW-ROUTE-INSTALLED</code> or <code>TGW-ROUTE-UNINSTALLED</code>, with per route the <code>destinationCidrBlock</code>, attachments, <code>routeType</code> and <code>routeState</code> (<code>active</code> or <code>blackhole</code>).</li>
+					<li><strong>Status Update</strong>: VPN IPsec and BGP, and Connect peer BGP, down or up.</li>
+				</ul>
+				<span class="file">Send every route change and every VPC attachment change to the guardrail checker and the change log (AWS CLI, us-west-2)</span>
+<pre><code>aws events put-rule --region us-west-2 \
+  --name tgw-routing-and-attachments \
+  --event-pattern '{
+    "source": ["aws.networkmanager"],
+    "detail-type": ["Network Manager Routing Update", "Network Manager Topology Change"],
+    "detail": {"changeType": ["TGW-ROUTE-INSTALLED", "TGW-ROUTE-UNINSTALLED", "VPC-ATTACHMENT-CREATED", "VPC-ATTACHMENT-DELETED"]}
+  }'
+
+<span class="c"># a Lambda function checks the change; the log group keeps a searchable timeline</span>
+aws events put-targets --region us-west-2 --rule tgw-routing-and-attachments \
+  --targets Id=checker,Arn=arn:aws:lambda:us-west-2:111111111111:function:network-guardrails Id=timeline,Arn=arn:aws:logs:us-west-2:111111111111:log-group:/network/change-timeline</code></pre>
+				<p>The checker pages on a production route entering <code>blackhole</code> state and, since the incident below, on a new attachment from an inspection VPC with appliance mode off (read from the attachment's options).</p>
+				<p><strong>Route Analyzer</strong> traces Transit Gateway route tables only, between attachments of registered gateways, optionally through a middlebox and back. It ignores VPC route tables, security groups, network ACLs and on-premises devices.</p>
+				<span class="file">Trace Frankfurt booking to the Virginia fare service, and the return path (AWS CLI, us-west-2)</span>
+<pre><code>aws networkmanager start-route-analysis --region us-west-2 \
+  --global-network-id global-network-0travel1234567 \
+  --source TransitGatewayAttachmentArn=arn:aws:ec2:eu-central-1:111111111111:transit-gateway-attachment/tgw-attach-bookings-euc1,IpAddress=10.44.12.30 \
+  --destination TransitGatewayAttachmentArn=arn:aws:ec2:us-east-1:111111111111:transit-gateway-attachment/tgw-attach-shared-services,IpAddress=10.41.20.15 \
+  --include-return-path</code></pre>
+				<p>The console adds a topology tree and a geographic map, with the data centers as sites and devices tied to their customer gateways.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Path analysis: Reachability Analyzer and Network Access Analyzer</h3>
+				<p><strong>Reachability Analyzer</strong> models the configuration (route tables, security groups, ACLs, Transit Gateway tables, load balancers, Network Firewall 5-tuple rules) and reports a hop-by-hop path or the blocking component, with codes such as <code>TGW_RTB_NO_ROUTE_TO_TGW_ATTACHMENT</code>. It sends no packets and costs $0.10 per analysis.</p>
+				<p>Source and destination must be in the <strong>same Region</strong>. AWS's January 2024 blog chains analyses: source to the peering attachment, then peering attachment to destination; a path exists only if both legs succeed. Cross-account paths use Organizations trusted access, with the network account as <strong>delegated administrator</strong> (any member account except the management account; other accounts' resources by ARN).</p>
+				<span class="file">Two legs of the Frankfurt to Virginia path, from the delegated administrator (AWS CLI, network account)</span>
+<pre><code><span class="c"># leg 1, eu-central-1: the booking node's interface to the peering attachment</span>
+aws ec2 create-network-insights-path --region eu-central-1 \
+  --source arn:aws:ec2:eu-central-1:222222222222:network-interface/eni-0bookingeuc1node \
+  --destination tgw-attach-peer-use1-euc1 \
+  --destination-ip 10.41.20.15 --protocol tcp --destination-port 443
+aws ec2 start-network-insights-analysis --region eu-central-1 \
+  --network-insights-path-id LEG1_PATH_ID
+
+<span class="c"># leg 2, us-east-1: from the peering attachment to the fare instance</span>
+aws ec2 create-network-insights-path --region us-east-1 \
+  --source tgw-attach-peer-use1-euc1 --source-ip 10.44.12.30 \
+  --destination eni-0fare01 --protocol tcp --destination-port 443
+aws ec2 start-network-insights-analysis --region us-east-1 \
+  --network-insights-path-id LEG2_PATH_ID</code></pre>
+				<p>Limits: IPv4 only; no Connect attachments or policy tables; for TCP through a Transit Gateway route table only the forward direction is analyzed; a GWLB endpoint path stops short of the appliances. A "reachable" answer proves configuration, not the return path through a firewall fleet.</p>
+				<p><strong>Network Access Analyzer</strong> finds paths that should not exist. A scope lists <em>match paths</em> (violations) and <em>exclude paths</em> (exceptions). The team's scopes: no internet gateway reaches card-data interfaces, development reaches no production VPC, and peering-to-shared traffic passes the security VPC. An analysis covers one account and Region at $0.002 per interface.</p>
+				<p>For <strong>continuous compliance</strong>, the pattern from AWS's Security Hub blog runs: an EventBridge schedule (every 12 hours by default) starts a Step Functions state machine that runs every scope and sends findings to Security Hub. Scope syntax is on <a href="../d3-task-3-2.html#s7">Task 3.2</a>.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Packet capture on demand with Traffic Mirroring and Mountpoint</h3>
+				<p>Flow logs summarize; sometimes the team needs packets. <strong>Traffic Mirroring</strong> copies packets from a source interface, wrapped in VXLAN on UDP 4789, to an interface, a Network Load Balancer (UDP 4789 listener) or a Gateway Load Balancer endpoint. A filter decides what is copied (no rules, nothing mirrored). Inbound packets dropped by the source's security group or ACL are never mirrored.</p>
+				<p>A runbook creates sessions only during incidents, because each costs about $0.015 an hour until deleted. The target is one capture instance's interface, because NLB and GWLB targets can deliver packets out of order; AWS's January 2024 blog uses a GWLB endpoint and an Auto Scaling group when scale matters more.</p>
+				<span class="file">Mirror TCP 443 on the fare instance to the capture host, first 256 bytes of each packet (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-traffic-mirror-target \
+  --description "incident capture host" \
+  --network-interface-id eni-0capture01
+
+aws ec2 create-traffic-mirror-filter --description "fare-https"
+aws ec2 create-traffic-mirror-filter-rule --traffic-mirror-filter-id tmf-0farehttps01 \
+  --traffic-direction ingress --rule-number 100 --rule-action accept --protocol 6 \
+  --destination-port-range FromPort=443,ToPort=443 \
+  --source-cidr-block 10.44.0.0/16 --destination-cidr-block 10.41.20.15/32
+aws ec2 create-traffic-mirror-filter-rule --traffic-mirror-filter-id tmf-0farehttps01 \
+  --traffic-direction egress --rule-number 100 --rule-action accept --protocol 6 \
+  --source-port-range FromPort=443,ToPort=443 \
+  --source-cidr-block 10.41.20.15/32 --destination-cidr-block 10.44.0.0/16
+
+<span class="c"># headers are enough to see SYN, SYN-ACK and retransmissions</span>
+aws ec2 create-traffic-mirror-session \
+  --network-interface-id eni-0fare01 \
+  --traffic-mirror-target-id tmt-0capture0001 \
+  --traffic-mirror-filter-id tmf-0farehttps01 \
+  --session-number 1 --packet-length 256 --virtual-network-id 4101</code></pre>
+				<p>The capture host allows UDP 4789 from the fare subnets and writes rotating pcap files into S3 through <strong>Mountpoint for Amazon S3</strong>, so captures outlive the instance and open in Wireshark, which decodes VXLAN. Mountpoint does not implement full POSIX semantics, so each file is written once, start to finish, as with the blog's 900-second rotation.</p>
+				<span class="file">On the capture host: mount the bucket, capture the VXLAN stream in 15-minute files (shell)</span>
+<pre><code>mkdir -p /mnt/pcap
+mount-s3 travel-pcap-777777777777 /mnt/pcap
+
+<span class="c"># mirrored packets arrive as VXLAN on UDP 4789; one new file every 900 seconds</span>
+tcpdump -i ens5 -nn udp port 4789 -G 900 -w '/mnt/pcap/fare-%Y-%m-%d-%H-%M.pcap'</code></pre>
+				<p>Only the capture host's role may write and only the network team read, because captures can hold sensitive data.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>The incident: query, fix and prevent</h3>
+				<p><strong>Rule out routing.</strong> An old gateway-wide blackhole alarm on <code>tgw-euc1</code> fired at 14:10. One query splits the drops by attachment:</p>
+				<span class="file">Which attachments lost packets to a blackhole or no route in the incident hour (Athena SQL, log archive account)</span>
+<pre><code><span class="c">-- year, month, day and hour are the partition columns of the team's table</span>
+SELECT tgw_attachment_id, tgw_src_vpc_id, srcaddr, dstaddr, dstport,
+       SUM(packets_lost_blackhole) AS blackhole,
+       SUM(packets_lost_no_route)  AS no_route
+FROM tgw_flow_logs_euc1
+WHERE (packets_lost_blackhole &gt; 0 OR packets_lost_no_route &gt; 0)
+  AND year = '2026' AND month = '11' AND day = '17' AND hour = '14'
+GROUP BY tgw_attachment_id, tgw_src_vpc_id, srcaddr, dstaddr, dstport
+ORDER BY blackhole + no_route DESC
+LIMIT 20;</code></pre>
+				<p>Every row came from <code>tgw-attach-dev-euc1</code>: a development load test hitting the designed blackhole. Route Analyzer and both Reachability Analyzer legs reported the path reachable. Configuration was fine; forwarding was not.</p>
+				<p><strong>Find the asymmetry.</strong> The booking VPC's flow logs showed repeated egress records with <code>tcp-flags</code> 2 and no ingress reply. The mirror session on <code>eni-0fare01</code> showed every SYN answered, so the reply was lost on the way back. The Virginia Transit Gateway flow logs located it:</p>
+				<span class="file">For flows between the pod and the fare service, which security VPC interface and AZ each direction used (Athena SQL, log archive account)</span>
+<pre><code>SELECT srcaddr, srcport, dstaddr, dstport,
+       tgw_dst_eni, tgw_dst_az_id, SUM(packets) AS packets
+FROM tgw_flow_logs_use1
+WHERE tgw_attachment_id = 'tgw-attach-inspection-v2'
+  AND ((srcaddr = '10.44.12.30' AND dstaddr = '10.41.20.15')
+    OR (srcaddr = '10.41.20.15' AND dstaddr = '10.44.12.30'))
+  AND year = '2026' AND month = '11' AND day = '17' AND hour = '14'
+GROUP BY srcaddr, srcport, dstaddr, dstport, tgw_dst_eni, tgw_dst_az_id
+ORDER BY srcport, dstport;</code></pre>
+				<p>For failing connections, the request entered the security VPC through the interface in one AZ and the reply through another. Without <strong>appliance mode</strong> the Transit Gateway picks the AZ for each direction separately, so the halves of a flow reached different firewalls, and the one that saw only the SYN-ACK dropped it as an unknown session. Flows whose directions shared an AZ worked: hence the partial failure.</p>
+				<span class="file">The fix (AWS CLI, network account)</span>
+<pre><code>aws ec2 modify-transit-gateway-vpc-attachment --region us-east-1 \
+  --transit-gateway-attachment-id tgw-attach-inspection-v2 \
+  --options ApplianceModeSupport=enable</code></pre>
+				<p>Errors stopped within a minute and the mirror session was deleted. Prevention: the pipeline module now enables appliance mode by default, the Step 4 checker pages on any inspection attachment without it, and the gateway-wide blackhole alarm, which cost the first ten minutes, became per-attachment alarms.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>S3 and Athena as the store, CloudWatch Logs only where alarms need it</h4>
+				<p>S3 is cheap to keep and query by partition; CloudWatch Logs adds Logs Insights and metric filters at higher cost for this volume. Only firewall alert logs and the event timeline go to CloudWatch Logs; Firehose is the option when a SIEM needs a stream.</p>
+			</div>
+			<div class="entry">
+				<h4>Where to enable flow logs</h4>
+				<p>Transit Gateway flow logs on every gateway, where cross-account and cross-Region questions are answered; VPC flow logs on every production VPC, and REJECT-only in development. The Rivian blog shows a cheaper option for one question: a catch-all route to a "blackhole VPC" with flow logs on that attachment only.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Flow logs are vended logs, billed per GB even to S3, plus storage and Athena scans; Regional buckets avoid cross-Region delivery at the price of one table per Region. Network Manager is free; Reachability Analyzer is $0.10 per analysis; Network Access Analyzer $0.002 per interface, so one scope over 1,000 interfaces twice a day is about $120 a month; mirroring about $0.015 per session-hour plus data transfer.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>CloudWatch Logs Insights instead of Athena</h4>
+				<p>Simpler for one VPC or a short window, but at three Regions and a year of retention, ingestion cost and scattered log groups make it the wrong primary store.</p>
+			</div>
+			<div class="entry">
+				<h4>Network Synthetic Monitor for the hybrid paths</h4>
+				<p>Agentless probes to on-premises addresses give a latency and loss baseline over Direct Connect or VPN, with a health indicator for the AWS side. It complements Network Flow Monitor (workloads) and Internet Monitor (end users).</p>
+			</div>
+			<div class="entry">
+				<h4>An always-on packet broker</h4>
+				<p>A permanent mirror fleet feeding an IDS gives continuous packet visibility, at the price of session-hours on every source and more bandwidth on busy instances. The company inspects inline instead.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Trip each alarm</span><span class="desc">In staging, blackhole a test CIDR and send traffic: the attachment alarm fires within five minutes and a routing event with <code>routeState</code> <code>blackhole</code> reaches the checker.</span></li>
+				<li><span class="name">Check the logs end to end</span><span class="desc">Ten minutes after a test connection, Athena returns its records in both Regions, with <code>pkt_srcaddr</code> showing the pod and <code>instance_tag</code> the node.</span></li>
+				<li><span class="name">Run the chained path daily</span><span class="desc">A scheduled job runs both Reachability Analyzer legs per critical pair and alarms if either fails.</span></li>
+				<li><span class="name">Rehearse the asymmetry</span><span class="desc">In staging, attach an inspection VPC without appliance mode: the checker pages and the second query shows split interfaces.</span></li>
+				<li><span class="name">Rehearse a capture</span><span class="desc">Run the mirroring runbook on a test instance: pcap files appear every 15 minutes and stop when the session is deleted.</span></li>
+				<li><span class="name">Verify the compliance loop</span><span class="desc">Add a route that bypasses inspection in staging: a Network Access Analyzer finding appears in Security Hub after the next run.</span></li>
+			</ol>
+			<div class="callout trap"><p><strong>Troubleshooting checklist.</strong> Reachable but failing: look at the data plane (firewall symmetry, MTU, the application). Intermittent failures through an inspection VPC: appliance mode. Drop alarms always firing: alarm per production attachment. A known flow is missing: Amazon DNS, metadata, DHCP and ARP are never logged, and the default format has no <code>pkt-srcaddr</code>.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-4.html">1.4</a> Define logging and monitoring requirements across AWS and hybrid networks</td><td data-label="What this architecture demonstrates">Choosing metrics, flow log fields, destinations and monitoring tools; Transit Gateway, Direct Connect and VPN alarms; Network Flow Monitor</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Maintain routing and connectivity on AWS and hybrid networks</td><td data-label="What this architecture demonstrates">Route change events, blackhole and no-route drops, appliance mode on inspection attachments</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Monitor and analyze network traffic to troubleshoot and optimize connectivity patterns</td><td data-label="What this architecture demonstrates">Athena on flow logs, Route Analyzer, chained Reachability Analyzer, Network Access Analyzer, Traffic Mirroring</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Validate and audit security by using network monitoring and logging services</td><td data-label="What this architecture demonstrates">Central log archive, custom flow log formats, continuous compliance findings in Security Hub, controlled packet capture</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Traffic through a centralized inspection VPC fails intermittently between VPCs in different Availability Zones" is <strong>enable appliance mode on the inspection VPC's Transit Gateway attachment</strong>. "Identify which configuration component blocks a path without sending traffic" is <strong>Reachability Analyzer</strong>; "verify that no unintended path exists" is <strong>Network Access Analyzer</strong>; "trace Transit Gateway route tables across Regions" is <strong>Network Manager Route Analyzer</strong>; "inspect packet contents" is <strong>Traffic Mirroring</strong>, never flow logs, which hold metadata only.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/simplify-vpc-flow-logs-with-ec2-resource-tags-and-next-hop-metadata/">Simplify VPC Flow Logs with EC2 resource tags and next-hop metadata</a> (September 2026): the version 11 tag and next-hop fields used in Step 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/monitoring-global-traffic-with-aws-cloud-wan-flow-logs/">Monitoring global traffic with AWS Cloud WAN Flow Logs</a> (November 2026): flow logs for the segments already on Cloud WAN.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/rivians-proactive-approach-to-identify-unrouteable-traffic-with-aws-transit-gateway-flow-logs/">Rivian's proactive approach to identify unrouteable traffic with AWS Transit Gateway Flow Logs</a> (December 2025): finding unroutable traffic across accounts and Regions with a blackhole VPC.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/visualizing-network-performance-of-your-aws-cloud-workloads-with-network-flow-monitor/">Visualizing network performance of your AWS Cloud workloads with Network Flow Monitor</a> (April 2025): agents, monitors and the network health indicator.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/using-aws-network-manager-events-to-manage-and-monitor-your-global-network/">Using AWS Network Manager Events to manage and monitor your global network</a> (January 2024): the events behind Step 4.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/using-vpc-reachability-analyzer-to-discover-network-paths-across-multiple-aws-regions/">Using VPC Reachability Analyzer to discover network paths across multiple AWS Regions</a> (January 2024): chaining analyses across Transit Gateway peering.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/capture-packets-with-amazon-vpc-traffic-mirroring-and-mountpoint-for-amazon-s3/">Capture packets with Amazon VPC Traffic Mirroring and Mountpoint for Amazon S3</a> (January 2024): the capture pattern in Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/continuous-verification-of-network-compliance-using-amazon-vpc-network-access-analyzer-and-aws-security-hub/">Continuous verification of network compliance using Amazon VPC Network Access Analyzer and AWS Security Hub</a> (December 2021): the scheduled scope analyses with findings in Security Hub.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/tgw-flow-logs.html">AWS Transit Gateway Flow Logs</a> (AWS documentation): fields, default format and limitations.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/transit-gateway-cloudwatch-metrics.html">CloudWatch metrics in AWS Transit Gateway</a> (AWS documentation): drop counters, dimensions and ownership.</li>
+				<li><a href="https://docs.aws.amazon.com/network-manager/latest/tgwnm/monitoring-events.html">Monitor your global network using EventBridge</a> (AWS documentation): every Network Manager event type with example JSON.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
