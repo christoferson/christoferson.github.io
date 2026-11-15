@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Data Perimeter Across the Organization | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: an AWS data perimeter for the whole organization. Only trusted identities, only trusted resources, only expected networks, enforced with resource control policies (aws:PrincipalOrgID, aws:SourceOrgID, aws:VpceOrgID), service control policies (aws:ResourceOrgID, aws:ViaAWSService) and VPC endpoint policies, with dp: exception tags, safe rollout through Policy Staging, quotas, and how a pod's request and a stolen-credential request are evaluated.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Data perimeter</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Data perimeter across the organization</h1>
+		<p>Only trusted identities, reaching only trusted resources, from only expected networks: three organization-wide guardrails that hold whatever individual teams write in their IAM and resource policies. Resource control policies, service control policies and VPC endpoint policies each enforce one side, and together they cover every direction.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 4</span><span class="tag">Domain 5</span><span class="tag">Domain 6</span><span class="tag">RCPs</span><span class="tag">SCPs</span><span class="tag">VPC endpoint policies</span><span class="tag">IAM Access Analyzer</span><span class="tag">CloudTrail</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Measure first, enable RCPs, tag</a></li>
+				<li class="sub"><a href="#b2">2. Identity perimeter RCP</a></li>
+				<li class="sub"><a href="#b3">3. Network perimeter RCP</a></li>
+				<li class="sub"><a href="#b4">4. Resource and network SCPs</a></li>
+				<li class="sub"><a href="#b5">5. VPC endpoint policies</a></li>
+				<li class="sub"><a href="#b6">6. Protect the tags and roll out</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) runs its web app, EKS containers, S3 data platform and GenAI assistant in production account <code>111111111111</code>. The data platform bucket <code>shop-data-111111111111</code> uses a customer managed KMS key; the analytics account <code>777777777777</code> reads it with the <code>analytics-etl</code> role, and the vendor <code>999999999999</code> collects a daily export. Workload VPCs connect through a transit gateway in the shared network account, with central egress through NAT gateways and Network Firewall.</p>
+			<p>A review found three ways data could leave despite tidy IAM policies: a wildcard bucket policy, pod credentials stolen through a request forgery bug and replayed from the internet, and an engineer copying objects to a personal bucket.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Company data is reachable only by company identities, plus the named vendor</td><td data-label="Design choice">Identity perimeter RCP with <code>aws:PrincipalOrgID</code>, an AWS service exception and the vendor account</td></tr>
+						<tr><td data-label="Requirement">AWS services act on company resources only on the company's behalf</td><td data-label="Design choice">Confused deputy statement in the same RCP with <code>aws:SourceOrgID</code></td></tr>
+						<tr><td data-label="Requirement">Company identities can't write to or read from buckets outside the organization</td><td data-label="Design choice">Resource perimeter SCP and endpoint policies with <code>aws:ResourceOrgID</code></td></tr>
+						<tr><td data-label="Requirement">Stolen workload credentials don't work from outside company networks</td><td data-label="Design choice">Network perimeter SCP and RCP with <code>aws:VpceOrgID</code> and the corporate CIDR</td></tr>
+						<tr><td data-label="Requirement">Exceptions are explicit, reviewed and can't be self-granted</td><td data-label="Design choice"><code>dp:</code> tags from the AWS policy examples, protected by a governance SCP</td></tr>
+						<tr><td data-label="Requirement">No outage while rolling out</td><td data-label="Design choice">Analysis first, then Policy Staging, sandbox, non-prod, prod</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from the task pages: the production VPC <code>vpc-0shop1234567890ab</code>, its S3 gateway endpoint <code>vpce-0abc1234def567890</code>, the EKS cluster <code>shop-prod</code> with the pod role <code>orders-api-pod-role</code>, the data platform key <code>1234abcd-12ab-34cd-56ef-1234567890ab</code>, the sandbox account <code>333333333333</code>, and the shared network account <code>777700007777</code> (as on Task 6.2), which owns the central interface endpoints. New on this page:</p>
+			<ul>
+				<li><strong>Organization root</strong> <code>r-abcd</code>; <strong>Workloads OU</strong> <code>ou-abcd-33333333</code>; <strong>Policy Staging OU</strong> <code>ou-abcd-44444444</code> with the test account <code>101010101010</code>.</li>
+				<li><strong>Corporate public range</strong> <code>192.0.2.0/24</code> (office internet egress) and an <strong>attacker address</strong> <code>198.51.100.77</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 330" role="img" aria-labelledby="dgP-wide-t">
+<title id="dgP-wide-t">Data perimeter: the orders pod reads the shop-data bucket through the S3 gateway endpoint inside the organization; stolen credentials used from the internet are denied by the network perimeter SCP and RCP, a copy to a bucket in another organization is denied by the resource perimeter SCP and endpoint policy, and an unknown account is denied by the identity perimeter RCP.</title>
+<rect x="10" y="100" width="600" height="140" rx="12" class="dg-grp"/>
+<text x="20" y="116" class="dg-lbl">o-exampleorgid: SCPs on principals, RCPs on resources</text>
+<path d="M180.0 170.0 L220.0 170.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M380.0 170.0 L420.0 170.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M500.0 68.0 L500.0 147.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="500" cy="108" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M496 104l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="514" y="112" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">network SCP + RCP</text>
+<path d="M300.0 193.0 L300.0 277.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="300" cy="235" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M296 231l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="314" y="239" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">resource SCP</text>
+<path d="M620.0 170.0 L580.0 170.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="600" cy="170" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M596 166l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="600" y="202" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">identity RCP</text>
+<rect x="20" y="147" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="167" class="dg-t dg-sm">orders-api pod</text>
+<text x="100" y="184" class="dg-s dg-sm2">dp:include:network</text>
+<rect x="220" y="147" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="167" class="dg-t dg-sm">S3 gateway endpoint</text>
+<text x="300" y="184" class="dg-s dg-sm2">endpoint policy</text>
+<rect x="420" y="147" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="167" class="dg-t dg-sm">shop-data bucket</text>
+<text x="500" y="184" class="dg-s dg-sm2">RCPs on resources</text>
+<rect x="420" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="42" class="dg-t dg-sm">Stolen credentials</text>
+<text x="500" y="59" class="dg-s dg-sm2">198.51.100.77</text>
+<rect x="220" y="277" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="297" class="dg-t dg-sm">Personal bucket</text>
+<text x="300" y="314" class="dg-s dg-sm2">other organization</text>
+<rect x="620" y="147" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="167" class="dg-t dg-sm">Unknown account</text>
+<text x="700" y="184" class="dg-s dg-sm2">wildcard bucket policy</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 410" role="img" aria-labelledby="dgP-tall-t">
+<title id="dgP-tall-t">Data perimeter: the orders pod reads the shop-data bucket through the S3 gateway endpoint inside the organization; stolen credentials used from the internet are denied by the network perimeter SCP and RCP, a copy to a bucket in another organization is denied by the resource perimeter SCP and endpoint policy, and an unknown account is denied by the identity perimeter RCP.</title>
+<rect x="10" y="10" width="180" height="300" rx="12" class="dg-grp"/>
+<text x="20" y="26" class="dg-lbl">o-exampleorgid</text>
+<path d="M100.0 83.0 L100.0 142.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 188.0 L100.0 247.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 270.0 L180.0 270.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="270" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 266l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="200" y="302" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">network SCP + RCP</text>
+<path d="M180.0 165.0 L220.0 165.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="165" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 161l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="200" y="197" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">resource SCP</text>
+<path d="M100.0 293.0 L100.0 368.0 Q100.0 375.0 107.0 375.0 L220.0 375.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="160" cy="375" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M156 371l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="160" y="407" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">identity RCP</text>
+<rect x="20" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="57" class="dg-t dg-sm">orders-api pod</text>
+<text x="100" y="74" class="dg-s dg-sm2">dp:include:network</text>
+<rect x="20" y="142" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="162" class="dg-t dg-sm">S3 gateway endpoint</text>
+<text x="100" y="179" class="dg-s dg-sm2">endpoint policy</text>
+<rect x="20" y="247" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="267" class="dg-t dg-sm">shop-data bucket</text>
+<text x="100" y="284" class="dg-s dg-sm2">RCPs on resources</text>
+<rect x="220" y="247" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="267" class="dg-t dg-sm">Stolen credentials</text>
+<text x="300" y="284" class="dg-s dg-sm2">198.51.100.77</text>
+<rect x="220" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="162" class="dg-t dg-sm">Personal bucket</text>
+<text x="300" y="179" class="dg-s dg-sm2">other organization</text>
+<rect x="220" y="352" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="372" class="dg-t dg-sm">Unknown account</text>
+<text x="300" y="389" class="dg-s dg-sm2">wildcard bucket policy</text>
+</svg>
+				<figcaption>Figure: green is the trusted path. The pod's request passes the endpoint policy, the SCPs on its account and the RCPs on the bucket's account, because principal, network and resource all belong to <code>o-exampleorgid</code>; normal policies then grant it. Each red link is denied by a different perimeter: valid credentials replayed from <code>198.51.100.77</code> fail the network perimeter (no organization endpoint, outside the corporate range), a copy to a personal bucket fails the resource perimeter, and an outside account fails the identity perimeter even if a bucket policy says <code>"Principal": "*"</code>.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Each objective has an identity side and a resource side. SCPs apply to principals in member accounts, RCPs to resources in member accounts, and endpoint policies to company network paths (mapping from the AWS policy examples repository).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Objective</th><th>Applied on</th><th>Control on this page</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Objective">Only trusted identities can access my resources</td><td data-label="Applied on">Resources</td><td data-label="Control on this page">Identity perimeter RCP (Step 2)</td></tr>
+						<tr><td data-label="Objective">Only trusted identities are allowed from my network</td><td data-label="Applied on">Networks</td><td data-label="Control on this page">VPC endpoint policy (Step 5)</td></tr>
+						<tr><td data-label="Objective">My identities can access only trusted resources</td><td data-label="Applied on">Identities</td><td data-label="Control on this page">Resource perimeter SCP (Step 4)</td></tr>
+						<tr><td data-label="Objective">Only trusted resources can be accessed from my network</td><td data-label="Applied on">Networks</td><td data-label="Control on this page">VPC endpoint policy (Step 5)</td></tr>
+						<tr><td data-label="Objective">My identities can access resources only from expected networks</td><td data-label="Applied on">Identities</td><td data-label="Control on this page">Network perimeter SCP (Step 4)</td></tr>
+						<tr><td data-label="Objective">My resources can be accessed only from expected networks</td><td data-label="Applied on">Resources</td><td data-label="Control on this page">Network perimeter RCP (Step 3)</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Perimeter statements only deny; normal policies still grant. Steps marked <span class="who auto">AWS</span> are evaluated automatically.</p>
+			<ol class="flow">
+				<li class="group">A trusted request: the orders pod reads from the data platform</li>
+				<li><span class="name">Pod calls S3<span class="who">Workload</span></span><span class="desc">The <code>orders-api</code> pod in <code>shop-prod</code> uses its Pod Identity role <code>orders-api-pod-role</code> (tagged <code>dp:include:network=true</code>) to call <code>s3:GetObject</code> on <code>shop-data-111111111111</code>. The route table sends the request to the gateway endpoint <code>vpce-0abc1234def567890</code> in <code>vpc-0shop1234567890ab</code>.</span></li>
+				<li class="auto"><span class="name">Endpoint policy<span class="who auto">AWS</span></span><span class="desc">Principal and bucket are both in <code>o-exampleorgid</code>: the first statement allows it.</span></li>
+				<li class="auto"><span class="name">SCPs on the caller's account<span class="who auto">AWS</span></span><span class="desc"><code>aws:ResourceOrgID</code> matches, and <code>aws:VpceOrgID</code> matches because the endpoint's owner <code>111111111111</code> is a member. No deny.</span></li>
+				<li class="auto"><span class="name">RCPs on the bucket's account<span class="who auto">AWS</span></span><span class="desc"><code>aws:PrincipalOrgID</code> and <code>aws:VpceOrgID</code> both match. No deny.</span></li>
+				<li class="auto"><span class="name">Normal evaluation, then KMS<span class="who auto">AWS</span></span><span class="desc">Identity and bucket policies allow the read. S3 calls KMS with a forward access session: <code>aws:ViaAWSService</code> is true, so network statements skip it, and the identity check still sees an organization principal.</span></li>
+				<li class="group">Stolen credentials used from outside</li>
+				<li><span class="name">Attacker replays the role session<span class="who">Attacker</span></span><span class="desc">An attacker who stole the pod role's temporary credentials calls <code>s3:GetObject</code> from <code>198.51.100.77</code> over the internet. The identity perimeter alone would not stop valid organization credentials.</span></li>
+				<li class="auto"><span class="name">Network perimeter SCP denies<span class="who auto">AWS</span></span><span class="desc">No endpoint, so <code>aws:VpceOrgID</code> is absent and <code>StringNotEqualsIfExists</code> matches; the address is outside <code>192.0.2.0/24</code> and the role carries <code>dp:include:network</code>. Result: <code>AccessDenied</code>, explicit deny in a service control policy.</span></li>
+				<li class="auto"><span class="name">The RCP denies as well<span class="who auto">AWS</span></span><span class="desc">The bucket account's network RCP matches the same conditions, so the resource side holds even if the SCP were detached.</span></li>
+				<li class="group">Data pushed out, and outsiders pulling in</li>
+				<li class="auto"><span class="name">Copy to a personal bucket<span class="who auto">AWS</span></span><span class="desc">An engineer calls <code>s3:PutObject</code> on a bucket in another organization. The endpoint policy and the resource perimeter SCP (on every path) deny it.</span></li>
+				<li class="auto"><span class="name">A wildcard bucket policy<span class="who auto">AWS</span></span><span class="desc">With <code>"Principal": "*"</code> in a bucket policy, an unknown account tries to read. The identity perimeter RCP denies it.</span></li>
+				<li class="auto"><span class="name">A confused deputy<span class="who auto">AWS</span></span><span class="desc">Another customer points an AWS service at the company's bucket. The call's <code>aws:SourceOrgID</code> is theirs, so the confused deputy statement denies it.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Measure first, enable RCPs and agree the tags</h3>
+				<p>Before any deny goes live, the team measures what crosses the perimeter today. <strong>IAM Access Analyzer</strong> with the organization as zone of trust lists resources whose policies grant outside access; it is Regional, so it runs in both Regions from the delegated administrator <code>222222222222</code>. The <strong>organization trail</strong> in <code>444444444444</code>, queried with Athena, shows real requests: <code>userIdentity</code>, <code>sourceIPAddress</code>, <code>vpcEndpointId</code>, <code>resources</code> and <code>recipientAccountId</code> (S3 object calls need data events).</p>
+				<span class="file">Organization-wide external access analyzer, one per Region (AWS CLI, security tooling account 222222222222)</span>
+<pre><code>aws accessanalyzer create-analyzer --region us-east-1 \
+  --analyzer-name org-external-access \
+  --type ORGANIZATION
+
+aws accessanalyzer create-analyzer --region us-west-2 \
+  --analyzer-name org-external-access \
+  --type ORGANIZATION</code></pre>
+				<p>The queries ask which outside accounts reached company resources (only the vendor should), which company principals touched outside resources (expect AWS-owned buckets), and which calls by future <code>dp:include:network</code> roles arrived without a <code>vpcEndpointId</code> from outside the corporate range. Each answer becomes an exception or a fix. CloudTrail doesn't record condition key values, so the queries rebuild them from log fields; AWS's <em>data perimeter helper</em> sample automates this.</p>
+				<p>Enabling RCPs on the root attaches <code>RCPFullAWSAccess</code> everywhere, so nothing changes until a deny is attached.</p>
+				<span class="file">Enable RCPs and tag the first principals that the network perimeter will cover (AWS CLI)</span>
+<pre><code><span class="c"># management account 555555555555</span>
+aws organizations enable-policy-type --root-id r-abcd --policy-type RESOURCE_CONTROL_POLICY
+
+<span class="c"># production account 111111111111: the network perimeter applies only to tagged principals</span>
+aws iam tag-role --role-name orders-api-pod-role \
+  --tags '{"Key": "dp:include:network", "Value": "true"}'</code></pre>
+				<p>Tags follow the AWS policy examples, all set to <code>true</code>: <code>dp:include:network</code> marks principals the network perimeter targets (workload roles first, since their credentials get replayed); <code>dp:exclude:network</code>, <code>dp:exclude:identity</code> and <code>dp:exclude:resource</code> exempt a principal or resource from one perimeter; <code>dp:exclude</code> exempts from all, for break-glass only.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The identity perimeter on resources (RCP)</h3>
+				<p>One RCP caps every team's bucket, key, queue and secret policies. The first statement denies callers outside the organization unless they are the vendor, the resource carries an exception tag, or an AWS service principal calls directly (<code>aws:PrincipalIsAWSService</code>). The second is the confused deputy guard: for service principal calls carrying <code>aws:SourceAccount</code>, <code>aws:SourceOrgID</code> must be the company's organization.</p>
+				<span class="file">Identity perimeter and confused deputy protection for S3, STS, KMS, SQS and Secrets Manager (RCP, adapted from the aws-samples identity_perimeter_rcp.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceOrgIdentities",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:*",
+        "sts:AssumeRole",
+        "sts:DecodeAuthorizationMessage",
+        "sts:GetAccessKeyInfo",
+        "sts:GetFederationToken",
+        "sts:GetServiceBearerToken",
+        "sts:GetSessionToken",
+        "sts:SetContext",
+        "kms:*",
+        "sqs:*",
+        "secretsmanager:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:PrincipalOrgID": "o-exampleorgid",
+          "aws:PrincipalAccount": ["999999999999"],
+          "aws:ResourceTag/dp:exclude:identity": "true"
+        },
+        "BoolIfExists": {
+          "aws:PrincipalIsAWSService": "false"
+        }
+      }
+    },
+    {
+      "Sid": "EnforceConfusedDeputyProtection",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:*", "sts:*", "kms:*", "sqs:*", "secretsmanager:*"],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:SourceOrgID": "o-exampleorgid",
+          "aws:ResourceTag/dp:exclude:identity": "true"
+        },
+        "Null": {
+          "aws:SourceAccount": "false"
+        },
+        "Bool": {
+          "aws:PrincipalIsAWSService": "true"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>Keys inside one condition block are ANDed, so with a negated operator the deny applies only when <em>every</em> exception fails. The STS list leaves out <code>sts:AssumeRoleWithSAML</code> and <code>sts:AssumeRoleWithWebIdentity</code>, because federated callers have no <code>aws:PrincipalOrgID</code>; the full sample guards web identity separately.</p>
+				<span class="file">Create the RCP and attach it to Policy Staging first (AWS CLI, management account)</span>
+<pre><code>aws organizations create-policy \
+  --content file://dp-identity-rcp.json \
+  --name dp-identity-perimeter \
+  --type RESOURCE_CONTROL_POLICY \
+  --description "Data perimeter: org identities, vendor, AWS services on our behalf"
+
+<span class="c"># use the policy ID returned above</span>
+aws organizations attach-policy --policy-id $RCP_ID --target-id ou-abcd-44444444</code></pre>
+				<div class="callout note"><p>RCPs cover only listed services: first S3, STS, KMS, SQS and Secrets Manager, and since a January 2026 expansion many more, such as CloudWatch Logs, DynamoDB, ECR and SNS. Amazon Bedrock wasn't listed when this page was written. For uncovered services, put the same conditions in resource-based policies. RCPs never restrict resources in the management account, service-linked roles, AWS managed KMS keys or <code>kms:RetireGrant</code>. They do apply to delegated administrator accounts and to member root users.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The network perimeter on resources (RCP)</h3>
+				<p>Listing every VPC or endpoint with <code>aws:SourceVpc</code> or <code>aws:SourceVpce</code> meant a policy change per new VPC. Since August 2025, <code>aws:VpceOrgID</code> holds the organization ID of the account that <em>owns the VPC endpoint</em> a request came through (with <code>aws:VpceOrgPaths</code> for OUs and <code>aws:VpceAccount</code> for one account). Every company endpoint, including the central ones in <code>777700007777</code>, is trusted automatically.</p>
+				<span class="file">Expected networks only, for services that support aws:VpceOrgID (RCP, adapted from the aws-samples network_perimeter_vpceorgid_rcp.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceNetworkPerimeterVpceOrgID",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["ecr:*", "kms:*", "s3:*", "sqs:*"],
+      "Resource": "*",
+      "Condition": {
+        "NotIpAddressIfExists": {
+          "aws:SourceIp": "192.0.2.0/24"
+        },
+        "StringNotEqualsIfExists": {
+          "aws:VpceOrgID": "o-exampleorgid",
+          "aws:PrincipalTag/dp:exclude:network": "true",
+          "aws:ResourceTag/dp:exclude:network": "true"
+        },
+        "BoolIfExists": {
+          "aws:PrincipalIsAWSService": "false",
+          "aws:ViaAWSService": "false"
+        },
+        "ArnNotLikeIfExists": {
+          "aws:PrincipalArn": ["arn:aws:iam::*:role/aws:ec2-infrastructure"]
+        },
+        "StringEquals": {
+          "aws:PrincipalTag/dp:include:network": "true"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>Deny when all are true: not from the office range (<code>aws:SourceIp</code> is absent through an endpoint), not through an organization-owned endpoint, no exception tag, no AWS service calling, not the <code>aws:ec2-infrastructure</code> role the sample excludes, and the caller <em>is</em> tagged <code>dp:include:network</code>. That last test keeps rollout gradual and leaves the vendor, whose roles lack the tag, free to read from its own network.</p>
+				<p>The <code>aws:ViaAWSService</code> exception is essential: when S3 calls KMS on the caller's behalf, the original endpoint isn't preserved, so without it every SSE-KMS read would fail at the KMS step.</p>
+				<div class="callout trap"><p><code>aws:VpceOrgID</code> is supported only by a listed set of services, and AWS warns that using it with others can give unintended results. That's why this statement names only four services. Secrets Manager, STS, CloudWatch Logs and DynamoDB go in a second statement copied from the AWS sample <code>network_perimeter_sourcevpc_rcp.json</code>, which lists VPC IDs with <code>aws:SourceVpc</code> instead. Remember that <code>aws:SourceVpc</code> is the VPC the <em>endpoint</em> is in. For the central interface endpoints that is the network account's endpoint VPC, not the workload VPC.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The resource and network perimeters on identities (SCPs)</h3>
+				<p>Exfiltration usually targets <em>someone else's</em> resource, where company RCPs don't apply, so an SCP stops company principals reaching resources outside the organization. AWS-owned resources (managed policies, public SSM documents, service sample buckets) are exempted with <code>NotResource</code>, and Amazon images with <code>ec2:Owner</code>. The list is shortened; <code>service_owned_resources.md</code> in the repository explains the full one.</p>
+				<span class="file">Company identities reach only company resources, AWS-owned resources and the vendor's export bucket (SCP, shortened from the aws-samples resource_perimeter_scp.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceResourcePerimeterAWSResources",
+      "Effect": "Deny",
+      "Action": "*",
+      "NotResource": [
+        "arn:aws:iam::aws:policy/*",
+        "arn:aws:ssm:*::document/*",
+        "arn:aws:ssm:*::parameter/*",
+        "arn:aws:ec2:*:aws:prefix-list/*",
+        "arn:aws:s3:::athena-examples-us-east-1",
+        "arn:aws:s3:::athena-examples-us-east-1/*",
+        "arn:aws:s3:::vendor-drop-999999999999/*"
+      ],
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:ResourceOrgID": "o-exampleorgid",
+          "ec2:Owner": "amazon",
+          "aws:PrincipalTag/dp:exclude:resource": "true"
+        }
+      }
+    },
+    {
+      "Sid": "EnforceResourcePerimeterThirdPartyResources",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": ["arn:aws:s3:::vendor-drop-999999999999/*"],
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:PrincipalTag/dp:exclude:resource": "true",
+          "aws:ResourceAccount": ["999999999999"]
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The vendor's bucket (named <code>vendor-drop-999999999999</code>, new here) is excluded from the first statement and guarded by the second, so company principals can reach it only while it stays in the vendor's account. A bucket with the same name re-created elsewhere (bucket sniping) is still denied.</p>
+				<p>The network perimeter SCP is the identity-side twin of Step 3. It stops stolen credentials being used against resources in the attacker's own account, where company RCPs don't reach.</p>
+				<span class="file">Company identities only from company networks (SCP, Action list shortened from the aws-samples network_perimeter_vpceorgid_scp.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceNetworkPerimeterVpceOrgID",
+      "Effect": "Deny",
+      "Action": ["ecr:*", "ecs:*", "kms:*", "lambda:*", "s3:*", "sqs:*"],
+      "Resource": "*",
+      "Condition": {
+        "BoolIfExists": {
+          "aws:ViaAWSService": "false"
+        },
+        "NotIpAddressIfExists": {
+          "aws:SourceIp": ["192.0.2.0/24"]
+        },
+        "StringNotEqualsIfExists": {
+          "aws:PrincipalTag/dp:exclude:network": "true",
+          "aws:VpceOrgID": "o-exampleorgid"
+        },
+        "ArnNotLikeIfExists": {
+          "aws:PrincipalArn": ["arn:aws:iam::*:role/aws:ec2-infrastructure"]
+        },
+        "StringEquals": {
+          "aws:PrincipalTag/dp:include:network": "true"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>SCPs have no <code>Principal</code> element and need no <code>aws:PrincipalIsAWSService</code> test, because they never apply to service principals or service-linked roles. They also never restrict the management account, which is one more reason to run no workloads there.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>VPC endpoint policies on the company's networks</h3>
+				<p>Every private request leaving a company VPC passes an endpoint policy, so it checks both identity and resource. The default AWS sample has three Allow statements: organization identities to organization resources; AWS service principals; and organization identities tagged <code>dp:exclude:resource</code> to any resource. Anything else through the endpoint is implicitly denied.</p>
+				<span class="file">Default data perimeter endpoint policy for the production S3 gateway endpoint (VPC endpoint policy, from the aws-samples default_endpoint_policy.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRequestsByOrgsIdentitiesToOrgsResources",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-exampleorgid",
+          "aws:ResourceOrgID": "o-exampleorgid"
+        }
+      }
+    },
+    {
+      "Sid": "AllowRequestsByAWSServicePrincipals",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:PrincipalIsAWSService": "true"
+        }
+      }
+    },
+    {
+      "Sid": "AllowRequestsByOrgsIdentitiesToAnyResources",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-exampleorgid",
+          "aws:PrincipalTag/dp:exclude:resource": "true"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<span class="file">Replace the default full-access policy on the gateway endpoint (AWS CLI, production account 111111111111)</span>
+<pre><code>aws ec2 modify-vpc-endpoint \
+  --vpc-endpoint-id vpce-0abc1234def567890 \
+  --policy-document file://dp-endpoint-policy.json</code></pre>
+				<p>An S3 <strong>gateway</strong> endpoint serves only its own VPC, not traffic over the transit gateway, VPN or Direct Connect, so every workload VPC gets one (free) with this policy through StackSets. <strong>Interface</strong> endpoints for STS, KMS, Secrets Manager and Bedrock are central in the network account, so one policy per endpoint covers every VPC. Services such as SSM, EC2 and ECR need the repository's service-specific endpoint policies. An endpoint policy can be up to 20,480 characters, and gateway endpoints require <code>"Principal": "*"</code>.</p>
+				<div class="callout trap"><p>An endpoint policy only filters traffic that uses the endpoint. On its own it can't stop a principal going around it, through the NAT gateway to the public S3 endpoint or from a laptop. The network perimeter SCP and RCP close that gap, and the egress firewall is a further layer, not the perimeter itself.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Protect the exception tags, then roll out in stages</h3>
+				<p>Anyone who can tag their own role <code>dp:exclude:network</code> could switch the perimeter off, so the governance SCP lets only platform administrators set <code>dp:</code> tags. The same file blocks sharing paths the main controls don't see, such as sharing snapshots and AMIs, RAM shares that allow outside principals and Lambda function URLs with no authentication. The governance RCP protects session tags, with an exception for tags set by the company's SAML identity provider.</p>
+				<span class="file">Only platform administrators may set dp: tags (SCP statement, from the aws-samples data_perimeter_governance_scp.json)</span>
+<pre><code>{
+  "Sid": "ProtectDataPerimeterTags",
+  "Effect": "Deny",
+  "Action": "*",
+  "Resource": "*",
+  "Condition": {
+    "StringNotEqualsIfExists": {
+      "aws:PrincipalTag/team": "admin"
+    },
+    "ForAnyValue:StringLike": {
+      "aws:TagKeys": ["dp:*"]
+    }
+  }
+}</code></pre>
+				<p>An SCP can be up to 10,240 characters with 10 attached per target. An RCP can be up to 5,120 characters with 5 per target, and the undetachable <code>RCPFullAWSAccess</code> counts as one, which leaves four. The pipeline minifies JSON, because whitespace counts. The company uses three: identity, network and governance.</p>
+				<p>Rollout follows the AWS advice not to attach RCPs to the root untested:</p>
+				<ol class="flow">
+					<li><b>Policy Staging</b>Attach all policies to <code>ou-abcd-44444444</code>, run the pod, analytics, vendor and console journeys against the test account <code>101010101010</code>, and watch CloudTrail for <code>AccessDenied</code>.</li>
+					<li><b>Sandbox</b>Attach the identity and resource perimeters to the Sandbox OU, where <code>333333333333</code> has real but low-risk users. The network perimeter isn't applied there: sandbox roles aren't tagged <code>dp:include:network</code>, and developers work from home.</li>
+					<li><b>Non-prod, then one prod account</b>Attach to the non-prod workloads OU, then directly to <code>111111111111</code>, and query the trail daily for denies from the new policies.</li>
+					<li><b>Workloads OU, then the root</b>Move the attachment to <code>ou-abcd-33333333</code> and finally to <code>r-abcd</code>, removing the account-level attachments. Widen <code>dp:include:network</code> from workload roles to human roles last.</li>
+				</ol>
+				<p>Control Tower users should check the AWS note that roles such as <code>AWSControlTowerExecution</code> may need an exception, or account enrollment breaks.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Deny on the organization ID, not allow lists of accounts</h4>
+				<p><code>aws:PrincipalOrgID</code>, <code>aws:ResourceOrgID</code>, <code>aws:SourceOrgID</code> and <code>aws:VpceOrgID</code> follow the organization automatically: a new account is inside the perimeter the moment it joins, and a divested one is outside the moment it leaves, with no policy edits. All four are single-valued and sensitive, so they are never used with wildcards. The perimeter is coarse on purpose; who may read <em>which</em> bucket is still the job of identity and resource policies (<a href="../d4-task-4-2.html">Task 4.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>RCPs first, resource policies where RCPs don't reach</h4>
+				<p>An RCP enforces the identity perimeter centrally, and developers keep writing their own resource policies inside it. For services not on the RCP list, the same statements go into resource policies, deployed and checked by AWS Config (<a href="../d6-task-6-1.html">Task 6.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>aws:VpceOrgID over lists of VPC and endpoint IDs</h4>
+				<p>One key replaces dozens of IDs and keeps policies within the RCP size limit. The cost is service coverage: services without <code>aws:VpceOrgID</code> support keep an <code>aws:SourceVpc</code> statement, which the platform team updates when a VPC is added. A tighter variant uses <code>aws:VpceOrgPaths</code> to trust only endpoints owned by accounts in the Workloads and Infrastructure OUs, so a sandbox endpoint doesn't count as an expected network.</p>
+			</div>
+			<div class="entry">
+				<h4>Network perimeter by opt-in tag</h4>
+				<p>Applying the network perimeter only to principals tagged <code>dp:include:network</code> lets it start with the highest-value targets, the workload roles whose credentials live on servers and pods, before human roles. The trade-off is that an untagged role is not covered. A custom AWS Config rule therefore flags workload roles without the tag, and the governance SCP stops anyone removing it.</p>
+			</div>
+			<div class="entry">
+				<h4>Vendor access by account, not by public resource</h4>
+				<p>Tagging the export bucket <code>dp:exclude:identity</code> would open it to anyone a bucket policy names. Adding <code>999999999999</code> to <code>aws:PrincipalAccount</code> keeps the identity perimeter in force for everyone else. The vendor's bucket gets the matching exception on the resource side. Both exceptions are reviewed when the contract is.</p>
+			</div>
+			<div class="entry">
+				<h4>Where the perimeter doesn't apply</h4>
+				<p>The management account <code>555555555555</code>, service-linked roles and AWS managed KMS keys are outside both SCPs and RCPs, so the management account holds no data and the data platform uses customer managed keys (<a href="../d5-task-5-2.html">Task 5.2</a>). Encryption in transit is a separate guardrail: the TLS-only RCP on <a href="../d6-task-6-1.html#s3">Task 6.1</a> sits alongside these policies and uses one of the four RCP slots (<a href="../d5-task-5-1.html">Task 5.1</a>).</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Resource policies only</h4>
+				<p>Adding <code>aws:PrincipalOrgID</code> and <code>aws:SourceVpce</code> conditions to every bucket and key policy was the only option before RCPs. At scale, one missed bucket is a breach.</p>
+			</div>
+			<div class="entry">
+				<h4>Control Tower RCP-based controls</h4>
+				<p>Control Tower offers managed RCP-based controls for S3, STS, KMS, SQS and Secrets Manager, with exemption parameters for principals and resources. They are quicker to turn on but less flexible than your own policies, which can add the vendor, tag and AWS-owned resource exceptions this design needs.</p>
+			</div>
+			<div class="entry">
+				<h4>Network controls alone</h4>
+				<p>Network Firewall domain filtering and DNS Firewall in the egress VPC block uploads to unknown hosts, but they can't see which bucket or account an S3 request targets, and they do nothing about credentials used from outside. They complement the perimeter as a separate layer (<a href="../d3-task-3-3.html">Task 3.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Instance credential binding</h4>
+				<p>Comparing <code>aws:SourceVpc</code> with <code>aws:Ec2InstanceSourceVpc</code> in an SCP stops EC2 instance role credentials from being used outside the instance's own VPC. That is narrower and stronger for EC2, but it doesn't cover pod roles or human sessions, and it still relies on VPC endpoints being in use.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Validate the policies</span><span class="desc">Run <code>aws accessanalyzer validate-policy --policy-type RESOURCE_CONTROL_POLICY</code> on each RCP and <code>SERVICE_CONTROL_POLICY</code> on each SCP in the pipeline, and fail the build on errors or on a minified size over the quota.</span></li>
+				<li><span class="name">Trusted paths still work</span><span class="desc">In the staging account, a pod reads and writes the test bucket through the gateway endpoint, including SSE-KMS objects. The analytics role reads from its own VPC, and the vendor role reads the export prefix. Each must succeed.</span></li>
+				<li><span class="name">Replay credentials from outside</span><span class="desc">Export a tagged test role's session and call <code>s3:GetObject</code> from a host outside the corporate range: expect <code>AccessDenied</code> with an explicit deny in a service control policy (within the organization, deny messages are gradually gaining the policy ARN). Repeat against a bucket in a separate test organization to prove the SCP, not the RCP, stopped it.</span></li>
+				<li><span class="name">Outsider and exfiltration tests</span><span class="desc">Add a wildcard bucket policy to a staging bucket and read it from an account outside the organization: expect a deny from the RCP. From inside the VPC, try <code>PutObject</code> to a bucket in the test organization: expect a deny from the endpoint policy and the SCP.</span></li>
+				<li><span class="name">Use the right tool</span><span class="desc">The IAM policy simulator evaluates SCPs but not RCPs or endpoint policies, so live tests in the staging account are the proof. Access Analyzer doesn't rescan when an RCP changes; trigger a rescan, and treat remaining findings as resource policies to fix at the source.</span></li>
+				<li><span class="name">Keep watching</span><span class="desc">A saved Athena query over the organization trail lists <code>AccessDenied</code> events that name the data perimeter policies, per account and day. A sudden rise after a deployment is a missed access pattern; a deny from an unknown IP is an incident.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Network Security Controls</td><td data-label="What this architecture demonstrates">VPC endpoint policies with <code>aws:PrincipalOrgID</code> and <code>aws:ResourceOrgID</code>; gateway endpoints per VPC, interface endpoints centralized</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Authorization Strategies</td><td data-label="What this architecture demonstrates">How SCPs, RCPs, endpoint and resource policies combine; IfExists operators; service principal and forward access session exceptions; reading deny messages</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-1.html">5.1</a> Controls for Data in Transit</td><td data-label="What this architecture demonstrates">Private paths through endpoints as the expected network; the TLS-only RCP alongside the perimeter</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">Data platform bucket and customer managed key protected org-wide; why AWS managed keys sit outside RCPs</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">RCP and SCP quotas, Policy Staging and sandbox rollout, management account exclusion, protected exception tags</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Ensure that only principals in our organization can access S3 buckets and KMS keys in all accounts, even if a developer misconfigures a bucket policy, with the least operational effort" is a <strong>resource control policy with <code>aws:PrincipalOrgID</code> and an <code>aws:PrincipalIsAWSService</code> exception</strong>. "Prevent employees from copying data to buckets outside the organization" is an <strong>SCP (and endpoint policy) with <code>aws:ResourceOrgID</code></strong>. "Stolen credentials must not work outside our networks" is a <strong>network perimeter with <code>aws:VpceOrgID</code> or <code>aws:SourceVpc</code>, <code>aws:SourceIp</code> for corporate ranges and an <code>aws:ViaAWSService</code> exception</strong>. Answers that list account IDs in every bucket policy are the high-effort distractor.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/establishing-a-data-perimeter-on-aws/">Establishing a data perimeter on AWS: Overview</a> (May 2022): the three objectives and which policy type enforces each; revised for RCPs (2024) and <code>aws:VpceOrgID</code> (2025).</li>
+				<li><a href="https://aws.amazon.com/blogs/security/establishing-a-data-perimeter-on-aws-allow-only-trusted-identities-to-access-company-data/">Establishing a data perimeter on AWS: Allow only trusted identities to access company data</a> (November 2022): <code>aws:PrincipalOrgID</code>, <code>aws:PrincipalIsAWSService</code> and <code>aws:SourceOrgID</code>, revised to enforce them with RCPs.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/establishing-a-data-perimeter-on-aws-allow-only-trusted-resources-from-my-organization/">Establishing a data perimeter on AWS: Allow only trusted resources from my organization</a> (March 2023): <code>aws:ResourceOrgID</code> in SCPs and endpoint policies, with AWS-owned resource exceptions.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/use-scalable-controls-to-help-prevent-access-from-unexpected-networks/">Use scalable controls to help prevent access from unexpected networks</a> (August 2025): <code>aws:VpceOrgID</code>, <code>aws:VpceOrgPaths</code> and <code>aws:VpceAccount</code> instead of lists of endpoint IDs.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/establishing-a-data-perimeter-on-aws-analyze-your-account-activity-to-evaluate-impact-and-refine-controls/">Establishing a data perimeter on AWS: Analyze your account activity to evaluate impact and refine controls</a> (May 2024): CloudTrail and Athena analysis before enforcing, and the data perimeter helper.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-a-data-perimeter-on-aws/building-a-data-perimeter-on-aws.html">Building a Data Perimeter on AWS</a> (AWS whitepaper, June 2023): the objectives, controls and condition keys in depth (predates RCPs and <code>aws:VpceOrgID</code>).</li>
+				<li><a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html">Resource control policies (RCPs)</a> (AWS Organizations documentation): supported services, what RCPs can't restrict, and testing advice.</li>
+				<li><a href="https://github.com/aws-samples/data-perimeter-policy-examples">aws-samples/data-perimeter-policy-examples</a> (AWS sample code): the SCP, RCP and endpoint policy examples, <code>dp:</code> tagging conventions and governance policies adapted on this page.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
