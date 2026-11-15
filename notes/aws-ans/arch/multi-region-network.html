@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Multi-Region Network with Transit Gateway Peering or Cloud WAN | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: three Regions joined by a full mesh of inter-Region Transit Gateway peerings with static summary routes, or by an AWS Cloud WAN core network with segments, share actions, tag-based attachment policies, network function groups and routing policies; migration through Transit Gateway peering and route table attachments, Direct Connect gateway attachments, costs and failure behaviour.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Multi-Region network</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Multi-Region network: Transit Gateway peering or Cloud WAN</h1>
+		<p>The travel company joins its three Regional hubs into one private network. Option A peers the Transit Gateways in a full mesh with static summary routes; option B replaces the mesh with an AWS Cloud WAN core network whose segments, attachments and inspection are defined in one policy document. This page builds both, then shows how to move from A to B without a flag day.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Transit Gateway</span><span class="tag">AWS Cloud WAN</span><span class="tag">Direct Connect gateway</span><span class="tag">Network Manager</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Peer the three Transit Gateways</a></li>
+				<li class="sub"><a href="#b2">2. Static summaries per segment</a></li>
+				<li class="sub"><a href="#b3">3. The core network policy</a></li>
+				<li class="sub"><a href="#b4">4. Attachments by tag</a></li>
+				<li class="sub"><a href="#b5">5. Migrate through TGW peering</a></li>
+				<li class="sub"><a href="#b6">6. Direct Connect on Cloud WAN</a></li>
+				<li class="sub"><a href="#b7">7. Cloud WAN flow logs</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) already runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a> in each of <code>us-east-1</code>, <code>eu-central-1</code> and <code>ap-northeast-1</code>, owned by the network account <code>111111111111</code>, with <code>prod</code>, <code>dev</code>, <code>shared</code> and <code>onprem</code> route tables, and <a href="centralized-egress.html">centralized egress</a> in every Region. That page set explains associations, propagation, blackholes and egress; this page connects the three hubs. Frankfurt bookings call shared fare services in Virginia, both data centers reach every Region, development in one Region must never reach production in another, and card data paths must stay inspectable for PCI DSS.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Private routing between three Regions</td><td data-label="Design choice">Option A: three inter-Region Transit Gateway peerings; option B: one Cloud WAN core network with an edge in each Region</td></tr>
+						<tr><td>Segments stay separate across Regions</td><td data-label="Design choice">A: summary routes only in the matching route tables; B: global segments with non-transitive share actions</td></tr>
+						<tr><td>New VPCs land in the right segment without tickets</td><td data-label="Design choice">A: EventBridge automation per Region; B: tag-based attachment policies</td></tr>
+						<tr><td>Inspect production traffic to and from the data centers</td><td data-label="Design choice">B: a network function group with <code>send-via</code></td></tr>
+						<tr><td>Move from A to B with no outage</td><td data-label="Design choice">Transit Gateway peering to the core network and route table attachments, segment by segment</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The hub page's address plan keeps routing small: one /14 per Region, split the same way:</p>
+			<ul>
+				<li><strong>us-east-1</strong> <code>10.40.0.0/14</code>: production <code>10.40.0.0/16</code>, shared services <code>10.41.0.0/16</code>, development <code>10.42.0.0/16</code>; Transit Gateway <code>tgw-use1</code>, ASN 64521.</li>
+				<li><strong>eu-central-1</strong> <code>10.44.0.0/14</code>: production <code>10.44.0.0/16</code>, shared <code>10.45.0.0/16</code>, development <code>10.46.0.0/16</code>; <code>tgw-euc1</code>, ASN 64522.</li>
+				<li><strong>ap-northeast-1</strong> <code>10.48.0.0/14</code>: production <code>10.48.0.0/16</code>, shared <code>10.49.0.0/16</code>, development <code>10.50.0.0/16</code>; <code>tgw-apne1</code>, ASN 64523.</li>
+				<li><strong>On premises</strong>: US data center <code>10.100.0.0/16</code> (AS 65010) and European data center <code>10.200.0.0/16</code> (AS 65020) on Direct Connect gateway <code>dxgw-travel-global</code> (AS 64512), associated with all three Transit Gateways.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<p>The same request, a Frankfurt booking pod at <code>10.44.12.30</code> calling the fare service at <code>10.41.20.15</code> in Virginia, takes a different path in each option.</p>
+			<ol class="flow">
+				<li class="group">Option A: across Transit Gateway peering</li>
+				<li class="auto"><span class="name">Spoke route<span class="who auto">AWS</span></span><span class="desc">The pod's subnet route table sends <code>10.0.0.0/8</code> to <code>tgw-euc1</code> in its Availability Zone, as on the hub page.</span></li>
+				<li class="auto"><span class="name">Sending table<span class="who auto">AWS</span></span><span class="desc">The booking attachment is associated with the Frankfurt <code>prod</code> table. A static route <code>10.41.0.0/16</code> points to the peering attachment toward <code>tgw-use1</code>. Frankfurt charges $0.02 per GB processing, because the bytes entered from a VPC.</span></li>
+				<li class="auto"><span class="name">Across the backbone<span class="who auto">AWS</span></span><span class="desc">Encrypted on the AWS backbone, 8500-byte MTU, inter-Region data transfer billed.</span></li>
+				<li class="auto"><span class="name">Receiving table<span class="who auto">AWS</span></span><span class="desc">In Virginia the peering attachment is associated with a <code>peer</code> table that holds the propagated local VPC routes. Traffic arriving from a peering is not charged processing again.</span></li>
+				<li class="auto"><span class="name">The reply<span class="who auto">AWS</span></span><span class="desc">The Virginia <code>shared</code> table has static routes for the Frankfurt summaries to the same peering.</span></li>
+				<li class="group">Option A: Tokyo development tries Frankfurt production</li>
+				<li class="auto"><span class="name">No route at the source<span class="who auto">AWS</span></span><span class="desc">The Tokyo <code>dev</code> table holds static routes only for the other Regions' development and shared /16s. <code>10.44.0.0/16</code> hits only the RFC 1918 blackhole from the egress design, so the packet dies in Tokyo.</span></li>
+				<li class="group">Option B: across the Cloud WAN core network</li>
+				<li class="auto"><span class="name">Spoke route<span class="who auto">AWS</span></span><span class="desc">The subnet route table now points <code>10.0.0.0/8</code> at the core network. The attachment, tagged <code>segment=prod</code>, sits in the <code>prod</code> segment.</span></li>
+				<li class="auto"><span class="name">Frankfurt edge lookup<span class="who auto">AWS</span></span><span class="desc">The Frankfurt edge looks up the <code>prod</code> segment, where the <code>shared</code>-to-<code>prod</code> share placed the Virginia shared services routes, learned over BGP.</span></li>
+				<li class="auto"><span class="name">Edge to edge<span class="who auto">AWS</span></span><span class="desc">Edges peer automatically with each other: no peering to build, no static route. $0.02 per GB processing from the VPC, plus inter-Region data transfer.</span></li>
+				<li class="auto"><span class="name">Delivered in Virginia<span class="who auto">AWS</span></span><span class="desc">The Virginia edge forwards to the shared services attachment; the reply follows the shared segment's routes back.</span></li>
+				<li class="group">Option B: data center to production, inspected</li>
+				<li class="auto"><span class="name">Through the network function group<span class="who auto">AWS</span></span><span class="desc">A packet from <code>10.100.20.5</code> enters through the Direct Connect gateway attachment in the <code>onprem</code> segment. A <code>send-via</code> action steers it through the inspection VPC in the <code>inspection</code> network function group before the booking VPC.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+			<p>Steps 1 and 2 are option A; Steps 3 to 7 build option B and the migration toward it.</p>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Peer the three Transit Gateways</h3>
+				<p>Three Regions need three peering attachments: Virginia to Frankfurt, Virginia to Tokyo and Frankfurt to Tokyo. Only one peering is allowed between two Transit Gateways, so the mesh is n(n&minus;1)/2 peerings; a fourth Region adds three. The accepter's owner accepts, and each side pays its own attachment-hour.</p>
+				<p>Transit Gateway peering between Transit Gateways is <strong>static routing only</strong>. AWS still recommends unique ASNs per peered Transit Gateway for future route propagation, and option B needs them to differ from the Cloud WAN edges; the hubs use 64521 to 64523.</p>
+				<span class="file">Request the Virginia to Frankfurt peering and accept it in Frankfurt (AWS CLI, network account)</span>
+<pre><code><span class="c"># requester side, us-east-1</span>
+aws ec2 create-transit-gateway-peering-attachment --region us-east-1 \
+  --transit-gateway-id tgw-use1 \
+  --peer-transit-gateway-id tgw-euc1 \
+  --peer-account-id 111111111111 \
+  --peer-region eu-central-1 \
+  --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=peer-use1-euc1}]'
+
+<span class="c"># accepter side, run in the peer Region</span>
+aws ec2 accept-transit-gateway-peering-attachment --region eu-central-1 \
+  --transit-gateway-attachment-id tgw-attach-peer-use1-euc1
+
+<span class="c"># repeat for use1-apne1 and euc1-apne1: three peerings for a full mesh</span></code></pre>
+				<ul>
+					<li><strong>MTU</strong>: 8500 bytes over intra-Region, inter-Region and Cloud WAN peering attachments. No Path MTU Discovery on peering attachments, so larger do-not-fragment packets are silently dropped.</li>
+					<li><strong>Encryption</strong>: inter-Region traffic is AES-256 encrypted at the virtual network layer, plus physical-layer encryption on links outside AWS control.</li>
+					<li><strong>DNS</strong>: a Transit Gateway peering does not resolve public or private DNS hostnames to private IPs in another Region through Route 53 Resolver. Use Resolver endpoints and rules per Region, or associate private hosted zones with VPCs in every Region (<a href="../d2-task-2-3.html">Task 2.3</a>).</li>
+				</ul>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Static summaries in the right tables only</h3>
+				<p>A peering attachment is associated with exactly one route table, so traffic arriving from Frankfurt is looked up in one table whatever its segment: the receiver cannot tell production from development. Segmentation across Regions is enforced at the <strong>sending</strong> side, with static routes only for the peer summaries each table may reach.</p>
+				<ul>
+					<li><code>prod</code>: peer production and shared services /16s (for Virginia: <code>10.44.0.0/16</code>, <code>10.45.0.0/16</code>, <code>10.48.0.0/16</code>, <code>10.49.0.0/16</code>).</li>
+					<li><code>dev</code>: peer development and shared services /16s (<code>10.45</code>, <code>10.46</code>, <code>10.49</code>, <code>10.50</code>).</li>
+					<li><code>shared</code>: the peer Regions' whole /14s, so shared services reach everything.</li>
+					<li><code>onprem</code>: nothing new; each data center already reaches every Region directly through the Direct Connect gateway associations, which is shorter than hairpinning through another Region.</li>
+					<li>A new <code>peer</code> table, associated with the peering attachments, holds the local VPC routes by propagation.</li>
+				</ul>
+				<span class="file">Virginia: the peer table, and production's static routes to Frankfurt (AWS CLI, network account)</span>
+<pre><code><span class="c"># one table for traffic arriving over the peerings</span>
+aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=peer}]'
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-peer \
+  --transit-gateway-attachment-id tgw-attach-peer-use1-euc1
+
+<span class="c"># local spokes propagate into peer so returning traffic finds them (repeat per spoke)</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-peer \
+  --transit-gateway-attachment-id tgw-attach-booking-prod
+
+<span class="c"># prod may reach Frankfurt production and shared services, nothing else</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.44.0.0/16 --transit-gateway-attachment-id tgw-attach-peer-use1-euc1
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.45.0.0/16 --transit-gateway-attachment-id tgw-attach-peer-use1-euc1</code></pre>
+				<p>That is about thirty static routes for the whole mesh, manageable only because IPAM keeps each environment in one /16 per Region; random CIDRs would mean a route per VPC in every peer Region. A managed prefix list per segment (<a href="tgw-hub-spoke.html#b2">hub page</a>) keeps Regions identical.</p>
+				<div class="callout trap"><p>Static routes never withdraw. If a production VPC is deleted, or a whole Region becomes unreachable, the summary in the peer Regions still points at the peering and the traffic is dropped there instead of failing over. Region failover belongs to the application and DNS layer (Route 53 or ARC), not to the peering mesh.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The core network policy</h3>
+				<p>Option B adds a <strong>core network</strong> to the existing global network. One JSON policy defines edges, ASNs, segments, sharing, inspection, attachment placement and, since version <code>2025.11</code>, routing policies. Each Region in <code>edge-locations</code> gets a <strong>core network edge</strong>, peered with every other edge; a Region cannot be removed while it has attachments.</p>
+				<p>Design choices in this policy:</p>
+				<ul>
+					<li><strong>ASNs</strong> 64531 to 64533 avoid the Transit Gateways and Direct Connect gateways. An edge's ASN cannot change, and a Transit Gateway with the same ASN cannot peer with it.</li>
+					<li><strong>Segments</strong> are global VRFs. <code>prod</code> uses <code>isolate-attachments</code> (production VPCs do not reach each other, as on the hub); <code>dev</code> needs no acceptance; <code>onprem</code> holds the Direct Connect gateway attachment.</li>
+					<li><strong>Share is not transitive.</strong> Sharing <code>shared</code> with <code>prod</code> and <code>dev</code> gives both access to shared services but does not join production to development, and shared routes are not re-shared.</li>
+					<li><strong>Inspection</strong>: the <code>inspection</code> network function group holds one inspection VPC per Region. <code>send-via</code> (<code>single-hop</code>) sends <code>onprem</code>-to-<code>prod</code> traffic through it, cross-Region flows through one Region chosen by priority or edge overrides; <code>send-to</code> covers north-south egress.</li>
+					<li><strong>Attachment policies</strong>: rule 50 puts <code>inspection</code>-tagged attachments in the network function group; rule 100 maps others to the segment in their <code>segment</code> tag. Lowest rule first, first match wins; no match means no segment.</li>
+				</ul>
+				<span class="file">core-network-policy.json: three edges, four segments, hybrid inspection and tag-based placement (version 2025.11)</span>
+<pre><code>{
+  "version": "2025.11",
+  "core-network-configuration": {
+    "vpn-ecmp-support": true,
+    "dns-support": true,
+    "security-group-referencing-support": true,
+    "asn-ranges": ["64530-64540"],
+    "edge-locations": [
+      {"location": "us-east-1", "asn": 64531},
+      {"location": "eu-central-1", "asn": 64532},
+      {"location": "ap-northeast-1", "asn": 64533}
+    ]
+  },
+  "segments": [
+    {"name": "prod", "isolate-attachments": true, "require-attachment-acceptance": true},
+    {"name": "dev", "require-attachment-acceptance": false},
+    {"name": "shared", "require-attachment-acceptance": true},
+    {"name": "onprem", "require-attachment-acceptance": true, "deny-filter": ["dev"]}
+  ],
+  "network-function-groups": [
+    {"name": "inspection", "require-attachment-acceptance": true}
+  ],
+  "segment-actions": [
+    {"action": "share", "mode": "attachment-route", "segment": "shared", "share-with": ["prod", "dev"]},
+    {"action": "share", "mode": "attachment-route", "segment": "onprem", "share-with": ["shared"]},
+    {"action": "send-via", "segment": "onprem", "mode": "single-hop",
+     "when-sent-to": {"segments": ["prod"]},
+     "via": {"network-function-groups": ["inspection"]}}
+  ],
+  "attachment-policies": [
+    {"rule-number": 50, "condition-logic": "and",
+     "conditions": [{"type": "tag-exists", "key": "inspection"}],
+     "action": {"add-to-network-function-group": "inspection"}},
+    {"rule-number": 100, "condition-logic": "or",
+     "conditions": [{"type": "tag-exists", "key": "segment"}],
+     "action": {"association-method": "tag", "tag-value-of-key": "segment"}}
+  ]
+}</code></pre>
+				<p>The <code>deny-filter</code> on <code>onprem</code> is a backstop like the blackholes: whatever shares are added later, no routes flow between the data centers and development.</p>
+				<span class="file">Create the core network with the policy (AWS CLI, network account, Network Manager home Region)</span>
+<pre><code>aws networkmanager create-core-network --region us-west-2 \
+  --global-network-id global-network-0travel1234567 \
+  --description "travel core network" \
+  --policy-document file://core-network-policy.json</code></pre>
+				<p>Every change is a new policy version with a change set you review before executing, so a wrong share is caught before it reaches the network (<a href="../d2-task-2-4.html">Task 2.4</a>).</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>VPC attachments placed by tag</h3>
+				<p>The attachment policy reads the <strong>attachment's</strong> tags, not the VPC's. Production and shared segments require acceptance; development attachments go live at once, and without acceptance a changed tag also moves an attachment between segments, one reason production keeps it on. Security group referencing (June 2025) works only between VPCs on the same edge, so the same Region.</p>
+				<span class="file">A Frankfurt production VPC joins the prod segment; the inspection VPC joins the network function group with appliance mode (AWS CLI)</span>
+<pre><code><span class="c"># booking account in eu-central-1: the tag value must match a segment name exactly</span>
+aws networkmanager create-vpc-attachment --region us-west-2 \
+  --core-network-id core-network-0travel123456 \
+  --vpc-arn arn:aws:ec2:eu-central-1:222222222222:vpc/vpc-0bookingeuc1 \
+  --subnet-arns arn:aws:ec2:eu-central-1:222222222222:subnet/subnet-0cwan1a arn:aws:ec2:eu-central-1:222222222222:subnet/subnet-0cwan1b arn:aws:ec2:eu-central-1:222222222222:subnet/subnet-0cwan1c \
+  --tags Key=segment,Value=prod
+
+<span class="c"># network account: appliance mode keeps both directions of a flow on one firewall AZ</span>
+aws networkmanager create-vpc-attachment --region us-west-2 \
+  --core-network-id core-network-0travel123456 \
+  --vpc-arn arn:aws:ec2:eu-central-1:111111111111:vpc/vpc-0inspecteuc1 \
+  --subnet-arns arn:aws:ec2:eu-central-1:111111111111:subnet/subnet-0insp1a arn:aws:ec2:eu-central-1:111111111111:subnet/subnet-0insp1b arn:aws:ec2:eu-central-1:111111111111:subnet/subnet-0insp1c \
+  --options ApplianceModeSupport=true \
+  --tags Key=inspection,Value=true</code></pre>
+				<p>Appliance mode is still needed for stateful inspection behind service insertion, exactly as on the <a href="centralized-egress.html#b4">egress page</a>; the network function group does not turn it on. A tag typo such as <code>segment=Prod</code> matches no segment, leaving an attachment with no routes.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Migrate through Transit Gateway peering and route table attachments</h3>
+				<p>Each Transit Gateway peers with the edge <strong>in its own Region</strong>, and a <strong>route table attachment</strong> maps one Transit Gateway route table to one segment, so <code>prod</code>, <code>dev</code> and <code>shared</code> stay separate end to end while VPCs remain on the Transit Gateways.</p>
+				<p>Unlike Transit Gateway to Transit Gateway peering, this peering uses <strong>dynamic BGP only</strong>; adding a static route to it returns an error. The Transit Gateway side uses a policy table on the peering attachment, filled in automatically. Route table attachments ignore <code>isolate-attachments</code>, so what the <code>prod</code> table propagates is the network team's responsibility.</p>
+				<span class="file">Peer tgw-use1 with the us-east-1 edge and map its prod table to the prod segment (AWS CLI, network account)</span>
+<pre><code><span class="c"># the Transit Gateway ASN (64521) differs from the edge ASN (64531), so the peering can form</span>
+aws networkmanager create-transit-gateway-peering --region us-west-2 \
+  --core-network-id core-network-0travel123456 \
+  --transit-gateway-arn arn:aws:ec2:us-east-1:111111111111:transit-gateway/tgw-use1
+
+<span class="c"># one route table attachment per table; the tag places it in the matching segment</span>
+aws networkmanager create-transit-gateway-route-table-attachment --region us-west-2 \
+  --peering-id peering-0use1prod1234 \
+  --transit-gateway-route-table-arn arn:aws:ec2:us-east-1:111111111111:transit-gateway-route-table/tgw-rtb-prod \
+  --tags Key=segment,Value=prod</code></pre>
+				<p>A migration sequence that keeps traffic flowing:</p>
+				<ol class="flow">
+					<li><b>Build the core network</b>Edges and segments, no attachments; edge-hours start.</li>
+					<li><b>Peer every Transit Gateway</b>Three peerings and route table attachments per table; cross-Region routes now also arrive dynamically.</li>
+					<li><b>Remove the static routes</b>Delete Step 2's summaries table by table; otherwise they keep winning, since static beats propagated for the same prefix.</li>
+					<li><b>Delete the mesh</b>Remove the idle inter-Region peerings.</li>
+					<li><b>Move VPCs</b>Re-attach VPCs to the core network by tag, a few at a time.</li>
+				</ol>
+				<p>During the overlap both networks are paid for: each Transit Gateway peering to an edge is $0.065 an hour on the Cloud WAN side plus $0.05 an hour on the Transit Gateway side, with no Cloud WAN processing charge across that peering.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Direct Connect gateway attachments on Cloud WAN</h3>
+				<p>Since November 2024 a Direct Connect gateway can attach to the core network directly (all Cloud WAN Regions since June 2025), with no Transit Gateway in between. Three rules shape the migration:</p>
+				<ul>
+					<li>A Direct Connect gateway associated with a core network cannot be used for any other gateway type while associated: no Transit Gateways, no virtual private gateways, no private VIFs. So <code>dxgw-travel-global</code> keeps serving the Transit Gateways and a new <code>dxgw-travel-cwan</code> with its own transit VIFs serves Cloud WAN.</li>
+					<li>Its ASN must be outside the core network's <code>asn-ranges</code>, so 64512 and the new gateway's ASN are both fine with 64530 to 64540.</li>
+					<li>There are <strong>no allowed prefixes</strong> and no static routes toward the attachment. Routing is BGP both ways: each edge advertises its local routes, and data center routes are learned at every associated edge.</li>
+				</ul>
+				<span class="file">Attach the Cloud WAN Direct Connect gateway to all three edges in the onprem segment (AWS CLI, network account)</span>
+<pre><code>aws networkmanager create-direct-connect-gateway-attachment --region us-west-2 \
+  --core-network-id core-network-0travel123456 \
+  --direct-connect-gateway-arn arn:aws:directconnect::111111111111:dx-gateway/DXGW_ID \
+  --edge-locations us-east-1 eu-central-1 ap-northeast-1 \
+  --routing-policy-label dxonprem \
+  --tags Key=segment,Value=onprem</code></pre>
+				<p>Because allowed prefixes are gone, route control moves into <strong>routing policies</strong> (policy version <code>2025.11</code>, GA November 2025, no extra cost). The policy below, bound by the routing policy label (which only the core network owner can set), drops a leaked default route; outbound <code>summarize</code> and AS path prepending are other common uses.</p>
+				<span class="file">Added to core-network-policy.json: drop a leaked default route from the data centers, accept their 10.0.0.0/8 routes</span>
+<pre><code>"routing-policies": [
+  {
+    "routing-policy-name": "dxInboundFilter",
+    "routing-policy-direction": "inbound",
+    "routing-policy-number": 100,
+    "routing-policy-rules": [
+      {"rule-number": 10,
+       "rule-definition": {
+         "match-conditions": [{"type": "prefix-equals", "value": "0.0.0.0/0"}],
+         "condition-logic": "and",
+         "action": {"type": "drop"}}},
+      {"rule-number": 20,
+       "rule-definition": {
+         "match-conditions": [{"type": "prefix-in-cidr", "value": "10.0.0.0/8"}],
+         "condition-logic": "and",
+         "action": {"type": "allow"}}}
+    ]
+  }
+],
+"attachment-routing-policy-rules": [
+  {"rule-number": 10,
+   "conditions": [{"type": "routing-policy-label", "value": "dxonprem"}],
+   "action": {"associate-routing-policies": ["dxInboundFilter"]}}
+]</code></pre>
+				<p>Drop and allow are terminal, so non-terminal actions go first. During migration the data centers learn AWS prefixes from both Direct Connect gateways; prepend on the new path until cut-over (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Flow logs for the core network</h3>
+				<p>Cloud WAN flow logs (November 2026) are scoped to the core network, an edge or an attachment, and go to CloudWatch Logs, S3 or Firehose with no Cloud WAN charge. Fields include <code>src-segment-name</code>, <code>dst-segment-name</code>, <code>src-region</code>, <code>dst-region</code>, the network function group attachments a flow passed, and drop reasons such as <code>drop:no-route</code>.</p>
+				<span class="file">Flow logs for the whole core network, created in the home Region (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-flow-logs --region us-west-2 \
+  --resource-type CoreNetwork \
+  --resource-ids core-network-0travel123456 \
+  --log-group-name /cloudwan/travel-core \
+  --deliver-logs-permission-arn arn:aws:iam::111111111111:role/cwan-flow-logs</code></pre>
+				<p>Grouping by Region pair gives the bytes that drive transfer cost; on option A, Transit Gateway flow logs on the peering attachments do the same (<a href="tgw-hub-spoke.html#b6">hub page</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Peering mesh or Cloud WAN</h4>
+				<p>The Cloud WAN FAQ describes the Transit Gateway path as suited to "a few AWS Regions" where you want to manage your own peering and routing configuration. Three summarized Regions sit on that line, so the company started with A. Each added Region or segment favours Cloud WAN: more peerings, routes multiplied by segments times Regions, segmentation only at the sender. See <a href="../d1-task-1-6.html">Task 1.6</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost comparison</h4>
+				<p>Take 100 VPC attachments across the three Regions and 10 TB (10,240 GB) a month crossing Regions.</p>
+				<ul>
+					<li><strong>Option A</strong>: VPC attachments 100 &times; $0.05 &times; 730 &asymp; $3,650; peering attachments 3 peerings &times; 2 sides &times; $0.05 &times; 730 &asymp; $219; processing 10,240 GB &times; $0.02 &asymp; $205 on the sending gateways. Total about $4,074 plus inter-Region data transfer.</li>
+					<li><strong>Option B</strong>: three edges 3 &times; $0.50 &times; 730 &asymp; $1,095 before any traffic; VPC attachments 100 &times; $0.065 &times; 730 &asymp; $4,745 at the us-east-1 rate (Frankfurt's published example is $0.080); the same $205 processing. Total about $6,045 plus the same inter-Region data transfer.</li>
+				</ul>
+				<p>Inter-Region data transfer is identical in both and is often the largest line; the AWS example prices Virginia to Oregon at $0.02 per GB, and other Region pairs differ. Cloud WAN's premium is roughly $2,000 a month, bought back in fewer route changes and mistakes. Rates outside us-east-1 differ. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Failure behaviour</h4>
+				<p>Both survive an AZ loss if attachments span every AZ used. Option A's static summaries stay installed when a peer Region or its VPCs fail, so traffic is blackholed rather than rerouted. Option B's routes are dynamic: when attachments go away their routes are withdrawn across all edges, and data center routes learned through the Direct Connect gateway at several edges remain reachable through the surviving edges. Neither design moves an application to another Region; that is the job of Route 53 health checks or ARC (<a href="../d1-task-1-1.html">Task 1.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Hybrid: Direct Connect gateway with Transit Gateways, or attached to Cloud WAN</h4>
+				<p>With Transit Gateways, one Direct Connect gateway associates with every Regional Transit Gateway and advertises the allowed prefixes you choose, one summary per Region. With Cloud WAN, the Direct Connect gateway attaches to the core network once, routing is fully BGP with no allowed prefixes, and routing policies replace them. See <a href="../d1-task-1-5.html">Task 1.5</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Segment count and quotas</h4>
+				<p>Cloud WAN allows 40 segments per core network (raised through your account team), 5,000 attachments and 10,000 routes across all segments. Segments are for routing domains, not teams; <code>isolate-attachments</code> handles "same segment, no talking". On option A, the 20 route tables per Transit Gateway and 50 peering attachments are the ceilings.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Inter-Region VPC peering</h4>
+				<p>For one heavy cross-Region pair, such as the Tokyo booking database replicating to Virginia, a direct VPC peering has no hourly or processing charge, only inter-Region data transfer, also with 8500-byte MTU since March 2025. It is not transitive, so it complements a hub for a few pairs (<a href="tgw-hub-spoke.html#b7">hub page, Step 7</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Transit Gateways with Cloud WAN as the backbone only</h4>
+				<p>Keep VPCs on the Regional Transit Gateways permanently and use Cloud WAN only between Regions, through peering and route table attachments. This keeps Transit Gateway-only features such as multicast, at the price of two services to pay for and configure.</p>
+			</div>
+			<div class="entry">
+				<h4>SD-WAN overlay</h4>
+				<p>A vendor SD-WAN fabric between Regions and branches can carry segments as VRFs. Connect attachments map each VRF to a route table or segment, at the cost of appliances to run.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check the route tables first</span><span class="desc">On option A, check each Region's gateway with Network Manager Route Analyzer or <code>search-transit-gateway-routes</code>: Frankfurt <code>prod</code> must hold the static <code>10.41.0.0/16</code> to the Virginia peering, and the Virginia <code>peer</code> table the propagated shared services route. On option B, the core network's route view per segment and edge should show the Virginia shared services routes in the Frankfurt <code>prod</code> segment, and no development routes there.</span></li>
+				<li><span class="name">Prove the boundary</span><span class="desc">From a Tokyo development instance, connect to <code>10.44.12.30</code>. It must fail; on option A the Tokyo gateway's <code>PacketDropCountBlackhole</code> rises, on option B a Cloud WAN flow log record shows <code>src-segment-name</code> <code>dev</code> with a drop destination type such as <code>drop:no-route</code>.</span></li>
+				<li><span class="name">Test the MTU</span><span class="desc">Between Frankfurt and Virginia, send pings with the do-not-fragment bit at 8500 bytes and just above. Larger ones are dropped; keep application MTU below the limit.</span></li>
+				<li><span class="name">Test placement</span><span class="desc">Create an attachment tagged <code>segment=Prod</code> from a sandbox account and confirm it is not associated with any segment; one tagged <code>segment=prod</code> must wait for acceptance; one tagged <code>segment=dev</code> must go live without it.</span></li>
+				<li><span class="name">Fail a Region's hybrid path</span><span class="desc">In a maintenance window, shut the BGP sessions on the US data center's transit VIF to the Cloud WAN Direct Connect gateway. Virginia should reach <code>10.100.0.0/16</code> only through another path (the European link or a backup VPN); watch synthetic checks and Network Manager routing events.</span></li>
+				<li><span class="name">Rehearse the migration on one segment</span><span class="desc">Move <code>dev</code> first and confirm with flow logs that its inter-Region traffic crosses the core network before touching <code>prod</code>.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Transit Gateway peering compared with Cloud WAN, segments, non-transitive share, cost per option</td></tr>
+						<tr><td><a href="../d1-task-1-5.html">1.5</a> Hybrid routing and connectivity design</td><td data-label="What this architecture demonstrates">Direct Connect gateway with Transit Gateways and allowed prefixes, or attached to Cloud WAN with BGP only</td></tr>
+						<tr><td><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">Creating the Direct Connect gateway attachment, ASN rules, path preference during migration</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Peering attachments, static summaries, tag-based attachments, service insertion</td></tr>
+						<tr><td><a href="../d2-task-2-3.html">2.3</a> Implement hybrid and multi-account DNS</td><td data-label="What this architecture demonstrates">No cross-Region private DNS resolution over Transit Gateway peering</td></tr>
+						<tr><td><a href="../d2-task-2-4.html">2.4</a> Automate and configure network infrastructure</td><td data-label="What this architecture demonstrates">Policy as code, versions and change sets, attachment policies</td></tr>
+						<tr><td><a href="../d3-task-3-1.html">3.1</a> Maintain routing and connectivity</td><td data-label="What this architecture demonstrates">Static compared with propagated routes, routing policies, migration without outage</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Monitor and analyze network traffic</td><td data-label="What this architecture demonstrates">Cloud WAN flow logs, Route Analyzer, MTU testing</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Edge-hours, attachment-hours, processing and inter-Region transfer; failure behaviour</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"A company with VPCs in many Regions wants global segmentation, automatic routing between Regions and new VPCs placed in the correct segment by tag, with the least operational overhead" is <strong>AWS Cloud WAN with segments and tag-based attachment policies</strong>. "Existing Transit Gateways must keep working during the move" adds <strong>Transit Gateway peering to the core network edge in the same Region and route table attachments mapped to segments</strong>. If instead the question says "two or three Regions, the cheapest option, the team is happy to manage routes", the answer is <strong>inter-Region Transit Gateway peering with static routes</strong>, and "routes are not exchanged across the peering" is fixed by <strong>adding static routes, because Transit Gateway peering does not propagate</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/building-a-global-network-using-aws-transit-gateway-inter-region-peering/">Building a global network using AWS Transit Gateway Inter-Region peering</a> (June 2020): the static-route mesh of option A (predates Cloud WAN).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/aws-cloud-wan-and-aws-transit-gateway-migration-and-interoperability-patterns/">AWS Cloud WAN and AWS Transit Gateway migration and interoperability patterns</a> (July 2022): peering and route table attachments behind Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/simplify-global-hybrid-connectivity-with-aws-cloud-wan-and-aws-direct-connect-integration/">Simplify global hybrid connectivity with AWS Cloud WAN and AWS Direct Connect integration</a> (November 2024): native Direct Connect gateway attachments from Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/aws-cloud-wan-routing-policy-fine-grained-controls-for-your-global-network-part-1/">AWS Cloud WAN Routing Policy: Fine-grained controls for your global network (Part 1)</a> (November 2025): filtering, summarizing and path preference.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/monitoring-global-traffic-with-aws-cloud-wan-flow-logs/">Monitoring global traffic with AWS Cloud WAN Flow Logs</a> (November 2026): the flow log scopes and fields from Step 7.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/tgw-peering.html">Transit gateway peering attachments</a> (AWS documentation): static routing, MTU, encryption and DNS limits.</li>
+				<li><a href="https://docs.aws.amazon.com/network-manager/latest/cloudwan/cloudwan-policies-json.html">Core network policy version parameters in AWS Cloud WAN</a> (AWS documentation): every policy section used in Steps 3 and 6.</li>
+				<li><a href="https://docs.aws.amazon.com/network-manager/latest/cloudwan/cloudwan-dxattach-about.html">Direct Connect gateway attachments in AWS Cloud WAN</a> (AWS documentation): prerequisites, ASN rules and route propagation.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

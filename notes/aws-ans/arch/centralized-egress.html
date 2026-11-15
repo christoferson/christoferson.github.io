@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Centralized Egress with NAT Gateways and Network Firewall | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: one egress VPC per Region behind Transit Gateway, spoke default routes with RFC 1918 blackholes, NAT gateway per AZ with return routes, AWS Network Firewall in an inspection VPC with appliance mode or natively attached to Transit Gateway, strict-order domain allow lists, DNS Firewall, IPv6 egress, costs, availability and logging.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Centralized egress</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Centralized egress with NAT gateways and Network Firewall</h1>
+		<p>Instead of NAT gateways in every VPC and Availability Zone, the travel company sends all internet-bound traffic from its spokes over the Transit Gateway to one egress VPC per Region. There it passes AWS Network Firewall, which allows only approved domains, before a NAT gateway in the same AZ takes it to the internet.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">Transit Gateway</span><span class="tag">NAT gateway</span><span class="tag">AWS Network Firewall</span><span class="tag">Route 53 Resolver DNS Firewall</span><span class="tag">Egress-only internet gateway</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Transit Gateway routes and blackholes</a></li>
+				<li class="sub"><a href="#b2">2. The egress VPC and NAT gateways</a></li>
+				<li class="sub"><a href="#b3">3. Firewall endpoints in the egress VPC</a></li>
+				<li class="sub"><a href="#b4">4. The firewall policy</a></li>
+				<li class="sub"><a href="#b5">5. Transit Gateway-attached firewall</a></li>
+				<li class="sub"><a href="#b6">6. DNS Firewall</a></li>
+				<li class="sub"><a href="#b7">7. Logging and monitoring</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) already runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a>: one Transit Gateway per Region in the network account <code>111111111111</code>, with <code>prod</code>, <code>dev</code>, <code>shared</code> and <code>onprem</code> route tables. That page explains associations, propagation and blackholes; this page adds internet egress on top. Today many of the 300 VPCs have their own NAT gateways, which costs an hourly charge per gateway and gives the security team no single place to control where traffic goes. The PCI DSS assessor also wants the card data environment's outbound connections limited to the payment processors it actually uses.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Fewer NAT gateways, one place to manage internet access</td><td data-label="Design choice">One egress VPC per Region in the network account, reached from every spoke through the Transit Gateway</td></tr>
+						<tr><td>Egress must not become a path between segments</td><td data-label="Design choice">Default route to egress in the spoke tables, plus blackholes for every RFC 1918 range</td></tr>
+						<tr><td>Outbound HTTPS only to approved domains</td><td data-label="Design choice">AWS Network Firewall with a strict-order domain allow list on TLS SNI and HTTP Host, default drop established</td></tr>
+						<tr><td>No data leaving through DNS queries</td><td data-label="Design choice">Route 53 Resolver DNS Firewall on every VPC</td></tr>
+						<tr><td>Survive the loss of one Availability Zone</td><td data-label="Design choice">One NAT gateway and one firewall endpoint per AZ, route tables per AZ</td></tr>
+						<tr><td>Evidence for auditors and troubleshooting</td><td data-label="Design choice">Firewall alert and flow logs, Transit Gateway flow logs, NAT gateway metrics</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The address plan from the hub page still applies: in <code>us-east-1</code> production <code>10.40.0.0/16</code>, shared services <code>10.41.0.0/16</code>, development <code>10.42.0.0/16</code>, all inside the Region summary <code>10.40.0.0/14</code>; <code>eu-central-1</code> uses <code>10.44.0.0/14</code> and <code>ap-northeast-1</code> <code>10.48.0.0/14</code>. The egress VPC takes <code>10.41.240.0/22</code> from the shared services range, with three subnet tiers in each of <code>us-east-1a</code>, <code>us-east-1b</code> and <code>us-east-1c</code>: a /28 for the Transit Gateway attachment, a /28 for the firewall endpoint, and a public subnet for the NAT gateway. The same build is repeated in each Region, so European traffic leaves in Frankfurt and does not cross the Atlantic.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>The path below is model A, firewall endpoints inside the egress VPC. Model B (the firewall attached to the Transit Gateway) changes only where the firewall sits; it is built in <a href="#b5">Step 5</a>.</p>
+			<ol class="flow">
+				<li class="group">A booking pod calls a payment processor</li>
+				<li class="auto"><span class="name">Spoke VPC route<span class="who auto">AWS</span></span><span class="desc">A pod at <code>10.40.12.30</code> opens HTTPS to <code>api.payments-partner.example</code>. The subnet route table sends <code>0.0.0.0/0</code> (and <code>10.0.0.0/8</code>) to the Transit Gateway ENI in its AZ. The spoke has no NAT gateway and no internet gateway.</span></li>
+				<li class="auto"><span class="name">Spoke Transit Gateway table<span class="who auto">AWS</span></span><span class="desc">The booking attachment is associated with <code>prod</code>. No more specific route matches, so the static <code>0.0.0.0/0</code> sends the packet to the egress VPC attachment.</span></li>
+				<li class="auto"><span class="name">Appliance mode picks one AZ<span class="who auto">AWS</span></span><span class="desc">Appliance mode on the egress attachment hashes the flow and chooses one ENI in the egress VPC. Both directions of this flow use that AZ for its whole life.</span></li>
+				<li class="auto"><span class="name">Attachment subnet to firewall<span class="who auto">AWS</span></span><span class="desc">The attachment subnet's route table in <code>us-east-1b</code> sends <code>0.0.0.0/0</code> to the firewall endpoint in <code>us-east-1b</code>.</span></li>
+				<li class="auto"><span class="name">Firewall inspects<span class="who auto">AWS</span></span><span class="desc">The stateless engine forwards to the stateful engine. In strict order, the domain allow list matches the SNI <code>api.payments-partner.example</code> and passes the flow. The firewall sees the pod's real source address, because NAT has not happened yet.</span></li>
+				<li class="auto"><span class="name">Firewall subnet to NAT<span class="who auto">AWS</span></span><span class="desc">The firewall subnet's route table sends <code>0.0.0.0/0</code> to the NAT gateway in the same AZ.</span></li>
+				<li class="auto"><span class="name">NAT and internet gateway<span class="who auto">AWS</span></span><span class="desc">The NAT gateway translates the source to its Elastic IP and sends the packet through the internet gateway. The payment processor allow-lists the three NAT addresses.</span></li>
+				<li class="auto"><span class="name">The reply comes back<span class="who auto">AWS</span></span><span class="desc">The NAT gateway translates the reply back to <code>10.40.12.30</code>. Its subnet route table sends <code>10.0.0.0/8</code> to the same-AZ firewall endpoint; the firewall subnet sends <code>10.0.0.0/8</code> to the Transit Gateway; the egress table holds the propagated booking VPC route.</span></li>
+				<li class="group">A pod tries an unapproved site</li>
+				<li class="auto"><span class="name">Dropped after the handshake<span class="who auto">AWS</span></span><span class="desc">The TCP handshake to <code>files.unknown-share.example</code> passes, because the SNI is only visible in the TLS Client Hello. That SNI is not on the list, so the default action drop established drops the flow and the firewall writes an alert log entry.</span></li>
+				<li class="group">A development host tries production through the egress VPC</li>
+				<li class="auto"><span class="name">Blackholed at the hub<span class="who auto">AWS</span></span><span class="desc">Without the blackholes, a packet from development to <code>10.40.12.30</code> would follow <code>0.0.0.0/0</code> to the egress VPC, and the egress table (which knows every spoke) would deliver it. The <code>dev</code> table's <code>10.0.0.0/8</code> blackhole drops it before it leaves the spoke table.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Transit Gateway routes: default to egress, blackholes for private ranges</h3>
+				<p>Centralized egress uses two kinds of Transit Gateway route table. The <strong>spoke tables</strong> (here the existing <code>prod</code>, <code>dev</code> and <code>shared</code>) get a static <code>0.0.0.0/0</code> to the egress VPC attachment. A new <strong>egress table</strong> is associated with the egress VPC attachment, and every spoke propagates into it so replies find their way home.</p>
+				<p>The egress table knows every spoke in every segment. That makes the egress VPC a potential bridge: any private destination that a spoke table does not explicitly route would match <code>0.0.0.0/0</code>, reach the egress VPC, and be routed back to the destination spoke by the egress table. The fix is a blackhole for each RFC 1918 range in every spoke table. Longest prefix still wins, so the real routes in each table (the propagated shared services /21s, the on-premises <code>10.100.0.0/16</code> and <code>10.200.0.0/16</code>, the peer Region summaries) are more specific than <code>10.0.0.0/8</code> and keep working. Without these blackholes, production VPCs, which deliberately do not propagate into <code>prod</code>, could suddenly reach each other through the egress VPC.</p>
+				<span class="file">The egress table and the default routes with RFC 1918 blackholes (AWS CLI, network account)</span>
+<pre><code><span class="c"># egress table: only the egress VPC attachment is associated with it</span>
+aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=egress}]'
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-egress \
+  --transit-gateway-attachment-id tgw-attach-egress
+
+<span class="c"># every spoke propagates into egress so return traffic reaches it (repeat per spoke)</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-egress \
+  --transit-gateway-attachment-id tgw-attach-booking-prod
+
+<span class="c"># in prod, dev and shared: internet via the egress VPC</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 0.0.0.0/0 \
+  --transit-gateway-attachment-id tgw-attach-egress
+
+<span class="c"># and no private range may reach the egress VPC through that default route</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.0.0.0/8 --blackhole
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 172.16.0.0/12 --blackhole
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 192.168.0.0/16 --blackhole</code></pre>
+				<p>The <code>onprem</code> table gets no default route, because the data centers have their own internet breakout. In each spoke, the default route now points at the Transit Gateway.</p>
+				<span class="file">Spoke side: the default route now points at the Transit Gateway (AWS CLI, application account)</span>
+<pre><code><span class="c"># replaces the old 0.0.0.0/0 to the VPC's own NAT gateway</span>
+aws ec2 replace-route --route-table-id rtb-bookings-app \
+  --destination-cidr-block 0.0.0.0/0 --transit-gateway-id tgw-use1</code></pre>
+				<div class="callout trap"><p>The blackhole belongs in the <strong>spoke</strong> Transit Gateway tables, not in the egress table and not in the egress VPC. The egress VPC needs the opposite: a <strong>return route</strong> for the spoke ranges back to the Transit Gateway (Step 2). Questions that describe "spokes can now reach each other after centralizing NAT" are missing the spoke-table blackhole.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The egress VPC: attachment, NAT gateway per AZ, return routes</h3>
+				<p>The egress VPC has an internet gateway, a NAT gateway with an Elastic IP in each AZ's public subnet, and a Transit Gateway attachment that uses the /28 attachment subnets. Each AZ gets its own route tables, so traffic stays in one AZ and avoids cross-AZ data charges. Before the firewall is added (Step 3), the routing is:</p>
+				<ol class="flow">
+					<li><b>Attachment subnet route table (one per AZ)</b><code>0.0.0.0/0</code> to the NAT gateway in the same AZ.</li>
+					<li><b>NAT gateway subnet route table (one per AZ)</b><code>0.0.0.0/0</code> to the internet gateway, and <code>10.0.0.0/8</code> to the Transit Gateway. Without the return route, the NAT gateway translates the reply but has nowhere to send it.</li>
+				</ol>
+				<span class="file">One AZ of the egress VPC; repeat for us-east-1b and us-east-1c (AWS CLI, network account)</span>
+<pre><code><span class="c"># appliance mode is needed once a firewall is in the path (Step 3); set it from the start</span>
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-use1 \
+  --vpc-id vpc-0egressuse1 \
+  --subnet-ids subnet-egress-tgw-1a subnet-egress-tgw-1b subnet-egress-tgw-1c \
+  --options ApplianceModeSupport=enable,DnsSupport=enable
+
+<span class="c"># a public NAT gateway with an Elastic IP in us-east-1a</span>
+aws ec2 create-nat-gateway --subnet-id subnet-egress-nat-1a \
+  --allocation-id eipalloc-0natuse1a
+
+<span class="c"># attachment subnet (1a): internet traffic to the same-AZ NAT gateway</span>
+aws ec2 create-route --route-table-id rtb-egress-tgw-1a \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id nat-0use1a
+
+<span class="c"># NAT subnet (1a): out to the internet, and replies for spokes back to the hub</span>
+aws ec2 create-route --route-table-id rtb-egress-nat-1a \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id igw-0egressuse1
+aws ec2 create-route --route-table-id rtb-egress-nat-1a \
+  --destination-cidr-block 10.0.0.0/8 --transit-gateway-id tgw-use1</code></pre>
+				<p>Each NAT gateway address supports 55,000 simultaneous connections per unique destination (IP, port and protocol), and a NAT gateway can hold up to 8 addresses; bandwidth starts at 5 Gbps and scales to 100 Gbps. Centralizing concentrates connections onto a few addresses, so watch <code>ErrorPortAllocation</code>.</p>
+				<p><strong>IPv6</strong> does not need NAT. AWS's guidance is an egress-only internet gateway in each dual-stack VPC (outbound-only and stateful, the IPv6 counterpart of NAT for direction control), or a centralized path through NAT or proxy instances. The booking VPCs are dual-stack, so each gets its own egress-only gateway; inspecting that IPv6 traffic would need a firewall in the VPC itself.</p>
+				<span class="file">IPv6 egress stays in the spoke: an egress-only internet gateway (AWS CLI, application account)</span>
+<pre><code>aws ec2 create-egress-only-internet-gateway --vpc-id vpc-0bookingprod
+
+aws ec2 create-route --route-table-id rtb-bookings-app \
+  --destination-ipv6-cidr-block ::/0 \
+  --egress-only-internet-gateway-id eigw-0bookingprod</code></pre>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Model A: Network Firewall endpoints inside the egress VPC</h3>
+				<p>The first filtering model puts the firewall in the same VPC as the NAT gateways. Create the firewall with one subnet mapping per AZ; Network Firewall places an endpoint in each firewall subnet. Then insert the endpoint between the attachment subnet and the NAT gateway, and make sure the return path passes it too:</p>
+				<ol class="flow">
+					<li><b>Attachment subnet (per AZ)</b><code>0.0.0.0/0</code> to the firewall endpoint in the same AZ.</li>
+					<li><b>Firewall subnet (per AZ)</b><code>0.0.0.0/0</code> to the NAT gateway in the same AZ, and <code>10.0.0.0/8</code> to the Transit Gateway.</li>
+					<li><b>NAT gateway subnet (per AZ)</b><code>0.0.0.0/0</code> to the internet gateway, and <code>10.0.0.0/8</code> now to the same-AZ firewall endpoint instead of the Transit Gateway.</li>
+				</ol>
+				<span class="file">Create the firewall in the egress VPC and re-point one AZ's routes (AWS CLI, network account)</span>
+<pre><code>aws network-firewall create-firewall \
+  --firewall-name use1-egress \
+  --firewall-policy-arn arn:aws:network-firewall:us-east-1:111111111111:firewall-policy/egress-strict \
+  --vpc-id vpc-0egressuse1 \
+  --subnet-mappings SubnetId=subnet-egress-fw-1a SubnetId=subnet-egress-fw-1b SubnetId=subnet-egress-fw-1c
+
+<span class="c"># the endpoint ID per AZ is in the firewall's sync states (describe-firewall)</span>
+aws ec2 replace-route --route-table-id rtb-egress-tgw-1a \
+  --destination-cidr-block 0.0.0.0/0 --vpc-endpoint-id vpce-0fwuse1a
+
+<span class="c"># firewall subnet (1a): on to the NAT gateway, and replies back to the hub</span>
+aws ec2 create-route --route-table-id rtb-egress-fw-1a \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id nat-0use1a
+aws ec2 create-route --route-table-id rtb-egress-fw-1a \
+  --destination-cidr-block 10.0.0.0/8 --transit-gateway-id tgw-use1
+
+<span class="c"># NAT subnet (1a): replies now go back through the firewall</span>
+aws ec2 replace-route --route-table-id rtb-egress-nat-1a \
+  --destination-cidr-block 10.0.0.0/8 --vpc-endpoint-id vpce-0fwuse1a</code></pre>
+				<p><strong>Appliance mode</strong> (set on the egress attachment in Step 2) makes the Transit Gateway pick one ENI per flow and keep it for both directions. Without it, the Transit Gateway keeps traffic in the source AZ, and once the same firewall also inspects east-west or hybrid flows, the two halves of a conversation can land on different endpoints and be dropped by the stateful engine. It goes on the <strong>inspection VPC's attachment</strong>, never on the spokes. Two caveats from the documentation: stickiness holds only for traffic that enters the inspection VPC from the Transit Gateway, and turning it on for a live attachment can move existing flows, so do it in a maintenance window.</p>
+				<div class="callout tip"><p>Put the firewall <strong>before</strong> the NAT gateway. The firewall then logs and filters on the pod's real address (<code>10.40.12.30</code>), so rules can differ for the card data VPC and the logs show which workload made the call. After NAT, every flow would carry one of three Elastic IPs.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The firewall policy: strict order, domain allow list, drop established</h3>
+				<p>The policy forwards everything from the stateless engine to the stateful engine (<code>aws:pass</code> in the stateless engine would skip stateful inspection and logging). The stateful engine runs in <strong>strict order</strong>: rule groups by priority, rules in the order written, and a default action for whatever matches nothing. In the default action order, by contrast, pass rules win over drop rules wherever they appear, which makes an allow list harder to reason about.</p>
+				<p>Domain rules match the <strong>TLS SNI</strong> for HTTPS and the <strong>HTTP Host</strong> header for HTTP. Both arrive after the TCP handshake, so the default action must be <strong>drop established</strong>: the handshake is allowed, then any established flow that no rule passed is dropped. "Drop all" would drop the handshake before the domain can be seen, and nothing would ever match. Policies created since June 2026 default to "application drop established (server-directed only)", a variant that waits for application-layer data and avoids dropping keep-alives and resets.</p>
+				<span class="file">The allow-list rule group; HOME_NET is set to the spoke ranges (AWS CLI, network account)</span>
+<pre><code>aws network-firewall create-rule-group \
+  --rule-group-name egress-allowed-domains --type STATEFUL --capacity 100 \
+  --rule-group '{
+    "RuleVariables": {"IPSets": {"HOME_NET": {"Definition": ["10.40.0.0/14"]}}},
+    "RulesSource": {"RulesSourceList": {
+      "Targets": [".example.com", ".amazonaws.com", ".payments-partner.example", ".partner-airline.example"],
+      "TargetTypes": ["TLS_SNI", "HTTP_HOST"],
+      "GeneratedRulesType": "ALLOWLIST"}},
+    "StatefulRuleOptions": {"RuleOrder": "STRICT_ORDER"}}'</code></pre>
+				<p>Domain list rules apply to traffic from <code>HOME_NET</code>. By default that variable is the CIDR of the firewall's own VPC, which in a central design is the egress VPC (<code>10.41.240.0/22</code>), not the spokes, so the rule would never match spoke traffic. Override it with the Region summary as above; for the Transit Gateway-attached firewall in Step 5 the override is mandatory, because the firewall has no VPC CIDR to infer. A leading dot (<code>.example.com</code>) matches the domain and all its subdomains.</p>
+				<span class="file">The firewall policy that uses it (AWS CLI, network account)</span>
+<pre><code>aws network-firewall create-firewall-policy \
+  --firewall-policy-name egress-strict \
+  --firewall-policy '{
+    "StatelessDefaultActions": ["aws:forward_to_sfe"],
+    "StatelessFragmentDefaultActions": ["aws:forward_to_sfe"],
+    "StatefulEngineOptions": {"RuleOrder": "STRICT_ORDER"},
+    "StatefulDefaultActions": ["aws:drop_established", "aws:alert_established"],
+    "StatefulRuleGroupReferences": [
+      {"ResourceArn": "arn:aws:network-firewall:us-east-1:111111111111:stateful-rulegroup/egress-allowed-domains", "Priority": 100}]}'</code></pre>
+				<p>The policy and every stateful rule group in it must use the same rule order. The card data VPC can get a tighter list from a second rule group at a lower priority number, with source addresses limited to the payments CIDR, so the general list never applies to it. Analysis mode on <code>TLS_SNI</code> and <code>HTTP_HOST</code> reports the domains actually used over the last 30 days, a good starting point for the list.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Model B: the firewall attached natively to the Transit Gateway</h3>
+				<p>Since July 2025 in all Regions, Network Firewall can attach directly to a Transit Gateway. AWS owns a hidden VPC with the endpoints; the firewall appears on the Transit Gateway as a network function attachment. You build no inspection VPC, <strong>appliance mode is always on</strong>, and traffic reaches the firewall only through <strong>static routes in Transit Gateway route tables</strong> (no propagation from the firewall, no VPC route tables). The firewall's AZs must already be enabled on the Transit Gateway.</p>
+				<p>Because the managed VPC cannot hold a NAT gateway or an internet gateway, internet egress still needs a <strong>separate egress VPC</strong>, built exactly as in Step 2 without firewall subnets. The routing moves into the hub:</p>
+				<ol class="flow">
+					<li><b>Spoke tables (prod, dev, shared)</b><code>0.0.0.0/0</code> to the firewall attachment, plus the RFC 1918 blackholes from Step 1.</li>
+					<li><b>Firewall table (associated with the firewall attachment)</b><code>0.0.0.0/0</code> to the egress VPC attachment, and the spoke routes (propagated from the spokes) for inspected return traffic.</li>
+					<li><b>Egress table (associated with the egress VPC attachment)</b>A static <code>10.0.0.0/8</code> to the firewall attachment, and <strong>no</strong> spoke propagations. A propagated /21 would beat the /8 and send replies straight to the spoke, bypassing the firewall on the way back, and the stateful engine would drop the half-seen flow.</li>
+					<li><b>Egress VPC</b>Attachment subnets to the same-AZ NAT gateway; NAT subnets to the internet gateway and <code>10.0.0.0/8</code> to the Transit Gateway.</li>
+				</ol>
+				<span class="file">Create the attached firewall and route through it (AWS CLI, network account)</span>
+<pre><code><span class="c"># no VPC or subnets: the Transit Gateway and its AZs, fixed at creation</span>
+aws network-firewall create-firewall \
+  --firewall-name use1-central \
+  --firewall-policy-arn arn:aws:network-firewall:us-east-1:111111111111:firewall-policy/egress-strict \
+  --transit-gateway-id tgw-use1 \
+  --availability-zone-mappings AvailabilityZone=us-east-1a AvailabilityZone=us-east-1b AvailabilityZone=us-east-1c
+
+<span class="c"># spokes: internet traffic goes to the firewall first</span>
+aws ec2 replace-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 0.0.0.0/0 \
+  --transit-gateway-attachment-id tgw-attach-firewall
+
+<span class="c"># after inspection: on to the egress VPC</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-firewall \
+  --destination-cidr-block 0.0.0.0/0 \
+  --transit-gateway-attachment-id tgw-attach-egress
+
+<span class="c"># replies from the egress VPC are inspected before reaching a spoke</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-egress \
+  --destination-cidr-block 10.0.0.0/8 \
+  --transit-gateway-attachment-id tgw-attach-firewall</code></pre>
+				<p>The firewall can be owned by a separate security account: the network account shares the Transit Gateway through RAM, the security account creates the firewall, and the network account accepts the pending attachment (unless auto accept is on). The attached firewall itself cannot be shared through RAM; share the Transit Gateway instead. Either account can delete the firewall, and the Transit Gateway cannot be deleted while the attachment exists.</p>
+				<div class="callout note"><p>The 2021 blog that introduced the inspection-VPC pattern now carries an AWS note recommending the Transit Gateway-attached firewall for new designs. Model A is still valid and still common in exam questions, especially where a third-party firewall behind Gateway Load Balancer is needed, which the native attachment does not support.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>DNS Firewall against DNS exfiltration</h3>
+				<p>A blocked HTTPS connection does not stop a compromised pod from encoding data into DNS lookups such as <code>c2VjcmV0.tunnel.bad.example</code>. Those queries go to the VPC Resolver (VPC base +2) in the spoke itself, never cross the Transit Gateway and cannot be filtered by security groups or network ACLs, so Network Firewall never sees them. Route 53 Resolver DNS Firewall filters queries that pass through the VPC Resolver: rule groups of domain lists (yours or AWS managed), evaluated by priority, with actions ALLOW, ALERT or BLOCK (responses NODATA, NXDOMAIN or a CNAME OVERRIDE). It works on names only: it does not inspect connections, and clients using their own DNS servers bypass it, which is why it is paired with Network Firewall.</p>
+				<span class="file">Block a list of bad domains for the booking VPC (AWS CLI; repeat per Region, DNS Firewall is Regional)</span>
+<pre><code>aws route53resolver create-firewall-domain-list \
+  --creator-request-id dl-use1-1 --name blocked-domains
+aws route53resolver update-firewall-domains \
+  --firewall-domain-list-id DOMAIN_LIST_ID --operation ADD \
+  --domains "*.tunnel.bad.example" "*.unknown-share.example"
+
+aws route53resolver create-firewall-rule-group \
+  --creator-request-id rg-use1-1 --name egress-dns
+<span class="c"># test as ALERT first, then switch to BLOCK</span>
+aws route53resolver create-firewall-rule \
+  --creator-request-id r-use1-1 --name block-bad \
+  --firewall-rule-group-id RULE_GROUP_ID \
+  --firewall-domain-list-id DOMAIN_LIST_ID \
+  --priority 100 --action BLOCK --block-response NXDOMAIN
+
+<span class="c"># association priority must be between 100 and 9900</span>
+aws route53resolver associate-firewall-rule-group \
+  --name booking-dns-fw --firewall-rule-group-id RULE_GROUP_ID \
+  --vpc-id vpc-0bookingprod --priority 101</code></pre>
+				<p>Across 300 VPCs, nobody associates rule groups by hand: share the rule group through RAM and add it to the Route 53 Profile the spokes already use, or let Firewall Manager associate it with every in-scope VPC. DNS Firewall <strong>fails closed</strong> by default (unanswered queries get SERVFAIL); choose fail open only where availability matters more than filtering. DNS Firewall Advanced adds detection of DGA and tunneling patterns.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Logging and monitoring</h3>
+				<p>Network Firewall logs only traffic that reaches the stateful engine, which is why Step 4 forwards everything there. <strong>Alert</strong> logs record flows that hit a drop, alert or reject action (including the default drop established); <strong>flow</strong> logs record every flow the stateful engine saw; <strong>TLS</strong> logs need TLS inspection. Each type can go to S3, CloudWatch Logs or Firehose.</p>
+				<span class="file">Alert logs to CloudWatch Logs for alarms, flow logs to the central bucket (CloudFormation, network account)</span>
+<pre><code><span class="k">EgressFirewallLogging:</span>
+  <span class="k">Type:</span> AWS::NetworkFirewall::LoggingConfiguration
+  <span class="k">Properties:</span>
+    <span class="k">FirewallArn:</span> !GetAtt EgressFirewall.FirewallArn
+    <span class="k">LoggingConfiguration:</span>
+      <span class="k">LogDestinationConfigs:</span>
+        <span class="c"># dropped and alerted flows: searched during incidents, alarmed on</span>
+        - <span class="k">LogType:</span> ALERT
+          <span class="k">LogDestinationType:</span> CloudWatchLogs
+          <span class="k">LogDestination:</span>
+            <span class="k">logGroup:</span> /network-firewall/use1-egress/alert
+        <span class="c"># every inspected flow: kept cheaply for audits and Athena</span>
+        - <span class="k">LogType:</span> FLOW
+          <span class="k">LogDestinationType:</span> S3
+          <span class="k">LogDestination:</span>
+            <span class="k">bucketName:</span> central-flow-logs-111111111111
+            <span class="k">prefix:</span> nfw/use1-egress</code></pre>
+				<p>The hub already has Transit Gateway flow logs (see the <a href="tgw-hub-spoke.html#b6">hub page, Step 6</a>). For egress, per-attachment logs on the egress or firewall attachment show which spoke account sends the most internet traffic, which matters because that account's bytes drive the processing charges. For the Transit Gateway-attached firewall these logs, together with the firewall's own logs, are the main visibility: VPC flow logs and PrivateLink metrics are not available for its hidden endpoint ENIs.</p>
+				<span class="file">Flow logs for the egress attachment only (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-flow-logs --resource-type TransitGatewayAttachment \
+  --resource-ids tgw-attach-egress \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::central-flow-logs-111111111111/tgw-egress/</code></pre>
+				<p>On the NAT gateways, alarm on <code>ErrorPortAllocation</code> above zero (port exhaustion to one destination) and on <code>PacketsDropCount</code>. Resolver query logs record DNS Firewall matches.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>One egress VPC per Region, in the network account</h4>
+				<p>Internet traffic leaves in the Region where it starts, so a Frankfurt booking call does not pay inter-Region transfer or latency to reach a US NAT gateway, and data stays in the Region for residency rules. The network team owns the internet gateways; an SCP keeps application accounts from creating their own, so the egress VPC really is the only way out. See <a href="../d1-task-1-6.html">Task 1.6</a> and <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost: hours saved, bytes added</h4>
+				<p>Centralizing trades many hourly charges for per-GB charges. Using the published rates: a NAT gateway is $0.045 an hour and $0.045 per GB (the Ohio example on the pricing page), Transit Gateway data processing is $0.02 per GB on every byte a VPC sends into it, and a Network Firewall endpoint is $0.395 an hour plus $0.065 per GB in <code>us-east-1</code>. When a NAT gateway is service-chained with Network Firewall (same account, same Region, same network path), the NAT gateway's hourly and per-GB charges are <strong>waived one-to-one</strong> against firewall endpoint hours and gigabytes.</p>
+				<ul>
+					<li><strong>Before</strong>: 300 VPCs with NAT gateways in two AZs is 600 &times; $0.045 &times; 730 &asymp; $19,700 a month in NAT hours alone, with no filtering.</li>
+					<li><strong>Model A</strong>: three firewall endpoints are 3 &times; $0.395 &times; 730 &asymp; $865 a month, and the three NAT gateways' hours are waived. If 50 TB (51,200 GB) a month crosses the hub, Transit Gateway processing adds about $1,024 and firewall processing about $3,330, while the NAT per-GB charge is waived.</li>
+					<li><strong>Model B</strong>: egress traffic crosses the Transit Gateway twice (spoke to firewall, firewall to egress VPC), and each hop is processed, so the same 50 TB costs about $2,048 in Transit Gateway processing. The pricing page does not say whether a NAT gateway in a separate egress VPC qualifies for the service-chain waiver, so budget for NAT charges unless AWS confirms it for your setup.</li>
+				</ul>
+				<p>The catch is volume. A VPC that downloads hundreds of terabytes (for example a data pipeline pulling partner fare files) pays $0.02 per GB extra through the hub; a local NAT gateway, or VPC endpoints for AWS services, can be cheaper for that one VPC. Gateway endpoints for S3 and DynamoDB are free but work only in their own VPC, so each spoke should keep its own rather than sending S3 traffic through egress. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Availability: one of everything per AZ</h4>
+				<p>A NAT gateway and a firewall endpoint are zonal. With one of each per AZ and per-AZ route tables, losing <code>us-east-1b</code> takes out its Transit Gateway ENI, NAT gateway and endpoint together, and the Transit Gateway sends new flows through the remaining AZs; flows that were pinned to <code>us-east-1b</code> must reconnect. The weaker case is a single component failing while its AZ is healthy: VPC route tables do not fail over by themselves, so a broken NAT gateway in one AZ blackholes the flows hashed to it until routes are changed. Give the egress VPC an attachment subnet in every AZ the spokes use, and use AZ IDs (not names) when matching AZs across accounts. Resources in a spoke can only reach the Transit Gateway from AZs where that spoke has an attachment subnet.</p>
+			</div>
+			<div class="entry">
+				<h4>Model A or model B</h4>
+				<p>Model A keeps everything in one VPC that you can see and troubleshoot with VPC flow logs, and the NAT waiver clearly applies. Model B removes the inspection VPC, the per-AZ firewall route tables and the appliance-mode setting, lets a separate security account own the firewall, and supports Flexible Cost Allocation metering policies that charge firewall data processing back to spoke accounts. Its costs are the second Transit Gateway hop and less visibility into the managed endpoints. The travel company runs model B.</p>
+			</div>
+			<div class="entry">
+				<h4>Filtering on names, not addresses</h4>
+				<p>Partner APIs sit behind CDNs whose addresses change, so IP allow lists break; SNI and Host matching follows the name. SNI can be forged by a client that controls both ends, so where that is in the threat model add TLS inspection or Route 53 resolved IP validation (October 2026). See <a href="../d4-task-4-1.html">Task 4.1</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Distributed NAT gateways (and firewalls) per VPC</h4>
+				<p>No Transit Gateway processing, no shared blast radius, and each team controls its own internet path. It costs an hourly charge per NAT gateway per AZ in every VPC, and filtering would need a firewall in every VPC. It fits a few high-volume VPCs, not 300.</p>
+			</div>
+			<div class="entry">
+				<h4>Regional NAT gateway</h4>
+				<p>Since November 2025 a NAT gateway can run in regional availability mode: no public subnet, its own route table with a route to the internet gateway (the Transit Gateway is a valid target there), automatic expansion to AZs where ENIs appear (which can take up to 60 minutes), billed per AZ-hour. It simplifies the egress VPC's NAT tier, but it does not support private NAT, and how it combines with firewall service chaining should be checked before relying on it.</p>
+			</div>
+			<div class="entry">
+				<h4>Gateway Load Balancer with third-party firewalls</h4>
+				<p>The same egress VPC, with Gateway Load Balancer endpoints in place of Network Firewall endpoints and a vendor firewall fleet behind GENEVE on port 6081. Use it when the security team needs a specific vendor's features. Appliance mode is still required on the egress attachment, and GWLB 2-tuple or 3-tuple stickiness cannot be combined with it.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">An allowed domain works</span><span class="desc">From a booking pod, <code>curl -sv https://api.payments-partner.example/health</code> should succeed, and the payment processor should see one of the three NAT Elastic IPs as the source. The firewall flow log shows the pod's own <code>10.40.x</code> address.</span></li>
+				<li><span class="name">An unapproved domain fails</span><span class="desc"><code>curl -sv https://files.unknown-share.example</code> should complete the TCP handshake and then hang or reset after the Client Hello, with a matching alert log entry naming the SNI. If the handshake itself fails, the default action is drop all instead of drop established.</span></li>
+				<li><span class="name">Segments stay apart</span><span class="desc">Reachability Analyzer from a development instance to a production ENI should fail at the <code>dev</code> Transit Gateway route table. From a booking instance to the internet gateway, it should succeed through the NAT gateway and the firewall; it evaluates Network Firewall 5-tuple rules only, so domain rules are tested with real traffic.</span></li>
+				<li><span class="name">The return path is inspected</span><span class="desc">For model B, temporarily remove the static <code>10.0.0.0/8</code> from the egress table in a test Region: replies bypass the firewall and connections fail, proving the route is what keeps the flow symmetric. Restore it and confirm traffic recovers.</span></li>
+				<li><span class="name">DNS exfiltration is blocked</span><span class="desc"><code>dig test.tunnel.bad.example</code> from a spoke should return NXDOMAIN, and the Resolver query log should record the DNS Firewall rule.</span></li>
+				<li><span class="name">An AZ goes away</span><span class="desc">In a staging copy, delete the attachment subnet path in one AZ (or the NAT gateway there) and run a synthetic check that opens many short connections. Watch which flows fail and how long recovery takes, and confirm the NAT gateway alarms fire.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">Centralized egress as a Transit Gateway pattern, egress per Region, spoke and egress route tables</td></tr>
+						<tr><td><a href="../d1-task-1-4.html">1.4</a> Logging and monitoring requirements</td><td data-label="What this architecture demonstrates">Firewall alert and flow logs, Transit Gateway attachment flow logs, NAT gateway metrics</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Exact egress routes, RFC 1918 blackholes, NAT return route, appliance mode, Transit Gateway-attached Network Firewall</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">NAT hours against Transit Gateway processing, the NAT waiver, per-AZ redundancy</td></tr>
+						<tr><td><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Domain allow lists with strict order and drop established, DNS Firewall against exfiltration, outbound control for PCI DSS</td></tr>
+						<tr><td><a href="../d4-task-4-2.html">4.2</a> Validate and audit security with monitoring and logging</td><td data-label="What this architecture demonstrates">Alert logs as evidence, Reachability Analyzer for segmentation, DNS Firewall query logs</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Reduce the cost of NAT gateways in many VPCs and inspect all outbound internet traffic centrally, allowing only approved domains" is <strong>an egress VPC behind the Transit Gateway with a NAT gateway per AZ and AWS Network Firewall in the path (appliance mode on the egress or inspection attachment, or the Transit Gateway-attached firewall), using a stateful domain list on SNI and Host with strict order and drop established</strong>. If the question adds "spokes can now reach each other", the fix is <strong>blackhole routes for the private ranges in the spoke Transit Gateway route table</strong>; if "return traffic never arrives", it is <strong>the spoke CIDR route to the Transit Gateway in the NAT gateway subnets</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/deployment-models-for-aws-network-firewall-transit-gateway-attachment-and-multiple-vpc-endpoints/">Deployment models for AWS Network Firewall: Transit Gateway attachment and multiple VPC endpoints</a> (August 2026): model B's routing, the separate egress VPC, double Transit Gateway processing and chargeback.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/choosing-the-right-inspection-architecture-for-aws-network-firewall/">Choosing the right inspection architecture for AWS Network Firewall</a> (September 2026): distributed, centralized VPC and Transit Gateway-attached models compared.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/using-nat-gateways-with-multiple-amazon-vpcs-at-scale/">Using NAT Gateways with multiple-Amazon VPCs at scale</a> (September 2023): centralized against decentralized NAT, AZ affinity and cost (predates the regional NAT gateway).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/centralizing-outbound-internet-traffic-for-dual-stack-ipv4-and-ipv6-vpcs/">Centralizing outbound Internet traffic for dual stack IPv4 and IPv6 VPCs</a> (February 2023): the IPv6 side of central egress, with egress-only gateways and NAT64.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/centralizing-domain-list-management-for-aws-network-firewall-and-route-53-resolver-dns-firewall/">Centralizing Domain List Management for AWS Network Firewall and Route 53 Resolver DNS Firewall</a> (March 2023): one domain list feeding both firewalls from Steps 4 and 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/migrating-from-squid-web-proxy-to-aws-network-firewall/">Migrating from Squid Web Proxy to AWS Network Firewall</a> (August 2021): SNI and Host domain lists replacing a proxy fleet (predates the Transit Gateway-attached firewall).</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/using-nat-gateway-for-centralized-egress.html">Building a Scalable and Secure Multi-VPC AWS Network Infrastructure: centralized egress with NAT gateway</a> (AWS whitepaper, April 2024): the route tables, return route and blackhole for this design.</li>
+				<li><a href="https://docs.aws.amazon.com/network-firewall/latest/developerguide/tgw-firewall-considerations.html">Considerations for transit gateway-attached firewalls</a> (AWS documentation): appliance mode, routing only in Transit Gateway tables, HOME_NET and cross-account rules.</li>
+				<li><a href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver-dns-firewall.html">Route 53 Resolver DNS Firewall</a> (AWS documentation): rule groups, actions and fail mode.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>

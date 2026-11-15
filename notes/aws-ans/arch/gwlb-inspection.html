@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Centralized Inspection with Gateway Load Balancer | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: a security VPC per Region with a Gateway Load Balancer, a GENEVE target group on UDP 6081 and vendor firewalls in an Auto Scaling group; endpoint service and GWLB endpoints per AZ; east-west and egress inspection through Transit Gateway with appliance mode; north-south inbound with ingress routing; stickiness, failover, idle timeout and TCP reset; MTU, cost and Network Firewall comparison.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">GWLB inspection</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Centralized inspection with Gateway Load Balancer</h1>
+		<p>The travel company's security team has standardized on one vendor's next-generation firewall. In each Region, a security VPC runs a fleet of those firewalls behind a Gateway Load Balancer. Gateway Load Balancer endpoints put the fleet in the path of traffic between VPCs, traffic to the internet, and inbound partner traffic, without any VPC knowing that a firewall is there.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">Gateway Load Balancer</span><span class="tag">GWLB endpoints</span><span class="tag">Transit Gateway</span><span class="tag">VPC ingress routing</span><span class="tag">EC2 Auto Scaling</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Security VPC and Gateway Load Balancer</a></li>
+				<li class="sub"><a href="#b2">2. The firewall fleet</a></li>
+				<li class="sub"><a href="#b3">3. Flow behaviour attributes</a></li>
+				<li class="sub"><a href="#b4">4. Endpoint service and endpoints</a></li>
+				<li class="sub"><a href="#b5">5. Transit Gateway routing</a></li>
+				<li class="sub"><a href="#b6">6. North-south ingress routing</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a> in the network account <code>111111111111</code>, with <code>tgw-use1</code> and the <code>prod</code>, <code>dev</code>, <code>shared</code> and <code>onprem</code> route tables, and the <a href="centralized-egress.html">centralized egress</a> design, in which internet traffic passes AWS Network Firewall before a NAT gateway in the egress VPC. The security team has now standardized on one vendor's next-generation firewall, with the same rules, threat feeds and console it runs in the data centers. Network Firewall cannot run that software, so the firewall layer moves to Gateway Load Balancer (GWLB); the egress VPC and its NAT gateways stay.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>One firewall product and policy across data centers and AWS</td><td data-label="Design choice">Vendor firewall instances behind a Gateway Load Balancer in a security VPC per Region</td></tr>
+						<tr><td>Inspect traffic into and out of the card data VPC</td><td data-label="Design choice">Static Transit Gateway routes for the payments range point to the security VPC attachment</td></tr>
+						<tr><td>Inspect all internet egress before NAT</td><td data-label="Design choice">Spoke default routes go to the security VPC first, then to the existing egress VPC</td></tr>
+						<tr><td>Inspect inbound partner traffic before it reaches the partner API</td><td data-label="Design choice">Ingress routing on the partner VPC's internet gateway sends traffic to local GWLB endpoints</td></tr>
+						<tr><td>Both halves of every flow reach the same firewall</td><td data-label="Design choice">Appliance mode on the security VPC attachment and 5-tuple flow stickiness on the GWLB</td></tr>
+						<tr><td>Survive an appliance or AZ failure, scale with load</td><td data-label="Design choice">Appliances in an Auto Scaling group across three AZs with GWLB health checks, TCP reset on failure</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>The hub's address plan stays (<code>us-east-1</code> is <code>10.40.0.0/14</code>; booking VPC <code>10.40.8.0/21</code>; egress VPC <code>10.41.240.0/22</code>). This page adds the security VPC <code>10.41.236.0/22</code>, the payments VPC holding the card data environment <code>10.40.48.0/21</code>, and the partner API VPC <code>10.40.56.0/22</code>, which has its own internet gateway and an internet-facing NLB with Elastic IPs. The security VPC has three tiers in each of <code>us-east-1a</code>, <code>1b</code> and <code>1c</code>: a /28 for the Transit Gateway attachment, a /28 for the GWLB endpoint, and a /26 for the GWLB and firewall interfaces. The other two Regions get identical builds, so traffic never crosses a Region to find a firewall.</p>
+
+			<h2 id="flow">How it works</h2>
+			<p>A GWLB is a layer 3 "bump in the wire": it takes all IP packets on all ports, wraps each in GENEVE (UDP 6081) for one appliance, and gets it back the same way. Traffic reaches it only through a <strong>GWLB endpoint</strong>, a PrivateLink endpoint used as a route table next hop, so route tables, not addresses, put the firewall in the path.</p>
+			<ol class="flow">
+				<li class="group">A booking pod calls the payments API (east-west)</li>
+				<li class="auto"><span class="name">Spoke to the hub<span class="who auto">AWS</span></span><span class="desc">A pod at <code>10.40.12.30</code> opens HTTPS to the payments API at <code>10.40.50.20</code>. The booking subnet sends <code>10.0.0.0/8</code> to the Transit Gateway.</span></li>
+				<li class="auto"><span class="name">Prod table sends it to inspection<span class="who auto">AWS</span></span><span class="desc">In the <code>prod</code> table, a static route for <code>10.40.48.0/21</code> points at the security VPC attachment. It is more specific than the <code>10.0.0.0/8</code> blackhole, so the packet goes to inspection.</span></li>
+				<li class="auto"><span class="name">Appliance mode picks an AZ<span class="who auto">AWS</span></span><span class="desc">Appliance mode hashes the flow and picks one attachment ENI, for example in <code>us-east-1b</code>. Both directions of this flow will use that AZ.</span></li>
+				<li class="auto"><span class="name">Attachment subnet to the endpoint<span class="who auto">AWS</span></span><span class="desc">The attachment subnet route table in <code>us-east-1b</code> sends <code>0.0.0.0/0</code> to the GWLB endpoint in <code>us-east-1b</code>.</span></li>
+				<li class="auto"><span class="name">GENEVE to a firewall<span class="who auto">AWS</span></span><span class="desc">The GWLB picks a healthy firewall by 5-tuple hash and sends the packet inside GENEVE. The firewall sees the real addresses, applies its "booking to payments, TCP 443 only" rule and returns the packet.</span></li>
+				<li class="auto"><span class="name">Back to the hub<span class="who auto">AWS</span></span><span class="desc">The endpoint subnet sends <code>0.0.0.0/0</code> to the Transit Gateway, and the <code>inspection</code> table, which holds every spoke's propagated routes, delivers the packet to the payments VPC.</span></li>
+				<li class="auto"><span class="name">The reply follows the same path<span class="who auto">AWS</span></span><span class="desc">The payments VPC's <code>pci</code> table sends everything to the security VPC. Appliance mode returns the reply to <code>us-east-1b</code>, the GWLB's 5-tuple stickiness sends it to the same firewall, and the firewall matches it to the existing session.</span></li>
+				<li class="group">A pod calls a partner airline on the internet (egress)</li>
+				<li class="auto"><span class="name">Inspect, then NAT<span class="who auto">AWS</span></span><span class="desc">The <code>prod</code> table's <code>0.0.0.0/0</code> now points at the security VPC. After the firewall allows the URL category, the <code>inspection</code> table sends the packet to the egress VPC and its NAT gateway. The reply is inspected too, because the egress table holds only a static <code>10.0.0.0/8</code> to the security VPC.</span></li>
+				<li class="group">A partner calls the partner API (north-south inbound)</li>
+				<li class="auto"><span class="name">Internet gateway edge route<span class="who auto">AWS</span></span><span class="desc">A partner connects to the NLB's Elastic IP. The internet gateway translates it to the NLB's private address in <code>10.40.56.0/26</code>, and the gateway route table (associated with the internet gateway) sends that subnet range to the GWLB endpoint in the same AZ.</span></li>
+				<li class="auto"><span class="name">Inspected, then local<span class="who auto">AWS</span></span><span class="desc">The same fleet inspects it, and the endpoint subnet's local route delivers it to the NLB. The NLB subnet sends <code>0.0.0.0/0</code> to the same endpoint, so responses are inspected on the way out.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The security VPC, the Gateway Load Balancer and the GENEVE target group</h3>
+				<p>The GWLB lives in the same VPC as its appliances, with one subnet per AZ (at least 8 free addresses each). Subnets cannot be removed later, so choose all three AZs at creation. Its single listener has no protocol or port and forwards everything to one target group, whose protocol must be <strong>GENEVE</strong> on port <strong>6081</strong>, with instance or IP targets.</p>
+				<span class="file">Create the GWLB, its target group and listener (AWS CLI, network account)</span>
+<pre><code><span class="c"># one appliance subnet per AZ; subnets cannot be removed later</span>
+aws elbv2 create-load-balancer --name gwlb-use1 --type gateway \
+  --subnets subnet-sec-appl-1a subnet-sec-appl-1b subnet-sec-appl-1c
+
+<span class="c"># GENEVE on 6081 is the only option; health checks go to the vendor's probe port</span>
+aws elbv2 create-target-group --name ngfw-use1 \
+  --protocol GENEVE --port 6081 --vpc-id vpc-0secuse1 --target-type instance \
+  --health-check-protocol HTTPS --health-check-port 443 --health-check-path /health \
+  --health-check-interval-seconds 10 --healthy-threshold-count 3 --unhealthy-threshold-count 2
+
+<span class="c"># the single listener: no protocol or port, just a forward to the target group</span>
+aws elbv2 create-listener --load-balancer-arn GWLB_ARN \
+  --default-actions Type=forward,TargetGroupArn=TG_ARN</code></pre>
+				<p>Health checks can use TCP (the default, port 80), HTTP or HTTPS. A TCP check only proves a port answers; a vendor HTTPS probe that fails when the data plane fails is a better signal (it must accept TLS 1.2, as TLS 1.3-only targets fail HTTPS checks). Checks come from several GWLB nodes, so each appliance sees several probes per interval.</p>
+				<p>The <strong>MTU</strong> rule is a classic trap. The GWLB accepts packets up to 8,500 bytes; GENEVE adds 68, so the appliance's data interface must accept at least <strong>8,568 bytes</strong>. The GWLB does not fragment or send ICMP "fragmentation needed", so Path MTU Discovery fails: a 1,500-byte appliance silently drops large packets, and small requests work while large transfers hang.</p>
+				<div class="callout trap"><p>The GWLB and its targets are in the <strong>security VPC</strong>; GWLB endpoints are in the VPCs being inspected. An endpoint and the workloads it protects must be in <strong>different subnets</strong>, because the workload subnet's route table points at the endpoint.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The firewall fleet in an Auto Scaling group</h3>
+				<p>The vendor's Marketplace image runs in an Auto Scaling group across the three AZs, with the target group attached so instances register and deregister automatically. With <code>--health-check-type ELB</code>, the group also replaces instances that fail the GWLB health check. Bootstrap user data points each new instance at the vendor console, which pushes the policy before the instance turns healthy.</p>
+				<span class="file">Two firewalls per AZ, scaled on load (AWS CLI, network account)</span>
+<pre><code><span class="c"># the launch template holds the vendor AMI, instance type and bootstrap user data</span>
+aws autoscaling create-auto-scaling-group --auto-scaling-group-name ngfw-use1 \
+  --launch-template LaunchTemplateName=ngfw-use1,Version='$Latest' \
+  --min-size 6 --max-size 12 --desired-capacity 6 \
+  --vpc-zone-identifier "subnet-sec-appl-1a,subnet-sec-appl-1b,subnet-sec-appl-1c" \
+  --target-group-arns TG_ARN \
+  --health-check-type ELB --health-check-grace-period 600</code></pre>
+				<p>Scale on the appliance's bottleneck (CPU or a vendor session metric), and scale in slowly: a terminated firewall takes its sessions with it. Licences are part of the design: pay-as-you-go Marketplace images suit a group that grows and shrinks, while bring-your-own-licence is cheaper for the six that always run.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Flow behaviour: stickiness, failover, idle timeout and TCP reset</h3>
+				<p><strong>Flow stickiness</strong> is a target group attribute: 5-tuple by default, or 3-tuple (<code>source_ip_dest_ip_proto</code>) or 2-tuple (<code>source_ip_dest_ip</code>) through <code>stickiness.type</code>, which keeps all flows between two hosts on one appliance. Here 5-tuple is the only choice: <strong>2-tuple and 3-tuple are not supported with Transit Gateway appliance mode</strong>, and the idle timeout can only be changed with 5-tuple.</p>
+				<p><strong>Target failover</strong> controls existing flows when an appliance fails or deregisters. With <code>no_rebalance</code> (the default) they stay on the same target, which allows draining but drops them if the target is gone; new flows go to healthy targets. With <code>rebalance</code>, they are rehashed to healthy targets after the deregistration delay or unhealthy detection, which can take minutes. <code>target_failover.on_deregistration</code> and <code>target_failover.on_unhealthy</code> must match. Rebalancing moves a mid-session flow to a firewall that never saw it, so it helps only with session synchronization.</p>
+				<p><strong>TCP reset</strong> (September 2026) is what the company uses: with <code>no_rebalance</code>, the GWLB sends a TCP RST to the sender when a target turns unhealthy or finishes deregistering, so clients reconnect through a healthy firewall within seconds. It needs 5-tuple stickiness, excludes <code>rebalance</code>, and covers TCP only.</p>
+				<span class="file">No rebalance with TCP reset, and a longer idle timeout (AWS CLI, network account)</span>
+<pre><code><span class="c"># target group: keep 5-tuple (stickiness off), no rebalance, reset on failure and deregistration</span>
+aws elbv2 modify-target-group-attributes --target-group-arn TG_ARN \
+  --attributes Key=stickiness.enabled,Value=false \
+    Key=target_failover.on_deregistration,Value=no_rebalance \
+    Key=target_failover.on_unhealthy,Value=no_rebalance \
+    Key=send_tcp_reset.on_unhealthy.enabled,Value=true \
+    Key=send_tcp_reset.on_deregistration.enabled,Value=true
+
+<span class="c"># listener: match the firewall's TCP session timeout, and reset idle flows</span>
+aws elbv2 modify-listener-attributes --listener-arn LISTENER_ARN \
+  --attributes Key=tcp.idle_timeout.seconds,Value=1800 \
+    Key=send_tcp_reset.on_idle_timeout.enabled,Value=true</code></pre>
+				<p>The <strong>TCP idle timeout</strong> defaults to 350 seconds, configurable from 60 to 6,000 (UDP is fixed at 120). After it expires, data on the old connection is dropped. Booking pods hold long-lived connections, so the company sets 1,800 seconds to match the firewall's session timeout, and raises the appliances' ENI <code>TcpEstablishedTimeout</code> to match, since on Nitro v6 it also defaults to 350.</p>
+				<p><strong>Cross-zone load balancing</strong> is off by default, so each GWLB node uses only its own AZ's appliances: no inter-AZ charges, but if all appliances in an AZ are unhealthy, the GWLB sends each flow to a random target and it is dropped. The company keeps it off, with two appliances per AZ and Auto Scaling replacement.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The endpoint service and a GWLB endpoint per AZ</h3>
+				<p>The network account creates a <strong>VPC endpoint service</strong> from the GWLB and lists the <strong>allowed principals</strong> that may create endpoints: itself and the partner API account. With acceptance required, the security team approves each endpoint.</p>
+				<span class="file">Endpoint service with allowed principals (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-vpc-endpoint-service-configuration \
+  --gateway-load-balancer-arns GWLB_ARN --acceptance-required
+
+<span class="c"># who may create GWLB endpoints for this service</span>
+aws ec2 modify-vpc-endpoint-service-permissions --service-id vpce-svc-0ngfwuse1 \
+  --add-allowed-principals arn:aws:iam::111111111111:root arn:aws:iam::PARTNER_ACCOUNT_ID:root
+
+<span class="c"># approve a pending endpoint from the partner account</span>
+aws ec2 accept-vpc-endpoint-connections --service-id vpce-svc-0ngfwuse1 \
+  --vpc-endpoint-ids vpce-0partner1a</code></pre>
+				<p>A GWLB endpoint sits in one subnet, so each AZ gets its own and each AZ's routes use the local one. Across accounts, match AZ IDs (<code>use1-az1</code>), not names. GWLB endpoints have no private DNS names; they are only route targets.</p>
+				<span class="file">The security VPC's own endpoint in us-east-1a; repeat for 1b and 1c (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-vpc-endpoint --vpc-endpoint-type GatewayLoadBalancer \
+  --vpc-id vpc-0secuse1 \
+  --service-name com.amazonaws.vpce.us-east-1.vpce-svc-0ngfwuse1 \
+  --subnet-ids subnet-sec-gwlbe-1a</code></pre>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Transit Gateway routing with appliance mode</h3>
+				<p>The security VPC attaches to <code>tgw-use1</code> with <strong>appliance mode</strong>. Without it, each direction stays in its source AZ: a request from 1a to a payments host in 1c is inspected in 1a and the reply in 1c, and the second firewall drops a reply for a session it never saw. Appliance mode uses one security VPC ENI for both directions. It goes on the <strong>security VPC's attachment only</strong>; enabling it on a live attachment can move flows.</p>
+				<span class="file">Attach the security VPC and give it its own route table (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-vpc-attachment --transit-gateway-id tgw-use1 \
+  --vpc-id vpc-0secuse1 \
+  --subnet-ids subnet-sec-tgw-1a subnet-sec-tgw-1b subnet-sec-tgw-1c \
+  --options ApplianceModeSupport=enable,DnsSupport=enable
+
+<span class="c"># inspection table: associated with the security VPC; every spoke propagates into it</span>
+aws ec2 associate-transit-gateway-route-table --transit-gateway-route-table-id tgw-rtb-inspection \
+  --transit-gateway-attachment-id tgw-attach-inspection
+aws ec2 enable-transit-gateway-route-table-propagation --transit-gateway-route-table-id tgw-rtb-inspection \
+  --transit-gateway-attachment-id tgw-attach-payments-prod
+
+<span class="c"># after inspection, internet traffic continues to the egress VPC</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-inspection \
+  --destination-cidr-block 0.0.0.0/0 --transit-gateway-attachment-id tgw-attach-egress</code></pre>
+				<p>The spoke side has three parts:</p>
+				<ol class="flow">
+					<li><b>Spoke tables (prod, dev, shared)</b><code>0.0.0.0/0</code> now points at <code>tgw-attach-inspection</code> instead of the Network Firewall attachment; the RFC 1918 blackholes stay, so development still cannot reach production through the security VPC.</li>
+					<li><b>Card data routes</b>A new <code>pci</code> table for the payments attachment has one <code>0.0.0.0/0</code> to the security VPC. Payments propagates only into <code>inspection</code>. <code>prod</code>, <code>shared</code> and <code>onprem</code> get a static <code>10.40.48.0/21</code> to the security VPC, which beats their <code>10.0.0.0/8</code> blackholes; <code>dev</code> gets nothing.</li>
+					<li><b>Egress table</b>A static <code>10.0.0.0/8</code> to the security VPC and no spoke propagations; a propagated /21 would win and let replies bypass the firewall.</li>
+				</ol>
+				<span class="file">The card data environment always goes through the firewalls (AWS CLI, network account)</span>
+<pre><code><span class="c"># prod (and shared, onprem): reach payments only via inspection</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.40.48.0/21 --transit-gateway-attachment-id tgw-attach-inspection
+
+<span class="c"># pci: everything out of the card data VPC is inspected</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-pci \
+  --destination-cidr-block 0.0.0.0/0 --transit-gateway-attachment-id tgw-attach-inspection</code></pre>
+				<p>Inside the security VPC, each AZ's <strong>attachment subnet</strong> table sends <code>0.0.0.0/0</code> to its same-AZ endpoint (so these are per AZ), and one <strong>endpoint subnet</strong> table sends <code>0.0.0.0/0</code> back to the Transit Gateway.</p>
+				<span class="file">Security VPC routes for us-east-1a (AWS CLI, network account)</span>
+<pre><code><span class="c"># from the hub into the firewall, in the same AZ</span>
+aws ec2 create-route --route-table-id rtb-sec-tgw-1a \
+  --destination-cidr-block 0.0.0.0/0 --vpc-endpoint-id vpce-0gwlbuse1a
+
+<span class="c"># inspected traffic goes back to the hub (shared by all AZs)</span>
+aws ec2 create-route --route-table-id rtb-sec-gwlbe \
+  --destination-cidr-block 0.0.0.0/0 --transit-gateway-id tgw-use1</code></pre>
+				<div class="callout trap"><p>A route whose target is a GWLB endpoint cannot use a <strong>prefix list</strong> as its destination. The ingress and spoke route tables that point at GWLB endpoints must list CIDRs, even though prefix lists work for routes to the Transit Gateway.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>North-south inbound with ingress routing</h3>
+				<p>Traffic entering the partner VPC through its own internet gateway never touches the Transit Gateway, and appliance mode's stickiness only covers traffic arriving from the Transit Gateway. So the partner VPC gets its own GWLB endpoints from the same service, and <strong>ingress routing</strong> steers traffic to them: a <strong>gateway route table</strong> with an edge association to the internet gateway applies to inbound traffic.</p>
+				<ol class="flow">
+					<li><b>Gateway route table (edge association with the internet gateway)</b>Each NLB subnet range, for example <code>10.40.56.0/26</code> in 1a, to the GWLB endpoint in the same AZ.</li>
+					<li><b>NLB subnet route table (per AZ)</b><code>0.0.0.0/0</code> to the same-AZ GWLB endpoint, replacing the old route to the internet gateway, so responses are inspected too.</li>
+					<li><b>GWLB endpoint subnet route table</b><code>0.0.0.0/0</code> to the internet gateway. Inspected inbound traffic needs no extra route: the local route delivers it to the NLB.</li>
+				</ol>
+				<span class="file">Edge association and routes for us-east-1a (AWS CLI, partner account)</span>
+<pre><code><span class="c"># a route table associated with the internet gateway itself</span>
+aws ec2 create-route-table --vpc-id vpc-0partnerapi
+aws ec2 associate-route-table --route-table-id rtb-partner-edge --gateway-id igw-0partnerapi
+
+<span class="c"># traffic for the NLB subnet in 1a goes to the endpoint in 1a first</span>
+aws ec2 create-route --route-table-id rtb-partner-edge \
+  --destination-cidr-block 10.40.56.0/26 --vpc-endpoint-id vpce-0partner1a
+
+<span class="c"># the NLB subnet's replies are inspected before reaching the internet gateway</span>
+aws ec2 replace-route --route-table-id rtb-partner-nlb-1a \
+  --destination-cidr-block 0.0.0.0/0 --vpc-endpoint-id vpce-0partner1a
+
+<span class="c"># after inspection, outbound traffic leaves through the internet gateway</span>
+aws ec2 create-route --route-table-id rtb-partner-gwlbe-1a \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id igw-0partnerapi</code></pre>
+				<p>The gateway route table's destination is the subnet range, not the Elastic IP, because the internet gateway has already translated the public address. The firewall sees the partner's real public source address, so rules and logs can identify partners.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Gateway Load Balancer instead of AWS Network Firewall</h4>
+				<p>The <a href="centralized-egress.html">egress page's</a> Transit Gateway-attached Network Firewall is managed and needs no instances. The company changes for operational reasons (one rule base, console and threat feed for data centers and AWS) and accepts running the firewalls itself: patching, licences, scaling and failure behaviour. The native attachment does not accept third-party firewalls, so a vendor product means an inspection VPC with GWLB. See <a href="../d4-task-4-1.html">Task 4.1</a> and <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>One security VPC per Region, shared by east-west, egress and inbound</h4>
+				<p>One fleet per Region keeps traffic in its Region for latency and European data residency, and one GWLB serves both the Transit Gateway path and the partner VPC, so there is one policy and one fleet to size. Separate inbound and outbound fleets would stop an inbound attack from exhausting egress capacity; the company will split them if partner traffic grows.</p>
+			</div>
+			<div class="entry">
+				<h4>Failure behaviour: TCP reset rather than rebalance</h4>
+				<p>The vendor's firewalls do not share session tables, so rebalancing a live flow would only move the drop. A reset makes the client open a new flow, which goes to a healthy firewall. Rebalance fits only with session synchronization or UDP-heavy traffic.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost: endpoints, GLCUs, double Transit Gateway processing, licences</h4>
+				<p>GWLB endpoints are billed per AZ-hour and per GB (PrivateLink pricing); the GWLB per AZ-hour plus GLCUs (600 new flows per second, 60,000 active flows or 1 GB per hour); and at least six EC2 firewalls with licences run around the clock. Transit Gateway processing ($0.02 per GB on every byte a VPC sends into it) applies twice to each inspected packet: from the spoke, and from the security VPC after inspection. NAT gateways now pay full charges, because the service chaining waiver belongs to Network Firewall. So inspect only what the rules require (card data, egress, partner ingress); production to shared services stays on direct routes. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Encryption Controls, MTU and other compatibility limits</h4>
+				<p><strong>VPC Encryption Controls</strong> enforce mode is not compatible with Gateway Load Balancer, so the security VPC (and, to be safe, the partner VPC) stays in monitor mode, whose flow log fields still give encryption evidence. Security group referencing does not work through GWLB inspection, so the payments security groups allow the booking CIDR. Transit Gateway carries 8,500 bytes, matching the GWLB; the appliances need 8,568. See <a href="../d4-task-4-3.html">Task 4.3</a> and <a href="../d3-task-3-2.html">Task 3.2</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>AWS Network Firewall (inspection VPC or Transit Gateway attachment)</h4>
+				<p>The managed option, covered on the <a href="centralized-egress.html#b3">egress page</a>: endpoints in an inspection VPC with appliance mode, or the native Transit Gateway attachment with appliance mode always on. No instances or licences, plus the NAT waiver. Choose it unless a vendor product is required.</p>
+			</div>
+			<div class="entry">
+				<h4>Distributed GWLB endpoints in every VPC</h4>
+				<p>Every internet-facing VPC gets endpoints and ingress routing, as the partner VPC does, served by the central fleet. No Transit Gateway charges, but endpoint hours multiply, and east-west traffic still needs the hub.</p>
+			</div>
+			<div class="entry">
+				<h4>Appliances without GWLB</h4>
+				<p>Routing to firewall ENIs (source/destination check off) with scripted route failover scales poorly. VPC Route Server can instead learn routes from appliances over BGP and steer to healthy ones (July 2026 blog).</p>
+			</div>
+			<div class="entry">
+				<h4>Cloud WAN service insertion</h4>
+				<p>On Cloud WAN, a network function group with send-via and send-to policies inserts the same security VPCs into paths across Regions; the GWLB fleet inside stays the same.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Reachability Analyzer, in two legs</span><span class="desc">Booking to payments should pass the <code>prod</code> route and end at a GWLB endpoint; paths through an endpoint exclude the GWLB and its targets, so analyze the GWLB-to-appliance leg separately with <strong>UDP 6081</strong> (other protocols or ports fail with GWLB restriction codes). Development to payments should stop at the <code>dev</code> blackhole.</span></li>
+				<li><span class="name">Symmetry</span><span class="desc">Run long transfers between AZs and confirm in the firewall logs that each session shows both directions on one firewall. Turning appliance mode off in a staging hub should produce one-sided sessions.</span></li>
+				<li><span class="name">Large packets</span><span class="desc">Send don't-fragment pings of 8,500 bytes between jumbo-frame hosts across the hub. If they fail while 1,400-byte pings pass, an appliance MTU is below 8,568.</span></li>
+				<li><span class="name">Appliance failure</span><span class="desc">Stop one firewall's data plane under load. Within about 20 seconds (2 failures at 10 seconds) clients should get resets and reconnect, <code>describe-target-health</code> should show <code>Target.FailedHealthChecks</code>, and Auto Scaling should replace the instance. Alarm on <code>UnHealthyHostCount</code> (<code>AWS/GatewayELB</code>, Minimum statistic).</span></li>
+				<li><span class="name">Idle connections</span><span class="desc">A database connection idle for 25 minutes should still work; after 30 minutes the client should get a reset, not a silent hang.</span></li>
+				<li><span class="name">Inbound inspection</span><span class="desc">Call the partner API from outside AWS and confirm the firewall logs the caller's public address. GWLB has no access logs, so VPC flow logs on the endpoint ENIs confirm the path.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Load balancing for availability, scalability and security</td><td data-label="What this architecture demonstrates">GWLB with a GENEVE 6081 target group, health checks, stickiness, cross-zone, Auto Scaling traffic source</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing strategy</td><td data-label="What this architecture demonstrates">Centralized inspection as a Transit Gateway pattern, per-Region security VPCs, inspection and pci route tables</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Endpoint service with allowed principals, GWLB endpoints per AZ, appliance mode, ingress routing, prefix list limit</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Monitor and analyze network traffic</td><td data-label="What this architecture demonstrates">The 8,568-byte appliance MTU without PMTUD, Reachability Analyzer on UDP 6081</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Vendor firewalls for east-west, egress and inbound inspection; card data segmentation for PCI DSS</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-3.html">4.3</a> Confidentiality of data and communications</td><td data-label="What this architecture demonstrates">Encryption Controls enforce mode not compatible with GWLB; monitor mode as evidence</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Inspect traffic between VPCs and to the internet with a third-party firewall, scalable and highly available, with both directions of each flow on the same appliance" is <strong>a security VPC with a Gateway Load Balancer, a GENEVE target group on UDP 6081 and appliances in an Auto Scaling group, GWLB endpoints per AZ as route targets, and Transit Gateway appliance mode on the security VPC attachment</strong>. If the question adds "inspect inbound internet traffic in a VPC with its own internet gateway", the answer is <strong>a gateway route table associated with the internet gateway that sends the application subnet range to a GWLB endpoint</strong>. If "large packets are dropped", it is <strong>the appliance MTU below 8,568 bytes</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/centralized-inspection-architecture-with-aws-gateway-load-balancer-and-aws-transit-gateway/">Centralized inspection architecture with AWS Gateway Load Balancer and AWS Transit Gateway</a> (December 2020): the canonical security VPC with GWLB endpoints and appliance mode for east-west and egress (predates the Transit Gateway-attached Network Firewall).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-for-deploying-gateway-load-balancer/">Best practices for deploying Gateway Load Balancer</a> (July 2021): health checks, stickiness, cross-zone, appliance mode and failure behaviour.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/reduce-traffic-interruptions-with-gateway-load-balancer-tcp-reset/">Reduce Traffic Interruptions with Gateway Load Balancer TCP Reset</a> (September 2026): the reset attributes from Step 3 and when to use them.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-configurable-tcp-idle-timeout-for-gateway-load-balancer/">Introducing configurable TCP idle timeout for Gateway Load Balancer</a> (September 2024): matching the GWLB timeout to appliance session tables.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-aws-gateway-load-balancer-supported-architecture-patterns/">Introducing AWS Gateway Load Balancer: Supported architecture patterns</a> (November 2020): GENEVE, endpoints, ingress routing, north-south and east-west patterns.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/design-your-firewall-deployment-for-internet-ingress-traffic-flows/">Design your firewall deployment for Internet ingress traffic flows</a> (February 2022): where to put the firewall for inbound flows, distributed or central.</li>
+				<li><a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/gateway/edit-target-group-attributes.html">Edit target group attributes for your Gateway Load Balancer</a> (AWS documentation): stickiness, target failover, TCP reset and their constraints.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/privatelink/vpce-gateway-load-balancer.html">Access virtual appliances through AWS PrivateLink</a> (AWS documentation): GWLB endpoints, ingress routing tables, the prefix list restriction and pricing.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
