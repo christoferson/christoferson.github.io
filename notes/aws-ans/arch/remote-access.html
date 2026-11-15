@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Remote Workforce Access with Client VPN and Verified Access | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: AWS Client VPN natively attached to a Transit Gateway with preserved client source IPs, mutual plus SAML authentication, authorization rules, split tunnel, route enforcement and device posture with a Cedar policy; AWS Verified Access for HTTP and TCP applications with identity and device trust providers; AWS Network Firewall on both paths; when to choose Client VPN, Verified Access or Site-to-Site VPN.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Remote access</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Remote workforce access: Client VPN and Verified Access</h1>
+		<p>The travel company's call-center agents, staff and contractors work from home. Operations staff get full network access through AWS Client VPN, attached directly to the Transit Gateway so their own addresses reach every firewall and log. Everyone else gets per-application, VPN-less access through AWS Verified Access, which checks identity and device health on every request. AWS Network Firewall inspects both paths.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">AWS Client VPN</span><span class="tag">AWS Verified Access</span><span class="tag">Transit Gateway</span><span class="tag">Network Firewall</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Client VPN on the Transit Gateway</a></li>
+				<li class="sub"><a href="#b2">2. Routes, authorization and return paths</a></li>
+				<li class="sub"><a href="#b3">3. Device posture and the Cedar policy</a></li>
+				<li class="sub"><a href="#b4">4. Verified Access for the web apps</a></li>
+				<li class="sub"><a href="#b5">5. Verified Access for the database</a></li>
+				<li class="sub"><a href="#b6">6. Network Firewall on both paths</a></li>
+				<li class="sub"><a href="#b7">7. Logs and evidence</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>About 2,000 call-center agents and back-office staff work from home, together with contractors from an outsourced support firm. They need four things in <code>us-east-1</code>: the <strong>booking console</strong> (a web app behind an internal Application Load Balancer in the production booking VPC <code>vpc-bookings-prod</code>, <code>10.40.8.0/21</code>, bookings account <code>222222222222</code>), the <strong>agent CRM</strong> (another web app behind the same ALB), <strong>SSH and RDP</strong> to servers in AWS and in the data centers (operations staff only), and a <strong>reporting database</strong> (Amazon RDS for PostgreSQL in the booking VPC). Card data stays in the payments VPC <code>vpc-0payment01</code> (<code>10.40.48.0/21</code>), which is in PCI DSS scope; no remote user may reach it.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">About 400 operations staff need SSH, RDP and admin tools across many networks</td><td data-label="Design choice">Client VPN with a native Transit Gateway attachment on <code>tgw-use1</code>, authorization rules per group, split tunnel</td></tr>
+						<tr><td data-label="Requirement">Agents and contractors need two web apps and one database, nothing else</td><td data-label="Design choice">Verified Access endpoints per application (HTTP for the console and CRM, TCP for the database)</td></tr>
+						<tr><td data-label="Requirement">Only healthy, managed laptops connect</td><td data-label="Design choice">Device trust from CrowdStrike on both services, written into Cedar policies</td></tr>
+						<tr><td data-label="Requirement">Inspect remote traffic and keep per-user evidence for PCI DSS</td><td data-label="Design choice">Network Firewall on the Client VPN path (Transit Gateway) and in front of the Verified Access targets (VPC routing); connection, flow and access logs to the log archive account <code>777777777777</code></td></tr>
+						<tr><td data-label="Requirement">Remote users never reach card data</td><td data-label="Design choice">No route, no authorization rule and a firewall drop rule for <code>10.40.48.0/21</code></td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Values used on this page:</p>
+			<ul>
+				<li><strong>Client CIDR <code>10.250.0.0/20</code></strong> (as on <a href="../d2-task-2-2.html#s8">Task 2.2</a>): outside the Regional <code>/14</code> blocks, both data centers, the Transit Gateway CIDR block <code>10.255.10.0/24</code> and the <code>100.64.0.0/10</code> ranges already in use. Its 4,096 addresses are twice the expected peak of about 600 sessions, as AWS advises.</li>
+				<li><strong>Network account <code>111111111111</code></strong>: endpoint <code>cvpn-endpoint-0ops</code>, attachment <code>tgw-attach-clientvpn</code>, new route table <code>tgw-rtb-remote</code>, and the attached firewall <code>use1-central</code> (<code>tgw-attach-firewall</code>) from <a href="centralized-egress.html">Centralized egress</a>.</li>
+				<li><strong>Bookings account <code>222222222222</code></strong>: Verified Access resources; new subnets in <code>vpc-bookings-prod</code>: Verified Access <code>10.40.15.0/27</code> and <code>10.40.15.32/27</code>, firewall <code>10.40.15.64/28</code> and <code>10.40.15.80/28</code>.</li>
+				<li><strong>Identity</strong>: SAML provider <code>travel-idp</code> for Client VPN; IAM Identity Center for Verified Access, with contractors in a <code>contractors-support</code> group. The support firm's laptops are enrolled in the company's CrowdStrike tenant as a contract condition.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 320" role="img" aria-labelledby="dgR-wide-t">
+<title id="dgR-wide-t">Remote access: an operations engineer connects through a Client VPN endpoint attached to tgw-use1, inspected by Network Firewall, to hosts in the booking VPC; agents and contractors use Verified Access in a browser for the booking console, and analysts use the Connectivity Client for the reporting database, both through firewall endpoints in the booking VPC.</title>
+<rect x="410" y="125" width="375" height="180" rx="12" class="dg-grp"/>
+<text x="420" y="141" class="dg-lbl">vpc-bookings-prod</text>
+<path d="M170.0 55.0 L210.0 55.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 55.0 L420.0 55.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 55.0 L620.0 55.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M170.0 175.0 L183.0 175.0 Q190.0 175.0 190.0 182.0 L190.0 211.0 Q190.0 218.0 197.0 218.0 L210.0 218.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 275.0 L183.0 275.0 Q190.0 275.0 190.0 268.0 L190.0 239.0 Q190.0 232.0 197.0 232.0 L210.0 232.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M370.0 218.0 L420.0 218.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 232.0 L420.0 232.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M580.0 218.0 L593.0 218.0 Q600.0 218.0 600.0 211.0 L600.0 182.0 Q600.0 175.0 607.0 175.0 L620.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 232.0 L593.0 232.0 Q600.0 232.0 600.0 239.0 L600.0 268.0 Q600.0 275.0 607.0 275.0 L620.0 275.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="10" y="32" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="52" class="dg-t dg-sm">Ops engineer</text>
+<text x="90" y="69" class="dg-s dg-sm2">SSH, split tunnel</text>
+<rect x="210" y="32" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="52" class="dg-t dg-sm">Client VPN endpoint</text>
+<text x="290" y="69" class="dg-s dg-sm2">10.250.0.0/20</text>
+<rect x="420" y="32" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="52" class="dg-t dg-sm">tgw-use1</text>
+<text x="500" y="69" class="dg-s dg-sm2">firewall in path</text>
+<rect x="620" y="32" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="52" class="dg-t dg-sm">Ops hosts</text>
+<text x="700" y="69" class="dg-s dg-sm2">in vpc-bookings-prod</text>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Agent, contractor</text>
+<text x="90" y="189" class="dg-s dg-sm2">browser, no VPN</text>
+<rect x="10" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="272" class="dg-t dg-sm">Analyst</text>
+<text x="90" y="289" class="dg-s dg-sm2">Connectivity Client</text>
+<rect x="210" y="202" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="222" class="dg-t dg-sm">Verified Access</text>
+<text x="290" y="239" class="dg-s dg-sm2">IdP + device policy</text>
+<rect x="420" y="202" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="222" class="dg-t dg-sm">Firewall endpoints</text>
+<text x="500" y="239" class="dg-s dg-sm2">same AZ, both ways</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Booking console</text>
+<text x="700" y="189" class="dg-s dg-sm2">internal ALB</text>
+<rect x="620" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="272" class="dg-t dg-sm">Reporting database</text>
+<text x="700" y="289" class="dg-s dg-sm2">RDS, TCP 5432</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 615" role="img" aria-labelledby="dgR-tall-t">
+<title id="dgR-tall-t">Remote access: an operations engineer connects through a Client VPN endpoint attached to tgw-use1, inspected by Network Firewall, to hosts in the booking VPC; agents and contractors use Verified Access in a browser for the booking console, and analysts use the Connectivity Client for the reporting database, both through firewall endpoints in the booking VPC.</title>
+<rect x="10" y="430" width="380" height="175" rx="12" class="dg-grp"/>
+<text x="380" y="446" class="dg-lbl" text-anchor="end">vpc-bookings-prod</text>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 145.0 L180.0 145.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 300.5 Q100.0 307.5 107.0 307.5 L186.0 307.5 Q193.0 307.5 193.0 314.5 L193.0 337.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 300.5 Q300.0 307.5 293.0 307.5 L214.0 307.5 Q207.0 307.5 207.0 314.5 L207.0 337.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M193.0 383.0 L193.0 442.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M207.0 383.0 L207.0 442.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M193.0 488.0 L193.0 513.0 Q193.0 520.0 186.0 520.0 L107.0 520.0 Q100.0 520.0 100.0 527.0 L100.0 552.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M207.0 488.0 L207.0 513.0 Q207.0 520.0 214.0 520.0 L293.0 520.0 Q300.0 520.0 300.0 527.0 L300.0 552.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Ops engineer</text>
+<text x="100" y="54" class="dg-s dg-sm2">SSH, split tunnel</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">Client VPN endpoint</text>
+<text x="300" y="54" class="dg-s dg-sm2">10.250.0.0/20</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="142" class="dg-t dg-sm">tgw-use1</text>
+<text x="300" y="159" class="dg-s dg-sm2">firewall in path</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">Ops hosts</text>
+<text x="100" y="159" class="dg-s dg-sm2">in vpc-bookings-prod</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">Agent, contractor</text>
+<text x="100" y="269" class="dg-s dg-sm2">browser, no VPN</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Analyst</text>
+<text x="300" y="269" class="dg-s dg-sm2">Connectivity Client</text>
+<rect x="120" y="337" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="200" y="357" class="dg-t dg-sm">Verified Access</text>
+<text x="200" y="374" class="dg-s dg-sm2">IdP + device policy</text>
+<rect x="120" y="442" width="160" height="46" rx="10" class="dg-box"/>
+<text x="200" y="462" class="dg-t dg-sm">Firewall endpoints</text>
+<text x="200" y="479" class="dg-s dg-sm2">same AZ, both ways</text>
+<rect x="20" y="552" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="572" class="dg-t dg-sm">Booking console</text>
+<text x="100" y="589" class="dg-s dg-sm2">internal ALB</text>
+<rect x="220" y="552" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="572" class="dg-t dg-sm">Reporting database</text>
+<text x="300" y="589" class="dg-s dg-sm2">RDS, TCP 5432</text>
+</svg>
+				<figcaption>Figure: green is Client VPN for operations staff. The endpoint is attached directly to <code>tgw-use1</code>, so packets keep their <code>10.250.0.0/20</code> source address, and <code>tgw-rtb-remote</code> sends them through the firewall before the booking VPC. Device posture and the Cedar policy are checked at connect and on each token refresh; authorization rules decide destinations. Blue (HTTP, booking console) and yellow (TCP, reporting database) are Verified Access: no VPN, a policy decision on every request, and same-AZ firewall endpoints on both directions in front of the targets.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions of a user, a device or a server you run.</p>
+			<ol class="flow">
+				<li class="group">An operations engineer opens an SSH session through Client VPN</li>
+				<li><span class="name">Connect and authenticate<span class="who">Engineer's laptop</span></span><span class="desc">The AWS client presents the device certificate, signs in to the IdP (SAML) and sends the CrowdStrike agent's signed device token. Both authentications must succeed.</span></li>
+				<li class="auto"><span class="name">Cedar policy<span class="who auto">AWS</span></span><span class="desc">The endpoint verifies the token and evaluates its policy (an operations group and a CrowdStrike score above 70); no traffic flows until it permits. The client gets an address from <code>10.250.0.0/20</code> and, with split tunnel, only the endpoint's routes, which route enforcement protects.</span></li>
+				<li class="auto"><span class="name">Authorization rule<span class="who auto">AWS</span></span><span class="desc"><code>ssh 10.40.10.25</code> is allowed because a rule grants <code>10.40.8.0/21</code> to <code>ops-sre</code>. The packet enters <code>tgw-attach-clientvpn</code> with its source <code>10.250.3.17</code> unchanged: no source NAT.</span></li>
+				<li class="auto"><span class="name">Firewall and return<span class="who auto">AWS</span></span><span class="desc"><code>tgw-rtb-remote</code> sends it to <code>tgw-attach-firewall</code>, which passes and logs SSH with the real client IP. The reply returns through the same firewall, because <code>tgw-rtb-prod</code> has a static <code>10.250.0.0/20</code> to it.</span></li>
+				<li class="group">An agent opens the booking console through Verified Access</li>
+				<li><span class="name">Browse to the app<span class="who">Agent's browser</span></span><span class="desc"><code>https://console.example.com</code> is a public CNAME to the Verified Access endpoint. No VPN client.</span></li>
+				<li class="auto"><span class="name">Policy on every request<span class="who auto">AWS</span></span><span class="desc">Verified Access signs the agent in through IAM Identity Center, collects CrowdStrike device claims, filters with AWS WAF and evaluates the group and endpoint policies for <strong>each request</strong>, logging each decision.</span></li>
+				<li class="auto"><span class="name">Through the firewall to the ALB<span class="who auto">AWS</span></span><span class="desc">The Verified Access interface forwards the request from its own address (the agent's is in <code>X-Forwarded-For</code>); subnet routes steer it through the same-AZ firewall endpoint both ways.</span></li>
+				<li class="group">An analyst queries the reporting database</li>
+				<li><span class="name">Connectivity Client<span class="who">Analyst's laptop</span></span><span class="desc">The client signs the analyst in, tunnels the traffic and resolves the database name; <code>psql</code> connects on port 5432, and the RDS endpoint forwards through the firewall endpoint if the <code>reporting</code> policy permits.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The Client VPN endpoint on the Transit Gateway</h3>
+				<p>A VPC-associated endpoint <strong>source-NATs</strong> all client traffic to its interface addresses, so downstream firewalls and flow logs see a handful of IPs instead of users. Since April 2026 an endpoint can attach <strong>natively to a Transit Gateway</strong>: AWS creates an attachment of type <code>client-vpn</code>, there is no hosting VPC, and the client's own address is kept end to end. For an auditor asking "who ran this SSH session", that decides it. The rules:</p>
+				<ul>
+					<li>Same Region; the Transit Gateway needs an IPv4 CIDR block (<code>10.255.10.0/24</code>). The client CIDR (<code>/22</code> to <code>/12</code>, fixed) must not overlap attached VPCs or that block.</li>
+					<li>Up to 5 AZs (AWS picks 2 by default); subnet and Transit Gateway associations cannot be mixed on one endpoint.</li>
+					<li>No security groups (authorization rules only), no route propagation into the endpoint, no inter-Region peering; a RAM-shared Transit Gateway works across accounts.</li>
+				</ul>
+				<p>Authentication combines a <strong>client certificate</strong> issued only to managed laptops with <strong>SAML</strong> to the IdP, so neither a stolen password nor a copied configuration file is enough. An ACM server certificate is always required.</p>
+				<span class="file">Create the operations endpoint on tgw-use1 with mutual plus SAML authentication, split tunnel and route enforcement (AWS CLI, network account)</span>
+<pre><code><span class="c"># the Resolver inbound endpoint IPs become the clients' DNS servers</span>
+<span class="c"># configuration files go out through device management, so the self-service portal is off</span>
+aws ec2 create-client-vpn-endpoint \
+  --description "Operations remote access" \
+  --client-cidr-block 10.250.0.0/20 \
+  --server-certificate-arn arn:aws:acm:us-east-1:111111111111:certificate/SERVER_CERT_ID \
+  --authentication-options Type=certificate-authentication,MutualAuthentication={ClientRootCertificateChainArn=arn:aws:acm:us-east-1:111111111111:certificate/DEVICE_CA_ID} Type=federated-authentication,FederatedAuthentication={SAMLProviderArn=arn:aws:iam::111111111111:saml-provider/travel-idp} \
+  --connection-log-options Enabled=true,CloudwatchLogGroup=/clientvpn/ops,IncludeAuthorizationPolicyContext=true \
+  --transit-gateway-configuration TransitGatewayId=tgw-use1,AvailabilityZones=us-east-1a,us-east-1b \
+  --split-tunnel \
+  --dns-servers 10.41.0.10 10.41.1.10 \
+  --client-route-enforcement-options Enforced=true \
+  --session-timeout-hours 10 \
+  --self-service-portal disabled \
+  --transport-protocol udp --vpn-port 443</code></pre>
+				<div class="callout note"><p>The AWS CLI reference lists <code>--transit-gateway-configuration</code> (with <code>TransitGatewayId</code> and <code>AvailabilityZones</code> or <code>AvailabilityZoneIds</code>), while the administrator guide's example uses <code>--transit-gateway-id</code> and <code>--availability-zone-list</code>; check your CLI version's help. Add an AZ later with <code>associate-client-vpn-target-network --availability-zone</code>.</p></div>
+				<p><strong>Split tunnel</strong> keeps home browsing off the company's firewall and NAT bills. On a Transit Gateway endpoint it needs both routes and authorization rules, and any route-table change resets every session, so route changes go into a maintenance window.</p>
+				<p><strong>Route enforcement</strong> makes the AWS client revert any routing-table change that conflicts with the VPN routes, which defeats TunnelVision-style DHCP option 121 injection on hostile Wi-Fi. It needs client 5.2.0 or later (5.3.0 for IPv6) on Windows, macOS or Ubuntu and applies after a reconnect. Its blog describes VPC-associated endpoints, so the company proved it on a test Transit Gateway endpoint first.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Routes, authorization rules and Transit Gateway return paths</h3>
+				<p>Three layers must agree: the <strong>endpoint route table</strong> (what goes into the tunnel), <strong>authorization rules</strong> (which group reaches which CIDR) and the <strong>Transit Gateway route table</strong> (where packets go). The payments range is in none of them.</p>
+				<span class="file">Endpoint routes without a target subnet, and authorization rules per IdP group (AWS CLI, network account)</span>
+<pre><code><span class="c"># booking VPC, shared services (DNS, directory), both data centers</span>
+aws ec2 create-client-vpn-route --client-vpn-endpoint-id cvpn-endpoint-0ops --destination-cidr-block 10.40.8.0/21
+aws ec2 create-client-vpn-route --client-vpn-endpoint-id cvpn-endpoint-0ops --destination-cidr-block 10.41.0.0/16
+aws ec2 create-client-vpn-route --client-vpn-endpoint-id cvpn-endpoint-0ops --destination-cidr-block 10.100.0.0/16
+aws ec2 create-client-vpn-route --client-vpn-endpoint-id cvpn-endpoint-0ops --destination-cidr-block 10.200.0.0/16
+
+<span class="c"># access group IDs are the SAML memberOf values</span>
+aws ec2 authorize-client-vpn-ingress --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --target-network-cidr 10.41.0.0/16 --authorize-all-groups
+aws ec2 authorize-client-vpn-ingress --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --target-network-cidr 10.40.8.0/21 --access-group-id ops-sre
+aws ec2 authorize-client-vpn-ingress --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --target-network-cidr 10.100.0.0/16 --access-group-id network-engineers
+aws ec2 authorize-client-vpn-ingress --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --target-network-cidr 10.200.0.0/16 --access-group-id network-engineers</code></pre>
+				<p>Rules only allow, the longest prefix wins and <code>0.0.0.0/0</code> is evaluated last, so a narrower rule for one group <em>removes</em> that range from everyone relying on a broader rule.</p>
+				<p>The attachment gets its own Transit Gateway route table. Every destination points at the firewall, and returns are pinned to it as in the egress design: the client CIDR propagates only into the firewall table, and spoke and on-premises tables get a static route to the firewall.</p>
+				<span class="file">The remote-user route table and the return routes (AWS CLI, network account)</span>
+<pre><code>aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-remote \
+  --transit-gateway-attachment-id tgw-attach-clientvpn
+
+<span class="c"># outbound: each permitted destination goes to the firewall first; no route for 10.40.48.0/21</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-remote \
+  --destination-cidr-block 10.40.8.0/21 --transit-gateway-attachment-id tgw-attach-firewall
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-remote \
+  --destination-cidr-block 10.100.0.0/16 --transit-gateway-attachment-id tgw-attach-firewall
+
+<span class="c"># after inspection the firewall table must know how to reach the clients</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-firewall \
+  --transit-gateway-attachment-id tgw-attach-clientvpn
+
+<span class="c"># replies from production and the data centers are inspected too (repeat for tgw-rtb-shared)</span>
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 10.250.0.0/20 --transit-gateway-attachment-id tgw-attach-firewall
+aws ec2 create-transit-gateway-route --transit-gateway-route-table-id tgw-rtb-onprem \
+  --destination-cidr-block 10.250.0.0/20 --transit-gateway-attachment-id tgw-attach-firewall</code></pre>
+				<p>The <code>10.41.0.0/16</code> and <code>10.200.0.0/16</code> routes follow the same pattern; <code>tgw-rtb-pci</code> gets no route to the client range. Without source NAT the range must be routable everywhere: spoke VPCs already send <code>10.0.0.0/8</code> to the Transit Gateway, and the data centers learn it as a Direct Connect gateway allowed prefix:</p>
+				<span class="file">Advertise the client range to the data centers over Direct Connect (AWS CLI, network account)</span>
+<pre><code>aws directconnect update-direct-connect-gateway-association \
+  --association-id a1b2c3d4-0000-0000-0000-dxgwtgwuse1 \
+  --add-allowed-prefixes-to-direct-connect-gateway cidr=10.250.0.0/20</code></pre>
+				<p>Target security groups now see client addresses and cannot reference a Client VPN group: jump hosts allow TCP 22 and 3389 from <code>10.250.0.0/20</code>, and the Resolver inbound endpoint's group gets a rule for port 53 from it.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Device posture and the Cedar authorization policy</h3>
+				<p>Since October 2026 an endpoint can register <strong>device trust providers</strong> (CrowdStrike, Jamf, JumpCloud). The AWS client reads a signed token from the provider's existing agent; Client VPN checks the signature against the public key URL and rejects other tenants' tokens.</p>
+				<span class="file">Register the company's CrowdStrike tenant on the endpoint (AWS CLI, network account)</span>
+<pre><code>aws ec2 modify-client-vpn-endpoint \
+  --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --device-posture-options 'TrustProviders=[{TrustProviderType=crowdstrike,TenantId=CROWDSTRIKE_TENANT_ID,PublicSigningKeyUrl=CROWDSTRIKE_KEY_URL}],Enabled=true'</code></pre>
+				<p>Device claims and identity share one Cedar context, so one expression can require both. The endpoint's single policy is evaluated at connect time and for each refreshed token, about every five minutes; a deny disconnects the session. Stale claims are reused for up to 15 minutes, then a device-based policy denies.</p>
+				<span class="file">ops-access.cedar: the operations groups on a healthy CrowdStrike-managed device</span>
+<pre><code>permit(principal, action, resource)
+when {
+  (context.saml.memberOf.contains("ops-sre") || context.saml.memberOf.contains("network-engineers"))
+  &amp;&amp; context.crowdstrike.assessment.overall &gt; 70
+};</code></pre>
+				<span class="file">Attach the policy in shadow mode first, then enforce (AWS CLI, network account)</span>
+<pre><code><span class="c"># shadow mode evaluates and logs every connection but blocks nothing</span>
+aws ec2 modify-client-vpn-endpoint-authorization-policy \
+  --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --policy-document file://ops-access.cedar \
+  --description "Ops groups with CrowdStrike score above 70" \
+  --shadow-mode enabled
+
+<span class="c"># after a week of clean logs</span>
+aws ec2 modify-client-vpn-endpoint-authorization-policy \
+  --client-vpn-endpoint-id cvpn-endpoint-0ops \
+  --shadow-mode disabled</code></pre>
+				<p>The policy decides <em>whether</em> a connection carries traffic; authorization rules still decide <em>where</em>. Claims differ per provider (CrowdStrike 1&ndash;100 scores, Jamf a risk level, JumpCloud only "managed"). The blog does not mention Transit Gateway endpoints, so this too was proven on a test endpoint.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Verified Access for the booking console and CRM</h3>
+				<p>Agents need two web apps, not a network. Verified Access is an identity-aware reverse proxy that checks <strong>every request</strong> against Cedar policies, denies by default and logs each decision. An <strong>instance</strong> holds the trust providers, <strong>groups</strong> share a policy, and <strong>endpoints</strong> (load balancer, network interface, network CIDR or RDS) can add their own.</p>
+				<p>An instance takes <strong>one</strong> user trust provider plus device providers. IAM Identity Center must be the organization instance in the same Region; contractors are users there. The <code>--policy-reference-name</code> is the prefix used in policies.</p>
+				<span class="file">The two trust providers; they are then attached to the Verified Access instance (AWS CLI, bookings account)</span>
+<pre><code>aws ec2 create-verified-access-trust-provider \
+  --trust-provider-type user --user-trust-provider-type iam-identity-center \
+  --policy-reference-name idc
+
+aws ec2 create-verified-access-trust-provider \
+  --trust-provider-type device --device-trust-provider-type crowdstrike \
+  --device-options TenantId=CROWDSTRIKE_TENANT_ID,PublicSigningKeyUrl=CROWDSTRIKE_KEY_URL \
+  --policy-reference-name crwd</code></pre>
+				<p>The company creates the instance, attaches both providers and an AWS WAF web ACL (16 KB body inspection by default), and creates the <code>agent-apps</code> group. AWS advises naming Identity Center groups by ID, so renames do not break policies.</p>
+				<span class="file">agent-apps.cedar: agents or contractors, verified email, healthy device (group policy)</span>
+<pre><code>permit(principal, action, resource)
+when {
+  (context.idc.groups has "AGENTS_GROUP_ID" || context.idc.groups has "CONTRACTORS_GROUP_ID")
+  &amp;&amp; context.idc.user.email.verified == true
+  &amp;&amp; context.crwd.assessment.overall &gt; 70
+};</code></pre>
+				<span class="file">One HTTPS endpoint per application on the internal ALB, in dedicated Verified Access subnets (AWS CLI, bookings account)</span>
+<pre><code><span class="c"># the ACM certificate must match the name users type</span>
+aws ec2 create-verified-access-endpoint \
+  --verified-access-group-id vagr-0agentapps \
+  --endpoint-type load-balancer --attachment-type vpc \
+  --domain-certificate-arn arn:aws:acm:us-east-1:222222222222:certificate/CONSOLE_CERT_ID \
+  --application-domain console.example.com --endpoint-domain-prefix console \
+  --security-group-ids sg-ava-endpoints \
+  --load-balancer-options Protocol=https,Port=443,LoadBalancerArn=BOOKING_ALB_ARN,SubnetIds=subnet-ava-az1,subnet-ava-az2
+
+<span class="c"># the CRM endpoint is identical apart from its domain, certificate and an endpoint policy</span>
+aws ec2 create-verified-access-endpoint \
+  --verified-access-group-id vagr-0agentapps \
+  --endpoint-type load-balancer --attachment-type vpc \
+  --domain-certificate-arn arn:aws:acm:us-east-1:222222222222:certificate/CRM_CERT_ID \
+  --application-domain crm.example.com --endpoint-domain-prefix crm \
+  --security-group-ids sg-ava-endpoints \
+  --load-balancer-options Protocol=https,Port=443,LoadBalancerArn=BOOKING_ALB_ARN,SubnetIds=subnet-ava-az1,subnet-ava-az2 \
+  --policy-document 'permit(principal, action, resource) when { context.idc.groups has "AGENTS_GROUP_ID" };'</code></pre>
+				<p>The CRM endpoint policy narrows access to employees: a request needs both the group and the endpoint policy to allow it. <code>console</code> and <code>crm</code> become CNAMEs in the public <code>example.com</code> zone.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Verified Access for the reporting database (TCP)</h3>
+				<p>Since February 2025 Verified Access also fronts <strong>TCP resources</strong> (SSH, RDP, databases). Users need the <strong>Connectivity Client</strong> (Windows x64, macOS), which signs them in, tunnels traffic and handles DNS; TCP endpoint names have no public A record. Its configuration comes from <code>export-verified-access-instance-client-configuration</code>. Requirements include a local IPv6 stack, TPM and WebView2 on Windows, and <strong>no other VPN running</strong>, so engineers on Client VPN reach the database through Client VPN instead.</p>
+				<span class="file">A separate group with a stricter policy, then an RDS endpoint for PostgreSQL (AWS CLI, bookings account)</span>
+<pre><code>aws ec2 create-verified-access-group \
+  --verified-access-instance-id vai-0travelagents \
+  --description "Reporting database" \
+  --policy-document 'permit(principal, action, resource) when { context.idc.groups has "ANALYSTS_GROUP_ID" &amp;&amp; context.crwd.assessment.overall &gt; 80 };'
+
+aws ec2 create-verified-access-endpoint \
+  --verified-access-group-id vagr-0reporting \
+  --endpoint-type rds --attachment-type vpc \
+  --security-group-ids sg-ava-endpoints \
+  --rds-options Protocol=tcp,Port=5432,RdsDbInstanceArn=arn:aws:rds:us-east-1:222222222222:db:reporting-db,SubnetIds=subnet-ava-az1,subnet-ava-az2</code></pre>
+				<p>Contractors are not analysts, so they never reach the reporting data. TCP policies can also test <code>context.tcp_flow.client_ip</code>. An OIDC provider used for TCP needs native application settings (redirect URI <code>http://localhost:8000</code>).</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Network Firewall on both paths</h3>
+				<p><strong>Client VPN path.</strong> Step 2 already sends remote traffic through <code>use1-central</code>. In AWS's 2024 pattern the firewall saw only the endpoint's NAT addresses; now rules and logs work per client address. A strict-order group drops card data, passes the ports operations need, and leaves the rest to the policy's <code>drop_established</code> default:</p>
+				<span class="file">A remote-user rule group added to the firewall policy at a priority ahead of the egress rules (AWS CLI, network account)</span>
+<pre><code>aws network-firewall create-rule-group \
+  --rule-group-name remote-users --type STATEFUL --capacity 100 \
+  --rule-group '{
+    "RuleVariables": {"IPSets": {
+      "REMOTE_USERS": {"Definition": ["10.250.0.0/20"]},
+      "CARD_DATA": {"Definition": ["10.40.48.0/21"]},
+      "OPS_TARGETS": {"Definition": ["10.40.8.0/21", "10.100.0.0/16", "10.200.0.0/16"]},
+      "DNS_INBOUND": {"Definition": ["10.41.0.10/32", "10.41.1.10/32"]}}},
+    "RulesSource": {"RulesString": "drop ip $REMOTE_USERS any -&gt; $CARD_DATA any (msg:\"remote user to card data\"; sid:9100001; rev:1;)\npass tcp $REMOTE_USERS any -&gt; $OPS_TARGETS [22,443,3389] (msg:\"ops admin\"; flow:to_server; sid:9100002; rev:1;)\npass udp $REMOTE_USERS any -&gt; $DNS_INBOUND 53 (msg:\"remote dns\"; sid:9100003; rev:1;)\npass tcp $REMOTE_USERS any -&gt; $DNS_INBOUND 53 (msg:\"remote dns tcp\"; flow:to_server; sid:9100004; rev:1;)"},
+    "StatefulRuleOptions": {"RuleOrder": "STRICT_ORDER"}}'</code></pre>
+				<p>Policy and rule groups must share one rule order. The drop rule is a backstop to the missing routes; PCI DSS assessors like controls at more than one layer.</p>
+				<p><strong>Verified Access path.</strong> Verified Access to an ALB in the same VPC never touches the Transit Gateway. The June 2026 blog inserts firewall endpoints with VPC routing, which needs Verified Access endpoints in <strong>dedicated subnets</strong>:</p>
+				<ul>
+					<li>Verified Access subnets: routes to the ALB and RDS subnets via the <strong>same-AZ</strong> firewall endpoint.</li>
+					<li>ALB and RDS subnets: routes to each Verified Access subnet via the firewall endpoint in <em>that</em> subnet's AZ, keeping flows symmetric across AZs.</li>
+					<li>Target security groups allow the Verified Access subnet CIDRs; group referencing does not work through a firewall.</li>
+				</ul>
+				<p>This firewall sees Verified Access interface addresses and TLS to the ALB, so it enforces addresses, ports and threat signatures while Verified Access enforces identity and device. Network interface and network CIDR endpoints cannot have a firewall inserted, because they share the target's subnet.</p>
+				<div class="callout trap"><p>A firewall can sit <em>in front of</em> Verified Access only for HTTP endpoints, which resolve through DNS. TCP endpoints are reached through the Connectivity Client tunnel, so for the database the firewall goes behind Verified Access, as here.</p></div>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Logs and evidence</h3>
+				<p>PCI DSS asks who accessed what and when. Four sources answer it, delivered to the log archive account <code>777777777777</code>:</p>
+				<ul>
+					<li><strong>Client VPN connection logs</strong>: user, client IP, times, and an <code>authorization-policy-evaluation</code> object (result, reason, device token status, shadow mode).</li>
+					<li><strong>Transit Gateway flow logs</strong> on <code>tgw-attach-clientvpn</code>: flows with real client IPs; match IP and time against the connection log to name the user.</li>
+					<li><strong>Network Firewall alert and flow logs</strong>, also keyed by client IP.</li>
+					<li><strong>Verified Access logs</strong> (CloudWatch Logs, S3 or Firehose): each request with its identity and device context.</li>
+				</ul>
+				<span class="file">Flow logs on the Client VPN attachment to the central bucket (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-flow-logs --resource-type TransitGatewayAttachment \
+  --resource-ids tgw-attach-clientvpn \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::central-flow-logs-111111111111/tgw-clientvpn/</code></pre>
+				<p><code>AWS/ClientVPN</code> publishes <code>AuthorizationPolicyDeniedConnections</code> and <code>AuthorizationPolicyTerminatedConnections</code> per endpoint. An alarm on a jump catches an attack or a broken CrowdStrike rollout.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Client VPN for a few hundred, Verified Access for everyone else</h4>
+				<p>Client VPN gives a laptop a route into the network: right for engineers whose SSH, RDP, ping and tools cannot be listed in advance, but a compromised laptop can probe every authorized CIDR. Verified Access exposes one application at a time and checks every request, so a stolen agent session reaches the console and nothing else. Agents use only browsers, which made them easy to move off VPN; the <a href="https://aws.amazon.com/blogs/networking-and-content-delivery/aws-client-vpn-and-verified-access-migration-and-interoperability-patterns/">migration and interoperability blog</a> covers running both meanwhile.</p>
+			</div>
+			<div class="entry">
+				<h4>Native Transit Gateway attachment rather than a VPN VPC</h4>
+				<p>Benefits: no hosting VPC, real source IPs in every log, one place to route remote users through inspection. Costs: no endpoint security groups, hand-maintained routes, a client range that must be advertised to the data centers, and no Transit Gateway Encryption Support or 1:1 NAT for that attachment (both exclude Client VPN). Other Regions need their own endpoint, since Client VPN traffic does not cross Transit Gateway peering.</p>
+			</div>
+			<div class="entry">
+				<h4>Two factors plus device posture</h4>
+				<p>Certificates bind the connection to a managed laptop, SAML to a person and the IdP's MFA, and the Cedar policy adds device health rechecked about every five minutes. Mutual can be combined with SAML or Active Directory, never AD with SAML. Device claims are vendor-specific, so changing vendor means rewriting the policy.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Client VPN: $0.10 per endpoint association-hour plus $0.05 per connection-hour (how Transit Gateway AZ associations are counted is not stated in the sources used here). Four hundred engineers for 8 hours on 22 days is 70,400 connection-hours, about $3,520 a month; all 2,000 agents on Client VPN would add about $17,600 more. Verified Access bills per application-hour and per GB, not per user. The booking VPC firewall costs $0.395 per endpoint-hour (about $577 a month for two AZs) plus $0.065 per GB; a secondary endpoint of a RAM-shared VPC-based firewall would be $0.158 an hour. Transit Gateway processing ($0.02 per GB) applies to every remote byte through the hub (<a href="../d4-task-4-1.html">Task 4.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas and limits to plan for</h4>
+				<ul>
+					<li>Client VPN: 5 endpoints per Region, 200 authorization rules, about 50 Mbps per user; one authorization policy per endpoint.</li>
+					<li>Verified Access: one user trust provider per instance; Connectivity Client on Windows x64 and macOS only.</li>
+				</ul>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Site-to-Site VPN from a call-center office</h4>
+				<p>Site-to-Site VPN joins <strong>networks</strong>, not people: it would suit agents back in a call-center building, not laptops at home. The decision framework blog picks its form by sites and bandwidth: a virtual private gateway for one VPC and few sites, the Transit Gateway or Cloud WAN for many VPCs (1.25 Gbps per tunnel, ECMP to scale), Large Bandwidth Tunnels up to 5 Gbps, a VPN Concentrator for many small sites (<a href="../d1-task-1-5.html#s3">Task 1.5</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Client VPN in a dedicated VPN VPC</h4>
+				<p>The pre-2026 pattern, still common in exam questions: endpoint subnets with security groups, source NAT to the endpoint interfaces, then a Transit Gateway onward. Choose it when targets must reference a Client VPN security group; the price is logs that show the endpoint, not users.</p>
+			</div>
+			<div class="entry">
+				<h4>Verified Access for SSH and RDP too</h4>
+				<p>TCP network CIDR or network interface endpoints could replace Client VPN for operations, suiting a known host list but not ad hoc troubleshooting across data center ranges. A client connect handler (Lambda) is the older way to vet connections, at connect time only.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove card data is unreachable</span><span class="desc">Reachability Analyzer from <code>tgw-attach-clientvpn</code> to the payments database interface on TCP 5432 should report no path, blocked at <code>tgw-rtb-remote</code>. From a test laptop, <code>10.40.48.10</code> should time out with no firewall flow, because the client has no route.</span></li>
+				<li><span class="name">Check source IP preservation</span><span class="desc">SSH to a jump host: its <code>who</code> output, the Transit Gateway flow log and the firewall log should show the same <code>10.250.x.x</code> address as that user's connection log.</span></li>
+				<li><span class="name">Test group separation</span><span class="desc">An <code>ops-sre</code> user has the route to a data center host but no authorization rule, so the connection fails; a <code>network-engineers</code> user succeeds.</span></li>
+				<li><span class="name">Break the device</span><span class="desc">In shadow mode, stop the CrowdStrike sensor on a test laptop: the connection log records a deny with shadow mode on while the session stays up. Enforced, the session should drop within about 20 minutes (grace plus refresh) and <code>AuthorizationPolicyTerminatedConnections</code> rise.</span></li>
+				<li><span class="name">Try to leak routes</span><span class="desc">Add a host route for <code>10.40.10.25</code> via the home router; with route enforcement the client should remove it and traffic stay in the tunnel.</span></li>
+				<li><span class="name">Exercise Verified Access policies</span><span class="desc">A contractor test account should open the console, be refused by the CRM and by the reporting database, with each denial in the Verified Access log.</span></li>
+			</ol>
+			<div class="callout trap"><p><strong>Troubleshooting checklist.</strong> Clients connect but reach nothing: a split-tunnel Transit Gateway endpoint needs a route and an authorization rule, and the spoke must route <code>10.250.0.0/20</code> back to the Transit Gateway. Replies vanish: the client CIDR propagated into a spoke table and the return skipped the firewall. One subnet disappears for everyone: a narrower authorization rule for one group. All sessions drop at once: a route change on a split-tunnel endpoint.</p></div>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-5.html">1.5</a> Hybrid routing and connectivity design</td><td data-label="What this architecture demonstrates">Choosing Client VPN, Verified Access or Site-to-Site VPN; advertising the client range over Direct Connect</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">A dedicated Transit Gateway route table for remote users, static return routes, one endpoint per Region</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">Mutual plus SAML authentication, authorization rules, split tunnel, the native Transit Gateway association, Verified Access trust providers</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Zero-trust access with Cedar policies and device posture, route enforcement, Network Firewall on both paths, WAF on Verified Access</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Validate and audit security with monitoring and logging</td><td data-label="What this architecture demonstrates">Correlating connection logs, Transit Gateway flow logs, firewall logs and Verified Access logs by client IP and identity</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Remote employees need access to a few internal web applications without a VPN, with access decided per request by user identity and device security posture" is <strong>AWS Verified Access with an identity trust provider, a device trust provider and Cedar policies</strong>. "Administrators need network-level access to many VPCs and on-premises servers, and security tools must see each user's own IP address" is <strong>Client VPN associated with the Transit Gateway</strong>. A Site-to-Site VPN answer for individual laptops, or security groups on a Transit Gateway-associated Client VPN endpoint, is wrong.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-aws-client-vpn-native-aws-transit-gateway-attachment/">Introducing AWS Client VPN native AWS Transit Gateway attachment</a> (April 2026): no hosting VPC, preserved client IPs and Transit Gateway routing, the core of Steps 1 and 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-device-posture-assessment-for-aws-client-vpn/">Introducing device posture assessment for AWS Client VPN</a> (November 2026): trust providers, the Cedar authorization policy, shadow mode and metrics for Step 3.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/prevent-vpn-traffic-leaks-with-client-vpn-route-enforcement-in-aws-client-vpn/">Prevent VPN traffic leaks with Client VPN Route Enforcement in AWS Client VPN</a> (July 2026): how the client protects its routes and what it defeats.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/securing-zero-trust-access-with-aws-verified-access-and-aws-network-firewall/">Securing zero trust access with AWS Verified Access and AWS Network Firewall</a> (June 2026): dedicated subnets and symmetric routing for the Verified Access path in Step 6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/aws-verified-access-support-for-non-http-resources-is-now-generally-available/">AWS Verified Access support for non-HTTP resources is now generally available</a> (February 2025): TCP endpoints and the Connectivity Client for Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/selecting-the-right-aws-vpn-solution-a-decision-framework/">Selecting the Right AWS VPN Solution: A Decision Framework</a> (May 2026): Site-to-Site VPN options against Client VPN.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/integrating-aws-client-vpn-with-aws-network-firewall/">Integrating AWS Client VPN with AWS Network Firewall</a> (July 2024): the inspection pattern for VPC-associated endpoints (predates the native Transit Gateway attachment).</li>
+				<li><a href="https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-tgw.html">Transit Gateway integration with Client VPN</a> (AWS documentation): prerequisites, routes, authorization and limitations.</li>
+				<li><a href="https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/client-authorization.html">Client VPN authorization</a> (AWS documentation): authorization rules, longest-prefix evaluation and security groups.</li>
+				<li><a href="https://docs.aws.amazon.com/verified-access/latest/ug/trust-data-iam-add-pol.html">Verified Access example policies</a> (AWS documentation): Cedar policies for Identity Center groups, device providers and client IPs.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
