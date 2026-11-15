@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: VPC Sharing or Transit Gateway for Multi-Account VPCs | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: an analytics platform of about 40 team accounts placed in one shared VPC per environment with AWS RAM subnet sharing, compared with a VPC per account on Transit Gateway. Owner and participant rules, security group referencing inside a shared VPC and across Transit Gateway and Cloud WAN, cost and Flexible Cost Allocation, quotas, blast radius, DNS, endpoints, flow logs and moving accounts between organizations.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">VPC sharing</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>VPC sharing or Transit Gateway for multi-account VPCs</h1>
+		<p>A new analytics group wants about 40 small accounts that talk to each other all day. Instead of 40 more VPCs and Transit Gateway attachments, the network account owns one analytics VPC per environment and shares its subnets with the team accounts through AWS RAM. Teams keep their own accounts, bills and security groups; the network team keeps routing, gateways and the single attachment.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">VPC sharing</span><span class="tag">AWS RAM</span><span class="tag">Transit Gateway</span><span class="tag">VPC IPAM</span><span class="tag">Route 53</span><span class="tag">VPC Flow Logs</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The analytics VPC from IPAM</a></li>
+				<li class="sub"><a href="#b2">2. Share subnets with RAM</a></li>
+				<li class="sub"><a href="#b3">3. One attachment, its own route table</a></li>
+				<li class="sub"><a href="#b4">4. Security groups</a></li>
+				<li class="sub"><a href="#b5">5. DNS and endpoints</a></li>
+				<li class="sub"><a href="#b6">6. Flow logs and cost</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) gives most workloads their own account and VPC on <code>tgw-use1</code> (AS 64521), segmented by route tables as on <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a>. A new analytics group wants about 40 small accounts in <code>us-east-1</code>, one per team (ingestion, machine learning, BI, data quality and so on), all reading the same MSK cluster, Aurora database and Redshift warehouse and calling each other constantly.</p>
+			<p>A VPC per account would mean 40 mostly empty VPCs, 40 more hourly attachments, and Transit Gateway data processing on all the east-west traffic. Instead the network account <code>111111111111</code> (the <strong>owner</strong>) owns one analytics VPC per environment and shares its subnets with the team accounts (the <strong>participants</strong>).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td>Each team keeps its own account, IAM boundary and bill</td><td data-label="Design choice">Team accounts are participants in a shared VPC; they own their instances, clusters, ENIs and security groups</td></tr>
+						<tr><td>Heavy team-to-team traffic without per-GB hub charges</td><td data-label="Design choice">All teams in one VPC, so east-west traffic uses the VPC's local route and never enters the Transit Gateway</td></tr>
+						<tr><td>Teams must not change routing or open the internet</td><td data-label="Design choice">Route tables, network ACLs, gateways, endpoints and the attachment exist only in the owner account</td></tr>
+						<tr><td>Production analytics separate from development, and outside PCI DSS scope</td><td data-label="Design choice">One shared VPC per environment, its own Transit Gateway route table, blackholes for the payments and development ranges</td></tr>
+						<tr><td>Data stores reachable only by the teams that need them</td><td data-label="Design choice">Subnet-level sharing in tiers, network ACLs between tiers, security group references between accounts</td></tr>
+						<tr><td>Charge-back and audit</td><td data-label="Design choice">Subnet flow logs to the log archive account, CUR usage types, Transit Gateway metering policy where it helps</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>New example values on this page (not used elsewhere in the guide):</p>
+			<ul>
+				<li><strong>Analytics VPCs</strong> from the <code>10.43.0.0/16</code> block that the us-east-1 plan held for growth: production <code>vpc-0anlyprod</code> <code>10.43.0.0/17</code>, development <code>vpc-0anlydev</code> <code>10.43.128.0/17</code>, both owned by <code>111111111111</code>.</li>
+				<li><strong>Team accounts</strong> in a new Analytics OU <code>ou-anly-33334444</code>: ingestion <code>121212121212</code>, machine learning <code>131313131313</code>, BI <code>141414141414</code>, data quality <code>151515151515</code>, and the data platform account <code>161616161616</code> that runs the shared data stores.</li>
+				<li><strong>Existing values reused</strong>: organization <code>o-travel1234</code> (management account <code>999999999999</code>), bookings account <code>222222222222</code> with the booking VPC <code>10.40.8.0/21</code>, the payments VPC <code>10.40.48.0/21</code> holding card data, shared services <code>10.41.0.0/16</code>, log archive <code>777777777777</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 330" role="img" aria-labelledby="dgH-wide-t">
+<title id="dgH-wide-t">VPC sharing: the network account owns vpc-0anlyprod and shares its subnets with the analytics team accounts through AWS RAM; teams launch their own resources into the shared subnets and talk to each other over the local route; the VPC has one Transit Gateway attachment, and the analytics route table reaches the booking VPC but blackholes the payments VPC.</title>
+<rect x="10" y="15" width="390" height="210" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">vpc-0anlyprod, owned by 111111111111</text>
+<path d="M180.0 175.0 L220.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 70.0 L220.0 70.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M380.0 70.0 L420.0 70.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 63.0 L620.0 63.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 77.0 L593.0 77.0 Q600.0 77.0 600.0 84.0 L600.0 168.0 Q600.0 175.0 607.0 175.0 L620.0 175.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="600" cy="126" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M596 122l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="614" y="130" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">blackhole</text>
+<path d="M180.0 295.0 L220.0 295.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M300.0 272.0 L300.0 198.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="306" y="239" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">launch into</text>
+<rect x="20" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="67" class="dg-t dg-sm">Ingestion subnet</text>
+<text x="100" y="84" class="dg-s dg-sm2">121212121212</text>
+<rect x="220" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="67" class="dg-t dg-sm">TGW attachment</text>
+<text x="300" y="84" class="dg-s dg-sm2">one for the VPC</text>
+<rect x="20" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="172" class="dg-t dg-sm">Application subnets</text>
+<text x="100" y="189" class="dg-s dg-sm2">ML and BI teams</text>
+<rect x="220" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="172" class="dg-t dg-sm">Data subnets</text>
+<text x="300" y="189" class="dg-s dg-sm2">MSK, data platform</text>
+<rect x="420" y="47" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="67" class="dg-t dg-sm">tgw-use1</text>
+<text x="500" y="84" class="dg-s dg-sm2">analytics table</text>
+<rect x="620" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="67" class="dg-t dg-sm">Booking VPC</text>
+<text x="700" y="84" class="dg-s dg-sm2">10.40.8.0/21</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Payments VPC</text>
+<text x="700" y="189" class="dg-s dg-sm2">10.40.48.0/21</text>
+<rect x="20" y="272" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="292" class="dg-t dg-sm">AWS RAM share</text>
+<text x="100" y="309" class="dg-s dg-sm2">to the Analytics OU</text>
+<rect x="220" y="272" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="292" class="dg-t dg-sm">Team accounts</text>
+<text x="300" y="309" class="dg-s dg-sm2">own SGs, instances</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgH-tall-t">
+<title id="dgH-tall-t">VPC sharing: the network account owns vpc-0anlyprod and shares its subnets with the analytics team accounts through AWS RAM; teams launch their own resources into the shared subnets and talk to each other over the local route; the VPC has one Transit Gateway attachment, and the analytics route table reaches the booking VPC but blackholes the payments VPC.</title>
+<rect x="10" y="220" width="380" height="195" rx="12" class="dg-grp"/>
+<text x="380" y="236" class="dg-lbl" text-anchor="end">vpc-0anlyprod, owned by 111111111111</text>
+<path d="M180.0 370.0 L220.0 370.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 265.0 L180.0 265.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 242.0 L100.0 173.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 127.0 L100.0 63.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 150.0 L220.0 150.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="150" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 146l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="200" y="182" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">blackhole</text>
+<path d="M180.0 485.0 L220.0 485.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M300.0 462.0 L300.0 393.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="306" y="432" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">launch into</text>
+<rect x="220" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="262" class="dg-t dg-sm">Ingestion subnet</text>
+<text x="300" y="279" class="dg-s dg-sm2">121212121212</text>
+<rect x="20" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="262" class="dg-t dg-sm">TGW attachment</text>
+<text x="100" y="279" class="dg-s dg-sm2">one for the VPC</text>
+<rect x="20" y="347" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="367" class="dg-t dg-sm">Application subnets</text>
+<text x="100" y="384" class="dg-s dg-sm2">ML and BI teams</text>
+<rect x="220" y="347" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="367" class="dg-t dg-sm">Data subnets</text>
+<text x="300" y="384" class="dg-s dg-sm2">MSK, data platform</text>
+<rect x="20" y="127" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="147" class="dg-t dg-sm">tgw-use1</text>
+<text x="100" y="164" class="dg-s dg-sm2">analytics table</text>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Booking VPC</text>
+<text x="100" y="54" class="dg-s dg-sm2">10.40.8.0/21</text>
+<rect x="220" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="147" class="dg-t dg-sm">Payments VPC</text>
+<text x="300" y="164" class="dg-s dg-sm2">10.40.48.0/21</text>
+<rect x="20" y="462" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="482" class="dg-t dg-sm">AWS RAM share</text>
+<text x="100" y="499" class="dg-s dg-sm2">to the Analytics OU</text>
+<rect x="220" y="462" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="482" class="dg-t dg-sm">Team accounts</text>
+<text x="300" y="499" class="dg-s dg-sm2">own SGs, instances</text>
+</svg>
+				<figcaption>Figure: one VPC, many accounts. The network account owns <code>vpc-0anlyprod</code>, its route tables, network ACLs and its single Transit Gateway attachment; AWS RAM shares the subnets with the Analytics OU, and each team launches its own instances and security groups into them (dashed). Traffic between teams stays on the VPC's local route (green), with no attachment and no Transit Gateway data processing. Traffic to the rest of the company (blue) uses the <code>analytics</code> table, which blackholes the payments VPC.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Steps marked <span class="who auto">AWS</span> happen automatically once configured; the others are actions by the named account.</p>
+			<ol class="flow">
+				<li class="group">A team joins</li>
+				<li><span class="name">Account lands in the Analytics OU<span class="who">Platform team</span></span><span class="desc">The data quality account <code>151515151515</code> is created in <code>ou-anly-33334444</code>. The subnet share names the OU, so the shared subnets appear at once, with no invitation.</span></li>
+				<li><span class="name">Team launches into shared subnets<span class="who">Team account</span></span><span class="desc">The team creates its own security group in <code>vpc-0anlyprod</code> and launches EMR or EKS nodes into the shared subnets, without being able to change routing.</span></li>
+				<li class="group">East-west traffic inside the VPC</li>
+				<li class="auto"><span class="name">Local route<span class="who auto">AWS</span></span><span class="desc">A Spark job in the ML account at <code>10.43.70.15</code> reads from the data platform's MSK broker at <code>10.43.17.20</code>. The <code>local</code> route delivers it directly: no attachment, no hop, no Transit Gateway processing.</span></li>
+				<li class="auto"><span class="name">Network ACL, then security group<span class="who auto">AWS</span></span><span class="desc">The owner's ACL on the data tier allows the Kafka port from the application tier. The broker's security group, owned by <code>161616161616</code>, allows the ML team's security group by reference (<code>131313131313/sg-...</code>).</span></li>
+				<li class="auto"><span class="name">Billing<span class="who auto">AWS</span></span><span class="desc">Same AZ ID: free, even across accounts. Different AZs: inter-AZ data transfer, billed to the participant that owns the resource.</span></li>
+				<li class="group">Traffic leaving the VPC</li>
+				<li class="auto"><span class="name">To the hub<span class="who auto">AWS</span></span><span class="desc">The ingestion job pulls change data from the booking database at <code>10.40.10.25</code>. The subnet route table sends <code>10.0.0.0/8</code> to the single Transit Gateway attachment, which belongs to the network account.</span></li>
+				<li class="auto"><span class="name">Analytics route table<span class="who auto">AWS</span></span><span class="desc">The <code>analytics</code> table holds shared services, on premises and the booking VPC, and blackholes payments and development. The packet leaves on the booking VPC attachment.</span></li>
+				<li class="auto"><span class="name">Who pays<span class="who auto">AWS</span></span><span class="desc">Data processing goes by default to the source attachment's owner, the network account, unless a metering policy moves it.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The analytics VPC from IPAM, with subnets in tiers</h3>
+				<p>The network account, the delegated IPAM administrator, allocates a <code>/17</code> per environment from a pool for the <code>10.43.0.0/16</code> growth block. One VPC carved into subnets wastes less space than 40 half-empty <code>/21</code>s, each with its own attachment subnets and headroom. The block sits inside the <code>10.40.0.0/14</code> summary already advertised to the data centers, so nothing changes on premises.</p>
+				<span class="file">Production analytics VPC from the IPAM pool (AWS CLI, network account 111111111111)</span>
+<pre><code><span class="c"># the pool hands out the next free /17 inside 10.43.0.0/16, so it cannot overlap</span>
+aws ec2 create-vpc --ipv4-ipam-pool-id ipam-pool-0use1anly12345 \
+  --ipv4-netmask-length 17 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=vpc-0anlyprod},{Key=env,Value=prod}]'</code></pre>
+				<p>The subnet is the unit you share, so the plan has tiers, one subnet per AZ, created by <strong>AZ ID</strong>: <code>us-east-1a</code> can be a different zone in every team account, <code>use1-az1</code> is the same everywhere.</p>
+				<ul>
+					<li><strong>Transit Gateway attachment</strong>: <code>/28</code> per AZ in <code>10.43.0.0/24</code>, owner only, never shared.</li>
+					<li><strong>Endpoints</strong>: <code>/24</code> per AZ in <code>10.43.4.0/22</code> for the owner's interface endpoints, never shared.</li>
+					<li><strong>Ingestion</strong>: <code>/24</code> per AZ in <code>10.43.8.0/21</code>, shared only with <code>121212121212</code>, so its addresses identify that team in rules and logs outside the VPC.</li>
+					<li><strong>Data</strong>: <code>/22</code> per AZ in <code>10.43.16.0/20</code>, shared only with the data platform account <code>161616161616</code> (MSK, Aurora, Redshift).</li>
+					<li><strong>Application</strong>: <code>/20</code> per AZ in <code>10.43.64.0/18</code>, shared with the whole Analytics OU.</li>
+				</ul>
+				<span class="file">One data-tier subnet, placed by AZ ID (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-subnet --vpc-id vpc-0anlyprod --availability-zone-id use1-az1 \
+  --cidr-block 10.43.16.0/22 \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=anly-data-az1},{Key=tier,Value=data}]'</code></pre>
+				<p>Participants control their own security groups, so network ACLs are the owner's main lever between them. The data tier's ACL allows Kafka and PostgreSQL only from the application and ingestion tiers, plus outbound ephemeral ports because ACLs are stateless.</p>
+				<span class="file">Data tier ACL: only the application and ingestion tiers reach the data stores (AWS CLI, network account)</span>
+<pre><code><span class="c"># Kafka (TLS listener) from the application tier</span>
+aws ec2 create-network-acl-entry --network-acl-id acl-anly-data \
+  --ingress --rule-number 100 --protocol tcp --port-range From=9094,To=9094 \
+  --cidr-block 10.43.64.0/18 --rule-action allow
+
+<span class="c"># PostgreSQL from the ingestion tier</span>
+aws ec2 create-network-acl-entry --network-acl-id acl-anly-data \
+  --ingress --rule-number 110 --protocol tcp --port-range From=5432,To=5432 \
+  --cidr-block 10.43.8.0/21 --rule-action allow
+
+<span class="c"># return traffic to clients (stateless ACL)</span>
+aws ec2 create-network-acl-entry --network-acl-id acl-anly-data \
+  --egress --rule-number 100 --protocol tcp --port-range From=1024,To=65535 \
+  --cidr-block 10.43.0.0/17 --rule-action allow</code></pre>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Share the subnets with AWS RAM</h3>
+				<p>VPC sharing works only inside one AWS Organization, and resource sharing with Organizations must be enabled once from the management account. Subnets of a default VPC cannot be shared. The network account creates one share per tier, so a principal sees only the subnets meant for it. Sharing to the OU means new team accounts get access automatically.</p>
+				<span class="file">Application subnets to the Analytics OU, data subnets to the data platform account (AWS CLI, network account)</span>
+<pre><code>aws ram create-resource-share --region us-east-1 \
+  --name anly-prod-app-subnets \
+  --resource-arns \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-app-az1 \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-app-az2 \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-app-az4 \
+  --principals arn:aws:organizations::999999999999:ou/o-travel1234/ou-anly-33334444 \
+  --no-allow-external-principals
+
+aws ram create-resource-share --region us-east-1 \
+  --name anly-prod-data-subnets \
+  --resource-arns \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-data-az1 \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-data-az2 \
+    arn:aws:ec2:us-east-1:111111111111:subnet/subnet-anly-data-az4 \
+  --principals 161616161616 \
+  --no-allow-external-principals</code></pre>
+				<p>The <strong>owner</strong> creates and manages the VPC, subnets, route tables, network ACLs, internet and NAT gateways, endpoints, Resolver endpoints, peering connections and Transit Gateway attachments. It can describe participants' ENIs and security groups, but cannot modify their ENIs, use their security groups or touch their resources.</p>
+				<p>A <strong>participant</strong> creates, modifies and deletes its own resources in the shared subnets (instances, EKS and EMR nodes, Aurora, Redshift, MSK, Lambda, load balancers and their ENIs) and its own security groups. It can describe the VPC, subnets, route tables, ACLs and internet gateways but change none of them, and cannot even describe NAT gateways. It cannot create peerings, gateways or attachments, or see other participants' resources. Tags on the VPC and its resources are not shared, so subnet IDs, not <code>Name</code> tags, are the contract.</p>
+				<div class="callout trap"><p>Participants cannot launch with the VPC's <strong>default security group</strong>: it belongs to the owner. A team's first launch with no security group specified fails, which surprises everyone the first time. Each team creates its own groups, or uses one the owner has shared (Step 4).</p></div>
+				<p>Resources a participant creates count against the <strong>participant's</strong> quotas, but limits of the VPC itself are shared by everyone (see Design decisions).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>One Transit Gateway attachment and its own route table</h3>
+				<p>Only the VPC owner can attach a shared VPC to a Transit Gateway, so the 40 teams share one attachment, paid for by the network account. Analytics needs a path to the booking database for change data capture, but production spokes do not propagate into the <code>prod</code> table, so production VPCs cannot reach each other. Rather than open <code>prod</code>, analytics gets its own <code>analytics</code> table.</p>
+				<span class="file">The attachment, using only the owner's /28 subnets (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-use1 \
+  --vpc-id vpc-0anlyprod \
+  --subnet-ids subnet-anly-tgw-az1 subnet-anly-tgw-az2 subnet-anly-tgw-az4 \
+  --options DnsSupport=enable,SecurityGroupReferencingSupport=enable \
+  --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=segment,Value=analytics}]'</code></pre>
+				<p>The attachment is in the Transit Gateway owner's own account, so there is no acceptance step. The <code>analytics</code> table receives propagation from shared services, the Direct Connect gateway and VPN attachments, and the booking VPC attachment. The analytics attachment propagates into <code>shared</code> and <code>onprem</code>, and into <code>prod</code> so that replies from the booking VPC can return.</p>
+				<span class="file">Associate, propagate and blackhole (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-transit-gateway-route-table --transit-gateway-id tgw-use1 \
+  --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=analytics}]'
+
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-analytics \
+  --transit-gateway-attachment-id tgw-attach-anly-prod
+
+<span class="c"># the booking VPC becomes reachable from analytics only</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-analytics \
+  --transit-gateway-attachment-id tgw-attach-bookings-prod
+
+<span class="c"># return path: the booking VPC (in prod) learns 10.43.0.0/17</span>
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --transit-gateway-attachment-id tgw-attach-anly-prod
+
+<span class="c"># card data stays out of reach, and so does analytics development</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-analytics \
+  --destination-cidr-block 10.40.48.0/21 --blackhole
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-analytics \
+  --destination-cidr-block 10.43.128.0/17 --blackhole</code></pre>
+				<p>Propagating into <code>prod</code> gives every production spoke a route toward analytics, but the <code>analytics</code> table has no route back except to the booking VPC (and a blackhole for payments), so no other connection can complete. The development analytics VPC attaches to <code>dev</code> like any development spoke.</p>
+				<div class="callout trap"><p>The growth block breaks the "one <code>/16</code> per environment" assumption behind the hub's blackholes. The <code>dev</code> table's blackhole for <code>10.40.0.0/16</code> does not cover <code>10.43.0.0/17</code>, so add a blackhole for it in <code>dev</code>, and for <code>10.43.128.0/17</code> in <code>prod</code>. IPAM pool rules keep the split clean; the route tables have to follow it.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Security groups inside the VPC and across the hub</h3>
+				<p>Inside the shared VPC, participants write rules that reference security groups owned by other participants or by the owner, in the form <code>account-id/security-group-id</code>. This is the main reason chatty teams fit a shared VPC well: the MSK brokers allow "the ML team's workers" rather than a list of addresses that changes every time an autoscaling group or EMR cluster replaces nodes.</p>
+				<span class="file">The data platform allows Kafka from the ML team's security group (AWS CLI, data platform account 161616161616)</span>
+<pre><code>aws ec2 authorize-security-group-ingress \
+  --group-id sg-0mskbrokers \
+  --ip-permissions 'IpProtocol=tcp,FromPort=9094,ToPort=9094,UserIdGroupPairs=[{GroupId=sg-0mlworkers,UserId=131313131313,Description=ml-spark-workers}]'</code></pre>
+				<p>Since October 2024 the owner can also <strong>share security groups</strong> through RAM: a baseline group (for example, allowing monitoring from shared services) that participants attach and that updates for everyone when the owner changes it. Only the account owning both VPC and group can share it, default groups cannot be shared, and participants cannot share theirs. On an ENI mixing shared and own groups, the groups-per-ENI limit is the lower of the two accounts' quotas.</p>
+				<p>Across the hub the rules are tighter. Since September 2024, VPCs on one Transit Gateway can reference each other's groups in <strong>inbound rules only</strong>: same gateway (so same Region, not across peering), not through Gateway Load Balancer or Network Firewall inspection, not for PrivateLink endpoints, not in <code>use1-az3</code>; off by default on the gateway (on for <code>tgw-use1</code>), on by default per attachment. Cloud WAN added the same in June 2025, inbound only within one core network edge.</p>
+				<p>The documentation used here does not say whether a cross-VPC reference to a group owned by a <em>participant</em> in a shared VPC works, so the booking database does not depend on it. The ingestion tier has its own subnets, so its CIDR identifies the team:</p>
+				<span class="file">Booking database allows PostgreSQL from the ingestion subnets only (AWS CLI, bookings account 222222222222)</span>
+<pre><code>aws ec2 authorize-security-group-ingress \
+  --group-id sg-0bookingdb \
+  --ip-permissions 'IpProtocol=tcp,FromPort=5432,ToPort=5432,IpRanges=[{CidrIp=10.43.8.0/21,Description="analytics ingestion tier via TGW"}]'</code></pre>
+				<div class="callout tip"><p>Dedicated subnets for a team that talks outside the VPC are cheap insurance: the same CIDR works in remote security groups, network ACLs, on-premises firewalls and flow log queries. Teams that only talk inside the VPC can share the common application subnets.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>DNS and endpoints, owned once</h3>
+				<p>One DHCP option set and one set of endpoints serve every participant. The owner sets the DHCP options and associates the shared Resolver rule <code>rslvr-rr-corpfwd01</code>, so corp.example.com queries reach the data centers.</p>
+				<p><strong>Endpoints</strong>: participants cannot create interface endpoints in shared subnets, so the owner creates them (Glue, STS, Secrets Manager, ECR, CloudWatch Logs) in the endpoint subnets and pays for them. The S3 gateway endpoint sits in the owner's route tables with an owner-managed policy, so a team needing a new bucket asks the network team. Participants can create VPC Lattice resource gateways in shared subnets, with their own security groups.</p>
+				<p><strong>Private hosted zones</strong>: the ML team owns <code>ml.analytics.example.com</code> in <code>131313131313</code>. For a zone in another account, the zone's account authorizes the association and the account that <strong>created the VPC</strong> makes it; in a shared VPC that is the network account, not the team.</p>
+				<span class="file">Cross-account private hosted zone association (AWS CLI, ML account, then network account)</span>
+<pre><code><span class="c"># in 131313131313: the zone owner authorizes the VPC</span>
+aws route53 create-vpc-association-authorization \
+  --hosted-zone-id Z0ML1234567890 \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-0anlyprod
+
+<span class="c"># in 111111111111: the VPC owner makes the association</span>
+aws route53 associate-vpc-with-hosted-zone \
+  --hosted-zone-id Z0ML1234567890 \
+  --vpc VPCRegion=us-east-1,VPCId=vpc-0anlyprod</code></pre>
+				<p>AWS recommends deleting the authorization afterwards; the association stays. The console cannot do either step, so this belongs in the network team's automation. Other VPCs that need the zone get it through the central Resolver design, because the Transit Gateway does not resolve attached VPCs' private hosted zones.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Flow logs, visibility and cost allocation</h3>
+				<p>The owner can create flow logs for the VPC, subnets and participants' ENIs. A participant can manage flow logs only for its own ENIs, never a shared subnet, and the owner cannot describe or delete them. So the network team logs every shared subnet centrally, and teams log their own ENIs if they want a copy.</p>
+				<span class="file">Central subnet flow logs for the shared tiers to the log archive bucket (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-flow-logs --resource-type Subnet \
+  --resource-ids subnet-anly-app-az1 subnet-anly-app-az2 subnet-anly-app-az4 subnet-anly-data-az1 subnet-anly-data-az2 subnet-anly-data-az4 \
+  --traffic-type ALL --max-aggregation-interval 60 \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::travel-log-archive/flow-logs/anly-prod/ \
+  --destination-options FileFormat=parquet,HiveCompatiblePartitions=true,PerHourPartition=true</code></pre>
+				<span class="file">A team logs only its own interfaces, to its own log group (AWS CLI, BI account 141414141414)</span>
+<pre><code>aws ec2 create-flow-logs --resource-type NetworkInterface \
+  --resource-ids eni-0bidash01 eni-0bidash02 \
+  --traffic-type REJECT \
+  --log-group-name bi-rejects \
+  --deliver-logs-permission-arn arn:aws:iam::141414141414:role/publishFlowLogs</code></pre>
+				<p><strong>Who pays what.</strong> Participants pay for their own resources and for their inter-AZ, peering, internet gateway and Direct Connect gateway data transfer. The owner pays the hourly and data charges of NAT gateways, virtual private gateways, Transit Gateway attachments, PrivateLink and VPC endpoints, and for the public IPv4 addresses in the VPC. Traffic between resources in the same AZ ID is free across accounts.</p>
+				<p>By default Transit Gateway data processing goes to the source attachment's owner, here the network account for all analytics traffic. Since November 2025 a <strong>metering policy</strong> (Flexible Cost Allocation) can charge matching traffic (by attachment type or ID, CIDR, port, protocol) to the source attachment owner, the destination attachment owner or the Transit Gateway owner. Here, analytics-to-booking traffic is billed to the bookings account as destination owner. It cannot bill a participant, which owns no attachment; it does not cover attachment hours; only the Transit Gateway owner manages it. The rest is charged back per team from flow log bytes by subnet or ENI.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Shared VPC for this group, Transit Gateway for the rest</h4>
+				<p>AWS positions VPC sharing for workloads with heavy interconnectivity inside one trust boundary: fewer VPCs, while separate accounts still handle billing and access. The analytics teams fit. Bookings, payments and partner services keep a VPC per account, where a route table, not another team's security group, is the boundary. See <a href="../d1-task-1-6.html">Task 1.6</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost compared</h4>
+				<p>Using the published us-east-2 example rates ($0.05 per VPC attachment-hour, $0.02 per GB of data processing), 40 team VPCs would cost about 40 &times; $0.05 &times; 730 &asymp; $1,460 a month in attachment hours. If the teams exchange 150 TB a month across the hub, processing adds about 153,600 GB &times; $0.02 &asymp; $3,070. The shared VPC needs one attachment (about $37 a month) and no east-west traffic enters the hub. Cross-AZ traffic inside the VPC still pays inter-AZ transfer ($0.01 per GB in and out in AWS's examples), billed to participants, so chatty consumers stay in their brokers' AZ ID where resilience allows. If the VPC is later peered, intra-Region peering charges appear since April 2025 under their own <code>VpcPeering-In/Out-Bytes</code> usage types in Cost Explorer and CUR. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Blast radius and isolation</h4>
+				<p>One set of route tables, ACLs, endpoints and one attachment serve 40 teams, so one bad change hits all of them. The design limits that with one shared VPC per environment; tiered subnet sharing, so the data stores sit in subnets only the data platform account can use; owner resources in reviewed infrastructure as code; and card data kept out. The payments VPC stays separate and blackholed, and analytics receives tokenized data only, so the shared VPC stays out of PCI DSS scope. A card data workload inside it would put every participant in the cardholder data environment's network. See <a href="../d4-task-4-1.html">Task 4.1</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Quotas that become shared</h4>
+				<ul>
+					<li>Participant accounts per VPC: 100 (adjustable); subnets shared with one account: 100 (adjustable).</li>
+					<li>Network interfaces per Region (5,000) and security groups per Region (2,500) apply to shared VPCs too.</li>
+					<li>Network Address Usage: 64,000 units per VPC by default (up to 256,000), counting every participant's IPs. EKS pods and EMR clusters use it fast; turn on NAU metrics.</li>
+					<li>The one attachment carries up to 100 Gbps and 7.5 million packets per second per AZ for all teams combined.</li>
+				</ul>
+			</div>
+			<div class="entry">
+				<h4>When an account leaves or moves between organizations</h4>
+				<p>Subnet sharing stays inside one organization. AWS's 2022 analysis: if the <strong>owner</strong> leaves, its subnets stop being shared but participants' existing resources stay active; Transit Gateway attachments keep working, but the organization principal is removed from the Transit Gateway share, so no new attachments until the owner re-shares, and billing moves to the new payer. If a <strong>participant</strong> leaves, it loses the share; by the documented unshare behaviour its resources keep running and can be modified or deleted, nothing new can be launched, and the owner cannot delete the subnet until they are gone.</p>
+				<p>So before a team account is divested or moved, its workloads move into a VPC of its own. A VPC per account moves with the account; a shared subnet does not. See <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Visibility for teams</h4>
+				<p>Participants cannot change routing or log subnets, so the network team exposes central flow log tables filtered per team, Reachability Analyzer (which supports shared subnets) and a request path for ACL and endpoint changes.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>A VPC per team account on the Transit Gateway</h4>
+				<p>The company default. Each team owns its VPC and moves with its account, and the route table is a hard boundary. The cost is 40 attachments, per-GB processing on every byte between teams, and IP space spread over many small VPCs: expensive for an east-west-heavy group.</p>
+			</div>
+			<div class="entry">
+				<h4>VPC peering between team VPCs</h4>
+				<p>No hourly or processing charge, and security group references in both directions within a Region. But peering is not transitive, so 40 VPCs would need up to 780 connections for a full mesh, and in a shared VPC only the owner can create or accept peerings. Good for a few heavy pairs, not for a group.</p>
+			</div>
+			<div class="entry">
+				<h4>PrivateLink or VPC Lattice between team VPCs</h4>
+				<p>One-way, service-level access that tolerates overlapping CIDRs. It suits teams publishing a few APIs, not Spark clusters reading from every Kafka broker.</p>
+			</div>
+			<div class="entry">
+				<h4>AWS Cloud WAN segments</h4>
+				<p>An analytics segment gives route-table-style isolation as policy as code, but keeps per-attachment and per-GB charges between team VPCs. A shared VPC can join Cloud WAN later as one attachment.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove the participant boundary</span><span class="desc">From the BI account, try to add a route, replace a network ACL and create a NAT gateway: each must be denied. A launch with no security group must fail, because the default group belongs to the owner.</span></li>
+				<li><span class="name">Prove east-west paths with Reachability Analyzer</span><span class="desc">ML worker ENI to MSK broker ENI on TCP 9094 should succeed; BI ENI to the Aurora ENI on 5432 should fail at the data tier ACL.</span></li>
+				<li><span class="name">Prove the hub segmentation</span><span class="desc">Ingestion ENI to the booking database on 5432 succeeds through the <code>analytics</code> table. Any analytics ENI to the payments VPC <code>10.40.48.0/21</code> fails at that table, and <code>PacketDropCountBlackhole</code> rises. Repeat from development analytics toward <code>10.43.0.0/17</code>.</span></li>
+				<li><span class="name">Read the flow logs</span><span class="desc">In Athena, most ML-to-broker bytes should stay within one AZ ID; a large cross-AZ share is a cost finding.</span></li>
+				<li><span class="name">Check DNS from a participant</span><span class="desc">Resolve a name in <code>ml.analytics.example.com</code>, an interface endpoint (an address in <code>10.43.4.0/22</code>) and a corp.example.com name.</span></li>
+				<li><span class="name">Rehearse an unshare</span><span class="desc">In development, remove a test account from the share: its instances keep working, a new launch fails, and subnet deletion is refused until they are gone.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">VPC sharing compared with a VPC per account on Transit Gateway, peering and PrivateLink; IPAM allocation; owner and participant rules</td></tr>
+						<tr><td><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates">RAM subnet shares to an OU, a dedicated Transit Gateway route table, security group referencing in a shared VPC and across the hub, account moves</td></tr>
+						<tr><td><a href="../d2-task-2-3.html">2.3</a> Implement hybrid and multi-account DNS</td><td data-label="What this architecture demonstrates">Cross-account private hosted zone association made by the VPC owner, shared Resolver rules</td></tr>
+						<tr><td><a href="../d3-task-3-2.html">3.2</a> Monitor and analyze network traffic</td><td data-label="What this architecture demonstrates">Owner and participant flow log rights, Reachability Analyzer in shared subnets</td></tr>
+						<tr><td><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">Attachment and processing cost avoided, same-AZ traffic, Flexible Cost Allocation, shared quotas</td></tr>
+						<tr><td><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Blast radius, network ACLs as the owner's control, PCI DSS scope kept out of the shared VPC</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Many accounts in the same organization need high-volume communication with each other; application teams must keep separate billing and must not manage networking; minimize Transit Gateway attachments and data processing cost" is <strong>VPC sharing: the network account owns the VPC and shares subnets with AWS RAM</strong>. If the question adds "accounts outside the organization" or "the account will be divested next quarter", VPC sharing is out: use a VPC per account with a Transit Gateway share, or PrivateLink.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/migrating-accounts-between-aws-organizations-from-a-network-perspective/">Migrating accounts between AWS Organizations from a network perspective</a> (July 2022): what happens to shared subnets, Transit Gateway shares and billing when an account moves.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-flexible-cost-allocation-for-aws-transit-gateway/">Introducing Flexible Cost Allocation for AWS Transit Gateway</a> (November 2025): metering policies that choose who pays data processing.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-security-group-referencing-for-aws-transit-gateway/">Introducing security group referencing for AWS Transit Gateway</a> (September 2024): the inbound-only, same-gateway limits used in Step 4.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-security-group-referencing-and-enhanced-dns-support-for-aws-cloud-wan/">Introducing security group referencing and enhanced DNS support for AWS Cloud WAN</a> (June 2025): the same feature on a core network edge.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/demystifying-amazon-vpc-peering-charges/">Demystifying Amazon VPC peering charges</a> (March 2026): finding the separately reported intra-Region peering charges in Cost Explorer and CUR.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/designing-hyperscale-amazon-vpc-networks/">Designing hyperscale Amazon VPC networks</a> (October 2022): quotas and connectivity choices at large scale (predates shared security groups and Transit Gateway security group referencing).</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/vpc-sharing.html">Share your VPC with other accounts</a> (AWS documentation): owner and participant permissions, billing, limitations and quotas.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/tgw/metering-policy.html">Flexible cost allocation</a> (AWS Transit Gateway documentation): metering policy entries, middlebox attachments and limits.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/welcome.html">Building a Scalable and Secure Multi-VPC AWS Network Infrastructure</a> (AWS whitepaper, April 2024): shared VPC alongside Transit Gateway, PrivateLink and Cloud WAN (predates Transit Gateway security group referencing).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
