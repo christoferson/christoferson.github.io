@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Dual-stack and IPv6 Network | AWS ANS-C01 Notes</title>
+	<meta name="description" content="End-to-end ANS-C01 architecture: IPAM IPv6 pools, dual-stack VPCs with a /56 per VPC and /64 subnets, IPv6 on Transit Gateway attachments, IPv6 BGP over Direct Connect and Site-to-Site VPN, egress-only internet gateways, NAT64 and DNS64 for IPv6-only subnets, EKS IPv6 clusters, IPv6 inspection options, dual-stack ALB and CloudFront, VPC Block Public Access and IPv6 security group rules.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../ans.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../../top-aws.html">AWS</a><span class="sep">/</span><a href="../index.html">ANS-C01</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Dual-stack and IPv6</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Dual-stack and IPv6 network</h1>
+		<p>Mobile carriers and large partners are moving to IPv6, the EKS booking platform is running out of IPv4 addresses for its pods, and every public IPv4 address now costs money by the hour. The travel company adds IPv6 to the network it already has: IPAM pools, dual-stack VPCs, IPv6 routes on the Transit Gateways and over Direct Connect and VPN, egress-only internet gateways, NAT64 for IPv6-only workloads, and guardrails for addresses that are public by default.</p>
+		<div class="tags"><span class="tag code">ANS-C01</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 4</span><span class="tag">Amazon VPC IPAM</span><span class="tag">Transit Gateway</span><span class="tag">Direct Connect</span><span class="tag">NAT gateway (NAT64)</span><span class="tag">Egress-only internet gateway</span><span class="tag">Amazon EKS</span><span class="tag">VPC Block Public Access</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. IPAM IPv6 pools and the address plan</a></li>
+				<li class="sub"><a href="#b2">2. Dual-stack VPCs and subnets</a></li>
+				<li class="sub"><a href="#b3">3. IPv6 on the Transit Gateways</a></li>
+				<li class="sub"><a href="#b4">4. IPv6 over Direct Connect and VPN</a></li>
+				<li class="sub"><a href="#b5">5. Internet egress, NAT64 and DNS64</a></li>
+				<li class="sub"><a href="#b6">6. The EKS IPv6 cluster</a></li>
+				<li class="sub"><a href="#b7">7. Inbound IPv6 and guardrails</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The travel company (example.com) runs the <a href="tgw-hub-spoke.html">Transit Gateway hub and spoke</a> in the network account <code>111111111111</code>, with <a href="centralized-egress.html">centralized IPv4 egress</a> and <a href="dx-resilient-hybrid.html">resilient Direct Connect</a> to its US and European data centers. Mobile carriers in Asia and Europe now give many customers IPv6-only addresses, and large partners publish IPv6-first APIs. The EKS booking platform in account <code>222222222222</code> uses one VPC IPv4 address per pod, and <code>10.40.0.0/16</code> is running short. And every public IPv4 address costs $0.005 an hour, in use or idle.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">One managed, summarizable IPv6 plan across accounts and Regions</td><td data-label="Design choice">Amazon VPC IPAM in the network account, one Amazon-provided IPv6 pool per Region, a /56 per VPC shared through RAM</td></tr>
+						<tr><td data-label="Requirement">Pods stop consuming VPC IPv4 addresses</td><td data-label="Design choice">A new EKS cluster in the IPv6 family; pods get IPv6 only from /80 prefixes on the nodes</td></tr>
+						<tr><td data-label="Requirement">IPv6 between VPCs, Regions and data centers</td><td data-label="Design choice">IPv6 on Transit Gateway attachments, IPv6 BGP on the transit VIFs, IPv6 VPN backup</td></tr>
+						<tr><td data-label="Requirement">Outbound IPv6 without inbound exposure, and IPv6-only hosts that still reach IPv4 services</td><td data-label="Design choice">Egress-only internet gateway per dual-stack VPC; NAT64 on the central NAT gateways with DNS64 on the IPv6-only subnets</td></tr>
+						<tr><td data-label="Requirement">Customers on IPv6-only networks, fewer public IPv4 addresses</td><td data-label="Design choice">CloudFront with IPv6, ALB in <code>dualstack-without-public-ipv4</code> mode, AAAA records</td></tr>
+						<tr><td data-label="Requirement">Public IPv6 addresses must not become an open door</td><td data-label="Design choice">VPC Block Public Access, SCPs on internet gateways, explicit IPv6 rules in security groups and network ACLs</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p><strong>The address plan.</strong> All IPv6 values here come from the documentation range <code>2001:db8::/32</code>. Real Amazon-provided addresses come from Amazon's own ranges and you cannot choose them, so these are stand-ins. Each Region gets a /44 pool: <code>us-east-1</code> <code>2001:db8:1000::/44</code>, <code>eu-central-1</code> <code>2001:db8:1010::/44</code>, <code>ap-northeast-1</code> <code>2001:db8:1020::/44</code>. A /44 holds 4,096 /56 VPC blocks, and a /56 holds 256 /64 subnets. In <code>us-east-1</code>, production gets <code>2001:db8:1000::/56</code>, shared services <code>2001:db8:1000:100::/56</code> and development <code>2001:db8:1000:200::/56</code>, and the other Regions follow the same pattern. The US data center keeps <code>2001:db8:100::/48</code> (AS 65010) and the European data center <code>2001:db8:200::/48</code> (AS 65020). All IPv4 values stay as on the other pages.</p>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 405" role="img" aria-labelledby="dg6-wide-t">
+<title id="dg6-wide-t">Dual-stack network: IPv6 users reach the booking ALB through CloudFront; booking pods use IPv6 and leave through an egress-only internet gateway for IPv6 partners, and through tgw-use1 and the central NAT gateway for IPv4; IPv6-only workers reach IPv4-only services through DNS64 and NAT64; the US data center reaches AWS over IPv6 on Direct Connect.</title>
+<rect x="205" y="120" width="385" height="180" rx="12" class="dg-grp"/>
+<text x="397" y="136" class="dg-lbl" text-anchor="middle">vpc-bookings-prod</text>
+<path d="M170.0 45.0 L210.0 45.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 68.0 L290.0 142.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 188.0 L290.0 237.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 260.0 L388.0 260.0 Q395.0 260.0 395.0 253.0 L395.0 172.0 Q395.0 165.0 402.0 165.0 L420.0 165.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M500.0 142.0 L500.0 68.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 283.0 L290.0 347.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M500.0 283.0 L500.0 308.0 Q500.0 315.0 493.0 315.0 L304.0 315.0 Q297.0 315.0 297.0 322.0 L297.0 347.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M370.0 363.0 L686.0 363.0 Q693.0 363.0 693.0 356.0 L693.0 283.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 377.0 L700.0 377.0 Q707.0 377.0 707.0 370.0 L707.0 283.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M700.0 237.0 L700.0 68.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 370.0 L210.0 370.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<rect x="10" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="42" class="dg-t dg-sm">IPv6 mobile user</text>
+<text x="90" y="59" class="dg-s dg-sm2">IPv6-only carrier</text>
+<rect x="210" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="42" class="dg-t dg-sm">CloudFront</text>
+<text x="290" y="59" class="dg-s dg-sm2">IPv6 to the origin</text>
+<rect x="420" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="42" class="dg-t dg-sm">Partner IPv6 API</text>
+<text x="500" y="59" class="dg-s dg-sm2">internet</text>
+<rect x="620" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="42" class="dg-t dg-sm">IPv4-only services</text>
+<text x="700" y="59" class="dg-s dg-sm2">203.0.113.5</text>
+<rect x="210" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="162" class="dg-t dg-sm">Booking ALB</text>
+<text x="290" y="179" class="dg-s dg-sm2">no public IPv4</text>
+<rect x="420" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="162" class="dg-t dg-sm">Egress-only IGW</text>
+<text x="500" y="179" class="dg-s dg-sm2">replies only</text>
+<rect x="210" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="257" class="dg-t dg-sm">Booking pods</text>
+<text x="290" y="274" class="dg-s dg-sm2">IPv6, dual-stack nodes</text>
+<rect x="420" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="257" class="dg-t dg-sm">Ingestion workers</text>
+<text x="500" y="274" class="dg-s dg-sm2">IPv6-only, DNS64</text>
+<rect x="210" y="347" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="367" class="dg-t dg-sm">tgw-use1</text>
+<text x="290" y="384" class="dg-s dg-sm2">IPv4 + IPv6 routes</text>
+<rect x="620" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="257" class="dg-t dg-sm">NAT gateway</text>
+<text x="700" y="274" class="dg-s dg-sm2">NAT64, egress VPC</text>
+<rect x="10" y="347" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="367" class="dg-t dg-sm">US data center</text>
+<text x="90" y="384" class="dg-s dg-sm2">2001:db8:100::/48</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 515" role="img" aria-labelledby="dg6-tall-t">
+<title id="dg6-tall-t">Dual-stack network: IPv6 users reach the booking ALB through CloudFront; booking pods use IPv6 and leave through an egress-only internet gateway for IPv6 partners, and through tgw-use1 and the central NAT gateway for IPv4; IPv6-only workers reach IPv4-only services through DNS64 and NAT64; the US data center reaches AWS over IPv6 on Direct Connect.</title>
+<rect x="10" y="105" width="380" height="195" rx="12" class="dg-grp"/>
+<text x="200" y="121" class="dg-lbl" text-anchor="middle">vpc-bookings-prod</text>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 255.0 L193.0 255.0 Q200.0 255.0 200.0 248.0 L200.0 152.0 Q200.0 145.0 207.0 145.0 L220.0 145.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 122.0 L300.0 63.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 352.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 308.0 Q300.0 315.0 293.0 315.0 L114.0 315.0 Q107.0 315.0 107.0 322.0 L107.0 352.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 368.0 L220.0 368.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 382.0 L220.0 382.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M300.0 398.0 L300.0 457.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 457.0 L100.0 398.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">CloudFront</text>
+<text x="100" y="54" class="dg-s dg-sm2">IPv6 to the origin</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">Partner IPv6 API</text>
+<text x="300" y="54" class="dg-s dg-sm2">internet</text>
+<rect x="220" y="457" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="477" class="dg-t dg-sm">IPv4-only services</text>
+<text x="300" y="494" class="dg-s dg-sm2">203.0.113.5</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">Booking ALB</text>
+<text x="100" y="159" class="dg-s dg-sm2">no public IPv4</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Egress-only IGW</text>
+<text x="300" y="159" class="dg-s dg-sm2">replies only</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">Booking pods</text>
+<text x="100" y="269" class="dg-s dg-sm2">IPv6, dual-stack nodes</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Ingestion workers</text>
+<text x="300" y="269" class="dg-s dg-sm2">IPv6-only, DNS64</text>
+<rect x="20" y="352" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="372" class="dg-t dg-sm">tgw-use1</text>
+<text x="100" y="389" class="dg-s dg-sm2">IPv4 + IPv6 routes</text>
+<rect x="220" y="352" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="372" class="dg-t dg-sm">NAT gateway</text>
+<text x="300" y="389" class="dg-s dg-sm2">NAT64, egress VPC</text>
+<rect x="20" y="457" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="477" class="dg-t dg-sm">US data center</text>
+<text x="100" y="494" class="dg-s dg-sm2">2001:db8:100::/48</text>
+</svg>
+				<figcaption>Figure: green is IPv6. Phones on IPv6-only networks reach CloudFront and the booking ALB, which has no public IPv4; pods call IPv6 partners straight through the VPC's egress-only internet gateway, and the data center reaches AWS over an IPv6 BGP session on the transit VIF. Blue is IPv4: EKS translates a pod's traffic to the node's IPv4 address, which takes the existing path through <code>tgw-use1</code> to the central NAT gateway. Yellow is NAT64: IPv6-only workers get <code>64:ff9b::/96</code> addresses from DNS64, and the NAT gateway translates them to IPv4. Example IPv6 prefixes are documentation stand-ins.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Dual-stack is two independent networks in the same VPCs; these paths show where they meet.</p>
+			<ol class="flow">
+				<li class="group">A customer on an IPv6-only mobile network opens the booking site</li>
+				<li class="auto"><span class="name">CloudFront answers over IPv6<span class="who auto">AWS</span></span><span class="desc">The phone gets an AAAA record for the CloudFront distribution and connects over IPv6. CloudFront reaches IPv6 custom origins, here the booking ALB in account <code>444444444444</code>.</span></li>
+				<li class="auto"><span class="name">ALB without public IPv4<span class="who auto">AWS</span></span><span class="desc">The ALB runs in <code>dualstack-without-public-ipv4</code> mode: public IPv6 addresses, private IPv4 only. It forwards to IPv6 pod targets in IP mode.</span></li>
+				<li class="group">A booking pod calls a partner airline's IPv6 API</li>
+				<li class="auto"><span class="name">Spoke route to the egress-only gateway<span class="who auto">AWS</span></span><span class="desc">The pod at <code>2001:db8:1000:10::a:1</code> sends to the partner's AAAA address. The node subnet sends <code>::/0</code> to the VPC's egress-only internet gateway; the pod's address is kept and the Transit Gateway is not involved.</span></li>
+				<li class="auto"><span class="name">Replies only<span class="who auto">AWS</span></span><span class="desc">The gateway is stateful: replies return, connections opened from the internet are dropped.</span></li>
+				<li class="group">A booking pod calls an IPv4-only payment processor</li>
+				<li class="auto"><span class="name">SNAT on the node<span class="who auto">AWS</span></span><span class="desc">IPv6 pods also have a host-local IPv4 address that the VPC CNI translates to the node's primary IPv4 address. The packet leaves the node as IPv4 from <code>10.40.14.x</code>.</span></li>
+				<li class="auto"><span class="name">The existing IPv4 egress path<span class="who auto">AWS</span></span><span class="desc">From there it follows <code>0.0.0.0/0</code> through <code>tgw-use1</code>, the firewall and the central NAT gateway, as on the <a href="centralized-egress.html">centralized egress page</a>.</span></li>
+				<li class="group">An IPv6-only worker calls an IPv4-only hotel feed</li>
+				<li class="auto"><span class="name">DNS64 synthesizes an address<span class="who auto">AWS</span></span><span class="desc">A content ingestion worker in the IPv6-only subnet <code>2001:db8:1000:20::/64</code> looks up <code>feed.hotel-partner.example</code>, which has only an A record, <code>203.0.113.5</code>. The Resolver returns <code>64:ff9b::cb00:7105</code>: the well-known prefix <code>64:ff9b::/96</code> plus the IPv4 address.</span></li>
+				<li class="auto"><span class="name">Route to the hub<span class="who auto">AWS</span></span><span class="desc">The subnet route table sends <code>64:ff9b::/96</code> to <code>tgw-use1</code>, and the <code>prod</code> table sends it on to the egress path like <code>0.0.0.0/0</code>.</span></li>
+				<li class="auto"><span class="name">NAT64 on the NAT gateway<span class="who auto">AWS</span></span><span class="desc">In the egress VPC, the attachment subnet sends <code>64:ff9b::/96</code> to the same-AZ NAT gateway. It strips the prefix to get <code>203.0.113.5</code>, uses its own private IPv4 address as the source, and the internet gateway maps that to its Elastic IP.</span></li>
+				<li class="auto"><span class="name">The reply<span class="who auto">AWS</span></span><span class="desc">The NAT gateway translates the reply back to IPv6. Its subnet route for <code>2001:db8:1000::/44</code> points at the Transit Gateway, and the egress table sends it back through the firewall.</span></li>
+				<li class="group">A US data center host reaches a booking service over IPv6</li>
+				<li class="auto"><span class="name">Over the transit VIF<span class="who auto">AWS</span></span><span class="desc">The host <code>2001:db8:100::25</code> sends to <code>2001:db8:1000:1::40</code>. Its router learned <code>2001:db8:1000::/44</code> over the IPv6 BGP session on <code>dxvif-us1a</code>, because that prefix is allowed on the <code>tgw-use1</code> association. The <code>onprem</code> table holds the propagated production /56.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>IPAM IPv6 pools and the address plan</h3>
+				<p>IPv6 comes in three kinds. <strong>Amazon-provided public IPv6</strong> is globally unique and always advertised. <strong>BYOIPv6</strong> is your own registered range in IPAM, where you control advertising. <strong>Private IPv6</strong> (ULA under <code>fd00::/8</code> outside Amazon's <code>fd00::/16</code>, or a GUA you own and never advertise) exists <strong>only through IPAM</strong>, is free, and is dropped at internet and egress-only gateways. The company owns no IPv6 range and needs partner reachability, so it uses Amazon-provided addresses.</p>
+				<p>The IPAM is already the Organization's delegated administrator in the network account (<a href="../d1-task-1-6.html">Task 1.6</a>). Amazon-provided IPv6 needs a Regional pool in the <strong>public scope</strong> with a locale, service EC2 and source Amazon; you then provision a block of /40 to /52 (one per Regional pool by default). Allocation rules force /56 for VPCs.</p>
+				<span class="file">The us-east-1 IPv6 pool: Amazon-provided, /56 per VPC, tagged VPCs only (AWS CLI, network account)</span>
+<pre><code><span class="c"># public scope, because Amazon-provided IPv6 is advertisable; locale is required for Amazon-provided blocks</span>
+aws ec2 create-ipam-pool \
+  --ipam-scope-id ipam-scope-0public1234567 \
+  --address-family ipv6 \
+  --locale us-east-1 \
+  --aws-service ec2 \
+  --public-ip-source amazon \
+  --allocation-min-netmask-length 56 \
+  --allocation-max-netmask-length 56 \
+  --allocation-default-netmask-length 56 \
+  --allocation-resource-tags "Key=ipv6,Value=enabled"
+
+<span class="c"># ask Amazon for a /44 (4,096 VPCs); Amazon picks the range, the page shows 2001:db8:1000::/44</span>
+aws ec2 provision-ipam-pool-cidr \
+  --ipam-pool-id ipam-pool-0use1ipv6 \
+  --netmask-length 44</code></pre>
+				<p>Repeat per Region and share the pools with the organization through AWS RAM. The generous /44 buys clean summaries: one allowed prefix per Transit Gateway (Step 4) and one entry per Region in routes, prefix lists and firewall rules.</p>
+				<div class="callout trap"><p>Real Amazon-provided blocks for different Regions come from unrelated Amazon ranges, so there is no global IPv6 summary like <code>10.0.0.0/8</code>. The company keeps a customer-managed prefix list, <code>internal-ipv6</code>, with the three /44s and both data center /48s, for route tables and security groups.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Dual-stack VPCs and subnets, plus one IPv6-only subnet</h3>
+				<p>An existing VPC becomes dual-stack by associating an IPv6 block; IPv4 is untouched and always stays. AWS reserves the first four and the last address of each IPv6 subnet, and a VPC can hold five IPv6 blocks by default.</p>
+				<span class="file">Give the production VPC its /56 from the IPAM pool (AWS CLI, account 222222222222)</span>
+<pre><code><span class="c"># IPAM picks the next free /56 in the us-east-1 pool: here 2001:db8:1000::/56</span>
+aws ec2 associate-vpc-cidr-block \
+  --vpc-id vpc-0bookingprod \
+  --ipv6-ipam-pool-id ipam-pool-0use1ipv6 \
+  --ipv6-netmask-length 56</code></pre>
+				<p>Existing subnets get a /64 through the console (<strong>Edit IPv6 CIDRs</strong>). New EKS node subnets are dual-stack and must auto-assign IPv6, or EKS cannot launch nodes. The ingestion workers get an <strong>IPv6-only</strong> subnet: no IPv4 CIDR, Nitro instances only, instance-ID hostnames, and DNS64 on.</p>
+				<span class="file">A dual-stack node subnet and an IPv6-only worker subnet in us-east-1a (AWS CLI, account 222222222222)</span>
+<pre><code><span class="c"># dual-stack: an IPv4 /24 for the nodes themselves and a /64 for node and pod IPv6</span>
+aws ec2 create-subnet --vpc-id vpc-0bookingprod --availability-zone us-east-1a \
+  --cidr-block 10.40.14.0/24 --ipv6-cidr-block 2001:db8:1000:10::/64
+aws ec2 modify-subnet-attribute --subnet-id subnet-eks-node-1a \
+  --assign-ipv6-address-on-creation
+
+<span class="c"># IPv6-only: no --cidr-block; DNS64 and resource-name hostnames (one attribute per call)</span>
+aws ec2 create-subnet --vpc-id vpc-0bookingprod --availability-zone us-east-1a \
+  --ipv6-native --ipv6-cidr-block 2001:db8:1000:20::/64
+aws ec2 modify-subnet-attribute --subnet-id subnet-ingest-v6-1a --enable-dns64
+aws ec2 modify-subnet-attribute --subnet-id subnet-ingest-v6-1a \
+  --private-dns-hostname-type-on-launch resource-name</code></pre>
+				<p>Leave DNS64 off on dual-stack subnets, where it would push IPv4-reachable traffic through NAT64.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>IPv6 on the Transit Gateways</h3>
+				<p>The <code>Ipv6Support</code> attachment option (off by default) gives the Transit Gateway interface an IPv6 address and lets the VPC's IPv6 CIDRs propagate. It filters nothing, and static IPv6 routes work without it. Attachment subnets cannot be IPv6-only, so each /28 also gets a /64.</p>
+				<span class="file">Turn on IPv6 for the booking attachment and add the IPv6 routes the spokes need (AWS CLI, network account)</span>
+<pre><code>aws ec2 modify-transit-gateway-vpc-attachment \
+  --transit-gateway-attachment-id tgw-attach-booking-prod \
+  --options Ipv6Support=enable
+
+<span class="c"># existing propagations now also carry 2001:db8:1000::/56 into the shared and onprem tables</span>
+<span class="c"># NAT64 traffic follows the same path as 0.0.0.0/0 (spoke tables prod, dev, shared)</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 64:ff9b::/96 \
+  --transit-gateway-attachment-id tgw-attach-firewall
+
+<span class="c"># the Frankfurt Region over the inter-Region peering (peering routes are always static)</span>
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-prod \
+  --destination-cidr-block 2001:db8:1010::/44 \
+  --transit-gateway-attachment-id tgw-attach-peer-use1-euc1</code></pre>
+				<p>Segmentation carries over, because it depends on which routes exist: the <code>dev</code> table never receives production propagations. The spoke tables get <strong>no</strong> <code>::/0</code>, since IPv6 internet traffic leaves each VPC through its own egress-only gateway, so the egress VPC cannot bridge segments over IPv6.</p>
+				<p>In the spokes, the <code>internal-ipv6</code> prefix list and <code>64:ff9b::/96</code> go to the Transit Gateway and <code>::/0</code> to the egress-only gateway. Route quotas count IPv4 and IPv6 separately.</p>
+				<span class="file">The NAT64 route in the IPv6-only subnet's route table (AWS CLI, account 222222222222)</span>
+<pre><code>aws ec2 create-route --route-table-id rtb-ingest-v6 \
+  --destination-ipv6-cidr-block 64:ff9b::/96 --transit-gateway-id tgw-use1</code></pre>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>IPv6 over Direct Connect and Site-to-Site VPN</h3>
+				<p>A virtual interface runs <strong>one BGP session per address family</strong>, so each transit VIF gets a second, IPv6 session. AWS assigns the IPv6 peer addresses (a /125); omit them when creating the peer.</p>
+				<span class="file">Add an IPv6 BGP peer to each transit VIF (AWS CLI, network account)</span>
+<pre><code><span class="c"># repeat for dxvif-us1b, us2a, us2b (AS 65010) and dxvif-eu1a ... eu2b (AS 65020)</span>
+aws directconnect create-bgp-peer \
+  --virtual-interface-id dxvif-us1a \
+  --new-bgp-peer asn=65010,addressFamily=ipv6</code></pre>
+				<p>The routers advertise their /48 over the new sessions, and it propagates into the Transit Gateway tables. Toward the data centers, AWS advertises the <strong>allowed prefixes</strong> of each Direct Connect gateway association: exactly as written for a Transit Gateway, never overlapping between Transit Gateways, and /64 or shorter for IPv6.</p>
+				<span class="file">Advertise each Region's IPv6 pool to the data centers (AWS CLI, network account)</span>
+<pre><code><span class="c"># the tgw-use1 association already allows 10.40.0.0/14 and 10.255.10.0/24</span>
+aws directconnect update-direct-connect-gateway-association \
+  --association-id a1b2c3d4-0000-0000-0000-dxgwtgwuse1 \
+  --add-allowed-prefixes-to-direct-connect-gateway cidr=2001:db8:1000::/44
+<span class="c"># and cidr=2001:db8:1010::/44 on tgw-euc1, cidr=2001:db8:1020::/44 on tgw-apne1</span></code></pre>
+				<p>A transit VIF carries at most 200 prefixes per Transit Gateway toward on premises, IPv4 and IPv6 combined. From on premises, VIFs accept 100 IPv6 prefixes by default (up to 1,000 with prefix pools since August 2026); exceeding the limit idles the session. Alarm on the BGP metrics with <code>IpAddressFamily=ipv6</code>.</p>
+				<p>A Site-to-Site VPN connection carries either IPv4 or IPv6 inside its tunnels, so IPv6 backup is a <strong>second</strong> VPN connection, with inside addresses from <code>fd00::/8</code>. Since July 2025 the outside addresses can be IPv6 too, on a Transit Gateway or Cloud WAN only.</p>
+				<span class="file">The European data center's IPv6 backup VPN, IPv6 inside and outside, on tgw-euc1 (AWS CLI, network account)</span>
+<pre><code><span class="c"># the router's public IPv6 address at the European data center edge</span>
+aws ec2 create-customer-gateway --region eu-central-1 \
+  --ipv6-address 2001:db8:200:ff::1 --bgp-asn 65020 --type ipsec.1
+
+aws ec2 create-vpn-connection --region eu-central-1 --type ipsec.1 \
+  --transit-gateway-id tgw-euc1 --customer-gateway-id cgw-eu-dc1-v6 \
+  --options OutsideIPAddressType=IPv6,TunnelInsideIpVersion=ipv6,TunnelOptions=[{StartupAction=start},{StartupAction=start}]</code></pre>
+				<p>It joins the <code>onprem</code> table like the IPv4 backup on the <a href="dx-resilient-hybrid.html">Direct Connect page</a>, and Direct Connect stays preferred.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Internet egress: egress-only gateways, NAT64 and DNS64</h3>
+				<p>IPv6 needs no NAT, and the NAT gateway has no NAT66. Direction control comes from the <strong>egress-only internet gateway</strong>: outbound-only, stateful, highly available. Of the three patterns in the AWS dual-stack egress blog, the company uses <strong>IPv4 centralized, IPv6 distributed</strong>: IPv4 keeps the central egress VPC, and each dual-stack VPC gets its own egress-only gateway, which the blog notes has no data processing charge.</p>
+				<span class="file">IPv6 egress stays in each spoke (AWS CLI, account 222222222222)</span>
+<pre><code>aws ec2 create-egress-only-internet-gateway --vpc-id vpc-0bookingprod
+
+<span class="c"># dual-stack and IPv6-only subnets alike: IPv6 internet through the egress-only gateway</span>
+aws ec2 create-route --route-table-id rtb-bookings-app \
+  --destination-ipv6-cidr-block ::/0 \
+  --egress-only-internet-gateway-id eigw-0bookingprod</code></pre>
+				<p><strong>NAT64</strong> is built into every NAT gateway, with nothing to enable, and the NAT gateway's subnet need not be dual-stack. For spokes to use it, the egress VPC needs some IPv6:</p>
+				<ol class="flow">
+					<li><b>Egress VPC</b>A /56 from the pool, /64s on the attachment subnets, <code>Ipv6Support</code> on its attachment.</li>
+					<li><b>Attachment subnet route table (per AZ)</b><code>64:ff9b::/96</code> to the NAT gateway in the same AZ, beside the existing <code>0.0.0.0/0</code>.</li>
+					<li><b>NAT gateway subnet route table (per AZ)</b>The <code>internal-ipv6</code> prefix list to the Transit Gateway, for replies.</li>
+					<li><b>Transit Gateway</b><code>64:ff9b::/96</code> to the egress VPC in the firewall table; the three /44s back to the firewall in the egress table, the twin of the static <code>10.0.0.0/8</code>.</li>
+				</ol>
+				<span class="file">One AZ of the egress VPC: NAT64 in, replies out (AWS CLI, network account)</span>
+<pre><code>aws ec2 create-route --route-table-id rtb-egress-tgw-1a \
+  --destination-ipv6-cidr-block 64:ff9b::/96 --nat-gateway-id nat-0use1a
+
+aws ec2 create-route --route-table-id rtb-egress-nat-1a \
+  --destination-ipv6-cidr-block 2001:db8:1000::/44 --transit-gateway-id tgw-use1</code></pre>
+				<p><strong>DNS64</strong> runs in the Route 53 Resolver, per subnet. A name with an AAAA record is returned unchanged; only names without one get a synthesized answer. It also covers IPv4-only systems on premises: answers forwarded through <code>rslvr-rr-corpfwd01</code> are synthesized too, and that traffic must pass a NAT gateway on its way to the data center. Since April 2026, inbound Resolver endpoints can do DNS64 for IPv6-only clients on premises.</p>
+				<p>Security groups and network ACLs on the IPv6-only subnet must allow <code>64:ff9b::/96</code>, and the firewall's <code>HOME_NET</code> must include the three /44s, or the domain rules never match.</p>
+				<div class="callout note"><p>NAT64 traffic crosses the Transit Gateway-attached firewall as IPv6, before translation. This page does not confirm the attached firewall's IPv6 behaviour in every setup; prove it in staging before moving production workers.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>The EKS booking cluster in the IPv6 family</h3>
+				<p>This fixes the pod shortage. An EKS cluster chooses its IP family <strong>at creation</strong> and can never change it, so the company builds a new IPv6 cluster and shifts traffic with weighted DNS. In the IPv6 family:</p>
+				<ul>
+					<li><strong>Pods and services get only IPv6.</strong> EKS has no dual-stack pods. The VPC CNI gives each node /80 prefixes from its subnet's /64, so pods use no VPC IPv4 addresses.</li>
+					<li><strong>Nodes are dual-stack</strong>, and the cluster's VPC and subnets need IPv4 and IPv6, so nodes go in dual-stack subnets, not IPv6-only ones.</li>
+					<li><strong>Pods reach IPv4 through the node, not NAT64.</strong> A hidden host-local IPv4 address is translated to the node's primary IPv4 address; the EKS documentation says this removes the need for DNS64 and NAT64.</li>
+					<li><strong>Pod IPv6 is not translated</strong> on the way out through the egress-only gateway.</li>
+					<li><strong>Constraints</strong>: Nitro EC2 or Fargate only, no Windows pods, no custom networking, load balancers in IP mode (AWS Load Balancer Controller 2.3.1 or later), and the IPv6 IAM policy on the CNI role.</li>
+				</ul>
+				<p>Security groups need IPv6 rules of their own: an IPv4 rule never matches an IPv6 packet, and the 60-rule quotas count each family separately. The node group uses the <code>internal-ipv6</code> prefix list rather than one rule per range.</p>
+				<div class="callout tip"><p>IPv6 routers never fragment, so path MTU discovery needs ICMPv6 "Packet Too Big". A network ACL that allows TCP 443 but drops ICMPv6 makes large responses hang (<a href="../d3-task-3-3.html">Task 3.3</a>).</p></div>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Inbound IPv6 and the guardrails</h3>
+				<p><strong>Inbound.</strong> CloudFront has IPv6 enabled and <code>www.example.com</code> has A and AAAA alias records. The origin ALB moves to <code>dualstack-without-public-ipv4</code>: public IPv6, private IPv4, no public IPv4 charges. ALB authentication with an identity provider or Cognito still needs public IPv4 (HTTP 500 errors without it); the booking ALB uses none.</p>
+				<span class="file">Remove the ALB's public IPv4 addresses (AWS CLI, account 444444444444)</span>
+<pre><code><span class="c"># the subnets must already have IPv6 CIDRs</span>
+aws elbv2 set-ip-address-type \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:444444444444:loadbalancer/app/booking-web/0a1b2c3d4e5f6a7b \
+  --ip-address-type dualstack-without-public-ipv4</code></pre>
+				<p><strong>Guardrails.</strong> With Amazon-provided IPv6 there is no NAT hiding anything: every address is public. One wrong <code>::/0</code> to an internet gateway leaves only security groups and network ACLs in the way. The 2026 Block Public Access blog recommends layers: Block Public Access, SCPs that stop teams attaching internet or egress-only gateways, then security groups and network ACLs.</p>
+				<p>Block Public Access (per account and Region) overrides routes, security groups and network ACLs. <code>block-bidirectional</code> blocks all internet and egress-only gateway traffic; <code>block-ingress</code> blocks inbound but allows outbound through NAT and egress-only gateways, which suits a dual-stack spoke. Exclusions are <code>allow-bidirectional</code> or <code>allow-egress</code> (bidirectional mode only).</p>
+				<span class="file">Block inbound internet everywhere, except the ALB's public subnets (AWS CLI, run per account and Region)</span>
+<pre><code><span class="c"># workload account 222222222222: outbound through egress-only and NAT gateways still works</span>
+aws ec2 modify-vpc-block-public-access-options --internet-gateway-block-mode block-ingress
+
+<span class="c"># account 444444444444: the same mode, plus one exclusion per ALB subnet</span>
+aws ec2 modify-vpc-block-public-access-options --internet-gateway-block-mode block-ingress
+aws ec2 create-vpc-block-public-access-exclusion \
+  --subnet-id subnet-alb-1a --internet-gateway-exclusion-mode allow-bidirectional</code></pre>
+				<p>A declarative policy can enforce the mode organization-wide (<a href="../d4-task-4-1.html">Task 4.1</a>). Private paths such as the Transit Gateway are unaffected.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>A /44 per Region, a /56 per VPC, a /64 per subnet</h4>
+				<p>A /56 per VPC is what Amazon hands out directly, and a /64 per subnet is the convention (EKS prefix delegation carves /80s from it). The /44 per Region trades unused space for one summary per Transit Gateway, peering route and prefix list entry. IPAM shows which VPCs are still IPv4-only. See <a href="../d1-task-1-6.html">Task 1.6</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>Amazon-provided public IPv6, not BYOIPv6 or private IPv6</h4>
+				<p>Amazon-provided addresses are globally unique, so IPv6 never repeats the company's IPv4 overlaps with partners (<a href="overlapping-cidrs.html">overlapping CIDRs page</a>). BYOIPv6 would give partners one stable range to allow-list, at the cost of owning and registering it. Private IPv6 suits VPCs that must never reach the internet, but is hard to undo: getting out later needs a second, routable prefix or NPTv6 appliances.</p>
+			</div>
+			<div class="entry">
+				<h4>IPv4 centralized, IPv6 distributed</h4>
+				<p>Central IPv6 egress needs translation in the egress VPC, which no managed service offers: the NAT gateway has no NAT66, and the 2025 inspection blog states that Network Firewall supports neither NAT66 nor NPTv6. So IPv6 internet traffic is not inspected centrally. The company accepts this for general booking traffic, filtered by security groups, DNS Firewall and Block Public Access, and keeps the card data VPC IPv4-only so its outbound flows still pass the domain allow list. See <a href="../d4-task-4-1.html">Task 4.1</a>.</p>
+			</div>
+			<div class="entry">
+				<h4>EKS on dual-stack nodes, IPv6-only subnets for simple workers</h4>
+				<p>The pod shortage is solved by the IPv6 family, not by IPv6-only subnets: EKS needs dual-stack subnets and covers IPv4 with node SNAT. IPv6-only subnets with NAT64 suit workloads that can live without IPv4, like the ingestion workers. Each NAT64 flow pays NAT gateway and Transit Gateway processing, so heavy IPv4 use argues for dual-stack.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Public IPv4 is $0.005 an hour per address, about $3.65 a month each, across ALBs, NAT gateways and instances in 300 VPCs; every <code>dualstack-without-public-ipv4</code> ALB or IPv6-only subnet removes some. NAT64 and IPv4 egress still pay per-GB NAT and Transit Gateway charges; IPv6 through egress-only gateways pays only data transfer out. See <a href="../d3-task-3-3.html">Task 3.3</a>.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Centralized IPv6 egress through NAT66 instances or proxies</h4>
+				<p>The 2023 blog's other patterns: EC2 NAT66 instances in the egress VPC (which also let non-advertised BYOIP ranges reach the internet), or a proxy fleet behind an NLB for both families. Central control, but you run, scale and patch the instances, with routes per AZ.</p>
+			</div>
+			<div class="entry">
+				<h4>Inspected IPv6 egress (2025 inspection blog)</h4>
+				<p><strong>Distributed</strong>: a firewall or Gateway Load Balancer endpoint in each VPC before the internet gateway, an edge route table for symmetric replies, and a policy that drops internet-originated flows. <strong>Centralized</strong>: Gateway Load Balancer endpoints in each spoke sending to central appliances (no Transit Gateway charges, but egress-only, and not in IPv6-only subnets), or Transit Gateway routing to appliances doing NAT66 or NPTv6. The blog favours distributed endpoints for fault isolation and scale.</p>
+			</div>
+			<div class="entry">
+				<h4>Stay on IPv4 and fix the pods another way</h4>
+				<p>A secondary <code>100.64.0.0/10</code> CIDR with EKS custom networking, or IPv4 prefix delegation, fixes pod density without touching routing (<a href="overlapping-cidrs.html">overlapping CIDRs page</a>), but does nothing for IPv6-only customers or the IPv4 bill, and custom networking is unavailable in IPv6 clusters.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">The address plan is clean</span><span class="desc">IPAM shows every production VPC with a compliant, non-overlapping /56 from its Region's pool.</span></li>
+				<li><span class="name">DNS64 and NAT64 work</span><span class="desc">From an ingestion worker, <code>dig AAAA feed.hotel-partner.example</code> returns <code>64:ff9b::cb00:7105</code> and <code>curl -6 https://feed.hotel-partner.example</code> succeeds, arriving from a NAT gateway Elastic IP. A name with a real AAAA record comes back unchanged.</span></li>
+				<li><span class="name">Hub routing, both families</span><span class="desc">Reachability Analyzer is IPv4 only, a common exam trap. Route Analyzer in Network Manager accepts IPv6 addresses and checks Transit Gateway routes both ways: booking to <code>2001:db8:100::25</code> should use the Direct Connect gateway attachment, and development to <code>2001:db8:1000::/56</code> should fail.</span></li>
+				<li><span class="name">Hybrid IPv6 sessions</span><span class="desc">Each transit VIF shows two BGP peers up. A BGP failover test on <code>dxvif-us1a</code> should leave a Network Synthetic Monitor IPv6 probe to <code>2001:db8:100::25</code> healthy.</span></li>
+				<li><span class="name">No inbound exposure</span><span class="desc">An outside IPv6 host cannot connect to a pod. In staging, add a <code>::/0</code> route to an internet gateway: Block Public Access must still block inbound.</span></li>
+				<li><span class="name">Flow logs for IPv6</span><span class="desc">Query VPC flow logs for <code>64:ff9b::</code> destinations (NAT64 dependants) and for IPv6 rejects by IPv4-only security groups.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Load balancing for availability, scale and security</td><td data-label="What this architecture demonstrates">Dual-stack ALB, <code>dualstack-without-public-ipv4</code> and its authentication caveat, IPv6 pod targets in IP mode</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-5.html">1.5</a> Routing and connectivity to on premises</td><td data-label="What this architecture demonstrates">One BGP session per family per VIF, AWS-assigned /125, IPv6 allowed prefixes, IPv6 inside and outside VPN</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-6.html">1.6</a> Multi-account, multi-Region routing</td><td data-label="What this architecture demonstrates">IPAM IPv6 pools, public and private IPv6, NAT64 and DNS64, IPv6 as the long-term overlap fix</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Implement hybrid routing and connectivity</td><td data-label="What this architecture demonstrates">IPv6 BGP peers, Direct Connect gateway prefixes, IPv6 VPN tunnels, Route Analyzer for IPv6</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Implement multi-account, multi-Region connectivity</td><td data-label="What this architecture demonstrates"><code>Ipv6Support</code> on attachments, IPv6 propagation and static routes, NAT64 through the egress VPC</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Optimize for performance, reliability and cost</td><td data-label="What this architecture demonstrates">EKS IPv6 against IPv4 exhaustion, public IPv4 charges, egress-only gateway with no processing charge</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Network security and compliance</td><td data-label="What this architecture demonstrates">Block Public Access modes and exclusions, separate IPv6 rules in security groups and network ACLs, card data kept on inspected IPv4</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"IPv6-only instances must reach an IPv4-only service on the internet" is <strong>DNS64 on the subnet plus a route for <code>64:ff9b::/96</code> to a NAT gateway (NAT64)</strong>, not an egress-only gateway, which carries IPv6 only. "Instances must reach the internet over IPv6 without being reachable from it" is <strong>an egress-only internet gateway with <code>::/0</code></strong>, not a NAT gateway, which has no NAT66. "EKS is out of pod IPs and must not depend on IPv4 addressing" is <strong>a new cluster in the IPv6 family</strong>, because the family cannot be changed on an existing cluster.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/centralizing-outbound-internet-traffic-for-dual-stack-ipv4-and-ipv6-vpcs/">Centralizing outbound Internet traffic for dual stack IPv4 and IPv6 VPCs</a> (February 2023): the three egress patterns; central IPv4 with NAT64 and per-VPC egress-only gateways is the one used here (predates the Transit Gateway-attached Network Firewall).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/design-and-build-ipv6-internet-inspection-architectures-on-aws/">Design and build IPv6 internet inspection architectures on AWS</a> (June 2025): distributed and centralized IPv6 inspection, and why central egress needs NAT66 or NPTv6 appliances.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-for-securing-your-ipv6-infrastructure-on-aws-using-vpc-block-public-access/">Best practices for securing your IPv6 infrastructure on AWS using VPC Block Public Access</a> (June 2026): Block Public Access, SCPs and routing as layers for Amazon-provided, BYOIP and private IPv6.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-dual-stack-without-public-ipv4-application-load-balancer/">Introducing dual-stack without public IPv4 Application Load Balancer</a> (July 2024): the IPv6-only front end used in Step 7.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/dual-stack-architectures-for-aws-and-hybrid-networks-part-2/">Dual-stack IPv6 architectures for AWS and hybrid networks - Part 2</a> (June 2022): dual-stack Transit Gateway, Direct Connect and VPN designs (predates IPv6 VPN outside addresses).</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/aws-site-to-site-vpn-now-supports-ipv6-on-the-outside-ips/">AWS Site-to-Site VPN now supports IPv6 on the outside IPs</a> (September 2025): IPv6 tunnel endpoints on Transit Gateway and Cloud WAN.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-nat64-dns64.html">DNS64 and NAT64</a> (AWS documentation): the <code>64:ff9b::/96</code> prefix, the three routes and DNS64 toward on premises.</li>
+				<li><a href="https://docs.aws.amazon.com/eks/latest/userguide/cni-ipv6.html">Learn about IPv6 addresses to clusters, Pods, and services</a> (Amazon EKS documentation): the IPv6 family, node SNAT and its constraints.</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/ipam/create-ipv6-reg-pool.html">Create a Regional IPv6 address pool in your IPAM</a> (Amazon VPC IPAM documentation): Amazon-provided blocks from /40 to /52, public and private scopes.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Advanced Networking &ndash; Specialty (ANS-C01) exam guide.</div>
+</footer>
+
+</body>
+</html>
