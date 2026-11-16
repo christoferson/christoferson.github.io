@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Data-centre migration, VMware and Oracle to AWS | AWS SAP-C03 Notes</title>
+	<meta name="description" content="End-to-end SAP-C03 architecture: exiting an on-premises data centre of VMware virtual machines and Oracle databases as one programme. Business case with AWS Transform assessment and Migration Evaluator, discovery and dependency mapping, the 7 Rs, move groups and waves, MAP and the map-migrated tag, landing zone and Direct Connect readiness, rehosting with AWS Transform MGN launch templates, post-launch actions, test and cutover, Oracle to Aurora PostgreSQL with DMS Schema Conversion and DMS Serverless, Oracle to RDS for Oracle with native load and CDC, DataSync and Data Transfer Terminal, Route 53 weighted cutover, rollback and decommissioning.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../sap.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAP-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Data-centre migration</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Data-centre migration: VMware and Oracle to AWS</h1>
+		<p>One programme to empty the data centre before the lease ends: a business case and a dependency map, a strategy per application, small waves that grow, VMware servers rehosted with AWS Transform MGN, Oracle databases moved with minimal downtime, files and archives copied in bulk, and a cutover that can always be rolled back until the old racks are switched off.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Domain 4</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 2</span><span class="tag">AWS Transform</span><span class="tag">Transform MGN</span><span class="tag">AWS DMS</span><span class="tag">DataSync</span><span class="tag">Route 53</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Business case, portfolio and tracking tags</a></li>
+				<li class="sub"><a href="#b2">2. Landing zone and replication network</a></li>
+				<li class="sub"><a href="#b3">3. Rehost the VMs with Transform MGN</a></li>
+				<li class="sub"><a href="#b4">4. Orders database to Aurora PostgreSQL</a></li>
+				<li class="sub"><a href="#b5">5. Finance database to RDS for Oracle</a></li>
+				<li class="sub"><a href="#b6">6. File shares and archives</a></li>
+				<li class="sub"><a href="#b7">7. Cutover, rollback and decommission</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company's data centre runs several hundred VMware virtual machines and its Oracle databases, connected to AWS by Direct Connect. The landing zone in AWS Organizations (<code>o-a1b2c3d4e5</code>) is already in place: management, security tooling, log archive and shared-network (<code>666666666666</code>) accounts, and prod, staging and dev accounts per business unit. The lease ends in 18 months, so the board treats the exit as one programme with one budget and one deadline, not as a series of team projects. The mainframe billing batch and the SQL Server estate are part of the same exit but follow their own paths on <a href="../d4-task-4-1.html">Task 4.1</a>; this page covers the VMware servers, the Oracle databases and the file data.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">A funded business case before anything moves</td><td data-label="Design choice">AWS Transform assessment (with Migration Evaluator as a second opinion) and a Migration Acceleration Program (MAP) agreement</td></tr>
+						<tr><td data-label="Requirement">Never split an application from its database during a move</td><td data-label="Design choice">AWS Transform discovery with network connection data, move groups built from dependencies, waves of move groups</td></tr>
+						<tr><td data-label="Requirement">Most servers moved quickly with little change</td><td data-label="Design choice">Rehost with AWS Transform MGN (agent-based), modernize after the exit</td></tr>
+						<tr><td data-label="Requirement">Oracle databases moved with minutes of downtime, and less Oracle licensing</td><td data-label="Design choice">Orders schema refactored to Aurora PostgreSQL; the vendor-certified finance database replatformed to RDS for Oracle; DMS full load plus CDC for both</td></tr>
+						<tr><td data-label="Requirement">Every wave can roll back until it is accepted</td><td data-label="Design choice">Source systems kept intact, reverse replication for databases, DNS weights as the traffic switch, finalize only after hypercare</td></tr>
+						<tr><td data-label="Requirement">Migration spend and MAP credits tracked per wave</td><td data-label="Design choice"><code>map-migrated</code> tag applied by Transform MGN, a tag policy and activated cost allocation tags</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from the SAP task pages: production account <code>111111111111</code>, the shared-network account <code>666666666666</code>, source servers <code>s-1234567890abcdef0</code> and <code>s-0fedcba0987654321</code>, the DMS endpoints <code>ORACLESRC</code> and <code>AURORATGT</code> and the <code>ORDERS</code> schema (<a href="../d4-task-4-1.html">Task 4.1</a>), the DataSync location <code>loc-0a1b2c3d4e5f60001</code> for the on-premises NFS share (<a href="../d1-task-1-3.html">Task 1.3</a>), and the tag policy pattern (<a href="../d3-task-3-3.html">Task 3.3</a>). New on this page:</p>
+			<ul>
+				<li><strong>Account</strong>: <code>121212121212</code>, the retail business unit's development account, the target of the pilot wave.</li>
+				<li><strong>Transform MGN</strong>: launch configuration template <code>lct-0a1b2c3d4e5f6a7b8</code>, post-launch document <code>Company-PostMigrationHardening</code> and log bucket <code>mgn-postlaunch-logs-111111111111</code>.</li>
+				<li><strong>DMS</strong>: the finance endpoints <code>FINORASRC</code> and <code>RDSORATGT</code>, replication instance <code>FINRI</code> and subnet group <code>dms-migration-subnets</code>.</li>
+				<li><strong>Data</strong>: archive bucket <code>dc-archive-111111111111</code> (DataSync location <code>loc-0a1b2c3d4e5f60003</code>), and the partner portal <code>partners.example.com</code>, served today from <code>203.0.113.10</code>.</li>
+				<li><strong>Tags</strong>: <code>map-migrated</code> (value from the MAP agreement, shown as <code>MAP_TAG_VALUE</code>) and <code>MigrationWave</code>.</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> AWS Application Migration Service is now <strong>AWS Transform MGN</strong> (June 2026, same <code>aws mgn</code> APIs), and agentless vCenter replication is no longer available for new deployments (October 2026). AWS Application Discovery Service and AWS Migration Hub, including Strategy Recommendations and Orchestrator, have been closed to new customers since 7 November 2025; their capabilities are in AWS Transform. DMS Fleet Advisor reached end of support on 20 May 2026, and the Snow Family is closed to new customers. Older guidance, including the large migration guide and the Migration Lens, still names the closed tools.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgM-wide-t">
+<title id="dgM-wide-t">Data-centre migration: AWS Transform discovers the VMware and Oracle estate and builds the business case and wave plan; Transform MGN replicates each wave's servers into the target accounts, where EC2 instances are tested and then cut over with Route 53 weights; DMS with Schema Conversion moves the Oracle orders schema to Aurora PostgreSQL with a full load and change data capture.</title>
+<rect x="405" y="130" width="380" height="210" rx="12" class="dg-grp"/>
+<text x="415" y="146" class="dg-lbl">AWS target accounts</text>
+<path d="M170.0 161.0 L183.0 161.0 Q190.0 161.0 190.0 154.0 L190.0 67.0 Q190.0 60.0 197.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 189.0 L183.0 189.0 Q190.0 189.0 190.0 196.0 L190.0 283.0 Q190.0 290.0 197.0 290.0 L210.0 290.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 290.0 L420.0 290.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M620.0 175.0 L580.0 175.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Data centre</text>
+<text x="90" y="189" class="dg-s dg-sm2">VMware + Oracle</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">AWS Transform</text>
+<text x="290" y="74" class="dg-s dg-sm2">discovery, assessment</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Wave plan</text>
+<text x="500" y="74" class="dg-s dg-sm2">7 Rs, move groups</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">Transform MGN</text>
+<text x="290" y="189" class="dg-s dg-sm2">block replication</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">EC2 instances</text>
+<text x="500" y="189" class="dg-s dg-sm2">test, then cutover</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Route 53</text>
+<text x="700" y="189" class="dg-s dg-sm2">weighted cutover</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="287" class="dg-t dg-sm">DMS + Schema Conv.</text>
+<text x="290" y="304" class="dg-s dg-sm2">full load + CDC</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">Aurora PostgreSQL</text>
+<text x="500" y="304" class="dg-s dg-sm2">orders schema</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 420" role="img" aria-labelledby="dgM-tall-t">
+<title id="dgM-tall-t">Data-centre migration: AWS Transform discovers the VMware and Oracle estate and builds the business case and wave plan; Transform MGN replicates each wave's servers into the target accounts, where EC2 instances are tested and then cut over with Route 53 weights; DMS with Schema Conversion moves the Oracle orders schema to Aurora PostgreSQL with a full load and change data capture.</title>
+<rect x="10" y="210" width="380" height="200" rx="12" class="dg-grp"/>
+<text x="380" y="226" class="dg-lbl" text-anchor="end">AWS target accounts</text>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M20.0 40.0 L13.0 40.0 Q6.0 40.0 6.0 47.0 L6.0 358.0 Q6.0 365.0 13.0 365.0 L20.0 365.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 365.0 L220.0 365.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 255.0 L180.0 255.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Data centre</text>
+<text x="100" y="54" class="dg-s dg-sm2">VMware + Oracle</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">AWS Transform</text>
+<text x="300" y="54" class="dg-s dg-sm2">discovery, assessment</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Wave plan</text>
+<text x="300" y="159" class="dg-s dg-sm2">7 Rs, move groups</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="142" class="dg-t dg-sm">Transform MGN</text>
+<text x="100" y="159" class="dg-s dg-sm2">block replication</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">EC2 instances</text>
+<text x="100" y="269" class="dg-s dg-sm2">test, then cutover</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Route 53</text>
+<text x="300" y="269" class="dg-s dg-sm2">weighted cutover</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="362" class="dg-t dg-sm">DMS + Schema Conv.</text>
+<text x="100" y="379" class="dg-s dg-sm2">full load + CDC</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">Aurora PostgreSQL</text>
+<text x="300" y="379" class="dg-s dg-sm2">orders schema</text>
+</svg>
+				<figcaption>Figure: four stages repeat for every wave once the pilot has proven them. AWS Transform discovery and assessment turn the inventory into a business case and move groups (grey). For each wave, Transform MGN replicates block data over Direct Connect into a staging area and launches test, then cutover, instances (blue); DMS Schema Conversion and DMS move the Oracle databases with a full load and change data capture (green). Route 53 weights shift traffic at cutover and back again if the rollback decision calls for it (yellow), and the source systems are decommissioned after hypercare.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Four stages repeat for every wave once the pilot has proven them. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Assess and plan</li>
+				<li><span class="name">Discover the estate<span class="who">Migration team</span></span><span class="desc">The AWS Transform discovery tool, an appliance on vCenter, collects servers, utilization, Oracle database details and network connections over WinRM and SSH.</span></li>
+				<li class="auto"><span class="name">Business case and groups<span class="who auto">AWS</span></span><span class="desc">AWS Transform assessment turns the inventory into a TCO business case with scenarios, and the connection data shows which servers talk to which, the raw material for move groups.</span></li>
+				<li><span class="name">Decide and schedule<span class="who">Migration team</span></span><span class="desc">Each application group gets one of the 7 Rs, move groups become waves, and the pilot wave (under 10 dev and test servers) goes first, into <code>121212121212</code>.</span></li>
+				<li class="group">Rehost a wave</li>
+				<li><span class="name">Install agents<span class="who">Migration team</span></span><span class="desc">The replication agent goes on every server in the wave; block-level data flows over Direct Connect on TCP 1500 to replication servers in the target account's staging subnet.</span></li>
+				<li class="auto"><span class="name">Continuous replication<span class="who auto">AWS</span></span><span class="desc">After the initial sync, Transform MGN keeps the staging volumes current until launch. Launches use the account's launch configuration template, including the MAP tag.</span></li>
+				<li><span class="name">Test, then cut over<span class="who">Migration team</span></span><span class="desc">A test launch is checked by post-launch actions and the application owner; in the cutover window the team launches cutover instances and moves traffic.</span></li>
+				<li class="group">Move the databases</li>
+				<li><span class="name">Convert and load<span class="who">DBA</span></span><span class="desc">DMS Schema Conversion converts the orders schema to PostgreSQL; DMS runs a full load, then change data capture (CDC) from the Oracle redo logs, with validation.</span></li>
+				<li><span class="name">Switch writers<span class="who">DBA</span></span><span class="desc">At cutover, writes stop on Oracle, CDC drains to zero lag, applications point at the target, and a reverse task keeps Oracle current for rollback.</span></li>
+				<li class="group">Accept and decommission</li>
+				<li><span class="name">Hypercare<span class="who">Application owner</span></span><span class="desc">For an agreed period the old systems stay intact. DNS weights move back if the decision matrix calls for rollback.</span></li>
+				<li><span class="name">Finalize and switch off<span class="who">Migration team</span></span><span class="desc">Finalizing cutover stops replication and removes the agent; the source VMs are archived and powered off, and the tags show the wave's cost.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Business case, portfolio and tracking tags</h3>
+				<p><strong>The phases.</strong> AWS's large-migration guidance and MAP use the same three phases: <em>assess</em> (business case, readiness, TCO), <em>mobilize</em> (landing zone, detailed portfolio, operating model, closing readiness gaps) and <em>migrate and modernize</em> (an initialization period, then waves run by a migration factory). The Cloud Adoption Framework's six perspectives (Business, People, Governance, Platform, Security, Operations) frame the readiness review: who owns each application after the move, who signs off a cutover, which skills the operations team lacks. MAP adds funding and partner support across those phases, and in return expects migrated resources to carry the MAP tag (below). The Well-Architected Migration Lens gives best practices per phase, though it predates AWS Transform.</p>
+				<p><strong>The business case.</strong> AWS Transform assessment builds a TCO case in minutes from an inventory (RVTools exports, a CMDB, a discovery tool), with what-if scenarios for purchase options, Graviton, licensing and right-sizing, exported as PowerPoint, Excel or PDF. Migration Evaluator still offers Quick Insights and an AWS-built business case and is not closed. The Professional-level point is that the case rests on <em>utilization</em> data, not on the VMs' allocated sizes: on-premises servers are usually oversized, and right-sizing plus Savings Plans after the move is where much of the saving comes from (<a href="../d3-task-3-1.html">Task 3.1</a>). For Oracle, licensing often outweighs infrastructure in the case, which is why the refactor of the orders schema is in scope at all.</p>
+				<p><strong>Portfolio and the 7 Rs.</strong> The discovery data and interviews with owners place each application group in one of the 7 Rs. For this estate:</p>
+				<ul>
+					<li><strong>Retire</strong>: about one server in ten is a "zombie" (averaging under 5% CPU and memory); they are switched off after an owner confirms, which removes cost and wave effort at once.</li>
+					<li><strong>Retain</strong>: the mainframe until AWS Transform for mainframe finishes, and a lab system tied to on-premises hardware.</li>
+					<li><strong>Rehost</strong>: the bulk of the VMs, including the order monolith's application servers, with Transform MGN.</li>
+					<li><strong>Replatform</strong>: the finance database to RDS for Oracle; file shares to S3 and FSx.</li>
+					<li><strong>Refactor</strong>: only the orders schema to Aurora PostgreSQL, because the company already runs Aurora PostgreSQL and the Oracle licence renewal falls inside the programme. AWS advises against refactoring during a large migration otherwise: migrate first, modernize after.</li>
+					<li><strong>Repurchase</strong>: the on-premises HR system moves to SaaS. <strong>Relocate</strong> (Amazon EVS) is the fallback in <a href="#alternatives">Alternatives</a>.</li>
+				</ul>
+				<p><strong>Move groups and waves.</strong> A move group is everything that must move in the same window: servers sharing a database, a single owner or a patch window. Network connections reveal these groups; a server list alone doesn't, and that's how applications end up split from their databases across a slow link. Shared services such as Active Directory are not a reason to group; domain controllers are built in AWS first. Waves are one or more move groups, planned 4 to 5 waves ahead and sized to the network bandwidth and the team (AWS cites a team of four rehosting about 50 servers a week). The pilot wave is dev and test servers only, so the runbook and post-launch actions get fixed where mistakes are cheap.</p>
+				<p><strong>Tracking from day one.</strong> MAP benefits depend on migrated resources carrying the <code>map-migrated</code> tag, and finance wants spend per wave. A tag policy fixes the spelling and the allowed wave names, and the management account activates both keys as cost allocation tags before the pilot, because tags only allocate costs from the moment they're on a resource and activated.</p>
+				<span class="file">Tag policy: one spelling for the MAP and wave tags, with the allowed wave names enforced on EC2 instances (Organizations tag policy, attached to the workload OUs)</span>
+<pre><code>{
+  "tags": {
+    "map-migrated": {
+      "tag_key": { "@@assign": "map-migrated" }
+    },
+    "migrationwave": {
+      "tag_key": { "@@assign": "MigrationWave" },
+      "tag_value": { "@@assign": ["pilot", "wave-01", "wave-02", "wave-03", "wave-04"] },
+      "enforced_for": { "@@assign": ["ec2:instance"] }
+    }
+  }
+}</code></pre>
+				<span class="file">Activate the migration tags for billing (AWS CLI, management account)</span>
+<pre><code>aws ce update-cost-allocation-tags-status \
+  --cost-allocation-tags-status \
+    TagKey=map-migrated,Status=Active \
+    TagKey=MigrationWave,Status=Active</code></pre>
+				<div class="callout trap"><p>A tag policy controls spelling and values when a tag is used; it doesn't make the tag required. The MAP tag value comes from the MAP agreement, so the policy doesn't list values for it. Untagged resources launched before activation can't be backfilled into history that never existed.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Landing zone readiness and the replication network</h3>
+				<p><strong>Target accounts.</strong> Migrated servers land in the same business unit accounts as the cloud-native workloads, never in a "migration account" that would need splitting later. The accounts come from Control Tower Account Factory with the organization's baseline already applied: organization trail, Config, GuardDuty and Security Hub CSPM delegated to the security tooling account, and SCPs from the workload OUs (<a href="../d2-task-2-3.html">Task 2.3</a>; the full baseline is on the SCS <a href="../../aws-scs/arch/security-baseline.html">multi-account security baseline</a>). Each target account gets a staging subnet for replication servers and target subnets for the launched instances, in spoke VPCs attached to the Transit Gateway owned by <code>666666666666</code> (see the ANS <a href="../../aws-ans/arch/tgw-hub-spoke.html">Transit Gateway hub and spoke</a> for segmentation and route tables). Migration engineers and application testers sign in through IAM Identity Center permission sets scoped to the wave's accounts; nobody uses IAM users for agent installs (SCS <a href="../../aws-scs/arch/workforce-identity.html">workforce identity</a>).</p>
+				<p><strong>Connectivity.</strong> Replication runs over the existing Direct Connect: a transit VIF to a Direct Connect gateway associated with the Transit Gateway, two locations for resiliency, and Site-to-Site VPN as a backup that carries traffic only when Direct Connect fails (<a href="../d1-task-1-3.html">Task 1.3</a>; the ANS <a href="../../aws-ans/arch/dx-resilient-hybrid.html">resilient Direct Connect</a> architecture goes deeper). Two flows must be open: TCP 443 from source servers and the staging subnet to the Transform MGN endpoint (control), and TCP 1500 from source servers to the replication servers (data, encrypted). Swapping the two is a classic mistake. Hybrid DNS, with Route 53 Resolver forwarding <code>corp.example.com</code> to the on-premises resolvers, lets migrated servers keep finding systems that haven't moved yet.</p>
+				<p><strong>Bandwidth.</strong> Wave size follows the link, not ambition. Initial syncs, the DMS full loads and DataSync all share the connection with production traffic, so the plan staggers them: big initial syncs at night and at weekends, DataSync throttled during business hours (Step 6), and the replication servers sized to the wave as AWS's right-sizing post describes. As a rule of thumb from <a href="../d4-task-4-1.html">Task 4.1</a>, 100 TB takes about 12 days over 1 Gbps at 80% utilization.</p>
+				<span class="file">Install the replication agent on a source server without prompts; at scale the MGN connector does this over SSH or WinRM (Linux source server)</span>
+<pre><code><span class="c"># Credentials come from a role with AWSApplicationMigrationAgentInstallationPolicy</span>
+sudo ./aws-replication-installer-init \
+  --region us-east-1 \
+  --no-prompt</code></pre>
+				<div class="callout trap"><p>Agentless replication through vCenter is gone for new deployments, and AWS Transform never supported it, so every wave needs agents, change tickets and credentials for each server. Automating the agent install with the MGN connector or the AWS Transform workflow is what keeps the factory's pace.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Rehost the VMware servers with Transform MGN</h3>
+				<p><strong>How it works.</strong> The agent does a block-level copy of each disk, then continuous replication, to lightweight replication servers in the staging subnet; staging EBS volumes hold the copy. At launch, a conversion server makes the disks bootable on EC2, and test or cutover instances start from the server's EC2 launch template. Lifecycle: initial sync, ready for testing, testing (each new test replaces the last), ready for cutover, cutover, then finalize. Servers are grouped into applications and waves, and actions run at server, application or wave level, across accounts in the organization through global view. Each source server gets 2,160 free replication hours (90 days of continuous replication) from agent install, so agents go on shortly before the wave, not months ahead; the staging and launched resources are billed as usual.</p>
+				<p><strong>AWS Transform for VMware</strong> runs the same engine through an agentic, guided job: discovery, wave planning, translating on-premises networks and firewall rules into VPCs and security groups, and rehosting through MGN. It's free for these jobs, but each job targets one Region and one account per wave, and its waves can run in parallel workspaces for separate teams. The company uses it for the bulk waves and drives Transform MGN directly for the few servers that need special handling.</p>
+				<p><strong>The launch configuration template</strong> sets defaults for every new server in the account: right-sizing from the source's CPU and RAM (overriding the template's instance type), keeping the source's private IP where the target subnet's range allows it, transferring the source server's tags, and the MAP tag. With MAP tagging on, Transform MGN tags migrated resources with the key <code>map-migrated</code> and the value supplied. Post-launch actions run Systems Manager documents on test and cutover instances; one that must succeed blocks cutover until it does.</p>
+				<span class="file">Account launch defaults: right-sizing, MAP tag, tag transfer, and a hardening document that must pass before cutover (AWS CLI, production account 111111111111)</span>
+<pre><code>aws mgn create-launch-configuration-template \
+  --target-instance-type-right-sizing-method BASIC \
+  --copy-tags \
+  --launch-disposition STARTED \
+  --boot-mode USE_SOURCE \
+  --enable-map-auto-tagging \
+  --map-auto-tagging-mpe-id MAP_TAG_VALUE \
+  --post-launch-actions '{
+    "deployment": "TEST_AND_CUTOVER",
+    "s3LogBucket": "mgn-postlaunch-logs-111111111111",
+    "ssmDocuments": [{
+      "actionName": "post-migration-hardening",
+      "ssmDocumentName": "Company-PostMigrationHardening",
+      "timeoutSeconds": 3600,
+      "mustSucceedForCutover": true
+    }]
+  }'</code></pre>
+				<p>The command returns the template ID (here <code>lct-0a1b2c3d4e5f6a7b8</code>). Further actions can be added to it with <code>aws mgn put-template-action</code>, which takes the template ID, an action ID and name, the document, an order between 1001 and 10000, and an optional category such as <code>SECURITY</code> or <code>VALIDATION</code>. Template changes apply to servers added afterwards, not to servers already in the console, so the template is set before the first agent of a wave is installed. Windows servers that bring their own licence need a Dedicated Host: the EC2 launch template's tenancy must be <code>host</code>, or the launch fails.</p>
+				<span class="file">Test launch for the pilot application's two servers once both show ready for testing (AWS CLI, account 121212121212)</span>
+<pre><code>aws mgn start-test \
+  --source-server-ids s-1234567890abcdef0 s-0fedcba0987654321</code></pre>
+				<p>The test instances run in an isolated test subnet so they can't write to production systems, while replication carries on. The application owner signs off the test; the cutover, finalize and rollback commands are in Step 7.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Refactor the orders database to Aurora PostgreSQL</h3>
+				<p><strong>Schema first.</strong> DMS moves tables and data, not every database object. DMS Schema Conversion, managed and free, converts the Oracle schema and PL/SQL code to Aurora PostgreSQL, with generative AI (and since 2026 agentic assistance) for code the rules can't convert. Its assessment report is part of the business case: the share of code needing manual work decides whether refactoring fits in the programme's timeline. Secondary objects (triggers, sequences, foreign keys) are created after the full load so they don't slow it or fire during it. The desktop Schema Conversion Tool remains only for data warehouses and ETL code.</p>
+				<p><strong>Data.</strong> A full load copies the existing rows, then CDC applies changes read from the Oracle redo logs, so the target stays seconds behind until cutover. The table mapping includes every <code>ORDERS</code> table and turns Oracle's upper-case names into lower case, which PostgreSQL treats as unquoted identifiers. Oracle names in rules must be given in upper case.</p>
+				<span class="file">table-mappings.json: every table in the ORDERS schema, with schema, table and column names converted to lower case (DMS table mapping)</span>
+<pre><code>{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "orders-schema",
+      "object-locator": { "schema-name": "ORDERS", "table-name": "%" },
+      "rule-action": "include"
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "2",
+      "rule-name": "lowercase-schema",
+      "rule-action": "convert-lowercase",
+      "rule-target": "schema",
+      "object-locator": { "schema-name": "ORDERS" }
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "3",
+      "rule-name": "lowercase-tables",
+      "rule-action": "convert-lowercase",
+      "rule-target": "table",
+      "object-locator": { "schema-name": "ORDERS", "table-name": "%" }
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "4",
+      "rule-name": "lowercase-columns",
+      "rule-action": "convert-lowercase",
+      "rule-target": "column",
+      "object-locator": { "schema-name": "ORDERS", "table-name": "%", "column-name": "%" }
+    }
+  ]
+}</code></pre>
+				<p><strong>DMS Serverless</strong> fits this load: heavy during the full load, light during weeks of CDC. It scales between minimum and maximum DMS capacity units (1 DCU is 2 GB of RAM, up to 384), can't scale down during a full load, needs VPC endpoints to reach services such as S3 and Secrets Manager, and after its first start can only resume. Multi-AZ protects the long CDC phase.</p>
+				<span class="file">Serverless full load plus CDC for the orders schema, Multi-AZ, with validation on (AWS CLI, production account 111111111111)</span>
+<pre><code>aws dms create-replication-config \
+  --replication-config-identifier orders-oracle-to-aurora \
+  --source-endpoint-arn arn:aws:dms:us-east-1:111111111111:endpoint:ORACLESRC \
+  --target-endpoint-arn arn:aws:dms:us-east-1:111111111111:endpoint:AURORATGT \
+  --replication-type full-load-and-cdc \
+  --compute-config MinCapacityUnits=4,MaxCapacityUnits=64,MultiAZ=true,ReplicationSubnetGroupId=dms-migration-subnets \
+  --table-mappings file://table-mappings.json \
+  --replication-settings '{"ValidationSettings":{"EnableValidation":true}}'</code></pre>
+				<p>Validation compares source and target rows and needs a primary key or unique index on each table, so tables without one are found in the premigration assessment and fixed first. LOB columns use limited LOB mode, sized from the largest real LOB, because limited mode truncates anything larger. The AWS Oracle-to-PostgreSQL blog series follows the same discovery, assessment, planning and post-cutover tuning stages.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Replatform the finance database to RDS for Oracle</h3>
+				<p>The finance application is a packaged product its vendor supports only on Oracle, so refactoring isn't an option. RDS for Oracle keeps the engine and removes the operating work (backups, patching, Multi-AZ), with licensing either included or brought by the company (BYOL); which one is cheaper depends on the licences the company already owns and their terms, a question for the licence team, not the architects. If the vendor's agents need OS access, RDS Custom for Oracle is the managed option that allows it; otherwise EC2 with full control.</p>
+				<p>Oracle to Oracle doesn't qualify for DMS homogeneous data migrations (those cover MySQL, MariaDB, PostgreSQL, MongoDB and DocumentDB only). For a large database the fastest path is native: export or restore with Oracle's own tools (Data Pump or RMAN) into RDS, recording the system change number (SCN) the copy is consistent to, then start a DMS CDC-only task from that SCN to catch up and stay in sync.</p>
+				<span class="file">Catch the finance database up from the SCN of its native export, then keep it in sync until cutover (AWS CLI, production account 111111111111)</span>
+<pre><code>aws dms create-replication-task \
+  --replication-task-identifier finance-oracle-cdc \
+  --source-endpoint-arn arn:aws:dms:us-east-1:111111111111:endpoint:FINORASRC \
+  --target-endpoint-arn arn:aws:dms:us-east-1:111111111111:endpoint:RDSORATGT \
+  --replication-instance-arn arn:aws:dms:us-east-1:111111111111:rep:FINRI \
+  --migration-type cdc \
+  --cdc-start-position "&lt;SCN recorded by the Data Pump export&gt;" \
+  --table-mappings file://finance-mappings.json \
+  --replication-task-settings '{"ValidationSettings":{"EnableValidation":true}}'</code></pre>
+				<p>This one uses a provisioned replication instance, because the CDC load is steady and the instance can be sized once. RDS Blue/Green deployments don't support Oracle, so later engine upgrades of this database are planned as their own changes, not part of the migration.</p>
+				<div class="callout trap"><p>DMS homogeneous data migrations don't support Oracle or SQL Server, and DMS Fleet Advisor is past end of support, so database inventory now comes from the AWS Transform discovery tool (which collects Oracle details). A refactor to PostgreSQL removes Oracle licence cost; a replatform to RDS for Oracle removes operating effort but keeps the licence.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>File shares and archives</h3>
+				<p><strong>Online with DataSync.</strong> The NFS share used by the order monolith (80 TB, new on this page) moves to S3 with DataSync: an agent on premises, transfer over Direct Connect, verification of what was copied, and repeated incremental runs until cutover, when a final run takes only the changes. Several agents add speed, not availability. During business hours the task is throttled so replication and production traffic keep their share.</p>
+				<span class="file">Migration task for the order monolith NFS share, throttled to about 400 MB/s and reporting errors to S3 (AWS CLI, production account 111111111111)</span>
+<pre><code>aws datasync create-task \
+  --name nfs-share-migration \
+  --source-location-arn arn:aws:datasync:us-east-1:111111111111:location/loc-0a1b2c3d4e5f60001 \
+  --destination-location-arn arn:aws:datasync:us-east-1:111111111111:location/loc-0a1b2c3d4e5f60003 \
+  --options VerifyMode=ONLY_FILES_TRANSFERRED,TransferMode=CHANGED,PreserveDeletedFiles=PRESERVE,BytesPerSecond=419430400,LogLevel=BASIC \
+  --task-report-config '{"Destination":{"S3":{"S3BucketArn":"arn:aws:s3:::dc-archive-111111111111","Subdirectory":"datasync-reports/","BucketAccessRoleArn":"arn:aws:iam::111111111111:role/datasync-report-writer"}},"OutputType":"SUMMARY_ONLY","ReportLevel":"ERRORS_ONLY"}'</code></pre>
+				<p>The <code>BytesPerSecond</code> limit is in bytes (419430400 is 400 &times; 1024 &times; 1024); a separate night task without the limit, or updating the task's options before each night run, uses the full link. The report role <code>datasync-report-writer</code> is new on this page.</p>
+				<p><strong>Offline with Data Transfer Terminal.</strong> The backup and media archive (600 TB, new on this page) would take weeks over the shared link. Snowball is closed to new customers, so the company uses AWS Data Transfer Terminal: staff bring the company's own storage devices to an AWS facility and upload over 100 Gbps links, billed per port-hour with no per-GB fee. The user guide limits it to Enterprise Support customers, which the company is. The archive is moved once, early, because it doesn't change.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Cutover, rollback and decommission</h3>
+				<p><strong>Before the window.</strong> Every cutover has a written rollback plan with a decision-maker named in advance, a timebox (if the problem and its fix can't be explained within it, roll back) and a decision matrix of severity, scope and time to fix, as AWS's rollback post recommends. DNS TTLs are lowered days before. For databases, a reverse DMS task from the new target back to the old source is built and tested in the pilot, so the source can be kept current during hypercare.</p>
+				<p><strong>In the window.</strong> Writes stop at the source, DMS CDC drains to zero lag and validation shows no mismatches; applications switch connection strings (kept in Secrets Manager); cutover instances launch from the last replicated state; post-launch actions pass; traffic moves.</p>
+				<span class="file">Launch cutover instances for the wave's servers (AWS CLI, production account 111111111111)</span>
+<pre><code>aws mgn start-cutover \
+  --source-server-ids s-1234567890abcdef0 s-0fedcba0987654321</code></pre>
+				<p>The partner portal's web tier is stateless, so its traffic moves gradually: weighted records send 10% of DNS answers to the new load balancer, then more as error rates hold. Rollback is a single change setting the AWS weight to 0. The on-premises record and the load balancer alias have the same name and type, and AWS recommends a TTL of 60 seconds on non-alias records grouped with a load balancer alias.</p>
+				<span class="file">Canary step for partners.example.com: 90% on premises, 10% on the new ALB (change batch for aws route53 change-resource-record-sets)</span>
+<pre><code>{
+  "Comment": "Wave 2 cutover, canary 10 percent",
+  "Changes": [
+    { "Action": "UPSERT", "ResourceRecordSet": {
+        "Name": "partners.example.com", "Type": "A", "SetIdentifier": "on-premises", "Weight": 90, "TTL": 60,
+        "ResourceRecords": [ { "Value": "203.0.113.10" } ] } },
+    { "Action": "UPSERT", "ResourceRecordSet": {
+        "Name": "partners.example.com", "Type": "A", "SetIdentifier": "aws-use1", "Weight": 10,
+        "AliasTarget": { "HostedZoneId": "Z35SXDOTRQ7X7K", "DNSName": "partners-use1-1234567890.us-east-1.elb.amazonaws.com", "EvaluateTargetHealth": true } } }
+  ]
+}</code></pre>
+				<p>Stateful applications can't split traffic, so for them the same records move straight from 100/0 to 0/100 after the database switch, and back again if the rollback criteria are met while the reverse task runs. A change batch is applied all or nothing, so both weights always change together.</p>
+				<p><strong>Hypercare and decommission.</strong> Hypercare (two weeks for this company) keeps the source VMs, the reverse replication and the on-premises record. Then, and only then, the team finalizes: finalizing stops replication, deletes the replication resources within about 90 minutes and tells the agent to uninstall itself, but leaves the launched instances running. It's one-way.</p>
+				<span class="file">After acceptance: finalize each server, which removes its replication resources and agent (AWS CLI, production account 111111111111)</span>
+<pre><code>aws mgn finalize-cutover --source-server-id s-1234567890abcdef0
+aws mgn finalize-cutover --source-server-id s-0fedcba0987654321</code></pre>
+				<p>The source VMs are powered off and kept for the retention period the risk team sets, then deleted; the DMS tasks and the reverse task are stopped and removed; on-premises DNS records, firewall rules and backup jobs for the wave are retired; and the hardware list for the lease return is updated. Operations take over through a structured handoff, so the migration team can start the next wave without being pulled back. Cost Explorer grouped by <code>MigrationWave</code> shows each wave's run cost against the business case, and right-sizing and Savings Plans follow once usage has settled for a few weeks.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Migrate first, modernize after</h4>
+				<p>Rehost and replatform carry most of the estate because the lease, not the architecture, sets the deadline, and AWS's large-migration guidance recommends exactly that. The one refactor (orders to Aurora PostgreSQL) earns its place through the licence saving and an existing Aurora PostgreSQL skill set. The cost is that rehosted servers bring their inefficiencies with them; the modernization backlog (containers, managed services, the strangler fig on the order monolith) starts after the exit (<a href="../d4-task-4-1.html">Task 4.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Waves sized by dependencies and bandwidth</h4>
+				<p>Move groups come from network connection data, and wave size from the link and the team's measured pace. A small pilot slows the first month but fixes the runbook, the post-launch documents and the rollback before production waves depend on them. Bigger waves look faster on a plan and fail in practice when the initial syncs saturate Direct Connect.</p>
+			</div>
+			<div class="entry">
+				<h4>Agent-based replication into the final accounts</h4>
+				<p>Agents are the only Transform MGN option for new deployments, so the design invests in automated installs. Replicating straight into the business unit accounts means no second move later, at the price of a staging subnet and security groups in every target account, which the account baseline creates.</p>
+			</div>
+			<div class="entry">
+				<h4>Native load plus CDC for the large Oracle database</h4>
+				<p>For the finance database, a native Oracle copy is faster than a DMS full load and keeps every Oracle object; DMS CDC from the copy's SCN closes the gap. The cost is two tools and a DBA who knows both. The orders database uses DMS for both phases because the engines differ and validation is needed.</p>
+			</div>
+			<div class="entry">
+				<h4>Rollback kept open until finalize</h4>
+				<p>Source servers, reverse replication and DNS weights stay ready through hypercare, which costs two environments for a few weeks per wave. That cost buys the ability to say yes to a cutover window, and AWS's rollback guidance treats it as engineering maturity, not pessimism (<a href="../d4-task-4-3.html">Task 4.3</a>).</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Relocate the VMware estate to Amazon EVS</h4>
+				<p>Amazon Elastic VMware Service runs VMware Cloud Foundation in the company's own VPC on EC2 bare metal, and VMware HCX can move VMs with no conversion. It's the fastest way out of the building and keeps the VMware tools and skills, but it keeps the VMware licensing and the hypervisor layer too, and every later modernization still starts from VMs. It suits a deadline that rehosting can't meet, or workloads that can't take an agent.</p>
+			</div>
+			<div class="entry">
+				<h4>Everything Oracle to RDS for Oracle (or everything to PostgreSQL)</h4>
+				<p>Replatforming both databases is simpler and faster, but keeps all the Oracle licensing the business case was meant to reduce. Refactoring both would put the vendor's finance product out of support. The split follows what each application allows.</p>
+			</div>
+			<div class="entry">
+				<h4>VM Import/Export or a migration factory of scripts</h4>
+				<p>VM Import/Export fits a handful of one-off images but has no continuous replication, so downtime equals copy time. The Cloud Migration Factory on AWS solution automates wave metadata, prerequisite checks, agent installs and cutover across hundreds of servers; its README still mentions CloudEndure Migration, and for new programmes AWS Transform covers wave planning and orchestration.</p>
+			</div>
+			<div class="entry">
+				<h4>Network-only migration of data</h4>
+				<p>Copying the 600 TB archive over Direct Connect avoids handling devices, but takes weeks of shared bandwidth from replication. Data Transfer Terminal costs port-hours and staff time instead, and suits large one-off data sets that don't change.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove the dependency map</span><span class="desc">Before a wave is approved, compare its move groups with the discovery tool's network connections for the last 30 days: any connection from a wave server to a server in a later wave needs an owner's sign-off and a firewall rule over Direct Connect.</span></li>
+				<li><span class="name">Rehearse in the pilot</span><span class="desc">Run the full runbook in <code>121212121212</code>: agent install, test launch, post-launch actions (the hardening document must fail a deliberately noncompliant server and block its cutover), cutover, rollback by DNS, and a second cutover.</span></li>
+				<li><span class="name">Database cutover rehearsal</span><span class="desc">On a copy of the orders database, measure how long CDC takes to drain after writes stop and whether validation reports zero mismatched rows; run the reverse task and confirm Oracle receives a test write made on Aurora. The measured time sets the real cutover window.</span></li>
+				<li><span class="name">Performance and load tests</span><span class="desc">Load test the test instances at peak volume before cutover, because right-sized instances can be smaller than the VMs they replace; check that the Aurora version of the top queries is within the agreed latency.</span></li>
+				<li><span class="name">Tagging and cost checks</span><span class="desc">After each wave, the tag policy compliance report and Cost Explorer grouped by <code>map-migrated</code> and <code>MigrationWave</code> must show every launched instance and volume tagged; untagged resources mean lost MAP credit and are fixed the same week.</span></li>
+				<li><span class="name">Decommission check</span><span class="desc">Before the lease return, confirm no traffic reaches the old IP ranges for two weeks (firewall and DNS query logs), every server is finalized or archived in Transform MGN, and no DMS task or DataSync schedule still points on premises.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Design Migration Strategies by Using AWS Frameworks</td><td data-label="What this architecture demonstrates">AWS Transform discovery and assessment, the 7 Rs, move groups and pilot waves, Transform MGN launch templates and post-launch actions, DMS full load plus CDC, Schema Conversion, DataSync and Data Transfer Terminal</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-3.html">4.3</a> Design Solutions to Meet Business Continuity and Resiliency Requirements</td><td data-label="What this architecture demonstrates">Rollback plans with a timebox, reverse replication, DNS weights as the switch, hypercare before the one-way finalize</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Design Hybrid Cloud Integration Patterns</td><td data-label="What this architecture demonstrates">Direct Connect with VPN backup for replication traffic, hybrid DNS during the transition, DataSync over the link with bandwidth limits</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-5.html">1.5</a> Design Data, Storage, and Database Architectures</td><td data-label="What this architecture demonstrates">Choosing Aurora PostgreSQL, RDS for Oracle or RDS Custom per database, licence included or BYOL</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Design Architectures Based on AWS Pricing Models</td><td data-label="What this architecture demonstrates">A TCO business case from utilization, right-sizing then Savings Plans, Dedicated Hosts for BYOL, free migration tooling versus billed staging resources</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Design Multi-Account Governance and Compliance Solutions</td><td data-label="What this architecture demonstrates">Migration into baselined business unit accounts, IAM Identity Center access, a tag policy for the MAP and wave tags</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Design Cost Allocation and Visibility Solutions</td><td data-label="What this architecture demonstrates">Activated cost allocation tags and per-wave cost reporting</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Migrate hundreds of VMware VMs in 12 months with minimal changes and minimal downtime" is <strong>rehost with AWS Transform MGN (or AWS Transform for VMware), in waves</strong>, not refactoring. "Discover dependencies before planning waves" is <strong>AWS Transform discovery with network connection data</strong>; Application Discovery Service and Migration Hub answers are wrong for new customers. "Oracle to PostgreSQL with minimal downtime" is <strong>DMS Schema Conversion, then DMS full load plus CDC</strong>. "Keep the vendor-certified Oracle engine but stop managing it" is <strong>RDS for Oracle</strong> (RDS Custom if OS access is required). "Track migrated resources for MAP credits" is the <strong><code>map-migrated</code> tag</strong>, applied automatically by Transform MGN. "Hundreds of terabytes, one time, link too slow" is now <strong>Data Transfer Terminal</strong>, not Snowball.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/migration-and-modernization/simplify-server-migration-to-aws-with-aws-transform-for-vmware/">Simplify server migration to AWS with AWS Transform for VMware</a> (October 2025): end-to-end VMware-to-EC2 migration with AWS Transform, which replaces Application Discovery Service for discovery.</li>
+				<li><a href="https://aws.amazon.com/blogs/migration-and-modernization/migrating-and-modernizing-oracle-databases-to-postgresql-on-aws-part-1-discovery/">Migrating and Modernizing Oracle Databases to PostgreSQL on AWS - Part 1: Discovery</a> (August 2026): the first of four parts covering discovery, assessment, planning and execution, and post-cutover optimization.</li>
+				<li><a href="https://aws.amazon.com/blogs/migration-and-modernization/migration-rollback-strategies-when-your-migration-doesnt-go-as-planned/">Migration Rollback Strategies: When Your Migration Doesn't Go as Planned</a> (March 2026): timeboxes, decision matrices and rollback paths for each migration pattern.</li>
+				<li><a href="https://aws.amazon.com/blogs/migration-and-modernization/optimize-transfer-performance-with-aws-data-transfer-terminal/">Optimize transfer performance with AWS Data Transfer Terminal</a> (January 2026): choosing online or offline transfer by bandwidth and timeline.</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/large-migration-guide/introduction.html">Guide for AWS large migrations</a> (AWS Prescriptive Guidance): phases, migration factory, wave planning and the 7 Rs (predates AWS Transform and the Migration Hub closure).</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/application-portfolio-assessment-guide/introduction.html">Application portfolio assessment guide for AWS Cloud migration</a> (AWS Prescriptive Guidance): discovery, prioritization, 7 Rs disposition and wave planning inputs.</li>
+				<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/migration-lens/migration-lens.html">Migration Lens - AWS Well-Architected Framework</a> (AWS Well-Architected): best practices per migration phase (predates AWS Transform and the Transform MGN rename).</li>
+				<li><a href="https://github.com/aws-solutions/cloud-migration-factory-on-aws">aws-solutions Cloud Migration Factory on AWS</a> (AWS sample code): automation of wave metadata, agent installs and cutover for large-scale migrations; its README still names CloudEndure Migration.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026.</div>
+</footer>
+
+</body>
+</html>
