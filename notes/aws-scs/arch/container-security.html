@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Container and EKS Workload Security | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: a secure container platform from image to running pod. Minimal base images and hardened node AMIs, Amazon ECR with immutable tags, KMS encryption, repository policies and Inspector enhanced scanning, ECR managed signing with admission verification, EKS access entries and access policies, private API endpoint, envelope encryption with a customer managed key, audit logs, IMDSv2 with hop limit 1, EKS Pod Identity with session tags, Secrets Store CSI driver, Pod Security Admission, network policies and security groups for pods, with ECS and Fargate contrasts.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Container security</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Container and EKS workload security</h1>
+		<p>A container platform where only scanned, signed images from the pipeline can run, the cluster API is private and every human and pod has its own narrow identity. Pods can't borrow the node's role, read each other's secrets or talk to anything the platform team didn't allow. Each layer, from image to running pod, assumes the one before it may fail.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">Domain 5</span><span class="tag">Amazon EKS</span><span class="tag">Amazon ECR</span><span class="tag">Amazon Inspector</span><span class="tag">EKS Pod Identity</span><span class="tag">AWS KMS</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Images, ECR and scanning</a></li>
+				<li class="sub"><a href="#b2">2. Sign on push, verify at admission</a></li>
+				<li class="sub"><a href="#b3">3. Cluster access, endpoint, encryption, logs</a></li>
+				<li class="sub"><a href="#b4">4. Hardened nodes and IMDSv2</a></li>
+				<li class="sub"><a href="#b5">5. Pod Identity and secrets</a></li>
+				<li class="sub"><a href="#b6">6. Pod Security Admission and network policies</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) runs its container workloads in production account <code>111111111111</code>: an EKS cluster for the shop's APIs and ECS on Fargate for batch jobs. The security tooling account <code>222222222222</code> is the delegated administrator for GuardDuty and Inspector and owns the golden AMI pipeline. A review of the cluster found the usual gaps. Developers had <code>cluster-admin</code> through the <code>aws-auth</code> ConfigMap, the API endpoint was public, tags like <code>latest</code> were overwritten in place, pods could reach the node's instance role through IMDS, and any pod could reach any other pod.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Only known, scanned images reach production</td><td data-label="Design choice">Minimal base images, Inspector gate in the pipeline, immutable ECR tags, enhanced scanning on push and continuously</td></tr>
+						<tr><td data-label="Requirement">The cluster can prove an image came from the pipeline</td><td data-label="Design choice">ECR managed signing with an AWS Signer profile; signature verification in an admission controller</td></tr>
+						<tr><td data-label="Requirement">Cluster access is IAM-governed, least privilege and auditable</td><td data-label="Design choice">Access entries with namespace-scoped access policies, no creator admin, private endpoint, audit logs to CloudWatch</td></tr>
+						<tr><td data-label="Requirement">Pods get only their own AWS permissions</td><td data-label="Design choice">EKS Pod Identity per service account; IMDSv2 with hop limit 1 on nodes</td></tr>
+						<tr><td data-label="Requirement">Secrets never sit in images, manifests or environment variables</td><td data-label="Design choice">Secrets Manager mounted through the Secrets Store CSI driver with Pod Identity; tag-based access per namespace</td></tr>
+						<tr><td data-label="Requirement">A compromised pod can't escalate or move sideways</td><td data-label="Design choice">Pod Security Admission <code>restricted</code>, default-deny network policies, security groups for pods, TLS between services</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from the task pages: the cluster <code>shop-prod</code>, the namespace <code>orders</code> with service account <code>orders-api</code> and role <code>orders-api-pod-role</code>, the repository <code>shop/web</code> and signing profile <code>shop_release</code> (<a href="../d3-task-3-2.html">Task 3.2</a>), the secret <code>prod/orders/db</code> and the quarantine policy <code>ir-deny-all</code> (<a href="../d2-task-2-2.html">Task 2.2</a>), and the VPC <code>vpc-0shop1234567890ab</code> with its S3 gateway endpoint (<a href="data-perimeter.html">data perimeter</a>). New on this page:</p>
+			<ul>
+				<li><strong>Repository</strong> <code>shop/orders-api</code>; <strong>container key</strong> alias <code>alias/shop-containers</code> in <code>111111111111</code>, used for ECR and for the cluster's envelope encryption.</li>
+				<li><strong>Roles</strong> <code>shop-image-pipeline</code> (builds and pushes), <code>eks-platform-admin</code> (platform team) and <code>orders-deployer</code> (the orders team's deployment role).</li>
+				<li><strong>Node launch template</strong> <code>shop-prod-nodes</code> and the hardened node AMI family <code>golden-eks-al2023-*</code> from the security tooling account.</li>
+				<li><strong>Kubernetes labels</strong> <code>app: orders-api</code>, the ingress controller's namespace <code>ingress</code>, and the service port <code>8443</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 330" role="img" aria-labelledby="dgC-wide-t">
+<title id="dgC-wide-t">Container security: the image pipeline pushes orders-api to an immutable ECR repository that signs it on push, and Inspector keeps scanning it; the deployer reaches the private EKS API of shop-prod, admission checks enforce the restricted Pod Security Standard and the image signature, and the pod pulls its image by digest onto a hardened node, gets its role from Pod Identity and its secret from Secrets Manager.</title>
+<rect x="205" y="128" width="580" height="100" rx="12" class="dg-grp"/>
+<text x="215" y="144" class="dg-lbl">EKS cluster shop-prod</text>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M290.0 37.0 L290.0 17.0 Q290.0 10.0 297.0 10.0 L693.0 10.0 Q700.0 10.0 700.0 17.0 L700.0 157.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="495" y="24" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--info)">pull by digest</text>
+<path d="M170.0 180.0 L210.0 180.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 180.0 L420.0 180.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 180.0 L620.0 180.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M707.0 203.0 L707.0 267.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M693.0 203.0 L693.0 228.0 Q693.0 235.0 686.0 235.0 L507.0 235.0 Q500.0 235.0 500.0 242.0 L500.0 267.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">Image pipeline</text>
+<text x="90" y="74" class="dg-s dg-sm2">minimal base image</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">ECR repository</text>
+<text x="290" y="74" class="dg-s dg-sm2">immutable, signed</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Inspector</text>
+<text x="500" y="74" class="dg-s dg-sm2">continuous scanning</text>
+<rect x="10" y="157" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="177" class="dg-t dg-sm">orders-deployer</text>
+<text x="90" y="194" class="dg-s dg-sm2">deploy job</text>
+<rect x="210" y="157" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="177" class="dg-t dg-sm">EKS API</text>
+<text x="290" y="194" class="dg-s dg-sm2">private, access entries</text>
+<rect x="420" y="157" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="177" class="dg-t dg-sm">Admission</text>
+<text x="500" y="194" class="dg-s dg-sm2">PSA, signature check</text>
+<rect x="620" y="157" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="177" class="dg-t dg-sm">orders-api pod</text>
+<text x="700" y="194" class="dg-s dg-sm2">hardened node, IMDSv2</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Pod Identity</text>
+<text x="700" y="304" class="dg-s dg-sm2">orders-api-pod-role</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">Secrets Manager</text>
+<text x="500" y="304" class="dg-s dg-sm2">prod/orders/db</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 500" role="img" aria-labelledby="dgC-tall-t">
+<title id="dgC-tall-t">Container security: the image pipeline pushes orders-api to an immutable ECR repository that signs it on push, and Inspector keeps scanning it; the deployer reaches the private EKS API of shop-prod, admission checks enforce the restricted Pod Security Standard and the image signature, and the pod pulls its image by digest onto a hardened node, gets its role from Pod Identity and its secret from Secrets Manager.</title>
+<rect x="10" y="200" width="380" height="210" rx="12" class="dg-grp"/>
+<text x="380" y="216" class="dg-lbl" text-anchor="end">EKS cluster shop-prod</text>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M380.0 40.0 L386.0 40.0 Q392.0 40.0 392.0 46.0 L392.0 349.0 Q392.0 355.0 386.0 355.0 L380.0 355.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 227.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 250.0 L220.0 250.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 273.0 L300.0 332.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M307.0 378.0 L307.0 442.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M293.0 378.0 L293.0 403.0 Q293.0 410.0 286.0 410.0 L107.0 410.0 Q100.0 410.0 100.0 417.0 L100.0 442.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Image pipeline</text>
+<text x="100" y="54" class="dg-s dg-sm2">minimal base image</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">ECR repository</text>
+<text x="300" y="54" class="dg-s dg-sm2">immutable, signed</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Inspector</text>
+<text x="300" y="159" class="dg-s dg-sm2">continuous scanning</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">orders-deployer</text>
+<text x="100" y="159" class="dg-s dg-sm2">deploy job</text>
+<rect x="20" y="227" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="247" class="dg-t dg-sm">EKS API</text>
+<text x="100" y="264" class="dg-s dg-sm2">private, access entries</text>
+<rect x="220" y="227" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="247" class="dg-t dg-sm">Admission</text>
+<text x="300" y="264" class="dg-s dg-sm2">PSA, signature check</text>
+<rect x="220" y="332" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="352" class="dg-t dg-sm">orders-api pod</text>
+<text x="300" y="369" class="dg-s dg-sm2">hardened node, IMDSv2</text>
+<rect x="220" y="442" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="462" class="dg-t dg-sm">Pod Identity</text>
+<text x="300" y="479" class="dg-s dg-sm2">orders-api-pod-role</text>
+<rect x="20" y="442" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="462" class="dg-t dg-sm">Secrets Manager</text>
+<text x="100" y="479" class="dg-s dg-sm2">prod/orders/db</text>
+</svg>
+				<figcaption>Figure: one release of <code>orders-api</code>. The image is built from a minimal base, pushed with an immutable tag, signed by ECR on push and rescanned by Inspector as new CVEs appear (blue). Deployment goes through the cluster's private endpoint with an access entry, and admission rejects pods that break the restricted profile or carry an unsigned image (green). On a node with IMDSv2 and a hop limit of 1, the pod gets credentials only for its own role through Pod Identity and mounts its secret through the Secrets Store CSI driver (yellow); default-deny network policies fence its traffic.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The path of one release of <code>orders-api</code>, from commit to running pod. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Build and release</li>
+				<li><span class="name">Build from a minimal base<span class="who">Pipeline</span></span><span class="desc">The pipeline, running as <code>shop-image-pipeline</code>, builds from a base image pulled through an ECR pull-through cache. It runs as a non-root user with no secrets in its layers. The <code>InspectorScan</code> action fails the stage on any critical finding (<a href="../d3-task-3-2.html#s6">Task 3.2</a>).</span></li>
+				<li><span class="name">Push with an immutable tag<span class="who">Pipeline</span></span><span class="desc">The image is pushed as <code>shop/orders-api:2.7.0</code>. The repository is <code>IMMUTABLE</code>, so nobody can later push different content under that tag. Layers are encrypted with <code>alias/shop-containers</code>.</span></li>
+				<li class="auto"><span class="name">ECR signs the image<span class="who auto">AWS</span></span><span class="desc">A managed signing rule matching <code>shop/*</code> signs the image on push with the <code>shop_release</code> Signer profile. The signature, in Notation format, is stored next to the image.</span></li>
+				<li class="auto"><span class="name">Inspector scans and keeps scanning<span class="who auto">AWS</span></span><span class="desc">Enhanced scanning checks OS and language packages on push, then rescans continuously as new CVEs are published. Findings go to Security Hub CSPM in <code>222222222222</code>.</span></li>
+				<li class="group">Deploy</li>
+				<li><span class="name">Deployer calls the private API<span class="who">Pipeline</span></span><span class="desc">The deploy job assumes <code>orders-deployer</code> and reaches the API server's private endpoint from inside the VPC. The <code>orders-deployer</code> access entry has <code>AmazonEKSEditPolicy</code> scoped to namespace <code>orders</code> only.</span></li>
+				<li class="auto"><span class="name">Admission checks<span class="who auto">Kubernetes</span></span><span class="desc">Pod Security Admission rejects a pod spec that breaks the <code>restricted</code> profile, for example a root user or added capabilities. The signature verification webhook rejects an image with no valid <code>shop_release</code> signature.</span></li>
+				<li class="auto"><span class="name">Scheduled on a hardened node<span class="who auto">AWS</span></span><span class="desc">The pod lands on a node built from <code>golden-eks-al2023-*</code>, with IMDSv2 required and a hop limit of 1. The kubelet pulls the image by digest through the VPC endpoints.</span></li>
+				<li class="group">Run</li>
+				<li class="auto"><span class="name">Pod gets its own credentials<span class="who auto">AWS</span></span><span class="desc">The Pod Identity agent hands the pod temporary credentials for <code>orders-api-pod-role</code>, tagged with <code>eks-cluster-name</code>, <code>kubernetes-namespace</code>, <code>kubernetes-service-account</code> and the pod's name and UID.</span></li>
+				<li class="auto"><span class="name">Secret mounted as a file<span class="who auto">AWS</span></span><span class="desc">The Secrets Store CSI driver's AWS provider reads <code>prod/orders/db</code> with the pod's Pod Identity role and mounts it into the pod. The secret's tags must match the session's namespace and cluster tags.</span></li>
+				<li class="auto"><span class="name">Traffic is fenced<span class="who auto">AWS</span></span><span class="desc">Default-deny network policies in <code>orders</code> allow only the ingress path and named dependencies. Service-to-service calls use TLS. A request to IMDS from the pod never gets a token back, because the response can't make the extra hop.</span></li>
+				<li class="auto"><span class="name">Everything is watched<span class="who auto">AWS</span></span><span class="desc">API server audit logs go to CloudWatch Logs, and GuardDuty EKS Protection reads its own copy. The Runtime Monitoring agent watches processes; its findings and the crypto-mining playbook are on the <a href="threat-detection-response.html#b6">detection page</a>.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Images, ECR repositories and scanning</h3>
+				<p>Nodes and containers are hardened in different places. <strong>Node AMIs</strong> come from an EC2 Image Builder pipeline in <code>222222222222</code>, which applies CIS or STIG hardening components on top of the EKS-optimized base and is shared with the workload accounts (<a href="../d3-task-3-2.html#s1">Task 3.2</a>, and the AWS post on hardening EKS node images). <strong>Container images</strong> start from minimal bases, cached through a pull-through cache so even public bases are stored, scanned and controlled in the company's registry. They run as non-root, with no shell unless needed.</p>
+				<p>Release repositories are fully <code>IMMUTABLE</code>: deployments name a version tag or a digest, never <code>latest</code>. The <code>shop/web</code> repository on Task 3.2 keeps <code>latest</code> movable with <code>IMMUTABLE_WITH_EXCLUSION</code>, but that only suits development repositories. Encryption is chosen when the repository is created: <code>KMS</code> with the company's own key gives a key policy and CloudTrail record that the AWS managed key can't. The key must be in the repository's Region.</p>
+				<span class="file">Create the release repository and turn on enhanced scanning for the registry (AWS CLI, production account 111111111111)</span>
+<pre><code><span class="c"># immutable tags, customer managed key (same Region as the repository)</span>
+aws ecr create-repository --repository-name shop/orders-api \
+  --image-tag-mutability IMMUTABLE \
+  --encryption-configuration encryptionType=KMS,kmsKey=alias/shop-containers
+
+<span class="c"># registry level: Inspector enhanced scanning, continuous for shop/*, on push for everything else</span>
+aws ecr put-registry-scanning-configuration --scan-type ENHANCED \
+  --rules '[{"scanFrequency":"CONTINUOUS_SCAN","repositoryFilters":[{"filter":"shop/*","filterType":"WILDCARD"}]},
+            {"scanFrequency":"SCAN_ON_PUSH","repositoryFilters":[{"filter":"*","filterType":"WILDCARD"}]}]'</code></pre>
+				<p>Scanning is a <strong>registry</strong> setting: the repository-level <code>scanOnPush</code> setting (and <code>put-image-scanning-configuration</code>) is being deprecated in favour of it. With <code>ENHANCED</code>, Inspector scans, only <code>SCAN_ON_PUSH</code> and <code>CONTINUOUS_SCAN</code> apply, and a registry holds at most two rules. Inspector itself is turned on for every account by the delegated administrator (<a href="../d1-task-1-1.html">Task 1.1</a>, <a href="security-baseline.html#b3">security baseline Step 3</a>). Continuous rescanning lasts for a set period after push or last use, which defaults to 7 days for activations from October 2026. Inspector's SBOM export lists every package for supply chain audits.</p>
+				<p>The repository policy decides who can pull and push. Only the pipeline role may push. Organization principals may pull, which covers the node role here, ECS tasks and the DR account. The data perimeter's RCP and the ECR endpoint policies (<a href="data-perimeter.html#b5">data perimeter Step 5</a>) still apply on top.</p>
+				<span class="file">Pull for the organization, push only for the pipeline (ECR repository policy, applied with set-repository-policy)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowPullFromOrg",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"],
+      "Condition": { "StringEquals": { "aws:PrincipalOrgID": "o-exampleorgid" } }
+    },
+    {
+      "Sid": "DenyPushExceptPipeline",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["ecr:PutImage", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload"],
+      "Condition": {
+        "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::111111111111:role/shop-image-pipeline" }
+      }
+    }
+  ]
+}</code></pre>
+				<p>Every caller also needs <code>ecr:GetAuthorizationToken</code> in its IAM policy (<a href="../d4-task-4-2.html">Task 4.2</a>). IAM Access Analyzer flags the repository if a statement ever grants access outside the organization. A blanket push deny can also catch features that write to the repository on your behalf, such as replication or managed signing, so the staging tests in <a href="#testing">Testing it</a> confirm that signatures still appear before the deny reaches production.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Sign on push, verify at admission</h3>
+				<p>Scanning says an image has no known CVEs. A signature says it came from the company's pipeline and hasn't changed since. <strong>ECR managed signing</strong> (November 2025) moves signing into the registry. A registry-level rule names an AWS Signer signing profile and a repository filter, and ECR signs every matching image on push. Signer manages the keys and certificates, and the signature is stored in the repository in Notation format. The signature validity defaults to 135 months.</p>
+				<span class="file">Sign every image pushed to shop/* repositories, and let the pipeline role sign (signing configuration JSON and IAM statement)</span>
+<pre><code><span class="c"># signing-config.json, applied with: aws ecr put-signing-configuration --signing-configuration file://signing-config.json</span>
+{
+  "rules": [
+    {
+      "signingProfileArn": "arn:aws:signer:us-east-1:111111111111:/signing-profiles/shop_release",
+      "repositoryFilters": [{ "filter": "shop/*", "filterType": "WILDCARD_MATCH" }]
+    }
+  ]
+}
+
+<span class="c"># statement in shop-image-pipeline's policy: signing uses the pusher's credentials</span>
+{
+  "Sid": "SignOnPush",
+  "Effect": "Allow",
+  "Action": "signer:SignPayload",
+  "Resource": "arn:aws:signer:us-east-1:111111111111:/signing-profiles/shop_release"
+}</code></pre>
+				<p>Signing uses the credentials of whoever pushed, so the push fails to sign if that principal lacks <code>signer:SignPayload</code>. Together with the push-only-for-the-pipeline policy from Step 1, only the pipeline can produce a signed <code>shop/</code> image.</p>
+				<p>Verification happens in the cluster. An admission controller such as <strong>Kyverno</strong> or <strong>Ratify</strong>, with the AWS Signer plugin for Notation, checks each pod's images against a trust policy that trusts only the <code>shop_release</code> profile, and rejects unsigned or foreign images before the pod is created. On ECS, the same AWS post uses a service lifecycle hook at <code>PRE_SCALE_UP</code> that calls a Lambda function. The function verifies the task definition's images with the Notation CLI and can block or only log on failure.</p>
+				<div class="callout note"><p>The 2023 AWS post on securing the image build pipeline with AWS Signer shows signing with the Notation CLI inside the pipeline, plus the EKS verification setup. It <strong>predates ECR managed signing</strong>: its verification half still applies, but signing no longer needs a step in the build. Admission webhooks see only new pods, so images already running when the policy goes live are verified by redeploying them.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Cluster access, private endpoint, encryption and audit logs</h3>
+				<p><strong>Access entries</strong> replace the <code>aws-auth</code> ConfigMap, which the EKS best practices guide now calls deprecated. An access entry maps one IAM principal to the cluster through the EKS API, with calls CloudTrail records, instead of a ConfigMap where one typo can lock everyone out. <strong>Access policies</strong> are EKS-managed permission sets, such as <code>AmazonEKSClusterAdminPolicy</code> (like <code>cluster-admin</code>), <code>AmazonEKSEditPolicy</code> and <code>AmazonEKSViewPolicy</code>. Each is scoped to the whole cluster or to named namespaces, and Kubernetes RBAC through <code>--kubernetes-groups</code> still works alongside them.</p>
+				<p>The authentication mode moves from <code>CONFIG_MAP</code> through <code>API_AND_CONFIG_MAP</code> (both sources, access entries win) to <code>API</code> once the old mappings are migrated. New clusters are created with <code>bootstrapClusterCreatorAdminPermissions=false</code> in <code>--access-config</code>, so the creator doesn't keep a hidden permanent admin binding.</p>
+				<span class="file">Private endpoint, audit logging, the customer managed key and API-only authentication (AWS CLI, production account)</span>
+<pre><code><span class="c"># API server reachable only from inside the cluster VPC (and connected networks)</span>
+aws eks update-cluster-config --name shop-prod \
+  --resources-vpc-config endpointPublicAccess=false,endpointPrivateAccess=true
+
+<span class="c"># control plane logs to CloudWatch Logs: audit and authenticator matter most for security</span>
+aws eks update-cluster-config --name shop-prod \
+  --logging '{"clusterLogging":[{"types":["api","audit","authenticator"],"enabled":true}]}'
+
+<span class="c"># bring our own KMS key as the key encryption key for Kubernetes API data</span>
+aws eks associate-encryption-config --cluster-name shop-prod \
+  --encryption-config '[{"resources":["secrets"],"provider":{"keyArn":"arn:aws:kms:us-east-1:111111111111:alias/shop-containers"}}]'
+
+<span class="c"># after migrating aws-auth entries: access entries only</span>
+aws eks update-cluster-config --name shop-prod --access-config authenticationMode=API</code></pre>
+				<span class="file">Platform admins for the whole cluster, the orders team only in its namespace (AWS CLI)</span>
+<pre><code>aws eks create-access-entry --cluster-name shop-prod \
+  --principal-arn arn:aws:iam::111111111111:role/eks-platform-admin
+aws eks associate-access-policy --cluster-name shop-prod \
+  --principal-arn arn:aws:iam::111111111111:role/eks-platform-admin \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+
+aws eks create-access-entry --cluster-name shop-prod \
+  --principal-arn arn:aws:iam::111111111111:role/orders-deployer
+aws eks associate-access-policy --cluster-name shop-prod \
+  --principal-arn arn:aws:iam::111111111111:role/orders-deployer \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy \
+  --access-scope type=namespace,namespaces=orders</code></pre>
+				<p>Access entries take IAM roles or users, never STS session ARNs, and an entry stops working if its role is deleted and re-created with the same ARN. Node roles use the <code>EC2_LINUX</code> type, which can't carry access policies. Humans reach these roles through IAM Identity Center permission sets (<a href="workforce-identity.html">workforce identity</a>).</p>
+				<p><strong>Envelope encryption.</strong> Clusters on Kubernetes 1.28 or later already envelope-encrypt <em>all</em> Kubernetes API data with KMS v2 and an AWS owned key. A customer managed key adds a key policy, CloudTrail records and the ability to revoke. The <code>resources</code> field is deprecated and has no effect on what is encrypted, but if set it must be <code>["secrets"]</code>. The key must be symmetric and in the cluster's Region. The risk runs the other way too: if the key is disabled, the cluster is put in a degraded state and can't start its API server without a cached key, and the key should be re-enabled within 30 days. A deleted key, or revoked grants, leave the cluster unrecoverable. So the key's policy keeps <code>kms:DisableKey</code> and <code>kms:ScheduleKeyDeletion</code> with the key administrators only, behind an alarm (<a href="kms-at-scale.html#b2">KMS at scale Steps 2</a> and <a href="kms-at-scale.html#b6">6</a>).</p>
+				<p><strong>Audit logs.</strong> GuardDuty EKS Protection reads the audit log from its own independent stream and needs no control plane logging. The company still exports <code>audit</code> and <code>authenticator</code> logs to CloudWatch, because investigators need their own copy and GuardDuty doesn't make it available. Telemetry enablement rules turn this logging on for every new cluster, and the logs feed Security Lake's EKS audit source (<a href="security-data-lake.html#b2">security data lake Step 2</a>, <a href="../d1-task-1-2.html">Task 1.2</a>).</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Hardened nodes: golden AMIs, IMDSv2 with hop limit 1, no SSH</h3>
+				<p>Managed node groups launch from the <code>shop-prod-nodes</code> launch template. It names the current <code>golden-eks-al2023-*</code> AMI, has no key pair and no SSH security group rule, and sets the metadata options below. Administrative access, when it is needed at all, goes through Session Manager with logged sessions (<a href="../d3-task-3-2.html#s5">Task 3.2</a>). Nodes are replaced rather than patched in place: a new AMI version rolls through the node group.</p>
+				<span class="file">Node launch template: IMDSv2 only, and a hop limit of 1 so pods can't reach the node's credentials (AWS CLI)</span>
+<pre><code>aws ec2 create-launch-template --launch-template-name shop-prod-nodes \
+  --version-description "golden-eks-al2023, IMDSv2, hop limit 1" \
+  --launch-template-data '{
+    "ImageId": "GOLDEN_EKS_AMI_ID",
+    "MetadataOptions": {
+      "HttpEndpoint": "enabled",
+      "HttpTokens": "required",
+      "HttpPutResponseHopLimit": 1
+    }
+  }'</code></pre>
+				<p>Why 1 and not 2: a pod's request to IMDS crosses one extra network hop, so with a limit of 1 the IMDSv2 token response never reaches the pod. Pods using Pod Identity or IRSA get their credentials elsewhere and never need IMDS. Without the block, a pod with Pod Identity can still fall back to the node role, which can pull every image and manage network interfaces. Keep <code>HttpEndpoint</code> <code>enabled</code>: node agents such as the termination handler need IMDS. <a href="../d3-task-3-2.html#s1">Task 3.2</a> sets the account default hop limit to 2 for general EC2 hosts running containers; this launch template overrides it for EKS nodes. The SCP with <code>ec2:MetadataHttpTokens</code> from the same task stops anyone launching a node without IMDSv2.</p>
+				<div class="callout note"><p><strong>EKS Auto Mode</strong> changes who does this step. Auto Mode nodes run Bottlerocket-based AMIs that AWS treats as immutable, with SELinux in enforcing mode, a read-only root file system and no SSH or SSM access. They are replaced after at most 21 days (you can shorten this), and AWS patches them. The Pod Identity agent and network policy enforcement are built in. The customer still owns the containers, the VPC and cluster configuration, which is the shared responsibility split described in the Auto Mode security whitepaper.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Pod Identity, least privilege and secrets</h3>
+				<p>Each application gets its own service account and its own role. <strong>EKS Pod Identity</strong> associates the <code>orders-api</code> service account with <code>orders-api-pod-role</code>, whose trust policy names <code>pods.eks.amazonaws.com</code> with <code>sts:AssumeRole</code> and <code>sts:TagSession</code> (<a href="../d3-task-3-2.html#s2">Task 3.2</a>). Unlike IRSA, there is no per-cluster OIDC provider, the same role works in any cluster, and every session carries six tags: <code>eks-cluster-arn</code>, <code>eks-cluster-name</code>, <code>kubernetes-namespace</code>, <code>kubernetes-service-account</code>, <code>kubernetes-pod-name</code> and <code>kubernetes-pod-uid</code>. The tags are transitive, so they follow the session into role chaining.</p>
+				<span class="file">The association, and a permissions policy that reads only secrets tagged for this cluster and namespace (AWS CLI and identity policy JSON)</span>
+<pre><code>aws eks create-pod-identity-association --cluster-name shop-prod \
+  --namespace orders --service-account orders-api \
+  --role-arn arn:aws:iam::111111111111:role/orders-api-pod-role
+
+<span class="c"># orders-api-pod-role permissions (secret prod/orders/db is tagged kubernetes-namespace=orders, eks-cluster-name=shop-prod)</span>
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOwnNamespaceSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": "arn:aws:secretsmanager:us-east-1:111111111111:secret:prod/orders/*",
+      "Condition": {
+        "StringEquals": {
+          "secretsmanager:ResourceTag/kubernetes-namespace": "${aws:PrincipalTag/kubernetes-namespace}",
+          "secretsmanager:ResourceTag/eks-cluster-name": "${aws:PrincipalTag/eks-cluster-name}"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>Creating an association requires <code>iam:PassRole</code> on the role, so the orders team's deployer can't attach the platform's roles to its pods (<a href="../d4-task-4-2.html">Task 4.2</a>). The association's optional <code>--policy</code> is a session policy that narrows a shared role per association. It requires <code>--disable-session-tags</code>, so ABAC on session tags and session policies are alternatives, not a combination. For access in another account, <code>--target-role-arn</code> makes EKS chain into a role there, and the association's generated external ID goes in that role's trust policy to prevent a confused deputy. The secret's customer managed key must also allow <code>kms:Decrypt</code> for the pod role (<a href="kms-at-scale.html#b4">KMS at scale Step 4</a>).</p>
+				<span class="file">Mount the database secret into the orders pods with Pod Identity (Secrets Store CSI driver, AWS provider)</span>
+<pre><code>apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: orders-db
+  namespace: orders
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "prod/orders/db"        # secret name or ARN in Secrets Manager
+        objectType: "secretsmanager"
+    usePodIdentity: "true"                 # use the pod's Pod Identity role, not IRSA</code></pre>
+				<p>The AWS Secrets and Configuration Provider (ASCP) mounts the secret as a file in the pod's volume, so it isn't in the image, the manifest or <code>etcd</code>. Rotation (<a href="../d5-task-5-3.html">Task 5.3</a>) changes the value in Secrets Manager, and the application must reread the file or fall back on an authentication error. The AWS Workload Credentials Provider is the alternative for apps that prefer a local HTTP call to a file.</p>
+				<div class="callout trap"><p>Pod Identity is not supported on Fargate or Windows nodes; there, IRSA is still the answer (<a href="../d3-task-3-2.html#s2">Task 3.2</a>). On ECS, the equivalent split is the <strong>task role</strong> for the application's own calls, and the <strong>task execution role</strong> for the agent's image pulls, log writes and secret injection. Answers that give the execution role the app's S3 permissions mix them up.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Pod Security Admission, network policies and security groups for pods</h3>
+				<p>Pod Security Admission is built into Kubernetes and enforces the <strong>Pod Security Standards</strong> per namespace through labels. <code>restricted</code> builds on <code>baseline</code>, which blocks host namespaces, <code>hostPath</code>, host ports and added capabilities. It also requires a non-root user, <code>allowPrivilegeEscalation: false</code>, dropping <code>ALL</code> capabilities and a <code>RuntimeDefault</code> or <code>Localhost</code> seccomp profile. All three modes are set, because <code>enforce</code> alone rejects the pods but lets the Deployment through silently.</p>
+				<span class="file">Restricted profile for the orders namespace, in all three modes (Kubernetes Namespace)</span>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: orders
+  labels:
+    pod-security.kubernetes.io/enforce: restricted   # reject violating pods
+    pod-security.kubernetes.io/audit: restricted     # annotate the audit log event
+    pod-security.kubernetes.io/warn: restricted      # warn the client (kubectl, the deploy job)</code></pre>
+				<p>System namespaces whose agents need privileges stay at <code>privileged</code> or <code>baseline</code>, deployable only by the platform team. A read-only root file system is set in each pod's <code>securityContext</code>. Rules beyond PSA's three levels, such as "images only from our registry", need a policy-as-code engine such as Kyverno or OPA Gatekeeper, the same webhook layer that verifies signatures in Step 2.</p>
+				<p><strong>Network policies.</strong> By default every pod can reach every other pod. The Amazon VPC CNI enforces standard Kubernetes <code>NetworkPolicy</code> (version 1.21.0 or later also supports cluster-wide <code>ClusterNetworkPolicy</code> with Admin and Baseline tiers) on EC2 Linux nodes, but <strong>not on Fargate or Windows</strong>. The orders namespace starts from deny-all, then allows only what it needs.</p>
+				<span class="file">Default deny for the namespace, then ingress from the ingress controller and DNS out (Kubernetes NetworkPolicy)</span>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: orders
+spec:
+  podSelector: {}            # every pod in the namespace
+  policyTypes:
+    - Ingress
+    - Egress                 # no rules listed: nothing in, nothing out
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orders-api-allow
+  namespace: orders
+spec:
+  podSelector:
+    matchLabels:
+      app: orders-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress   # the load balancer controller's targets live here
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:                 # HTTPS to AWS APIs and the database; destinations are policed by the egress firewall and data perimeter
+        - protocol: TCP
+          port: 443</code></pre>
+				<p>The quarantine policy <code>ir-deny-all</code> from <a href="../d2-task-2-2.html">Task 2.2</a> is pre-staged in <code>orders</code> too, so responders only need to label a pod. Enforcement is reliable for pods that a controller such as a Deployment manages; AWS warns it may not be for standalone pods. Pods that still use the instance role would need an explicit allow to IMDS, which this design doesn't have.</p>
+				<p><strong>Security groups for pods</strong> give a pod its own EC2 security group through a <code>SecurityGroupPolicy</code>, so only the orders pods, not every pod on the node, reach the Aurora cluster. Network policies handle traffic inside the cluster and pod security groups handle AWS resources. Pod security groups need trunking-capable Nitro instance types (no <code>t</code> family) and Linux nodes; Auto Mode has its own variant. <strong>TLS between services</strong> comes from a service mesh with mutual TLS or cert-manager with AWS Private CA issuing short-lived pod certificates, because network policies control flows but don't encrypt (<a href="../d5-task-5-1.html#s3">Task 5.1</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Prevent in admission, detect at runtime</h4>
+				<p>Every control on this page acts before or as a pod starts: the pipeline gate, immutable tags, the signature check, PSA and IAM scoping. Runtime detection is the backstop for what prevention can't see, such as a zero-day in a signed image. EKS Protection watches the audit log, for example anonymous access or a pod created with a sensitive host mount. Runtime Monitoring's agent (the <code>aws-guardduty-agent</code> add-on, managed for the organization through <code>EKS_ADDON_MANAGEMENT</code> as on the <a href="security-baseline.html#b3">security baseline</a>) watches processes. The response playbooks live on the <a href="threat-detection-response.html#b6">detection page</a> and the evidence steps on the <a href="incident-forensics.html#b4">forensics page</a>. Inspector findings that matter most are the ones on images <em>in use</em>, which enhanced scanning reports for EKS and ECS.</p>
+			</div>
+			<div class="entry">
+				<h4>Pod Identity over IRSA, and IRSA where it must stay</h4>
+				<p>Pod Identity needs no OIDC provider per cluster or trust policy edits for blue/green upgrades, its session tags let one policy pattern serve every namespace, and it doesn't use the account's STS quota. IRSA remains for Fargate pods and for workloads that call <code>sts:AssumeRoleWithWebIdentity</code> directly into another account. With IRSA, the trust policy must pin the <code>:sub</code> claim to the namespace and service account (<a href="../d4-task-4-2.html">Task 4.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Namespace as the tenancy boundary, one cluster</h4>
+				<p>Teams share <code>shop-prod</code>, fenced by namespace at every layer: access policy scope, PSA labels, network policies, session tags and tagged secrets. That is soft multi-tenancy. Untrusted code or a compliance boundary gets its own cluster or account, because a container escape on a shared node crosses every namespace.</p>
+			</div>
+			<div class="entry">
+				<h4>Customer managed key for the cluster, with tight key administration</h4>
+				<p>The AWS owned key is free. The customer managed key costs a dollar a month plus requests (KMS v2 caching keeps them low) and gives CloudTrail records and a kill switch. The kill switch is also the risk, so key administration is separate from cluster administration. The key isn't shared with other clusters, because AWS warns that a disabled key shared by many clusters widens the impact. It is shared with this platform's ECR repositories, so a disable would also stop image pulls, one more reason for the alarm.</p>
+			</div>
+			<div class="entry">
+				<h4>A private endpoint, and how people still reach it</h4>
+				<p>Engineers reach the private endpoint over the transit gateway, and the pipeline's runners sit in the VPC. A public endpoint limited by <code>publicAccessCidrs</code> is the weaker half-step: a stolen credential from an allowed IP still reaches the API.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>ECS on Fargate instead of EKS</h4>
+				<p>Fargate gives each task (or EKS pod) its own isolated compute environment with no shared node, and it can't run privileged containers or use host networking. That removes the node hardening, IMDS hop limit and pod escape concerns at once. The trade-offs: no network policies (use security groups per task or pod), no DaemonSets (GuardDuty's agent runs as a managed sidecar on ECS Fargate), and on EKS no Pod Identity. Service-to-service TLS on ECS is Service Connect TLS (<a href="../d5-task-5-1.html">Task 5.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>EKS Auto Mode</h4>
+				<p>Auto Mode hands AWS the node layer of Step 4: immutable Bottlerocket nodes, no shell access, regular replacement and built-in network policy enforcement and Pod Identity. It suits teams who don't want to run an AMI pipeline. The cost is less control: you don't edit the default node pools, and custom node-level tooling has to run as DaemonSets.</p>
+			</div>
+			<div class="entry">
+				<h4>Kubernetes Secrets with envelope encryption</h4>
+				<p>Native Secrets are envelope-encrypted in <code>etcd</code>, but anyone with <code>get secrets</code> in the namespace reads them in plain text, and rotation is manual. Secrets Manager through ASCP keeps the source of truth outside the cluster, with IAM, rotation and CloudTrail.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">The supply chain holds</span><span class="desc">Push a different image under an existing tag of <code>shop/orders-api</code>: ECR rejects it. Push from a developer role: the repository policy denies it. Push an image with a known critical CVE through the pipeline: the <code>InspectorScan</code> action fails the stage. Check that a pipeline-built image shows a signature in the console.</span></li>
+				<li><span class="name">Admission rejects bad pods</span><span class="desc">In a staging copy of the namespace, apply a Deployment that runs as root, and another using an unsigned image from a scratch repository. Both Deployments are created but their pods aren't. The client sees the PSA warning, the audit log carries the annotation and the webhook logs the signature failure. Labelling a namespace that already has pods prints warnings for existing violators without evicting them, which is the safe way to roll out <code>enforce</code>.</span></li>
+				<li><span class="name">Access is as narrow as designed</span><span class="desc">As <code>orders-deployer</code>, try to list pods in <code>kube-system</code> or read secrets in another namespace: denied. Confirm no principal outside the platform team has a cluster-scoped access entry. From outside the VPC, the API endpoint doesn't answer at all.</span></li>
+				<li><span class="name">Pods can't borrow the node role</span><span class="desc">From a test pod, request an IMDSv2 token: the call times out because of the hop limit. Then call <code>aws sts get-caller-identity</code> from the orders pod: it returns <code>orders-api-pod-role</code>, not the node role. Check that credential refresh through the Pod Identity agent still works with default-deny egress in place.</span></li>
+				<li><span class="name">Secrets and tags line up</span><span class="desc">Associate a test service account in another namespace with the same role and try to mount <code>prod/orders/db</code>: the tag condition denies <code>GetSecretValue</code>. The IAM policy simulator can evaluate the policy with the session tag values set as context keys.</span></li>
+				<li><span class="name">Network policy and detection</span><span class="desc">From a pod in another namespace, connect to <code>orders-api</code> on 8443: blocked. Generate GuardDuty sample findings for EKS and runtime finding types to exercise the routing from the detection page. Run a game day that labels a pod <code>status=quarantine</code> and confirms it is cut off.</span></li>
+				<li><span class="name">Continuous checks</span><span class="desc">Security Hub CSPM controls for EKS and ECR, and AWS Config rules, track drift such as a public endpoint, missing logging or mutable tags. Inspector's coverage information shows any repository that isn't being scanned.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Compute Workload Security Controls</td><td data-label="What this architecture demonstrates">Hardened node AMIs and minimal images, immutable tags, Inspector enhanced scanning and the pipeline gate, managed signing, IMDSv2 hop limit 1, Session Manager instead of SSH, PSA, GuardDuty runtime as the backstop</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Network Security Controls</td><td data-label="What this architecture demonstrates">Private API endpoint, default-deny network policies, security groups for pods, egress through the central firewall</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Authorization Strategies</td><td data-label="What this architecture demonstrates">Access entries and namespace-scoped access policies instead of <code>aws-auth</code>; Pod Identity with session tags (ABAC) and PassRole; ECR repository policy; ECS task role versus execution role</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-1.html">5.1</a> Controls for Data in Transit</td><td data-label="What this architecture demonstrates">Pod-to-pod TLS with a mesh or Private CA certificates; network policies don't encrypt</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">ECR encryption with a customer managed key; EKS envelope encryption and the consequences of disabling or deleting the key</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-3.html">5.3</a> Secrets, Credentials and Key Material</td><td data-label="What this architecture demonstrates">Secrets Manager through the Secrets Store CSI driver with Pod Identity; no secrets in images or environment variables; rotation-aware apps</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design and Implement Logging Solutions</td><td data-label="What this architecture demonstrates">EKS audit and authenticator logs to CloudWatch, enabled everywhere by telemetry rules, while GuardDuty uses its own stream</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Pods must use only their own IAM permissions, not the worker node's" is <strong>EKS Pod Identity (or IRSA) plus IMDSv2 with a hop limit of 1 on the nodes</strong>. "Grant a team access to one namespace without editing the <code>aws-auth</code> ConfigMap" is an <strong>access entry with a namespace-scoped access policy</strong>. "Ensure only images built by our pipeline run in the cluster" is <strong>signing (ECR managed signing with AWS Signer) plus an admission controller that verifies signatures</strong>, not scanning alone. "Detect newly published CVEs in images already deployed" is <strong>Inspector enhanced scanning with continuous rescans</strong>. Basic scanning on push is the distractor.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/containers/streamline-container-image-signatures-with-amazon-ecr-managed-signing/">Streamline container image signatures with Amazon ECR managed signing</a> (November 2025): signing rules, Signer profiles, Notation signatures on push, and verification on EKS and ECS.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/best-practices-to-help-secure-your-container-image-build-pipeline-by-using-aws-signer/">Best Practices to help secure your container image build pipeline by using AWS Signer</a> (December 2023): Notation signing and EKS verification (predates ECR managed signing).</li>
+				<li><a href="https://aws.amazon.com/blogs/security/announcing-ascp-integration-with-pod-identity-enhanced-security-for-secrets-management-in-amazon-eks/">Announcing ASCP integration with Pod Identity: Enhanced security for secrets management in Amazon EKS</a> (February 2025): <code>usePodIdentity</code> and tag-based secret access per namespace.</li>
+				<li><a href="https://aws.amazon.com/blogs/containers/session-policies-for-amazon-eks-pod-identity/">Session policies for Amazon EKS Pod Identity</a> (March 2026): narrowing a shared role per association instead of creating more roles.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/how-to-create-a-pipeline-for-hardening-amazon-eks-nodes-and-automate-updates/">How to create a pipeline for hardening Amazon EKS nodes and automate updates</a> (June 2024): EC2 Image Builder producing CIS-hardened EKS node AMIs.</li>
+				<li><a href="https://docs.aws.amazon.com/eks/latest/best-practices/security.html">Best Practices for Security - Amazon EKS</a> (AWS documentation): IAM, Pod Identity, pod security, network, data and detective controls; the source for the hop limit and access entry guidance here.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/security-overview-amazon-eks-auto-mode/security-overview-amazon-eks-auto-mode.html">Security Overview of Amazon EKS Auto Mode</a> (AWS whitepaper, September 2025): Auto Mode node security and the shared responsibility split.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
