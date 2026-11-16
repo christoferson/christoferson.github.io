@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Secure CI/CD and Governance as Code | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: one secure delivery path for application code and infrastructure. GitHub OIDC federation with the sub condition, a deployment account, cross-account deployment roles with a permissions boundary, Amazon Inspector code security (SAST, SCA, IaC) and the InspectorScan pipeline action, cfn-lint, CloudFormation Guard, the managed Guard hook and Control Tower proactive controls, change sets with manual approval, termination protection and drift detection, StackSets auto-deployment, Service Catalog launch constraints, organization conformance packs, Security Hub CSPM standards and the audit evidence trail.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Secure pipeline</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Secure CI/CD and governance as code</h1>
+		<p>One delivery path for application code and infrastructure, where nothing reaches production without passing the same checks and nobody holds a long-lived key. Pull requests are scanned before merge, templates are checked in the pipeline and again inside CloudFormation, a human approves the change set, and the deployment role can't grant more than its boundary allows. After deployment, the same rules keep running as detective controls and leave the evidence trail the auditors ask for.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">Domain 6</span><span class="tag">AWS CodePipeline</span><span class="tag">Amazon Inspector</span><span class="tag">AWS CloudFormation</span><span class="tag">CloudFormation Guard</span><span class="tag">AWS Config</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Pipeline identities without keys</a></li>
+				<li class="sub"><a href="#b2">2. Code security on every pull request</a></li>
+				<li class="sub"><a href="#b3">3. Template checks in the pipeline</a></li>
+				<li class="sub"><a href="#b4">4. Hooks that every deployment meets</a></li>
+				<li class="sub"><a href="#b5">5. Change sets, approval and stack protection</a></li>
+				<li class="sub"><a href="#b6">6. Deploying at scale and self-service</a></li>
+				<li class="sub"><a href="#b7">7. Governance after deployment</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) has its <a href="security-baseline.html">multi-account baseline</a> in place and its containers hardened (<a href="container-security.html">container security</a>). The weak point is now delivery. Some teams deploy CloudFormation from laptops as administrators, one GitHub workflow holds an IAM user's access key, and the last audit found an unencrypted production bucket from a template nobody reviewed. The security team wants one checked path for code and infrastructure.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">No long-lived credentials anywhere in the pipeline</td><td data-label="Design choice">GitHub OIDC federation with a pinned <code>sub</code> claim, one role per stage, cross-account roles assumed by the pipeline</td></tr>
+						<tr><td data-label="Requirement">Vulnerable code, dependencies and secrets are caught before merge</td><td data-label="Design choice">Amazon Inspector code security on push and pull request, Amazon Q Developer reviews in the IDE, the <code>InspectorScan</code> action as a pipeline gate</td></tr>
+						<tr><td data-label="Requirement">Insecure templates can't deploy, whatever tool deploys them</td><td data-label="Design choice">cfn-lint and Guard in the pipeline; the managed Guard hook and Control Tower proactive controls inside CloudFormation</td></tr>
+						<tr><td data-label="Requirement">Production changes are reviewed and can't escalate privilege</td><td data-label="Design choice">Change sets with manual approval; a CloudFormation execution role that can only create roles with a permissions boundary</td></tr>
+						<tr><td data-label="Requirement">Every account gets the same baseline, including new ones</td><td data-label="Design choice">Service-managed StackSets with auto-deployment; Service Catalog products for team self-service</td></tr>
+						<tr><td data-label="Requirement">Drift and non-compliance are found, and auditors get evidence</td><td data-label="Design choice">Drift detection, organization conformance packs, Security Hub CSPM standards, Config history and CloudTrail</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from other pages: the GitHub repository <code>example-org/shop</code> and its trust policy shape (<a href="../d4-task-4-1.html#s1">Task 4.1</a>), the <code>security-baseline</code> stack set, the Guard hook alias <code>Private::Guard::CompanyBaseline</code> and the rules bucket <code>platform-guard-rules-222222222222</code> (<a href="../d6-task-6-2.html#s1">Task 6.2</a>), the Prod OU <code>ou-abcd-11111111</code>, Non-prod OU <code>ou-abcd-22222222</code>, Policy Staging OU <code>ou-abcd-44444444</code> with test account <code>101010101010</code>, and the <code>platform-admin</code> role (<a href="security-baseline.html">security baseline</a>). The image pipeline role <code>shop-image-pipeline</code> and repository <code>shop/orders-api</code> belong to the <a href="container-security.html#b1">container page</a>, which covers image scanning and signing. New on this page:</p>
+			<ul>
+				<li><strong>Deployment account</strong> <code>151515151515</code> in the Infrastructure OU. It holds the pipelines, the GitHub OIDC provider, the artifact bucket <code>shop-pipeline-artifacts-151515151515</code> and its key <code>alias/pipeline-artifacts</code>, and the SNS topic <code>release-approvals</code>. No workload runs there.</li>
+				<li><strong>Repository</strong> <code>example-org/shop-infra</code> for the CloudFormation and CDK code, next to the application repository <code>example-org/shop</code>.</li>
+				<li><strong>Roles</strong> <code>github-pr-checks</code> and <code>github-release</code> (deployment account, assumed from GitHub Actions), <code>shop-pipeline-service</code> (the CodePipeline service role), and in each workload account <code>pipeline-deploy</code> (the cross-account action role) and <code>cfn-exec-shop</code> (the CloudFormation execution role).</li>
+				<li><strong>Policies and stacks</strong>: the permissions boundary <code>shop-workload-boundary</code>, the production stack <code>shop-web-prod</code> with change set <code>release</code>, and the stack set <code>guard-hook-baseline</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 370" role="img" aria-labelledby="dgS-wide-t">
+<title id="dgS-wide-t">Secure pipeline: pull requests in the GitHub repositories are scanned by Inspector code security; releases reach CodePipeline in the deployment account through OIDC with no keys; template checks with cfn-lint, Guard and cdk-nag run, a change set waits for approval, and the pipeline-deploy role deploys the workload stacks, where the Guard hook evaluates every deployment; conformance packs record compliance for auditors.</title>
+<rect x="205" y="130" width="390" height="205" rx="12" class="dg-grp"/>
+<text x="215" y="146" class="dg-lbl">deployment 151515151515</text>
+<rect x="605" y="130" width="180" height="205" rx="12" class="dg-grp"/>
+<text x="615" y="146" class="dg-lbl">prod 111111111111</text>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M90.0 83.0 L90.0 168.0 Q90.0 175.0 97.0 175.0 L210.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<text x="150" y="169" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--accent)">OIDC, no keys</text>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M500.0 198.0 L500.0 267.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 290.0 L620.0 290.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M700.0 198.0 L700.0 267.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="706" y="236" class="dg-lbl dg-halo" text-anchor="start" fill="var(--warn)">evaluates</text>
+<path d="M700.0 313.0 L700.0 345.0 Q700.0 352.0 693.0 352.0 L97.0 352.0 Q90.0 352.0 90.0 345.0 L90.0 313.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">GitHub repos</text>
+<text x="90" y="74" class="dg-s dg-sm2">example-org/shop-infra</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">Inspector</text>
+<text x="290" y="74" class="dg-s dg-sm2">code security on PRs</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">CodePipeline</text>
+<text x="290" y="189" class="dg-s dg-sm2">release role, OIDC</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">Template checks</text>
+<text x="500" y="189" class="dg-s dg-sm2">cfn-lint, Guard, nag</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">Approval</text>
+<text x="500" y="304" class="dg-s dg-sm2">change set review</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Guard hook</text>
+<text x="700" y="189" class="dg-s dg-sm2">every deployment</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Workload stacks</text>
+<text x="700" y="304" class="dg-s dg-sm2">pipeline-deploy role</text>
+<rect x="10" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="287" class="dg-t dg-sm">Conformance packs</text>
+<text x="90" y="304" class="dg-s dg-sm2">evidence for auditors</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 515" role="img" aria-labelledby="dgS-tall-t">
+<title id="dgS-tall-t">Secure pipeline: pull requests in the GitHub repositories are scanned by Inspector code security; releases reach CodePipeline in the deployment account through OIDC with no keys; template checks with cfn-lint, Guard and cdk-nag run, a change set waits for approval, and the pipeline-deploy role deploys the workload stacks, where the Guard hook evaluates every deployment; conformance packs record compliance for auditors.</title>
+<rect x="10" y="95" width="380" height="215" rx="12" class="dg-grp"/>
+<text x="380" y="111" class="dg-lbl" text-anchor="end">deployment 151515151515</text>
+<rect x="10" y="330" width="380" height="95" rx="12" class="dg-grp"/>
+<text x="20" y="346" class="dg-lbl">prod 111111111111</text>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 145.0 L220.0 145.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 352.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 375.0 L220.0 375.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M300.0 398.0 L300.0 420.5 Q300.0 427.5 293.0 427.5 L107.0 427.5 Q100.0 427.5 100.0 434.5 L100.0 457.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">GitHub repos</text>
+<text x="100" y="54" class="dg-s dg-sm2">example-org/shop-infra</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">Inspector</text>
+<text x="300" y="54" class="dg-s dg-sm2">code security on PRs</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="142" class="dg-t dg-sm">CodePipeline</text>
+<text x="100" y="159" class="dg-s dg-sm2">release role, OIDC</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Template checks</text>
+<text x="300" y="159" class="dg-s dg-sm2">cfn-lint, Guard, nag</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Approval</text>
+<text x="300" y="269" class="dg-s dg-sm2">change set review</text>
+<rect x="20" y="352" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="372" class="dg-t dg-sm">Guard hook</text>
+<text x="100" y="389" class="dg-s dg-sm2">every deployment</text>
+<rect x="220" y="352" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="372" class="dg-t dg-sm">Workload stacks</text>
+<text x="300" y="389" class="dg-s dg-sm2">pipeline-deploy role</text>
+<rect x="20" y="457" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="477" class="dg-t dg-sm">Conformance packs</text>
+<text x="100" y="494" class="dg-s dg-sm2">evidence for auditors</text>
+</svg>
+				<figcaption>Figure: application and infrastructure code take one path. Inspector code security scans each pull request for vulnerable dependencies, code flaws, IaC misconfigurations and secrets (blue). Releases authenticate to the deployment account through GitHub OIDC with a pinned <code>sub</code>, then pass cfn-lint, Guard and cdk-nag, and a change set waits for approval before the cross-account <code>pipeline-deploy</code> role applies it (green). The Guard hook checks every CloudFormation deployment in the workload account, including ones that skip the pipeline (yellow), and organization conformance packs keep the compliance record afterwards (dashed).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The path of one infrastructure change, from pull request to the auditor's evidence. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Review</li>
+				<li><span class="name">Developer opens a pull request<span class="who">Developer</span></span><span class="desc">A change to <code>example-org/shop-infra</code> adds an S3 bucket and an IAM role, already reviewed by Amazon Q Developer in the IDE.</span></li>
+				<li class="auto"><span class="name">Inspector scans the pull request<span class="who auto">AWS</span></span><span class="desc">Inspector code security runs SAST, SCA and IaC rules on the <code>PULL_REQUEST</code> event and comments fixes for critical and high findings, including hardcoded secrets.</span></li>
+				<li><span class="name">Checks run with a short-lived role<span class="who">GitHub Actions</span></span><span class="desc">The workflow exchanges its OIDC token for the read-only <code>github-pr-checks</code> role and runs cfn-lint, Guard and Access Analyzer checks. Branch protection requires them and a reviewer before merge.</span></li>
+				<li class="group">Build and verify</li>
+				<li><span class="name">Merge starts the release<span class="who">GitHub Actions</span></span><span class="desc">On <code>main</code>, the workflow assumes <code>github-release</code> (trusted only for this repository's main branch) and starts the pipeline in <code>151515151515</code>.</span></li>
+				<li class="auto"><span class="name">Pipeline gates the source<span class="who auto">AWS</span></span><span class="desc"><code>InspectorScan</code> fails the stage above its thresholds; the build reruns cfn-lint, Guard with its unit tests, and cdk-nag for CDK apps.</span></li>
+				<li class="group">Deploy</li>
+				<li class="auto"><span class="name">Change set created in production<span class="who auto">AWS</span></span><span class="desc">The pipeline assumes <code>pipeline-deploy</code> in <code>111111111111</code>, which creates change set <code>release</code> on <code>shop-web-prod</code> with <code>cfn-exec-shop</code> as the CloudFormation role.</span></li>
+				<li class="auto"><span class="name">Hooks evaluate the change<span class="who auto">AWS</span></span><span class="desc">The Guard hook <code>Private::Guard::CompanyBaseline</code> and Control Tower proactive controls check the change inside CloudFormation, so a bypassed pipeline still meets them.</span></li>
+				<li><span class="name">A release manager approves<span class="who">Approver</span></span><span class="desc">The manual approval action notifies <code>release-approvals</code>; the approver reviews the change set, especially replacements.</span></li>
+				<li class="auto"><span class="name">Change set executes<span class="who auto">AWS</span></span><span class="desc">CloudFormation acts as <code>cfn-exec-shop</code>, which can create the role only with <code>shop-workload-boundary</code> attached.</span></li>
+				<li class="group">Govern</li>
+				<li class="auto"><span class="name">Detective controls keep checking<span class="who auto">AWS</span></span><span class="desc">Conformance packs and Security Hub CSPM controls evaluate the new resources, findings go to the <a href="threat-detection-response.html#b2">central routing</a>, and drift detection runs on a schedule.</span></li>
+				<li class="auto"><span class="name">Evidence accumulates<span class="who auto">AWS</span></span><span class="desc">CloudTrail, Config history and the pipeline's approval history form the audit trail.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Pipeline identities without keys</h3>
+				<p>The pipelines live in a dedicated <strong>deployment account</strong>, apart from production and from the security tooling account that watches it, with one role per stage. GitHub Actions exchanges a per-job <strong>OIDC token</strong> through <code>sts:AssumeRoleWithWebIdentity</code> for short-lived credentials (<a href="../d4-task-4-1.html#s1">Task 4.1</a>); the IAM user and its key are deleted.</p>
+				<span class="file">Only the main branch of the infrastructure repository can start a release (IAM role trust policy for github-release, deployment account 151515151515)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::151515151515:oidc-provider/token.actions.githubusercontent.com" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:example-org/shop-infra:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The <code>sub</code> claim is the security boundary: without it, any GitHub organization's workflow could assume the role. IAM rejects a new or changed trust policy for GitHub's provider whose <code>sub</code> condition is missing or only a wildcard. <code>github-pr-checks</code> uses <code>StringLike</code> with <code>repo:example-org/shop-infra:*</code> (any branch, as in AWS's documentation) and gets only read and validation permissions, because pull request branches are untrusted. Workload accounts never trust GitHub directly.</p>
+				<p>In each workload account, the <strong>cross-account role</strong> <code>pipeline-deploy</code> trusts only the <code>shop-pipeline-service</code> role in <code>151515151515</code>, not the whole account. It may call CloudFormation on the company's stacks, pass <code>cfn-exec-shop</code> and read the artifacts. CodePipeline requires the CloudFormation role to be in the same account as the action role. The artifact bucket uses a <strong>customer managed KMS key</strong> shared with the workload accounts, named by key ID or ARN, because an alias resolves only in the key's own account.</p>
+				<p><strong>The permissions boundary.</strong> A deployment role that can create roles can make itself an administrator, so <code>cfn-exec-shop</code> may create roles only with <code>shop-workload-boundary</code> and can't remove or edit it, the IAM delegation pattern (<a href="../d4-task-4-2.html#s3">Task 4.2</a>).</p>
+				<span class="file">Part of the cfn-exec-shop permissions policy: roles only with the boundary, and the boundary can't be removed or edited (identity policy JSON, workload account 111111111111)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateRolesOnlyWithBoundary",
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary"],
+      "Resource": "arn:aws:iam::111111111111:role/shop/*",
+      "Condition": {
+        "StringEquals": { "iam:PermissionsBoundary": "arn:aws:iam::111111111111:policy/shop-workload-boundary" }
+      }
+    },
+    {
+      "Sid": "NoBoundaryRemoval",
+      "Effect": "Deny",
+      "Action": "iam:DeleteRolePermissionsBoundary",
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoBoundaryPolicyEdit",
+      "Effect": "Deny",
+      "Action": ["iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion"],
+      "Resource": "arn:aws:iam::111111111111:policy/shop-workload-boundary"
+    }
+  ]
+}</code></pre>
+				<p>Stack-created roles sit under the <code>/shop/</code> path, away from the platform's roles. The boundary and both deployment roles come from a stack set (Step 6), never from the pipeline they constrain. For CDK, <code>cdk bootstrap</code> runs with <code>--trust 151515151515</code> and a scoped <code>--cloudformation-execution-policies</code> instead of the default AdministratorAccess (<a href="../d6-task-6-2.html#s1">Task 6.2</a>).</p>
+				<div class="callout trap"><p>A CloudFormation service role is used by <strong>anyone who can update the stack</strong>, even without <code>iam:PassRole</code>. If developers can still call <code>UpdateStack</code> on <code>shop-web-prod</code> directly, they deploy with <code>cfn-exec-shop</code>'s permissions and skip the approval. Step 4's SCP keeps stack changes in production limited to the pipeline.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Code security on every pull request</h3>
+				<p>Scanning happens at three points (<a href="../d3-task-3-2.html#s6">Task 3.2</a>). <strong>In the IDE</strong>, Amazon Q Developer code reviews flag security issues, secrets, IaC problems and vulnerable dependencies. <strong>In the repository</strong>, <strong>Amazon Inspector code security</strong> runs SAST on first-party code, SCA on dependencies and IaC rules on CloudFormation, Terraform and CDK; it connects to GitHub through the Amazon Inspector app and to GitLab Self Managed with a personal access token. <strong>In the pipeline</strong>, the <code>InspectorScan</code> action can stop a release.</p>
+				<div class="callout retired"><p>The exam guide names <strong>Amazon CodeGuru Security</strong> for pipeline scanning. It is no longer in the AWS documentation, and AWS points to <strong>Amazon Inspector code security</strong> and Amazon Q Developer code reviews instead. Inspector code security is the current answer for scanning repositories in the pipeline.</p></div>
+				<span class="file">Scan every repository on push and pull request, and weekly (AWS CLI, Inspector delegated administrator 222222222222)</span>
+<pre><code>aws inspector2 create-code-security-scan-configuration \
+  --name org-default \
+  --level ORGANIZATION \
+  --configuration '{"ruleSetCategories": ["SAST", "SCA", "IAC"],
+                    "continuousIntegrationScanConfiguration": {"supportedEvents": ["PUSH", "PULL_REQUEST"]},
+                    "periodicScanConfiguration": {"frequency": "WEEKLY"}}' \
+  --scope-settings projectSelectionScope=ALL</code></pre>
+				<p><code>projectSelectionScope=ALL</code> makes this the <strong>default</strong> configuration for every existing and future project; without it, a general configuration must be associated with projects one by one. <code>frequency</code> takes <code>WEEKLY</code>, <code>MONTHLY</code> or <code>NEVER</code>; the schedule catches new CVEs in repositories nobody has pushed to. Findings name the file, line and commit and flow through EventBridge like other Inspector findings.</p>
+				<p><strong>Secret scanning.</strong> Inspector's SAST rules and Q Developer report hardcoded secrets. A found secret is exposed: rotate it and move it to Secrets Manager, because deleting the line leaves it in the history (<a href="../d5-task-5-3.html">Task 5.3</a>).</p>
+				<p>The pipeline gate scans the exact source about to deploy, which also covers AWS CodeCommit repositories (CodeCommit returned to full general availability in November 2025).</p>
+				<span class="file">Fail the release if the source has any critical or high finding (CodePipeline action, pipeline structure YAML)</span>
+<pre><code>name: ScanSource
+actionTypeId:
+  category: Invoke
+  owner: AWS
+  provider: InspectorScan
+  version: '1'
+runOrder: 1
+configuration:
+  InspectorRunMode: SourceCodeScan
+  CriticalThreshold: '0'
+  HighThreshold: '0'
+inputArtifacts:
+  - name: SourceArtifact
+outputArtifacts:
+  - name: SourceSbom
+region: us-east-1</code></pre>
+				<p>The action runs on managed CodeBuild compute (billed as CodeBuild), outputs an SBOM and needs <code>inspector-scan:ScanSbom</code> in the service role. Images use <code>ECRImageScan</code> mode (<a href="container-security.html#b1">container page</a>).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Template checks in the pipeline: cfn-lint, Guard and cdk-nag</h3>
+				<p>Policy as code checks the company's own rules: every bucket encrypted, every role with a boundary, nothing public. The build runs three tools (<a href="../d6-task-6-2.html#s1">Task 6.2</a>). <strong>cfn-lint</strong> catches template errors and unsafe patterns, such as W1011 (a secret passed as a parameter instead of a dynamic reference). <strong>CloudFormation Guard</strong> evaluates the company rules. <strong>cdk-nag</strong> applies rule packs such as AWS Solutions or NIST 800-53 to CDK apps and records each suppression in metadata.</p>
+				<span class="file">Every IAM role in a template must carry a permissions boundary (Guard rule, iam_boundary.guard, in the shared rules repository)</span>
+<pre><code>let iam_roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+
+rule IAM_ROLE_HAS_PERMISSIONS_BOUNDARY when %iam_roles !empty {
+  %iam_roles.Properties.PermissionsBoundary exists
+  &lt;&lt;
+    Violation: Every IAM role must have a permissions boundary.
+    Fix: Set PermissionsBoundary to the shop-workload-boundary policy ARN
+  &gt;&gt;
+}</code></pre>
+				<span class="file">Run the rules and their unit tests in the build (shell, CodeBuild)</span>
+<pre><code><span class="c"># Unit-test the rules against known good and bad snippets first, so a broken rule can't pass everything</span>
+cfn-guard test -r rules/iam_boundary.guard -t rules/iam_boundary_tests.yaml
+
+<span class="c"># Then validate the template against the rule (repeat for each rule file)</span>
+cfn-guard validate -d templates/shop-web.yaml -r rules/iam_boundary.guard</code></pre>
+				<p>A rule whose resource type isn't in the template is skipped, not failed, which is why the rules have unit tests. The rules live in a security-owned repository and are published to <code>platform-guard-rules-222222222222</code>, so the pipeline and the Step 4 hook use the same files. The Guard Rules Registry adds ready-made rules for CIS, NIST and PCI DSS, named after the matching Config managed rules. IAM Access Analyzer <code>validate-policy</code> and custom policy checks review the policies in templates (<a href="../d4-task-4-2.html#s3">Task 4.2</a>).</p>
+				<p><strong>Terraform.</strong> Guard also reads Terraform plan JSON. State, which often holds secrets in plain text, goes in an S3 backend with SSE-KMS, versioning, locking and a restrictive bucket policy; applies assume a role in each target account.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Hooks that every deployment meets</h3>
+				<p>Pipeline checks protect only pipeline deployments. <strong>CloudFormation hooks</strong> run inside CloudFormation before a resource, stack, change set or Cloud Control API operation, so a template deployed from a laptop meets the same rules. The managed <strong>Guard hook</strong> runs Guard rules from S3 with no code. Hooks are activated per account and Region, so a stack set deploys them.</p>
+				<span class="file">The Guard hook as a resource, deployed to every workload account by the guard-hook-baseline stack set (CloudFormation YAML)</span>
+<pre><code>Resources:
+  GuardHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: guard-hook-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - hooks.cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: read-guard-rules
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::platform-guard-rules-222222222222
+                  - arn:aws:s3:::platform-guard-rules-222222222222/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - arn:aws:s3:::platform-guard-reports-222222222222/*
+  GuardHook:
+    Type: AWS::CloudFormation::GuardHook
+    Properties:
+      Alias: Private::Guard::CompanyBaseline
+      ExecutionRole: !GetAtt GuardHookRole.Arn
+      # start with WARN in the Policy Staging OU, then FAIL everywhere
+      FailureMode: FAIL
+      HookStatus: ENABLED
+      LogBucket: platform-guard-reports-222222222222
+      RuleLocation:
+        Uri: s3://platform-guard-rules-222222222222/baseline.guard
+      TargetOperations:
+        - STACK
+        - RESOURCE
+        - CHANGE_SET
+      TargetFilters:
+        Actions:
+          - CREATE
+          - UPDATE</code></pre>
+				<p>The rules and reports buckets in the security tooling account grant <code>guard-hook-execution</code> in organization accounts read and write respectively. Rules are downloaded on every invocation, so the bucket is versioned and only the security release job writes to it. Each invocation has a 30-second timeout. <code>StackFilters</code> can exclude stacks, but every exclusion is a way around the rules.</p>
+				<span class="file">Create the hook stack set and deploy it to the workload OUs, now and for every new account (AWS CLI, security tooling account as StackSets delegated administrator)</span>
+<pre><code>aws cloudformation create-stack-set --call-as DELEGATED_ADMIN \
+  --stack-set-name guard-hook-baseline \
+  --template-url https://s3.us-east-1.amazonaws.com/platform-templates-222222222222/guard-hook-baseline.yaml \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --managed-execution Active=true \
+  --capabilities CAPABILITY_NAMED_IAM
+
+aws cloudformation create-stack-instances --call-as DELEGATED_ADMIN \
+  --stack-set-name guard-hook-baseline \
+  --deployment-targets OrganizationalUnitIds=ou-abcd-11111111,ou-abcd-22222222 \
+  --regions us-east-1 us-west-2 \
+  --operation-preferences MaxConcurrentPercentage=25,FailureTolerancePercentage=10,RegionConcurrencyType=PARALLEL</code></pre>
+				<p><strong>Control Tower proactive controls</strong> are hooks that Control Tower manages, enabled per OU (<code>enable-control</code> is on the <a href="security-baseline.html#b4">baseline page</a>). A blocked deployment shows <code>AWS::ControlTower::Hook</code> in the stack events, and the console's <strong>hook invocation summary</strong> names the failed control, such as CT.S3.PR.1, and the fix. Company-specific rules, such as the boundary rule, stay in the company's own hook, which runs alongside them (<a href="../d6-task-6-1.html#s2">Task 6.1</a>).</p>
+				<span class="file">Only the pipeline and the platform team may change stacks or hook settings in production (SCP, attached to the Prod OU ou-abcd-11111111)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StackChangesOnlyThroughPipeline",
+      "Effect": "Deny",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:SetTypeConfiguration",
+        "cloudformation:ActivateType"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/pipeline-deploy",
+            "arn:aws:iam::*:role/platform-admin",
+            "arn:aws:iam::*:role/SCLaunchRole-*",
+            "arn:aws:iam::*:role/AWSControlTowerExecution"
+          ]
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The <code>SCLaunchRole-*</code> exception lets Service Catalog products (Step 6) provision through CloudFormation. StackSets and Control Tower deploy through their own roles in each account. Test the SCP in the Policy Staging OU (<code>101010101010</code>) and confirm that stack sets, Control Tower, Service Catalog and the pipeline still work. Hooks see only CloudFormation and Cloud Control deployments; a console click or direct API call meets SCPs and declarative policies (prevent) and Config (detect).</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Change sets, approval and stack protection</h3>
+				<p>Production never gets a direct stack update. The release stage creates a <strong>change set</strong> showing what will be added, modified or replaced, waits for a person, then executes it.</p>
+				<span class="file">Release stage: create the change set in production, wait for approval, execute (CodePipeline stage, pipeline structure YAML, deployment account 151515151515)</span>
+<pre><code>name: ReleaseProd
+actions:
+  - name: CreateChangeSet
+    actionTypeId:
+      category: Deploy
+      owner: AWS
+      provider: CloudFormation
+      version: '1'
+    runOrder: 1
+    # the pipeline assumes this role in the production account
+    roleArn: arn:aws:iam::111111111111:role/pipeline-deploy
+    configuration:
+      ActionMode: CHANGE_SET_REPLACE
+      StackName: shop-web-prod
+      ChangeSetName: release
+      TemplatePath: BuildArtifact::shop-web.yaml
+      TemplateConfiguration: BuildArtifact::prod-config.json
+      Capabilities: CAPABILITY_NAMED_IAM
+      # CloudFormation acts as this role; it must be in the same account as the action role
+      RoleArn: arn:aws:iam::111111111111:role/cfn-exec-shop
+    inputArtifacts:
+      - name: BuildArtifact
+  - name: ApproveRelease
+    actionTypeId:
+      category: Approval
+      owner: AWS
+      provider: Manual
+      version: '1'
+    runOrder: 2
+    configuration:
+      NotificationArn: arn:aws:sns:us-east-1:151515151515:release-approvals
+      CustomData: Review change set release on shop-web-prod, especially any Replacement entries.
+  - name: ExecuteChangeSet
+    actionTypeId:
+      category: Deploy
+      owner: AWS
+      provider: CloudFormation
+      version: '1'
+    runOrder: 3
+    roleArn: arn:aws:iam::111111111111:role/pipeline-deploy
+    configuration:
+      ActionMode: CHANGE_SET_EXECUTE
+      StackName: shop-web-prod
+      ChangeSetName: release</code></pre>
+				<p><code>RoleArn</code> isn't applied at execution; the change set keeps the role it was created with. The <code>TemplateConfiguration</code> file carries parameters, stack tags and a <strong>stack policy</strong>. Stack tags propagate to the resources, which guarantees <code>example:cost-center</code> and <code>example:environment</code>. Approval rights are granted on this action only, through a release manager permission set, so developers can't approve their own release (<a href="workforce-identity.html">workforce identity</a>).</p>
+				<p><strong>Stack protection.</strong> The stack policy denies <code>Update:Replace</code> and <code>Update:Delete</code> on the database; once set, a stack policy protects everything it doesn't allow and can't be deleted (<a href="../d6-task-6-2.html#s1">Task 6.2</a>). <strong>Termination protection</strong> stops stack deletion.</p>
+				<span class="file">Protect the stack from deletion, and check it for drift on a schedule (AWS CLI, production account)</span>
+<pre><code>aws cloudformation update-termination-protection \
+  --stack-name shop-web-prod \
+  --enable-termination-protection
+
+<span class="c"># Returns a StackDriftDetectionId; describe-stack-resource-drifts then lists what changed</span>
+aws cloudformation detect-stack-drift --stack-name shop-web-prod</code></pre>
+				<p>Drift detection checks only properties the template sets, skips nested stacks (check each one itself) and never fixes. <code>create-change-set --deployment-mode REVERT_DRIFT</code> creates a drift-aware change set that compares actual state, last deployment and template, and goes through the same approval. CloudTrail shows who made the manual change.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Deploying at scale and self-service</h3>
+				<p>The <strong>account baseline</strong> (<code>pipeline-deploy</code>, <code>cfn-exec-shop</code>, the boundary, the hook, Config rules) doesn't belong in an application pipeline. <strong>Service-managed StackSets</strong> from the security tooling account deploy it, and auto-deployment covers each account as it joins a target OU, so a new account such as <code>prod-payments</code> (<code>121212121212</code>) can receive releases on day one. The <code>security-baseline</code> stack set (<a href="../d6-task-6-2.html#s1">Task 6.2</a>) carries the roles and boundary; <code>guard-hook-baseline</code> carries the hook.</p>
+				<ul>
+					<li><strong>Operation preferences</strong> limit a bad change: 25 percent of accounts at a time, stopping once failures pass the per-Region tolerance. Policy Staging gets changes first.</li>
+					<li><strong>Limits</strong>: no management account, no nested stacks, macros or transforms; auto-deployment ignores account filters and parameter overrides, so the baseline avoids per-account overrides.</li>
+									</ul>
+				<p><strong>Self-service</strong>: teams that need a standard resource without a template use <strong>AWS Service Catalog</strong> products that already pass the Guard rules. A <strong>launch constraint</strong> provisions with a platform role, so teams need only Service Catalog permissions (<a href="../d6-task-6-2.html#s4">Task 6.2</a>).</p>
+				<span class="file">The encrypted bucket product launches with the platform role in whichever account it is shared to (AWS CLI, Service Catalog administrator)</span>
+<pre><code>aws servicecatalog create-constraint \
+  --portfolio-id port-y3fnkesxxxxx \
+  --product-id prod-cfrfxmraxxxxx \
+  --type LAUNCH \
+  --parameters '{"LocalRoleName": "SCLaunchRole-EncryptedBucket"}'</code></pre>
+				<p><code>LocalRoleName</code> works everywhere because the baseline stack set creates the role in every account. TagOptions add required tags, and the Guard hook still checks each launch.</p>
+				<p><strong>Tags.</strong> Tag policies standardize keys and values, and an SCP with <code>aws:RequestTag</code> and <code>aws:TagKeys</code> denies creation without them (<a href="../d6-task-6-2.html#s2">Task 6.2</a>). Pipeline stack tags satisfy it automatically.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Governance after deployment and the evidence trail</h3>
+				<p>Prevention misses paths nobody thought of, and rules change after resources exist, so the same intent runs as <strong>detective controls</strong>. The security tooling account, as Config delegated administrator, deploys <strong>organization conformance packs</strong> through a service-linked role, even where member policies deny <code>config:PutConfigRule</code> (<a href="../d6-task-6-3.html#s1">Task 6.3</a>). <code>org-cis-baseline</code> is already on the <a href="security-baseline.html#b3">baseline</a>; the payments audit adds the PCI DSS sample pack.</p>
+				<span class="file">Deploy the PCI DSS operational best practices pack to every account except the sandbox (AWS CLI, security tooling account 222222222222)</span>
+<pre><code>aws configservice put-organization-conformance-pack \
+  --organization-conformance-pack-name org-pci-dss \
+  --template-s3-uri s3://awsconfigconforms-templates-222222222222/operational-best-practices-pci-dss-4.yaml \
+  --delivery-s3-bucket awsconfigconforms-results-222222222222 \
+  --excluded-accounts 333333333333</code></pre>
+				<p>The delivery bucket name must start with <code>awsconfigconforms</code>, and remediation goes in the pack template, because the API can't attach it to service-linked rules. A <code>CUSTOM_POLICY</code> rule lets the Step 3 boundary rule run as a detective check, on the <code>guard-2.x.x</code> runtime, so test it separately.</p>
+				<ul>
+					<li><strong>Security Hub CSPM standards</strong> measure posture: FSBP everywhere through central configuration, PCI DSS v4.0.1 for payments. Disable controls that don't apply instead of suppressing findings, which inflates the score (<a href="../d6-task-6-3.html#s1">Task 6.3</a>).</li>
+					<li><strong>Firewall Manager</strong> keeps the WAF baseline on every production ALB and API stage, including new ones (<a href="../d6-task-6-2.html#s3">Task 6.2</a>); it needs continuous Config recording.</li>
+					<li><strong>Remediation and alerts</strong> follow the <a href="threat-detection-response.html#b3">detection and response page</a>.</li>
+				</ul>
+				<p><strong>Evidence for the auditor.</strong> What changed: CloudTrail records every <code>CreateChangeSet</code> and <code>ExecuteChangeSet</code> with its role session, and Config history shows each resource before and after. Who approved: the pipeline's approval history. Compliant over time: conformance pack history, advanced query exports, and Security Hub CSPM findings copied to S3 (archived findings last 30 days). AWS's own attestations come from AWS Artifact.</p>
+				<div class="callout retired"><p><strong>AWS Audit Manager</strong> is in maintenance mode: from 30 April 2026 it can't be set up in new accounts and gets no new frameworks. Its evidence finder runs on <strong>CloudTrail Lake</strong>, which closed to new customers on 31 May 2026. AWS recommends Config conformance packs, with Security Hub CSPM, Control Tower or partner tools for the rest.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>A deployment account, separate from security tooling</h4>
+				<p>Pipelines write to production; security tooling must not be changeable by those it watches. Combining them in <code>222222222222</code> would make the pipeline a path into the security account. A compromised deployment account yields deployment roles, limited by the SCP and approval, but no evidence. The cost is one more account and cross-account plumbing (key, bucket policy, a role per account), delivered by stack sets.</p>
+			</div>
+			<div class="entry">
+				<h4>Check in the pipeline and in CloudFormation</h4>
+				<p>The pipeline gives fast feedback before deployment; the hook enforces whatever path someone took. The same Guard rules serve both, proactive controls cover common AWS rules, and conformance packs catch what arrived outside CloudFormation.</p>
+			</div>
+			<div class="entry">
+				<h4>Permissions boundary rather than a fixed role list</h4>
+				<p>Templates legitimately create roles for functions and tasks; forbidding IAM would bring back tickets. A boundary allows any role inside a known ceiling, checked by Guard before deployment and by the IAM condition at the API. The ceiling needs upkeep, and it doesn't limit what a resource policy grants directly to a role session (<a href="../d4-task-4-2.html#s1">Task 4.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Manual approval only where it adds review</h4>
+				<p>Non-prod deploys skip approval so the gate doesn't become a rubber stamp. Production approvers review the change set, which shows what will actually happen, giving the auditor separation of duties.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>GitHub Actions deploying directly</h4>
+				<p>The workflow can assume a role in each account through OIDC and run the change set itself, with GitHub environments as the approval. Simpler, but the approval trail lives in GitHub, every account trusts GitHub, and each <code>sub</code> condition must be exact. AWS recommends deployment branch protection on environments used in OIDC policies.</p>
+			</div>
+			<div class="entry">
+				<h4>Terraform with HCP Terraform</h4>
+				<p>HCP Terraform federates through OIDC, and IAM requires <code>app.terraform.io:sub</code> in the trust policy. Hooks never see Terraform deployments, so prevention rests on SCPs and plan checks, with conformance packs as the safety net.</p>
+			</div>
+			<div class="entry">
+				<h4>Lambda hooks and Config proactive evaluation</h4>
+				<p>A <strong>Lambda hook</strong> runs your function for checks Guard can't express, at the cost of code. Config <strong>proactive evaluation</strong> (<code>start-resource-evaluation</code>) checks a configuration before it exists but never blocks, so it isn't an enforcement point.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Identity is pinned</span><span class="desc">From a feature branch, assuming <code>github-release</code> fails on <code>sub</code>. A trust policy without <code>sub</code> is rejected by IAM. <code>validate-policy</code> shows no <code>MISSING_GITHUB_REPO_CONDITION_KEY</code>, and no pipeline principal has access keys.</span></li>
+				<li><span class="name">Code findings block the merge</span><span class="desc">A pull request with a known critical CVE dependency and a fake credential gets Inspector comments, and fails <code>InspectorScan</code> if merged anyway.</span></li>
+				<li><span class="name">The rules are right</span><span class="desc"><code>cfn-guard test</code> with passing and failing fixtures catches a rule that silently skips everything; a role without a boundary fails <code>cfn-guard validate</code>.</span></li>
+				<li><span class="name">The hook catches a bypass</span><span class="desc">In <code>101010101010</code>, deploy the bad template from the CLI. In <code>WARN</code> it deploys with a warning in the invocation summary; in <code>FAIL</code> it stops before creation. A public bucket fails with <code>AWS::ControlTower::Hook</code>.</span></li>
+				<li><span class="name">No privilege escalation</span><span class="desc">The policy simulator allows <code>cfn-exec-shop</code> <code>iam:CreateRole</code> only with the <code>iam:PermissionsBoundary</code> context key set, and denies <code>iam:DeleteRolePermissionsBoundary</code>. A developer's <code>UpdateStack</code> on <code>shop-web-prod</code> hits the SCP.</span></li>
+				<li><span class="name">Approval and drift</span><span class="desc">A release that replaces a resource waits at <code>ApproveRelease</code> showing the replacement. A hand-edited security group shows as drifted and is reverted with a drift-aware change set.</span></li>
+				<li><span class="name">Detective controls and evidence</span><span class="desc">A resource created outside CloudFormation turns a conformance pack rule <code>NON_COMPLIANT</code> and alerts the team. Then pull what an auditor would ask for: the release's CloudTrail events, the bucket's Config history and the approval record.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Compute Workload Security Controls</td><td data-label="What this architecture demonstrates">Inspector code security (SAST, SCA, IaC) on push, pull request and schedule, the <code>InspectorScan</code> gate, Q Developer reviews, secret detection; Inspector code security in place of CodeGuru Security</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Authentication Strategies</td><td data-label="What this architecture demonstrates">GitHub OIDC federation with <code>aud</code> and a pinned <code>sub</code>; no access keys in CI</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Authorization Strategies</td><td data-label="What this architecture demonstrates">One role per stage, cross-account deployment roles, a boundary enforced with <code>iam:PermissionsBoundary</code>, the CloudFormation service role trap, Access Analyzer checks</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">A dedicated deployment account, Control Tower proactive controls, an SCP limiting stack changes to the pipeline</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-2.html">6.2</a> Secure, Consistent Deployment</td><td data-label="What this architecture demonstrates">cfn-lint, Guard and the Guard hook, cdk-nag, Terraform state, change sets, stack policies, termination protection, drift detection, StackSets auto-deployment, Service Catalog launch constraints, tags, Firewall Manager</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-3.html">6.3</a> Evaluate Compliance</td><td data-label="What this architecture demonstrates">Organization conformance packs, Security Hub CSPM standards, the Config and CloudTrail evidence trail, Audit Manager's maintenance status</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Prevent any team from deploying a non-compliant resource with CloudFormation, even outside the pipeline" is a <strong>CloudFormation Guard hook (or Control Tower proactive controls)</strong>, not a pipeline step, and not a Config rule, which only detects afterwards. "A GitHub workflow needs to deploy without stored credentials" is <strong>OIDC federation with a trust policy that pins the <code>sub</code> claim</strong>. "Scan application code for vulnerabilities in the pipeline", where the options name CodeGuru Security, tests static analysis. The current service is <strong>Amazon Inspector code security</strong> or the <strong><code>InspectorScan</code></strong> action. "Developers must create IAM roles in templates without being able to escalate" is a <strong>permissions boundary required by condition</strong>. "Every new account must get the baseline automatically" is <strong>service-managed StackSets with auto-deployment</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/shifting-vulnerability-detection-left-with-amazon-inspector-code-security-capabilities/">Beyond compute: Shifting vulnerability detection left with Amazon Inspector code security capabilities</a> (June 2025): SAST, SCA and IaC scanning of GitHub and GitLab repositories, pull request comments and scan schedules.</li>
+				<li><a href="https://aws.amazon.com/blogs/mt/simplify-aws-control-tower-governance-with-enhanced-aws-cloudformation-hooks/">Simplify AWS Control Tower governance with enhanced AWS CloudFormation Hooks</a> (February 2026): proactive controls as hooks, and diagnosing blocked deployments in the hook invocation summary.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/governing-infrastructure-as-code-using-pattern-based-policy-as-code/">Governing infrastructure as code using pattern-based policy as code</a> (May 2026): approved architecture patterns enforced with Guard rules and hooks across environments.</li>
+				<li><a href="https://aws.amazon.com/blogs/mt/manage-custom-aws-config-rules-with-remediation-using-conformance-packs/">Manage Custom AWS Config Rules with Remediation Using AWS Config Conformance Pack</a> (May 2025): packaging custom rules and Systems Manager remediation into conformance packs deployed across accounts.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/how-to-implement-the-principle-of-least-privilege-with-cloudformation-stacksets/">How to implement the principle of least privilege with CloudFormation StackSets</a> (March 2021): scoping StackSets administration and execution roles (predates wide use of service-managed StackSets with Organizations).</li>
+				<li><a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-idp_oidc.html">Create a role for OpenID Connect federation</a> (AWS documentation): GitHub and HCP Terraform trust policies, and IAM's check for the <code>sub</code> condition.</li>
+				<li><a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-cloudformation-guardhook.html">AWS::CloudFormation::GuardHook</a> (AWS documentation): the Guard hook as a template resource, with failure mode, rule location and filters.</li>
+				<li><a href="https://github.com/aws-samples/aws-security-reference-architecture-examples/tree/main/aws_sra_examples/solutions/config/config_conformance_pack_org">AWS SRA examples: Config Organization Conformance Pack</a> (AWS sample code): deploying a conformance pack to all accounts and chosen Regions from the delegated administrator.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
