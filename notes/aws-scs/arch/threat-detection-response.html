@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Centralized threat detection and automated response | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: GuardDuty, Inspector, Macie, Access Analyzer, Config and Security Hub CSPM findings from every account routed through EventBridge in the security tooling account, tuned with suppression and automation rules, and answered by Automated Security Response on AWS, Systems Manager Automation with approvals, Step Functions and Lambda playbooks for a compromised instance, an exposed access key, a public bucket and crypto-mining on EKS.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Threat detection and response</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Centralized threat detection and automated response</h1>
+		<p>Every detector in the organization already reports to the security tooling account. This design turns that stream of findings into action: tuned so that people only see what matters, routed by EventBridge to the right responder, and answered by playbooks that contain the common incidents in minutes, with a human approving anything destructive.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">GuardDuty</span><span class="tag">Security Hub CSPM</span><span class="tag">EventBridge</span><span class="tag">Automated Security Response</span><span class="tag">Systems Manager Automation</span><span class="tag">Step Functions</span><span class="tag">Detective</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Tune findings at the source</a></li>
+				<li class="sub"><a href="#b2">2. Route, notify and ticket</a></li>
+				<li class="sub"><a href="#b3">3. Posture findings and the public bucket</a></li>
+				<li class="sub"><a href="#b4">4. Compromised EC2 instance</a></li>
+				<li class="sub"><a href="#b5">5. Exposed access key</a></li>
+				<li class="sub"><a href="#b6">6. Crypto-mining on EKS</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) finished its <a href="security-baseline.html">multi-account security baseline</a>: GuardDuty, Security Hub CSPM, Inspector, Macie, Detective, Config and Access Analyzer are delegated to the security tooling account <code>222222222222</code> and auto-enabled in every account and governed Region, with <code>us-east-1</code> as the aggregation Region. That page ends where this one starts: <strong>findings exist</strong>. The team gets several hundred a week, most low severity or expected, and the last real incident (stolen instance credentials in production <code>111111111111</code>, <a href="../d2-task-2-2.html">Task 2.2</a>) took hours to contain because every step was manual.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">One place to see and act on every finding</td><td data-label="Design choice">Delegated administrators in 222222222222, Security Hub CSPM aggregation into us-east-1, the new Security Hub for correlation</td></tr>
+						<tr><td data-label="Requirement">Analysts only see findings worth their time</td><td data-label="Design choice">Narrow GuardDuty suppression rules and trusted lists, Security Hub CSPM automation rules, controls disabled rather than suppressed</td></tr>
+						<tr><td data-label="Requirement">The right people hear about the right findings within minutes</td><td data-label="Design choice">EventBridge rules in the security tooling account filtering on severity and type, SNS to chat, tickets for the rest</td></tr>
+						<tr><td data-label="Requirement">Common incidents contained without waiting for a person</td><td data-label="Design choice">Automated Security Response on AWS for posture findings, Lambda for single safe actions</td></tr>
+						<tr><td data-label="Requirement">Nothing destructive happens without approval, and evidence comes first</td><td data-label="Design choice">Step Functions with a task token, Automation runbooks with <code>aws:approve</code>, snapshots before isolation</td></tr>
+						<tr><td data-label="Requirement">Prove it works and keep improving</td><td data-label="Design choice">Sample findings, test events and game days; time to respond and false positive rate tracked per playbook</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused: the detector ID, topics <code>security-alerts</code> and <code>ir-approvals</code>, bus <code>security-events</code>, runbook <code>IR-IsolateInstance</code> and isolation group <code>sg-0123456789abcdef0</code> (Tasks 1.1 to 2.1), instance <code>i-0abc1234def567890</code> and user <code>app-user</code> (Task 2.2), and test account <code>101010101010</code> in Policy Staging <code>ou-abcd-44444444</code>. New on this page: the production EKS cluster is named <code>prod-eks</code>, the data platform bucket is <code>prod-data-platform-111111111111</code>, the Step Functions workflow in the security tooling account is <code>ec2-compromise-response</code>, and the AWS Health organizational view is delegated to <code>222222222222</code>.</p>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 310" role="img" aria-labelledby="dgT-wide-t">
+<title id="dgT-wide-t">Threat detection and response: detectors in the production account send findings to Security Hub CSPM and EventBridge in the security tooling account; Security Hub findings start Automated Security Response playbooks, and EventBridge starts the ec2-compromise-response workflow, which asks the on-call responder to approve, isolates the compromised instance and hands the evidence to the forensics account.</title>
+<rect x="10" y="15" width="180" height="230" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">prod 111111111111</text>
+<rect x="205" y="15" width="390" height="230" rx="12" class="dg-grp"/>
+<text x="215" y="31" class="dg-lbl">Security Tooling 222222222222</text>
+<path d="M180.0 63.0 L220.0 63.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 77.0 L193.0 77.0 Q200.0 77.0 200.0 84.0 L200.0 183.0 Q200.0 190.0 207.0 190.0 L220.0 190.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M380.0 70.0 L420.0 70.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M380.0 190.0 L420.0 190.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 183.0 L593.0 183.0 Q600.0 183.0 600.0 176.0 L600.0 117.0 Q600.0 110.0 607.0 110.0 L620.0 110.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="606" y="150" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">approve</text>
+<path d="M580.0 197.0 L593.0 197.0 Q600.0 197.0 600.0 204.0 L600.0 243.0 Q600.0 250.0 607.0 250.0 L620.0 250.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M500.0 213.0 L500.0 283.0 Q500.0 290.0 493.0 290.0 L107.0 290.0 Q100.0 290.0 100.0 283.0 L100.0 213.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="300" y="284" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--warn)">isolate</text>
+<rect x="20" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="67" class="dg-t dg-sm">Detectors</text>
+<text x="100" y="84" class="dg-s dg-sm2">GuardDuty, Macie, ...</text>
+<rect x="20" y="167" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="187" class="dg-t dg-sm">Compromised instance</text>
+<text x="100" y="204" class="dg-s dg-sm2">i-0abc1234def567890</text>
+<rect x="220" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="67" class="dg-t dg-sm">Security Hub CSPM</text>
+<text x="300" y="84" class="dg-s dg-sm2">ASFF, automation rules</text>
+<rect x="220" y="167" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="187" class="dg-t dg-sm">EventBridge rules</text>
+<text x="300" y="204" class="dg-s dg-sm2">High and Critical</text>
+<rect x="420" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="67" class="dg-t dg-sm">ASR on AWS</text>
+<text x="500" y="84" class="dg-s dg-sm2">remediation playbooks</text>
+<rect x="420" y="167" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="187" class="dg-t dg-sm">Response workflow</text>
+<text x="500" y="204" class="dg-s dg-sm2">Step Functions</text>
+<rect x="620" y="87" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="107" class="dg-t dg-sm">On-call responder</text>
+<text x="700" y="124" class="dg-s dg-sm2">Slack, approves</text>
+<rect x="620" y="227" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="247" class="dg-t dg-sm">Forensics account</text>
+<text x="700" y="264" class="dg-s dg-sm2">666666666666</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 420" role="img" aria-labelledby="dgT-tall-t">
+<title id="dgT-tall-t">Threat detection and response: detectors in the production account send findings to Security Hub CSPM and EventBridge in the security tooling account; Security Hub findings start Automated Security Response playbooks, and EventBridge starts the ec2-compromise-response workflow, which asks the on-call responder to approve, isolates the compromised instance and hands the evidence to the forensics account.</title>
+<rect x="10" y="15" width="380" height="90" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">prod 111111111111</text>
+<rect x="10" y="125" width="380" height="200" rx="12" class="dg-grp"/>
+<text x="20" y="318" class="dg-lbl">Security Tooling 222222222222</text>
+<path d="M93.0 83.0 L93.0 147.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M107.0 83.0 L107.0 108.0 Q107.0 115.0 114.0 115.0 L293.0 115.0 Q300.0 115.0 300.0 122.0 L300.0 147.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 193.0 L100.0 252.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 193.0 L300.0 252.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M293.0 298.0 L293.0 323.0 Q293.0 330.0 286.0 330.0 L107.0 330.0 Q100.0 330.0 100.0 337.0 L100.0 362.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M307.0 298.0 L307.0 362.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M380.0 275.0 L386.0 275.0 Q392.0 275.0 392.0 269.0 L392.0 66.0 Q392.0 60.0 386.0 60.0 L380.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="20" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="57" class="dg-t dg-sm">Detectors</text>
+<text x="100" y="74" class="dg-s dg-sm2">GuardDuty, Macie, ...</text>
+<rect x="220" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="57" class="dg-t dg-sm">Compromised instance</text>
+<text x="300" y="74" class="dg-s dg-sm2">i-0abc1234def567890</text>
+<rect x="20" y="147" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="167" class="dg-t dg-sm">Security Hub CSPM</text>
+<text x="100" y="184" class="dg-s dg-sm2">ASFF, automation rules</text>
+<rect x="220" y="147" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="167" class="dg-t dg-sm">EventBridge rules</text>
+<text x="300" y="184" class="dg-s dg-sm2">High and Critical</text>
+<rect x="20" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="272" class="dg-t dg-sm">ASR on AWS</text>
+<text x="100" y="289" class="dg-s dg-sm2">remediation playbooks</text>
+<rect x="220" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="272" class="dg-t dg-sm">Response workflow</text>
+<text x="300" y="289" class="dg-s dg-sm2">Step Functions</text>
+<rect x="20" y="362" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="382" class="dg-t dg-sm">On-call responder</text>
+<text x="100" y="399" class="dg-s dg-sm2">Slack, approves</text>
+<rect x="220" y="362" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="382" class="dg-t dg-sm">Forensics account</text>
+<text x="300" y="399" class="dg-s dg-sm2">666666666666</text>
+</svg>
+				<figcaption>Figure: findings from every account arrive in the security tooling account (blue): Security Hub CSPM imports them in ASFF and applies automation rules, and the delegated administrator's EventBridge default bus receives the GuardDuty events. Automated Security Response remediates control failures such as a public bucket, and a rule for High and Critical instance findings starts the <code>ec2-compromise-response</code> workflow (green). It snapshots and tags first, waits for the responder's approval through a task token (dashed), then swaps the instance into an isolation security group (yellow) and passes the evidence to the forensics account.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The path from a detector's first signal to a closed incident, using a high-severity GuardDuty finding on a production instance as the example. Steps marked <span class="who auto">AWS</span> happen without anyone acting.</p>
+			<ol class="flow">
+				<li class="group">Detect</li>
+				<li class="auto"><span class="name">A detector raises a finding<span class="who auto">AWS</span></span><span class="desc">GuardDuty in <code>111111111111</code> sees the instance talking to a known command-and-control host and raises a High finding with resource type <code>Instance</code>. Inspector, Macie, Access Analyzer and Security Hub CSPM controls do the same in each member account and Region.</span></li>
+				<li class="auto"><span class="name">Findings reach the security tooling account<span class="who auto">AWS</span></span><span class="desc">The GuardDuty administrator <code>222222222222</code> sees the member finding, and its EventBridge default bus in that Region receives a <code>GuardDuty Finding</code> event. Security Hub CSPM imports the same finding in ASFF and replicates it to the home Region <code>us-east-1</code>.</span></li>
+				<li class="group">Triage</li>
+				<li class="auto"><span class="name">Noise removed at the source<span class="who auto">AWS</span></span><span class="desc">Suppression rules archive known false positives; Security Hub CSPM automation rules escalate production findings and suppress sandbox ones.</span></li>
+				<li class="auto"><span class="name">Correlation<span class="who auto">AWS</span></span><span class="desc">GuardDuty Extended Threat Detection may link this finding with others into a Critical attack sequence; the new AWS Security Hub correlates it with Inspector vulnerabilities and reachability into an exposure finding.</span></li>
+				<li class="group">Route</li>
+				<li class="auto"><span class="name">EventBridge rules match<span class="who auto">AWS</span></span><span class="desc">In <code>222222222222</code>, a rule for High and Critical findings on instances starts the <code>ec2-compromise-response</code> workflow; another sends a short message to <code>security-alerts</code>, which posts to the team's Slack channel.</span></li>
+				<li class="group">Respond</li>
+				<li class="auto"><span class="name">Evidence first<span class="who auto">AWS</span></span><span class="desc">The workflow skips sample findings and exempt instances, then tags the instance with a case ID, turns on termination protection and snapshots every volume, using a role in the workload account.</span></li>
+				<li><span class="name">Approve containment<span class="who">On-call responder</span></span><span class="desc">The responder approves isolation from chat (or rejects it as a false positive), returning the task token to Step Functions.</span></li>
+				<li class="auto"><span class="name">Contain<span class="who auto">AWS</span></span><span class="desc">The instance's security groups are replaced with the isolation group; the finding's workflow status is set to <code>NOTIFIED</code> and a ticket is opened.</span></li>
+				<li><span class="name">Investigate and hand off<span class="who">Security team</span></span><span class="desc">Detective shows what the instance role did before and after the finding; the snapshots and case go to the forensics account <code>666666666666</code>, as described on the incident response and forensics page.</span></li>
+				<li class="group">Learn</li>
+				<li><span class="name">Close and measure<span class="who">Security team</span></span><span class="desc">The finding is resolved (or marked false positive, which feeds a suppression rule); time to detect, contain and close is recorded for the playbook.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+			<p>Everything below runs in the security tooling account <code>222222222222</code> unless a step says otherwise, and is repeated in <code>us-west-2</code> where the service is Regional. Enabling and delegating the services is on the <a href="security-baseline.html">security baseline</a> page and <a href="../d1-task-1-1.html#s3">Task 1.1</a>.</p>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Tune findings at the source</h3>
+				<p>A rule that isolates instances on every High finding will isolate the vulnerability scanner every week. Tuning happens in two places, both administrator-only, so member accounts can't hide their own findings.</p>
+				<p><strong>GuardDuty.</strong> First decide what to detect. Foundational detection (CloudTrail management events, VPC Flow Logs and DNS logs) is always on; the company also runs S3 Protection for the data platform, EKS Protection and Runtime Monitoring for the containers, Malware Protection for EC2 and for S3 uploads, RDS Protection and Lambda Protection, and AI Protection for the assistant (<a href="../d1-task-1-1.html#s1">Task 1.1</a>). These plans also widen what Extended Threat Detection correlates into attack sequences (always Critical, no extra cost).</p>
+				<p>Then remove known noise. GuardDuty advises suppression rules only for repeatedly confirmed false positives, with at least two criteria. A suppression rule is a saved filter with the action <code>ARCHIVE</code>; its findings are not sent to Security Hub CSPM, EventBridge, S3 or Detective, and are not used as attack sequence signals, so a broad rule blinds the whole pipeline.</p>
+				<span class="file">Suppress port scan findings from the approved scanner image only (AWS CLI, GuardDuty administrator, per Region)</span>
+<pre><code><span class="c"># Two criteria: the finding type AND the scanner's AMI. Without --action ARCHIVE this would only be a saved filter.</span>
+aws guardduty create-filter \
+  --detector-id 12abc34d567e8fa901bc2d34EXAMPLE \
+  --name suppress-approved-scanner \
+  --action ARCHIVE \
+  --rank 1 \
+  --finding-criteria '{"Criterion": {"type": {"Eq": ["Recon:EC2/Portscan"]}, "resource.instanceDetails.imageId": {"Eq": ["ami-0a7a207083example"]}}}'</code></pre>
+				<p>For traffic to a known-good public address (a partner's API, the company's on-premises egress), a <strong>trusted entity list</strong> (IPs and domains, since August 2025) stops GuardDuty generating those findings at all. Each account and Region allows one trusted entity list and one trusted IP list; the administrator's lists apply to every member.</p>
+				<p><strong>Security Hub CSPM.</strong> Automation rules change findings as they arrive, before any EventBridge rule sees them. They are created in the administrator account per Region (up to 100) and act only on findings imported after the rule exists. The company uses three: escalate MEDIUM findings on <code>env=prod</code> resources to HIGH, suppress findings from the sandbox <code>333333333333</code>, and note known exceptions.</p>
+				<span class="file">Escalate production findings so that routing treats them as urgent (AWS CLI, Security Hub CSPM administrator, us-east-1)</span>
+<pre><code>aws securityhub create-automation-rule \
+  --rule-name "escalate-prod-medium" \
+  --rule-order 10 \
+  --rule-status ENABLED \
+  --description "Medium findings on prod-tagged resources become High" \
+  --criteria '{"ResourceTags": [{"Key": "env", "Value": "prod", "Comparison": "EQUALS"}], "SeverityLabel": [{"Value": "MEDIUM", "Comparison": "EQUALS"}]}' \
+  --actions '[{"Type": "FINDING_FIELDS_UPDATE", "FindingFieldsUpdate": {"Severity": {"Label": "HIGH"}, "Note": {"Text": "Escalated: production resource", "UpdatedBy": "automation-rule-escalate-prod-medium"}}}]'</code></pre>
+				<p>Lower rule order numbers apply first and the highest has the last word. An irrelevant control is disabled in the central configuration policy instead, which stops checks and charges; suppressing its findings keeps paying for them.</p>
+				<div class="callout note"><p><strong>Two Security Hubs.</strong> The original service is now <strong>AWS Security Hub CSPM</strong>: same <code>securityhub</code> API, standards, controls, ASFF findings and <code>Security Hub Findings - Imported</code> events. The newer <strong>AWS Security Hub</strong> (generally available since 2 December 2025) turns CSPM on, reads its results, and correlates them with Inspector, GuardDuty and Macie signals into exposure findings in OCSF format, with its own event type (<code>Findings Imported V2</code>), its own automation rules and outbound ticketing to Jira Cloud and ServiceNow. It doesn't accept third-party findings. This page routes on CSPM events and uses the new Security Hub to prioritize exposures.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Route findings in the security tooling account: notify and ticket</h3>
+				<p>No organization-wide bus is needed for findings. EventBridge rules in the GuardDuty administrator account fire for member findings, and in the Security Hub CSPM administrator's home Region the <code>Imported</code> events include every member and linked Region. So the rules live on the default bus of <code>222222222222</code>: GuardDuty rules in each governed Region (its events stay Regional), Security Hub CSPM rules once in <code>us-east-1</code>. The <code>security-events</code> bus stays for sources with no delegated administrator, such as application events; <code>detail.accountId</code> identifies the member account.</p>
+				<span class="file">Rule 1: High and Critical GuardDuty findings on EC2 instances start the containment workflow (EventBridge event pattern)</span>
+<pre><code>{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Finding"],
+  "detail": {
+    "severity": [{ "numeric": [">=", 7] }],
+    "resource": { "resourceType": ["Instance"] }
+  }
+}</code></pre>
+				<span class="file">Rule 2: every attack sequence pages the on-call responder, whatever the resource (EventBridge event pattern)</span>
+<pre><code>{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Finding"],
+  "detail": {
+    "type": [{ "prefix": "AttackSequence:" }]
+  }
+}</code></pre>
+				<p>Notifications go to the <code>security-alerts</code> topic, delivered to Slack by Amazon Q Developer in chat applications. An input transformer keeps the message to severity, type, account, Region and a console link, as a single-line JSON template because GuardDuty's <code>description</code> can contain control characters. An encrypted topic needs a customer managed key that EventBridge may use (<a href="../d1-task-1-3.html#s2">Task 1.3</a>).</p>
+				<p>Findings that need an owner become tickets, fed from Security Hub CSPM, which carries GuardDuty, Inspector, Macie, Access Analyzer and control findings in one format after the automation rules have adjusted them.</p>
+				<span class="file">Rule 3: new, active High and Critical Security Hub CSPM findings go to the ticketing function (EventBridge event pattern, us-east-1)</span>
+<pre><code>{
+  "source": ["aws.securityhub"],
+  "detail-type": ["Security Hub Findings - Imported"],
+  "detail": {
+    "findings": {
+      "Severity": { "Label": ["HIGH", "CRITICAL"] },
+      "Workflow": { "Status": ["NEW"] },
+      "RecordState": ["ACTIVE"]
+    }
+  }
+}</code></pre>
+				<p>The <code>Workflow.Status</code> filter matters: every <code>BatchUpdateFindings</code> call also sends an <code>Imported</code> event, so once the ticketing function sets <code>NOTIFIED</code>, later updates don't open a second ticket. Analysts can also use the <code>send_to_ticketing</code> custom action (Task 1.1), and OpsCenter can create OpsItems with runbooks attached (<a href="../d2-task-2-1.html#s1">Task 2.1</a>).</p>
+				<div class="callout trap"><p>A rule that "never fires" usually has one of three causes: it is in the wrong Region (GuardDuty events stay in their Region; AWS Health global events appear only in <code>us-east-1</code>), the pattern doesn't match the real event (test it with <code>aws events test-event-pattern</code>), or the finding was archived by a suppression rule and never sent.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Posture findings: Automated Security Response and the public bucket playbook</h3>
+				<p>Most findings are misconfigurations, not attacks. Rather than writing a runbook per control, the company deploys <strong>Automated Security Response on AWS</strong> (ASR, formerly SHARR), an AWS Solution maintained by AWS, currently version 4.1.1. Version 3 added a web UI and support for the new Security Hub; version 4 added remediation of GuardDuty, Inspector and Macie findings in both ASFF and OCSF form.</p>
+				<p>It deploys as three CloudFormation templates:</p>
+				<ul>
+					<li><strong>Admin stack</strong> (<code>automated-security-response-admin.template</code>) in the Security Hub administrator <code>222222222222</code>: the orchestrator Step Functions workflow, optional web UI, and a nested stack per playbook. The company selects only the <strong>Security Controls (SC)</strong> playbook, recommended with consolidated control findings.</li>
+					<li><strong>Member roles</strong> (<code>automated-security-response-member-roles.template</code>): the remediation roles in each member account.</li>
+					<li><strong>Member stack</strong> (<code>automated-security-response-member.template</code>): the Systems Manager Automation runbooks and permissions in each member account, including the admin account.</li>
+				</ul>
+				<p>Both member templates go out with service-managed StackSets to the Workloads OU <code>ou-abcd-33333333</code>, so every new account gets them (<a href="../d6-task-6-2.html">Task 6.2</a>). Remediations start from the CSPM Actions menu, the web UI or the API; a few low-risk controls get <strong>fully automated remediation</strong>. Rollback is off by default, and remediating a stack-owned resource causes drift, so the template is fixed too.</p>
+				<p><strong>Public bucket playbook.</strong> The baseline's S3 organization policy already forces Block Public Access, so this is the safety net for Exceptions OU accounts and rollout gaps, and the attempt itself is a signal. GuardDuty raises <code>Policy:S3/BucketBlockPublicAccessDisabled</code> (Low) and <code>Policy:S3/BucketAnonymousAccessGranted</code> (High) from CloudTrail management events, with no S3 Protection needed; Macie raises policy findings for the same changes.</p>
+				<span class="file">Rule 4: someone opened a bucket to the internet or removed its Block Public Access (EventBridge event pattern)</span>
+<pre><code>{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Finding"],
+  "detail": {
+    "type": ["Policy:S3/BucketAnonymousAccessGranted", "Policy:S3/BucketBlockPublicAccessDisabled", "Policy:S3/BucketPublicAccessGranted"]
+  }
+}</code></pre>
+				<p>The target is a Lambda function: one quick, reversible action needs no approval. It reads the bucket from <code>detail.resource.s3BucketDetails</code> and the account from <code>detail.accountId</code>, assumes <code>IRAutomationRole</code> there, turns Block Public Access back on and tells the bucket owner:</p>
+				<span class="file">What the responder function does in the workload account (AWS CLI equivalent)</span>
+<pre><code><span class="c"># All four settings; existing public policies and ACLs stop working at once</span>
+aws s3api put-public-access-block \
+  --bucket prod-data-platform-111111111111 \
+  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+  --expected-bucket-owner 111111111111</code></pre>
+				<p>Whether sensitive data was exposed (Macie sensitive data findings, S3 data events) is an investigation, not something to automate.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Compromised EC2 instance: evidence, approval, isolation, hand-off</h3>
+				<p>This is Task 2.2's playbook automated. The order matters more than the tools: <strong>preserve before you isolate</strong>, because stopping an instance erases memory and instance store. The security group swap doesn't cut tracked connections, so a live reverse shell may survive it; a network ACL deny ends a session at once.</p>
+				<p>The runbook lives in each workload account (deployed by StackSets) because <code>aws:approve</code> isn't supported in executions spanning several accounts or Regions. Responders run it from an OpsItem; the approval topic name must start with <code>Automation</code>.</p>
+				<span class="file">IR-IsolateInstance, this page's version: tag, protect and snapshot first, then wait for approval, then isolate (Automation runbook, YAML, workload account)</span>
+<pre><code>description: Preserve evidence from an instance, then isolate it after a responder approves.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+  InstanceId:
+    type: String
+  IsolationGroupId:
+    type: String
+  CaseId:
+    type: String
+mainSteps:
+  - name: tagInstance
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateTags
+      Resources:
+        - '{{ InstanceId }}'
+      Tags:
+        - Key: ir-case
+          Value: '{{ CaseId }}'
+  - name: protectInstance
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: ModifyInstanceAttribute
+      InstanceId: '{{ InstanceId }}'
+      DisableApiTermination:
+        Value: true
+  - name: snapshotVolumes
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateSnapshots
+      InstanceSpecification:
+        InstanceId: '{{ InstanceId }}'
+      Description: 'IR evidence {{ CaseId }}'
+      CopyTagsFromSource: volume
+  - name: approveIsolation
+    action: aws:approve
+    # an unanswered request aborts after an hour (default 7 days)
+    timeoutSeconds: 3600
+    onFailure: Abort
+    inputs:
+      NotificationArn: arn:aws:sns:us-east-1:111111111111:AutomationIRApprovals
+      Message: 'Evidence captured for {{ InstanceId }} ({{ CaseId }}). Isolate it now?'
+      MinRequiredApprovals: 1
+      Approvers:
+        - arn:aws:iam::111111111111:role/IncidentResponder
+  - name: isolateInstance
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: ModifyInstanceAttribute
+      InstanceId: '{{ InstanceId }}'
+      Groups:
+        - '{{ IsolationGroupId }}'
+    isEnd: true</code></pre>
+				<p>The automatic path from Rule 1 is the <code>ec2-compromise-response</code> Standard workflow in the security tooling account, built as on <a href="../d2-task-2-1.html#s4">Task 2.1</a>. A first Lambda state drops sample findings (marked in the finding's additional information) and exempt instances; the evidence steps run through <code>IRAutomationRole</code> in the finding's account; then an <code>sns:publish.waitForTaskToken</code> task to <code>ir-approvals</code> pauses until the approval link returns the token. After an hour unanswered, the workflow escalates to the incident lead instead of isolating.</p>
+				<span class="file">Rule 1's target: pass only what the workflow needs (EventBridge targets file for put-targets)</span>
+<pre><code>[
+  {
+    "Id": "ec2-compromise-response",
+    "Arn": "arn:aws:states:us-east-1:222222222222:stateMachine:ec2-compromise-response",
+    "RoleArn": "arn:aws:iam::222222222222:role/EventBridgeStartIRWorkflows",
+    "InputTransformer": {
+      "InputPathsMap": {
+        "account": "$.detail.accountId",
+        "instance": "$.detail.resource.instanceDetails.instanceId",
+        "finding": "$.detail.id",
+        "type": "$.detail.type"
+      },
+      "InputTemplate": "{\"accountId\": &lt;account&gt;, \"instanceId\": &lt;instance&gt;, \"findingId\": &lt;finding&gt;, \"findingType\": &lt;type&gt;}"
+    }
+  }
+]</code></pre>
+				<span class="file">What the approval handler sends back to the paused workflow (AWS CLI equivalent)</span>
+<pre><code><span class="c"># The token arrived in the SNS message; the output becomes the result of the approval state</span>
+aws stepfunctions send-task-success \
+  --task-token "$TASK_TOKEN" \
+  --task-output '{"approved": true, "approver": "oncall-responder"}'</code></pre>
+				<p>Then the case leaves this design: Detective compares the instance role's activity with its 45-day baseline, and memory capture, snapshot sharing and analysis happen in the forensics account <code>666666666666</code> (the incident response and forensics page; <a href="../d2-task-2-2.html#s1">Task 2.2</a>).</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Exposed IAM access key</h3>
+				<p>Exposed long-term keys are the top entry point AWS's responders see. When AWS finds a key in a public repository, AWS Health raises <code>AWS_RISK_CREDENTIALS_EXPOSED</code>, and AWS attaches <code>AWSCompromisedKeyQuarantineV3</code> to the user and opens a support case. The quarantine limits the damage; it doesn't fix it.</p>
+				<p>IAM is global, so its Health events appear only in <code>us-east-1</code>. With the organizational view delegated to <code>222222222222</code>, member events arrive on that account's bus and one rule covers the organization.</p>
+				<span class="file">Rule 5: AWS found one of our access keys in public (EventBridge event pattern, us-east-1, security tooling account)</span>
+<pre><code>{
+  "source": ["aws.health"],
+  "detail-type": ["AWS Health Event"],
+  "detail": {
+    "service": ["RISK"],
+    "eventTypeCode": ["AWS_RISK_CREDENTIALS_EXPOSED"]
+  }
+}</code></pre>
+				<p>The target is a Lambda function, since each action is quick and safe without approval. It reads <code>detail.affectedAccount</code> and <code>detail.affectedEntities</code>, assumes <code>IRAutomationRole</code> in that account, and <strong>deactivates</strong> the key (reversible, keeps the key ID, and kills presigned URLs it signed). It then denies sessions issued before now, because temporary credentials made with the key outlive it, and posts the key's recent CloudTrail activity to the case.</p>
+				<span class="file">Deactivate the key and deny older sessions for the user (AWS CLI equivalent, workload account)</span>
+<pre><code>aws iam update-access-key --user-name app-user --access-key-id AKIAIOSFODNN7EXAMPLE --status Inactive
+
+<span class="c"># deny-older-sessions.json denies "*" when aws:TokenIssueTime is before the moment of containment</span>
+aws iam put-user-policy \
+  --user-name app-user \
+  --policy-name ir-revoke-older-sessions \
+  --policy-document file://deny-older-sessions.json</code></pre>
+				<span class="file">deny-older-sessions.json (IAM inline policy; the time is set by the function)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": {
+    "Effect": "Deny",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {
+      "DateLessThan": { "aws:TokenIssueTime": "2026-11-16T09:15:00Z" }
+    }
+  }
+}</code></pre>
+				<p>The function leaves the quarantine policy alone, as AWS instructs. Eradication in every Region and replacing the key with a role belong to the responders (<a href="../d2-task-2-2.html#s4">Task 2.2</a>); for a role, revoke sessions attaches <code>AWSRevokeOlderSessions</code> instead.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Crypto-mining on EKS</h3>
+				<p>Runtime Monitoring's agent on <code>prod-eks</code> reports process activity, and a miner starting in a pod raises <code>Impact:Runtime/CryptoMinerExecuted</code> or <code>CryptoCurrency:Runtime/BitcoinTool.B</code>. The finding names the cluster (<code>eksClusterDetails</code>), the workload and its namespace (<code>kubernetesDetails</code>), the container and the process. Related signals may become <code>AttackSequence:EKS/CompromisedCluster</code>, which Rule 2 pages on. Runtime fields can be attacker-controlled, so the notifier encodes them before display.</p>
+				<span class="file">Rule 6: mining in a container (EventBridge event pattern)</span>
+<pre><code>{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Finding"],
+  "detail": {
+    "type": ["Impact:Runtime/CryptoMinerExecuted", "CryptoCurrency:Runtime/BitcoinTool.B"]
+  }
+}</code></pre>
+				<p>Following AWS's EKS guidance: label the pod so the pre-staged deny-all NetworkPolicy from Task 2.2 isolates it, cordon the node, and keep the pod running for evidence. If one pod of a Deployment is compromised, assume all are. Rule 6 opens a case and pages the on-call responder, who runs these commands once the containment is approved.</p>
+				<span class="file">Quarantine the pod and the node (kubectl, responder access to prod-eks)</span>
+<pre><code><span class="c"># the ir-deny-all NetworkPolicy selects pods labelled status=quarantine</span>
+kubectl label pod POD_NAME -n shop status=quarantine
+
+<span class="c"># find the node, then stop new pods landing on it</span>
+kubectl get pods POD_NAME -n shop -o=jsonpath='{.spec.nodeName}'
+kubectl cordon NODE_NAME</code></pre>
+				<p>A privileged container or node-level identity means the node is compromised and a network policy won't help: the node goes through Step 4 and its role loses its permissions. Fargate pods can't be cordoned. Eradication means rebuilding from a clean image, using Inspector to find how it was exploited, and hunting for new instances, keys or roles in unused Regions.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Rules in the administrator account, not in every member</h4>
+				<p>One set of rules in <code>222222222222</code> covers the organization, including future accounts, and member administrators can't change it. The cost is a response role in every workload account: <code>IRAutomationRole</code>, deployed by StackSets, trusting only the security tooling account's automation roles, and protected by an SCP.</p>
+			</div>
+			<div class="entry">
+				<h4>Automate by blast radius and reversibility</h4>
+				<p>The company sorts actions into three groups. Fully automatic: reversible, narrow actions (Block Public Access on one bucket, deactivating one key, denying old sessions). Automatic evidence, human approval: anything that affects a running workload (isolating an instance, cordoning a node). Human only: destructive steps (terminating, deleting users, rotating shared secrets). This matches AWS's guidance that playbook steps become automation once they have proved consistent.</p>
+			</div>
+			<div class="entry">
+				<h4>Where the approval lives</h4>
+				<p>Step Functions with a task token is the main path: it runs in one account, waits up to a year in a Standard workflow, branches on rejection or timeout, and the approval can come from chat or a ticket. A runbook with <code>aws:approve</code> is the single-account path that responders start from OpsCenter; it is simpler, but approvers are listed as IAM principals and it can't be used in multi-account executions.</p>
+			</div>
+			<div class="entry">
+				<h4>Route on Security Hub CSPM for tickets, on GuardDuty for threats</h4>
+				<p>Threat playbooks take GuardDuty events directly: near real time, with the detail they need. Tickets come from Security Hub CSPM, where every source looks the same after the automation rules. GuardDuty alone would miss Inspector, Macie and control findings.</p>
+			</div>
+			<div class="entry">
+				<h4>ASR for posture, own code for threats</h4>
+				<p>ASR gives AWS-maintained remediations for many Security Hub CSPM controls, so the company writes none of those. Threat playbooks depend on the company's account layout, forensics process and approval rules, so they are the company's own code, kept small and tested every quarter.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>GuardDuty protection plans are priced separately, and CloudWatch usage metrics for each plan show what they process, so the company reviews them before adding plans in Regions it doesn't use (foundational detection stays on everywhere). Security Hub CSPM charges per check and per finding ingested beyond the free tier, and for automation rule evaluations beyond the first million; the new Security Hub is priced per resource unit.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>AWS Security Incident Response</h4>
+				<p>The managed service triages GuardDuty findings and third-party findings that arrive through Security Hub CSPM, opens cases, and gives access to AWS responders 24 hours a day. Its containment runbooks (<code>AWSSupport-ContainEC2Instance</code>, <code>AWSSupport-ContainIAMPrincipal</code>, <code>AWSSupport-ContainS3Resource</code>) are reversible and default to a dry run. It suits a team without round-the-clock cover, and can sit alongside this design; it doesn't do disk or memory forensics or recovery.</p>
+			</div>
+			<div class="entry">
+				<h4>An organization event bus</h4>
+				<p>Member accounts could forward GuardDuty events to the <code>security-events</code> bus, but that duplicates the delegated administrator's feed and needs a rule in every account and Region.</p>
+			</div>
+			<div class="entry">
+				<h4>A SIEM over Security Lake</h4>
+				<p>Security Lake normalizes logs and Security Hub CSPM findings into OCSF for a SIEM or Athena, which suits correlation with non-AWS sources and long retention. It is analysis, not response; this design's playbooks still start from EventBridge. The security data lake page covers it.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check every pattern against a real event</span><span class="desc">Save a sample event for each rule (the EventBridge console offers a GuardDuty Finding sample event) and run <code>aws events test-event-pattern --event-pattern file://rule1.json --event file://sample-finding.json</code>; it returns <code>{"Result": true}</code> or false. Check a non-matching event for each rule as well.</span></li>
+				<li><span class="name">Fire sample findings end to end</span><span class="desc">In the test account <code>101010101010</code>, <code>aws guardduty create-sample-findings --detector-id DETECTOR_ID --finding-types Backdoor:EC2/C&amp;CActivity.B</code> generates a finding marked [SAMPLE]. It must reach chat, open a ticket and start the workflow, and the workflow must stop at its first state because the finding is a sample. Then run once with the sample check off against a test instance, to prove isolation works.</span></li>
+				<li><span class="name">Generate real findings</span><span class="desc">The GuardDuty tester (awslabs/amazon-guardduty-tester) produces real findings in a dedicated non-production account; it may enable protection plans, so only the test account is used.</span></li>
+				<li><span class="name">Check the tuning</span><span class="desc">After creating a suppression rule, a matching sample finding must not appear in EventBridge or Security Hub CSPM, and a finding with only one of the two criteria still must. A finding on a <code>env=prod</code> resource must arrive in CSPM as HIGH.</span></li>
+				<li><span class="name">Game day</span><span class="desc">Every quarter the team runs the four playbooks against non-production workloads, with an FIS experiment running the isolation runbook while the application is under load (<a href="../d2-task-2-1.html#s3">Task 2.1</a>). A tabletop covers who approves at night and when to engage AWS.</span></li>
+				<li><span class="name">Measure</span><span class="desc">For each playbook: time from finding creation to containment (from the finding's <code>createdAt</code> and the workflow's end), time to close, and the share of findings closed as false positives (a finding's <code>VerificationState</code> of <code>FALSE_POSITIVE</code>). A rising false positive rate means a suppression rule or trusted list is due; containments that time out waiting for approval mean the on-call process needs work.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Monitoring and Alerting for an Account or Organization</td><td data-label="What this architecture demonstrates">GuardDuty protection plans and attack sequences, Security Hub CSPM aggregation and automation rules, the new Security Hub, EventBridge rules in the administrator account, Health events in us-east-1</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Troubleshoot Monitoring, Logging and Alerting</td><td data-label="What this architecture demonstrates">Rules in the wrong Region, patterns that don't match, suppressed findings that never arrive, encrypted SNS targets</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design and Test an Incident Response Plan</td><td data-label="What this architecture demonstrates">Automation runbooks with aws:approve, Step Functions with a task token, Automated Security Response on AWS, sample findings, test-event-pattern and game days</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Respond to Security Events</td><td data-label="What this architecture demonstrates">Evidence before isolation, security group isolation and its limits, deactivating keys and denying older sessions, EKS pod and node quarantine, Detective</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Compute Workload Security Controls</td><td data-label="What this architecture demonstrates">GuardDuty Runtime Monitoring findings for miners in containers, Inspector findings for how the workload was exploited</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Automatically respond to GuardDuty findings across all accounts with the least operational overhead" is an <strong>EventBridge rule in the GuardDuty delegated administrator account</strong> with a Lambda, Step Functions or Automation target, not a rule in every member account. "A person must approve before the instance is isolated" is <strong>Step Functions with .waitForTaskToken</strong> or a runbook with <strong>aws:approve</strong>. "Remediate Security Hub control findings with AWS-maintained playbooks" is <strong>Automated Security Response on AWS</strong>. "An access key was published on GitHub" is an EventBridge rule on <strong>AWS_RISK_CREDENTIALS_EXPOSED in us-east-1</strong> that deactivates the key. "Stop a scanner's findings without hiding real attacks" is a <strong>suppression rule with two criteria</strong> or a trusted list, not disabling GuardDuty or a broad filter.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/streamline-security-response-at-scale-with-aws-security-hub-automation/">Streamline security response at scale with AWS Security Hub automation</a> (January 2026): automation rules and EventBridge integrations in the new Security Hub for routing and responding to findings.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/reduce-alert-fatigue-by-customizing-threat-detection-features-in-amazon-guardduty/">Reduce alert fatigue by customizing threat detection features in Amazon GuardDuty</a> (November 2026): tuning protection plans, trusted and threat lists and suppression rules so that findings become actionable.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/navigating-amazon-guardduty-protection-plans-and-extended-threat-detection/">Navigating Amazon GuardDuty protection plans and Extended Threat Detection</a> (September 2025): which protection plans to enable and how attack sequences use them.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/testing-and-evaluating-guardduty-detections/">Testing and evaluating GuardDuty detections</a> (January 2025): sample findings and the tester scripts for validating the detection and response pipeline.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/detecting-and-preventing-crypto-mining-in-your-aws-environment/">Detecting and preventing crypto mining in your AWS environment</a> (May 2026): the GuardDuty findings, preventive controls and response steps behind the EKS playbook.</li>
+				<li><a href="https://docs.aws.amazon.com/solutions/latest/automated-security-response-on-aws/solution-overview.html">Automated Security Response on AWS implementation guide</a> (AWS Solutions): admin and member stacks, playbooks, and how remediations are started.</li>
+				<li><a href="https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_findings_eventbridge.html">Processing GuardDuty findings with Amazon EventBridge</a> (GuardDuty User Guide): event format, notification frequency and multi-account rules.</li>
+				<li><a href="https://docs.aws.amazon.com/security-ir/latest/userguide/what-is.html">AWS Security Incident Response User Guide</a> (AWS documentation): where the former incident response whitepaper's guidance on containment, eradication and recovery now lives.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
