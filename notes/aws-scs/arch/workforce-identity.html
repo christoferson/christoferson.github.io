@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Workforce Identity and Temporary Elevated Access | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: IAM Identity Center as an organization instance delegated to the identity account, an external IdP with SAML 2.0 and SCIM, MFA and session settings, permission sets with customer managed policies and permissions boundaries, group assignments per account, ABAC with attributes for access control, break-glass and emergency access, centralized root access, just-in-time elevation with TEAM, workload identity in contrast, and sign-in monitoring.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Workforce identity</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Workforce identity and temporary elevated access</h1>
+		<p>Every employee signs in once, through the corporate identity provider, and lands in the accounts their groups allow with short-lived role credentials. Day-to-day access is read-mostly and tag-scoped; production changes need an approved, time-boxed elevation; and when the normal path fails there is a sealed, alerted way in that nobody uses otherwise.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 4</span><span class="tag">Domain 6</span><span class="tag">Domain 1</span><span class="tag">IAM Identity Center</span><span class="tag">Permission sets</span><span class="tag">ABAC</span><span class="tag">TEAM</span><span class="tag">Break-glass</span><span class="tag">Access Analyzer</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Instance, delegation and IdP</a></li>
+				<li class="sub"><a href="#b2">2. Permission sets</a></li>
+				<li class="sub"><a href="#b3">3. Group assignments</a></li>
+				<li class="sub"><a href="#b4">4. Attributes for access control</a></li>
+				<li class="sub"><a href="#b5">5. Just-in-time elevation</a></li>
+				<li class="sub"><a href="#b6">6. Break-glass and root</a></li>
+				<li class="sub"><a href="#b7">7. Monitoring and the CLI</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) already has its accounts laid out as the <a href="security-baseline.html">security baseline</a> describes, with IAM Identity Center and centralized root access delegated to the identity account <code>666600006666</code>. What it lacks is a coherent access design: some teams federate straight into accounts, contractors have IAM users with keys, and the platform team holds standing administrator access to production. Everyone, contractors included, lives in the corporate identity provider (IdP).</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">One sign-in for every account, no IAM users for people</td><td data-label="Design choice">Identity Center organization instance, external IdP over SAML 2.0, users and groups provisioned by SCIM</td></tr>
+						<tr><td data-label="Requirement">The management account isn't used to run access</td><td data-label="Design choice">Delegated administration to the identity account; only the tasks that must stay are done in the management account</td></tr>
+						<tr><td data-label="Requirement">Access by job function, scoped to the team's own resources</td><td data-label="Design choice">Permission sets per job (RBAC) with ABAC conditions on session tags from the IdP</td></tr>
+						<tr><td data-label="Requirement">No standing write access to production</td><td data-label="Design choice">Time-boxed, approved assignments through TEAM, with audit</td></tr>
+						<tr><td data-label="Requirement">Access survives an Identity Center or IdP outage</td><td data-label="Design choice">AWS's emergency access configuration plus sealed break-glass users, alerted on every use</td></tr>
+						<tr><td data-label="Requirement">No root credentials in member accounts</td><td data-label="Design choice">Centralized root access with <code>assume-root</code> from the identity account</td></tr>
+						<tr><td data-label="Requirement">Unused and risky access is found, not guessed</td><td data-label="Design choice">Sign-in events in the organization trail, EventBridge alerts, Access Analyzer unused access findings</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from other pages: root <code>r-abcd</code>, Workloads OU <code>ou-abcd-33333333</code> with Prod OU <code>ou-abcd-11111111</code> and Non-prod OU <code>ou-abcd-22222222</code>, Security OU <code>ou-abcd-66666666</code>, Forensics OU <code>ou-abcd-55555555</code>, <code>prod-payments</code> <code>121212121212</code>, security tooling <code>222222222222</code>, log archive <code>444444444444</code>, the <code>IncidentResponder</code> permission set (<a href="incident-forensics.html">incident response</a>), and the start URL and <code>ops-break-glass</code> name from Task 4.1. New on this page: the emergency operations account <code>131313131313</code> in the Security OU, the Identity Center instance <code>ssoins-1111222233334444</code> with home Region <code>us-east-1</code>, and the IdP groups below.</p>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 320" role="img" aria-labelledby="dgW-wide-t">
+<title id="dgW-wide-t">Workforce identity: a payments developer signs in through the corporate IdP, which provisions users and groups into IAM Identity Center with SCIM; Identity Center, administered from the identity account, assigns permission sets to the non-prod accounts and prod-payments; a production change is requested in the TEAM app, approved by the approver group, and granted as a time-boxed assignment; break-glass access federates directly to the emergency operations account; events go to the organization trail.</title>
+<path d="M170.0 160.0 L210.0 160.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 160.0 L420.0 160.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 153.0 L593.0 153.0 Q600.0 153.0 600.0 146.0 L600.0 107.0 Q600.0 100.0 607.0 100.0 L620.0 100.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 167.0 L593.0 167.0 Q600.0 167.0 600.0 174.0 L600.0 213.0 Q600.0 220.0 607.0 220.0 L620.0 220.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M90.0 137.0 L90.0 68.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="96" y="106" class="dg-lbl dg-halo" text-anchor="start" fill="var(--warn)">request</text>
+<path d="M210.0 45.0 L170.0 45.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M90.0 22.0 L90.0 15.0 Q90.0 8.0 97.0 8.0 L493.0 8.0 Q500.0 8.0 500.0 15.0 L500.0 137.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M290.0 183.0 L290.0 257.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="296" y="224" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">break-glass</text>
+<path d="M500.0 183.0 L500.0 257.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<rect x="10" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="42" class="dg-t dg-sm">TEAM app</text>
+<text x="90" y="59" class="dg-s dg-sm2">request, 1 hour</text>
+<rect x="210" y="22" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="42" class="dg-t dg-sm">Approver group</text>
+<text x="290" y="59" class="dg-s dg-sm2">not the requester</text>
+<rect x="10" y="137" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="157" class="dg-t dg-sm">Payments developer</text>
+<text x="90" y="174" class="dg-s dg-sm2">IdP group member</text>
+<rect x="210" y="137" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="157" class="dg-t dg-sm">Corporate IdP</text>
+<text x="290" y="174" class="dg-s dg-sm2">SAML, SCIM, MFA</text>
+<rect x="420" y="137" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="157" class="dg-t dg-sm">IAM Identity Center</text>
+<text x="500" y="174" class="dg-s dg-sm2">admin 666600006666</text>
+<rect x="620" y="77" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="97" class="dg-t dg-sm">Non-prod accounts</text>
+<text x="700" y="114" class="dg-s dg-sm2">DeveloperAccess</text>
+<rect x="620" y="197" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="217" class="dg-t dg-sm">prod-payments</text>
+<text x="700" y="234" class="dg-s dg-sm2">ReadOnly; ProdChange</text>
+<rect x="210" y="257" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="277" class="dg-t dg-sm">Emergency operations</text>
+<text x="290" y="294" class="dg-s dg-sm2">131313131313</text>
+<rect x="420" y="257" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="277" class="dg-t dg-sm">Org trail, alerts</text>
+<text x="500" y="294" class="dg-s dg-sm2">444444444444</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgW-tall-t">
+<title id="dgW-tall-t">Workforce identity: a payments developer signs in through the corporate IdP, which provisions users and groups into IAM Identity Center with SCIM; Identity Center, administered from the identity account, assigns permission sets to the non-prod accounts and prod-payments; a production change is requested in the TEAM app, approved by the approver group, and granted as a time-boxed assignment; break-glass access federates directly to the emergency operations account; events go to the organization trail.</title>
+<path d="M180.0 150.0 L220.0 150.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 173.0 L300.0 200.5 Q300.0 207.5 293.0 207.5 L207.0 207.5 Q200.0 207.5 200.0 214.5 L200.0 242.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M193.0 288.0 L193.0 315.5 Q193.0 322.5 186.0 322.5 L107.0 322.5 Q100.0 322.5 100.0 329.5 L100.0 357.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M207.0 288.0 L207.0 315.5 Q207.0 322.5 214.0 322.5 L293.0 322.5 Q300.0 322.5 300.0 329.5 L300.0 357.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 127.0 L100.0 102.0 Q100.0 95.0 107.0 95.0 L293.0 95.0 Q300.0 95.0 300.0 88.0 L300.0 63.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M380.0 40.0 L386.0 40.0 Q392.0 40.0 392.0 46.0 L392.0 258.0 Q392.0 265.0 385.0 265.0 L280.0 265.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M120.0 265.0 L15.0 265.0 Q8.0 265.0 8.0 272.0 L8.0 474.0 Q8.0 480.0 14.0 480.0 L20.0 480.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">TEAM app</text>
+<text x="300" y="54" class="dg-s dg-sm2">request, 1 hour</text>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Approver group</text>
+<text x="100" y="54" class="dg-s dg-sm2">not the requester</text>
+<rect x="20" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="147" class="dg-t dg-sm">Payments developer</text>
+<text x="100" y="164" class="dg-s dg-sm2">IdP group member</text>
+<rect x="220" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="147" class="dg-t dg-sm">Corporate IdP</text>
+<text x="300" y="164" class="dg-s dg-sm2">SAML, SCIM, MFA</text>
+<rect x="120" y="242" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="200" y="262" class="dg-t dg-sm">IAM Identity Center</text>
+<text x="200" y="279" class="dg-s dg-sm2">admin 666600006666</text>
+<rect x="20" y="357" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="377" class="dg-t dg-sm">Non-prod accounts</text>
+<text x="100" y="394" class="dg-s dg-sm2">DeveloperAccess</text>
+<rect x="220" y="357" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="377" class="dg-t dg-sm">prod-payments</text>
+<text x="300" y="394" class="dg-s dg-sm2">ReadOnly; ProdChange</text>
+<rect x="20" y="457" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="477" class="dg-t dg-sm">Org trail, alerts</text>
+<text x="100" y="494" class="dg-s dg-sm2">444444444444</text>
+</svg>
+				<figcaption>Figure: one developer's access. The corporate IdP authenticates with MFA and provisions users and groups into Identity Center over SCIM (blue); Identity Center, delegated to <code>666600006666</code>, turns group assignments into roles in each account, with session tags for attribute-based access (green). Elevated access to production is requested in TEAM, approved by someone else and granted as an assignment that is removed when the time runs out (yellow). Break-glass access (dashed, desktop view) federates directly to the emergency operations account so it works even if Identity Center doesn't, and every sign-in is recorded and alerted on.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>One payments developer, one normal day and one production change. Steps marked <span class="who auto">AWS</span> happen without anyone acting.</p>
+			<ol class="flow">
+				<li class="group">Provisioned before the first sign-in</li>
+				<li><span class="name">Joiner added in the IdP<span class="who">HR and IdP admins</span></span><span class="desc">The developer is created in the corporate IdP with department and cost center attributes, and added to the group <code>aws-payments-developers</code>.</span></li>
+				<li class="auto"><span class="name">SCIM pushes user and group<span class="who auto">AWS</span></span><span class="desc">The IdP's SCIM client creates the user and group membership in Identity Center. Users must exist there before they can sign in; SAML doesn't create them on the fly.</span></li>
+				<li class="group">Daily access</li>
+				<li><span class="name">Sign in at the access portal<span class="who">Developer</span></span><span class="desc">The start URL redirects to the IdP, which checks the password and MFA and sends a SAML assertion back. Identity Center's own MFA settings don't apply to IdP users.</span></li>
+				<li class="auto"><span class="name">Portal shows assigned accounts<span class="who auto">AWS</span></span><span class="desc">The group is assigned <code>DeveloperAccess</code> in the non-prod accounts and <code>ReadOnlyAccess</code> in <code>121212121212</code>. The portal session lasts 8 hours by default.</span></li>
+				<li class="auto"><span class="name">Role session with session tags<span class="who auto">AWS</span></span><span class="desc">Choosing an account assumes the <code>AWSReservedSSO_DeveloperAccess_...</code> role there. Attributes for access control add <code>CostCenter</code> and <code>Department</code> as session tags, which the permission set's ABAC conditions compare with resource tags.</span></li>
+				<li class="group">A production change</li>
+				<li><span class="name">Request elevation<span class="who">Developer</span></span><span class="desc">In the TEAM application tile, request <code>ProdChange</code> on <code>121212121212</code> for one hour, with the change ticket as justification.</span></li>
+				<li><span class="name">Approve<span class="who">Approver group</span></span><span class="desc">A member of the payments approvers group approves; the company keeps requesters out of the approver groups for their own accounts. Unanswered requests expire.</span></li>
+				<li class="auto"><span class="name">Assignment granted, then removed<span class="who auto">AWS</span></span><span class="desc">TEAM's workflow creates the account assignment for that user, waits the approved duration, then removes it. The session activity is kept for auditors.</span></li>
+				<li class="group">Watched throughout</li>
+				<li class="auto"><span class="name">Events reach the security team<span class="who auto">AWS</span></span><span class="desc">Sign-in, assignment and role events go to the organization trail in <code>444444444444</code>; EventBridge rules page the team on root or break-glass sign-ins; unused access findings land in <code>222222222222</code>.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Organization instance, delegated administration and the external IdP</h3>
+				<p>Only an <strong>organization instance</strong> of Identity Center gives permission sets for multi-account access (<a href="../d4-task-4-1.html#s1">Task 4.1</a>). The instance always resides in the management account; registering <code>666600006666</code> as delegated administrator moves most administration out of it.</p>
+				<p>AWS's delegated administration guidance says what stays in the management account:</p>
+				<ul>
+					<li><strong>Management account access.</strong> Permission sets provisioned to the management account can only be changed by an Identity Center administrator in the management account; the delegated administrator can't alter them.</li>
+					<li><strong>Users, not groups, there.</strong> Assign users directly to management account permission sets; otherwise whoever controls group membership (the IdP admin included) decides who reaches it.</li>
+					<li><strong>Enabling and delegating.</strong> Turning Identity Center on and registering or deregistering the delegated administrator happen in the management account.</li>
+				</ul>
+				<p>AWS also recommends separating <strong>configuration</strong> (identity source, SCIM tokens, session timeouts) from <strong>permission set management</strong>: the company has <code>IdentityCenterConfigAdmin</code> and <code>PermissionSetAdmin</code>.</p>
+				<p><strong>Identity source.</strong> The external IdP is connected with SAML 2.0 for sign-in and SCIM for provisioning. The SAML NameID must match the SCIM user name. SCIM access tokens expire after one year (reminders start 90 days before); an expired token stops sync silently, so joiners can't sign in and leavers keep access.</p>
+								<span class="file">Stop identity account admins adding users to groups or creating SCIM bearer tokens (SCP from AWS's delegated administration guidance, attached to 666600006666)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdpOwnsGroupMembership",
+      "Effect": "Deny",
+      "Action": ["identitystore:CreateGroupMembership"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "NoScimTokensFromDelegatedAdmin",
+      "Effect": "Deny",
+      "Action": ["sso-directory:CreateBearerToken"],
+      "Resource": ["*"]
+    }
+  ]
+}</code></pre>
+				<p>SCIM sync is unaffected; the yearly token rotation lifts the second statement for a short, recorded window.</p>
+				<p><strong>MFA and sessions.</strong> With an external IdP, the IdP enforces MFA (phishing-resistant factors for the AWS application); Identity Center's MFA settings apply only to its own directory and AD sources. The portal session keeps its 8-hour default (15 minutes to 90 days); role sessions (1 to 12 hours per permission set) run independently, so disabling a user doesn't end sessions already issued (<a href="../d2-task-2-2.html#s4">Task 2.2</a> covers containment).</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Permission sets: managed, customer managed, inline and a boundary</h3>
+				<p>A permission set holds AWS managed policies, customer managed policies referenced by name, one inline policy and an optional permissions boundary, plus the session duration. Assigning it creates a protected <code>AWSReservedSSO_</code> role in each account; editing that role in IAM fails, and every change goes through Identity Center. The company's catalogue is short:</p>
+				<ul>
+					<li><code>ReadOnlyAccess</code>: the AWS managed <code>ReadOnlyAccess</code> policy, 8 hours, for every engineer in the accounts their team uses.</li>
+					<li><code>DeveloperAccess</code>: a customer managed policy plus an ABAC inline policy (Step 4) and a boundary, 8 hours, non-prod only.</li>
+					<li><code>ProdChange</code>: change rights in production, <strong>never assigned permanently</strong>; only TEAM assigns it, for 1 hour.</li>
+					<li><code>PlatformAdmin</code> and <code>IncidentResponder</code>: broad rights for the platform and response teams, both eligible through TEAM rather than standing (the responders' use is described on the <a href="incident-forensics.html">incident response</a> page).</li>
+					<li><code>MgmtAdmin</code> and the two admin sets from Step 1: assigned to named users.</li>
+				</ul>
+				<span class="file">Create DeveloperAccess with an 8-hour session (AWS CLI, identity account 666600006666, us-east-1)</span>
+<pre><code><span class="c"># The instance ARN comes from aws sso-admin list-instances; session duration is ISO-8601</span>
+aws sso-admin create-permission-set \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --name DeveloperAccess \
+  --description "Workload developers, non-prod, scoped by CostCenter tag" \
+  --session-duration PT8H \
+  --tags Key=owner,Value=identity-team</code></pre>
+				<p><strong>Customer managed policies by name and path.</strong> A permission set only <em>references</em> a customer managed policy; Identity Center doesn't create it. A policy with <strong>the same name and path must already exist in every account</strong> the permission set is assigned to, or provisioning there fails (<a href="../d4-task-4-1.html#s3">Task 4.1</a>). A service-managed stack set deploys <code>/company/workload-developer</code> and <code>/company/developer-boundary</code> to the Workloads OU <code>ou-abcd-33333333</code> first, and auto-deployment covers new accounts.</p>
+				<span class="file">Reference the customer managed policy, set the boundary and add the inline ABAC policy (AWS CLI, identity account)</span>
+<pre><code><span class="c"># The policy must exist as /company/workload-developer in every assigned account</span>
+aws sso-admin attach-customer-managed-policy-reference-to-permission-set \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-aaaa1111bbbb2222 \
+  --customer-managed-policy-reference Name=workload-developer,Path=/company/
+
+<span class="c"># A boundary can be an AWS managed policy ARN or a customer managed reference; this one caps the whole role</span>
+aws sso-admin put-permissions-boundary-to-permission-set \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-aaaa1111bbbb2222 \
+  --permissions-boundary 'CustomerManagedPolicyReference={Name=developer-boundary,Path=/company/}'
+
+<span class="c"># One inline policy per permission set (up to 32,768 characters); it replaces any previous one</span>
+aws sso-admin put-inline-policy-to-permission-set \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-aaaa1111bbbb2222 \
+  --inline-policy file://developer-abac.json
+
+<span class="c"># Changes reach accounts that already have the permission set only when it is re-provisioned</span>
+aws sso-admin provision-permission-set \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-aaaa1111bbbb2222 \
+  --target-type ALL_PROVISIONED_ACCOUNTS</code></pre>
+				<p>The <strong>permissions boundary</strong> caps whatever inline policy the access team adds: effective permissions are the intersection with <code>developer-boundary</code>, which denies IAM user creation, changes to the organization trail and any action on resources under the <code>/aws-reserved/sso.amazonaws.com/</code> path (<a href="../d4-task-4-2.html#s3">Task 4.2</a>).</p>
+				<div class="callout trap"><p>Editing a permission set doesn't change roles already provisioned. <code>create-account-assignment</code> provisions the current version to a new account, but existing accounts keep the old policies until <code>provision-permission-set</code> runs, so "we fixed the permission set but users still have the old access" means it wasn't re-provisioned.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Assign groups to accounts, OU by OU</h3>
+				<p>Assignments are always <strong>group + permission set + account</strong>; the target type is <code>AWS_ACCOUNT</code> only, so there's no single "assign to this OU" call. An assignment pipeline in the identity account reads a mapping of group, permission set and OU, lists each OU's accounts and creates missing assignments; it also runs when Account Factory vends an account, so <code>prod-payments</code> gets its assignments with no manual step.</p>
+				<ul>
+					<li><strong>Non-prod OU</strong> <code>ou-abcd-22222222</code>: <code>aws-payments-developers</code> &rarr; <code>DeveloperAccess</code> and <code>ReadOnlyAccess</code>.</li>
+					<li><strong>Prod OU</strong> <code>ou-abcd-11111111</code>: <code>aws-payments-developers</code> &rarr; <code>ReadOnlyAccess</code>; <code>ProdChange</code> only through TEAM.</li>
+					<li><strong>Security OU</strong> <code>ou-abcd-66666666</code>: <code>aws-security-analysts</code> &rarr; read and investigation permission sets in <code>222222222222</code> and <code>444444444444</code>.</li>
+					<li><strong>Forensics OU</strong> <code>ou-abcd-55555555</code> and every workload account: <code>IncidentResponder</code> eligible for <code>aws-incident-responders</code> through TEAM.</li>
+					<li><strong>Management account</strong> <code>555555555555</code>: <code>MgmtAdmin</code> assigned to two named users, done from the management account.</li>
+				</ul>
+				<span class="file">One assignment: the payments developers read-only in prod-payments (AWS CLI, identity account)</span>
+<pre><code><span class="c"># principal-id is the Identity Center group ID (from aws identitystore list-groups); the call is asynchronous</span>
+aws sso-admin create-account-assignment \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --target-id 121212121212 \
+  --target-type AWS_ACCOUNT \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-cccc3333dddd4444 \
+  --principal-type GROUP \
+  --principal-id PAYMENTS_DEVELOPERS_GROUP_ID</code></pre>
+				<p>The call returns a status and request ID; the pipeline polls <code>DescribeAccountAssignmentCreationStatus</code> and fails on <code>FAILED</code>, catching a missing customer managed policy before users do.</p>
+				<p>Group assignment makes leavers safe: removal from the IdP group removes access everywhere on the next sync. Direct user assignments are only for the management account and TEAM grants.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Attribute-based access control with attributes for access control</h3>
+				<p>Job-function permission sets would multiply if each team needed its own. Instead <code>DeveloperAccess</code> is one permission set whose conditions compare the caller's <strong>session tags</strong> with <strong>resource tags</strong> (RBAC outside, ABAC inside, as <a href="../d4-task-4-2.html#s2">Task 4.2</a> recommends).</p>
+				<p>Identity Center passes user attributes as session tags when <strong>attributes for access control</strong> is enabled. With an external IdP there are two ways: map attributes from the Identity Center identity store (which SCIM fills) in the instance configuration, or have the IdP send them in the SAML assertion as <code>https://aws.amazon.com/SAML/Attributes/AccessControl:CostCenter</code>. If both supply the same key, the <strong>identity store value wins</strong>. Attributes must be single-valued, and up to 50 can be configured.</p>
+				<span class="file">Enable ABAC with two attributes from the SCIM-synced enterprise fields (AWS CLI, identity account)</span>
+<pre><code>aws sso-admin create-instance-access-control-attribute-configuration \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --instance-access-control-attribute-configuration '{
+    "AccessControlAttributes": [
+      { "Key": "CostCenter", "Value": { "Source": ["${path:enterprise.costCenter}"] } },
+      { "Key": "Department", "Value": { "Source": ["${path:enterprise.department}"] } }
+    ]
+  }'</code></pre>
+				<p>Mapping from the identity store (not the assertion) keeps the values visible in Identity Center and fed by the same SCIM sync as groups. Policies use the key exactly: <code>${aws:PrincipalTag/CostCenter}</code>.</p>
+				<span class="file">developer-abac.json: start, stop and reboot only instances and read only secrets of your own cost center; resource access tags can't be changed after creation (inline policy JSON for DeveloperAccess)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OperateOwnCostCenterInstances",
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances", "ec2:StopInstances", "ec2:RebootInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/CostCenter": "${aws:PrincipalTag/CostCenter}" }
+      }
+    },
+    {
+      "Sid": "ReadOwnCostCenterSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/CostCenter": "${aws:PrincipalTag/CostCenter}" }
+      }
+    },
+    {
+      "Sid": "NoRetaggingEc2OutsideCreation",
+      "Effect": "Deny",
+      "Action": ["ec2:CreateTags", "ec2:DeleteTags"],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": { "aws:TagKeys": ["CostCenter"] },
+        "Null": { "ec2:CreateAction": "true" }
+      }
+    },
+    {
+      "Sid": "NoRetaggingSecrets",
+      "Effect": "Deny",
+      "Action": ["secretsmanager:TagResource", "secretsmanager:UntagResource"],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": { "aws:TagKeys": ["CostCenter"] }
+      }
+    }
+  ]
+}</code></pre>
+				<p><strong>Protecting the tags</strong> is the real control. The denies stop a developer re-tagging another team's resources into their cost center, while <code>ec2:CreateAction</code> still allows tags at launch. On the principal side, the tag comes from the identity store, which only SCIM writes (Step 1's SCP keeps identity account admins out of group membership), and Identity Center sets the session tags at sign-in; the user doesn't choose them.</p>
+				<div class="callout trap"><p>A user whose <code>costCenter</code> is empty in the IdP has no value to send as that session tag, so every ABAC allow fails: "a new joiner gets AccessDenied on everything their team owns" is usually a missing IdP attribute, not a policy bug.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Temporary elevated access with TEAM</h3>
+				<p>Temporary elevated access (just-in-time access) means requesting, approving and tracking a permission for a specific task and time. Identity Center's guide lists validated Security Competency partner solutions; AWS also publishes <strong>TEAM</strong> (Temporary Elevated Access Management), an open-source, self-hosted solution in AWS Samples.</p>
+				<p><strong>Where it runs.</strong> TEAM must be deployed in the Identity Center <strong>delegated administrator</strong> account, here <code>666600006666</code>, which AWS advises keeping for Identity Center and TEAM only. It appears in the portal as a custom SAML 2.0 application.</p>
+				<p><strong>Policies.</strong> TEAM admins (a named group set at deployment) define:</p>
+				<ul>
+					<li><strong>Eligibility policies</strong>: a user or group, accounts or OUs, permission sets, and whether approval is needed. <code>aws-payments-developers</code> are eligible for <code>ProdChange</code> in the Prod OU, approval required; <code>aws-incident-responders</code> are eligible for <code>IncidentResponder</code> everywhere.</li>
+					<li><strong>Approval policies</strong>: which group may approve for which accounts or OUs. Each account requiring approval needs one.</li>
+					<li><strong>Settings</strong>: mandatory fields (the company makes the ticket number mandatory), default timeouts and the maximum duration.</li>
+				</ul>
+				<div class="callout trap"><p>When an eligibility or approval policy names an OU, TEAM covers only the accounts <strong>directly under</strong> that OU, not those in child OUs. Naming the Workloads OU <code>ou-abcd-33333333</code> wouldn't reach Prod and Non-prod, so those OUs are named explicitly.</p></div>
+				<p><strong>The time-boxed flow</strong> is a set of Step Functions workflows behind a DynamoDB stream, according to TEAM's architecture documentation:</p>
+				<ol class="flow">
+					<li><b>Request</b>The requester chooses account, permission set, start time, duration and justification.</li>
+					<li><b>Approval</b>The approver group is notified; if nobody acts within the timeout (1 hour by default, configurable), the request expires.</li>
+					<li><b>Schedule</b>An approved request waits until its start time.</li>
+					<li><b>Grant</b>TEAM assigns the permission set in the account to the requester's user in Identity Center, then waits for the approved duration.</li>
+					<li><b>Revoke</b>TEAM removes the assignment and notifies the requester; the requester or an approver can also end it early.</li>
+					<li><b>Audit</b>Requesters, approvers and auditors see the request history and the session's activity.</li>
+				</ol>
+				<span class="file">What the grant step amounts to: a user-level assignment that exists only for the approved window (AWS CLI equivalent, identity account)</span>
+<pre><code><span class="c"># TEAM makes this call itself and removes the assignment when the duration ends; nobody runs it by hand</span>
+aws sso-admin create-account-assignment \
+  --instance-arn arn:aws:sso:::instance/ssoins-1111222233334444 \
+  --target-id 121212121212 \
+  --target-type AWS_ACCOUNT \
+  --permission-set-arn arn:aws:sso:::permissionSet/ssoins-1111222233334444/ps-eeee5555ffff6666 \
+  --principal-type USER \
+  --principal-id REQUESTER_USER_ID</code></pre>
+				<p><code>ProdChange</code> has a <strong>1-hour session duration</strong> (<code>PT1H</code>), so a session started late in the window can't run on for 8 hours. The Step 3 pipeline ignores <code>ProdChange</code>, so it never removes or widens TEAM's grants.</p>
+				<div class="callout retired"><p>TEAM's architecture uses <strong>AWS CloudTrail Lake</strong> for its session activity view. CloudTrail Lake closed to new customers on 31 May 2026, so a new deployment may not be able to create that event data store; check TEAM's current documentation. The company's audit record is the organization trail in <code>444444444444</code> and the <a href="security-data-lake.html">security data lake</a>.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Break-glass access and root</h3>
+				<p>Break-glass access is the planned way in when the normal path fails (<a href="../d6-task-6-1.html#s5">Task 6.1</a>); there is one layer per failure:</p>
+				<ul>
+					<li><strong>Identity Center unavailable, IdP working.</strong> AWS's emergency access configuration: an <strong>emergency operations account</strong> (<code>131313131313</code>) federated directly to the IdP with IAM SAML 2.0, an <code>EmergencyOperations</code> role there, an <code>EmergencyAccess</code> role trusting it in each critical account, and an IdP group <code>aws-emergency-operations</code> with <strong>no members</strong>. In a disruption the IdP admins add named responders, who sign in through the IdP and switch roles onward. AWS says to build it in advance and test it.</li>
+					<li><strong>IdP unavailable as well.</strong> Two IAM users, <code>ops-break-glass</code> and a second, exist in the emergency operations account only, with FIDO2 keys and passwords held by different people, able to assume the same <code>EmergencyAccess</code> roles.</li>
+					<li><strong>Root-only tasks.</strong> Members have no root credentials (<a href="security-baseline.html">security baseline</a>); a 15-minute <code>sts assume-root</code> session from the identity account, scoped by a task policy such as <code>S3UnlockBucketPolicy</code>, does the job. Only one role there may call <code>sts:AssumeRoot</code>, reachable only through TEAM.</li>
+				</ul>
+				<span class="file">Trust policy of EmergencyOperations: only the corporate IdP's SAML assertions, for the sign-in endpoint (IAM role, emergency operations account 131313131313)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::131313131313:saml-provider/CorpIdP" },
+      "Action": "sts:AssumeRoleWithSAML",
+      "Condition": {
+        "StringEquals": { "SAML:aud": "https://us-east-1.signin.aws.amazon.com/saml" }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The emergency path is deliberately separate from Identity Center: no permission set reaches the emergency operations account, the <code>EmergencyAccess</code> roles are deployed by stack set with the trust pinned to <code>arn:aws:iam::131313131313:role/EmergencyOperations</code>.</p>
+				<span class="file">Page the security team on any console sign-in by a break-glass IAM user (EventBridge event pattern; fields from the ConsoleLogin event)</span>
+<pre><code>{
+  "detail-type": ["AWS Console Sign In via CloudTrail"],
+  "detail": {
+    "eventSource": ["signin.amazonaws.com"],
+    "eventName": ["ConsoleLogin"],
+    "userIdentity": {
+      "type": ["IAMUser"],
+      "userName": ["ops-break-glass", "ops-break-glass-2"]
+    }
+  }
+}</code></pre>
+				<p>Task 6.1's root pattern (<code>userIdentity.type</code> <code>Root</code>) runs alongside it in us-east-1, us-east-2 and us-west-2, where root sign-ins can be recorded; a metric filter on the organization trail backs both up (<a href="../d1-task-1-1.html">Task 1.1</a>). The SAML emergency role is caught the same way, by its ARN; every use ends with a review and rotation.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Monitoring, unused access and the command line</h3>
+				<p><strong>Sign-in events.</strong> Identity Center sign-ins produce <code>CredentialChallenge</code> (a factor was requested), <code>CredentialVerification</code> (it succeeded or failed; external IdP failures show type <code>EXTERNAL_IDP</code>) and <code>UserAuthentication</code> (all challenges passed), linked by an <code>AuthWorkflowID</code> (<a href="../d4-task-4-1.html#s3">Task 4.1</a>). Role sessions then appear in each account as assumed-role sessions of the <code>AWSReservedSSO_</code> role. AWS changed the user identity fields in these events (fully deployed by November 2025), so check older detections. Federated users always show <code>MFAUsed: "No"</code>, since AWS can't see the IdP's MFA.</p>
+				<p><strong>Administrative events.</strong> Permission set changes, account assignments and the ABAC configuration are Identity Center management events in the identity account, logged by the organization trail. The security team alerts on <code>MgmtAdmin</code> or <code>ProdChange</code> assignments TEAM didn't make, and on attribute configuration changes, which alter every ABAC decision at once.</p>
+				<p><strong>Unused access.</strong> An organization-wide <strong>unused access analyzer</strong> in the security tooling account (Access Analyzer's delegated administrator) reports unused roles, access keys, passwords and permissions over a 90-day tracking period ($0.20 per role or user per month). A finding on an <code>AWSReservedSSO_</code> role means shrinking the permission set; an IAM user outside the emergency account is a leftover to delete.</p>
+				<p><strong>The CLI.</strong> Engineers get CLI credentials with <code>aws configure sso</code> and <code>aws sso login</code>; the profile holds the start URL and role name, never keys. <code>aws login</code> (CLI 2.32.0 or later, with the <code>SignInLocalDevelopmentAccess</code> policy) gives IAM, root and directly federated users up to 12 hours of credentials from a browser sign-in, and is the only CLI path for passkey or security key MFA; the break-glass users use it, never access keys.</p>
+				<span class="file">Two profiles from one sign-in: read-only in prod-payments, and the elevated set while a TEAM grant is active (~/.aws/config)</span>
+<pre><code>[sso-session corp]
+sso_region = us-east-1
+sso_start_url = https://example-corp.awsapps.com/start
+sso_registration_scopes = sso:account:access
+
+[profile payments-readonly]
+sso_session = corp
+sso_account_id = 121212121212
+sso_role_name = ReadOnlyAccess
+region = us-east-1
+
+<span class="c"># Works only while the TEAM assignment exists; afterwards the role isn't offered</span>
+[profile payments-prodchange]
+sso_session = corp
+sso_account_id = 121212121212
+sso_role_name = ProdChange
+region = us-east-1</code></pre>
+				<p><strong>Workload identity is a different design.</strong> On-premises servers use <strong>IAM Roles Anywhere</strong> certificates pinned to the trust anchor and subject; EKS pods use <strong>EKS Pod Identity</strong> associations; GitHub Actions deploys with <strong>OIDC federation</strong> with a <code>sub</code> condition (<a href="../d4-task-4-1.html#s2">Task 4.1</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Identity Center delegated to a dedicated identity account</h4>
+				<p>Delegation takes daily access administration out of the management account,; an account that does nothing else keeps the blast radius small. The cost: it becomes one of the most sensitive accounts, so few people, SCPs on identity store writes and SCIM tokens.</p>
+			</div>
+			<div class="entry">
+				<h4>External IdP as the single source of truth</h4>
+				<p>One joiner-mover-leaver process and one MFA policy for every system. The trade-offs: the IdP's MFA policy must be right, the SCIM token is a yearly dependency, and an IdP outage blocks normal access, hence the IAM user break-glass layer.</p>
+			</div>
+			<div class="entry">
+				<h4>RBAC permission sets with ABAC inside</h4>
+				<p>A few job-function permission sets stay reviewable, and ABAC stops them multiplying per team. The cost is tag discipline: every resource needs a correct <code>CostCenter</code> at creation, and not every action supports resource tag conditions.</p>
+			</div>
+			<div class="entry">
+				<h4>No standing production write access</h4>
+				<p>TEAM turns production change and incident response into requested, approved, time-boxed and logged events. The costs: a self-hosted application to operate, approvers needed at night (the on-call lead approves responders; break-glass covers TEAM being down), and the CloudTrail Lake dependency.</p>
+			</div>
+			<div class="entry">
+				<h4>Session lengths matched to risk</h4>
+				<p>8 hours for read-only and non-prod work, 1 hour for <code>ProdChange</code> and <code>PlatformAdmin</code>: shorter sessions limit how long a stolen session works, at the price of more sign-ins. Identity Center multi-Region replication (2026; needs a multi-Region KMS key) is planned to <code>us-west-2</code> for Regional resilience, alongside, not instead of, emergency access.</p>
+			</div>
+			
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Direct SAML federation into every account</h4>
+				<p>An IAM SAML provider and roles per account gives full control of trust policies, tags and paths, but every account needs its own IdP mapping and there is no organization-wide view of access. The company uses it only for emergency access.</p>
+			</div>
+			<div class="entry">
+				<h4>AWS account access manager</h4>
+				<p>A new IAM capability (November 2026) assigns users and groups from the Identity Center organization instance to <strong>your own IAM roles</strong> in specific accounts through entitlements, keeping custom trust policies, role tags, paths and per-user attribution through trusted identity propagation. It fits accounts whose roles differ too much for uniform permission sets and can run alongside them. The company is evaluating it.</p>
+			</div>
+			<div class="entry">
+				<h4>A partner just-in-time solution or IdP privileged groups</h4>
+				<p>The validated Security Competency partner products (for example Okta Access Requests or CyberArk Secure Cloud Access) are supported products with licensing cost. IdP group activation (for example Entra PIM) keeps approvals in the IdP but relies on SCIM sync. TEAM is free but is sample code the company supports itself.</p>
+			</div>
+			
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Provisioning end to end</span><span class="desc">Create a test user in the IdP, add them to <code>aws-payments-developers</code>, and confirm <code>ReadOnlyAccess</code> appears in <code>121212121212</code>; remove them and confirm it disappears after the next sync.</span></li>
+				<li><span class="name">ABAC with the policy simulator</span><span class="desc">Simulate the <code>DeveloperAccess</code> policies with the session tag <code>CostCenter=payments</code> against an instance tagged <code>payments</code> (allowed) and <code>analytics</code> (denied), and simulate <code>ec2:CreateTags</code> with the key <code>CostCenter</code> on an existing instance (explicit deny).</span></li>
+				<li><span class="name">Customer managed policy guard</span><span class="desc">Assign <code>DeveloperAccess</code> to a test account without the stack set; the assignment status must be <code>FAILED</code> and the pipeline must stop. Deploy the policy, re-run, and confirm <code>SUCCEEDED</code>.</span></li>
+				<li><span class="name">Elevation lifecycle</span><span class="desc">Request <code>ProdChange</code> for 15 minutes, approve it as a different user, and confirm the assignment is gone afterwards. Let a second request time out; it must expire. No developer may be in the Prod approver group.</span></li>
+				<li><span class="name">Guardrails on the identity account</span><span class="desc">As <code>PermissionSetAdmin</code>, try to add a user to a group and to create a SCIM token: both must fail with an explicit SCP deny. Try to change <code>MgmtAdmin</code> from the identity account: it must fail.</span></li>
+				<li><span class="name">Break-glass game day</span><span class="desc">Twice a year, add two responders to <code>aws-emergency-operations</code>, reach the forensics account through <code>EmergencyOperations</code>, sign in once as <code>ops-break-glass</code>, and confirm both pages arrive within minutes. Then rotate and empty the group.</span></li>
+				<li><span class="name">Unused access review</span><span class="desc">Check the unused access findings for <code>AWSReservedSSO_</code> roles and IAM users each month; an IAM user outside <code>131313131313</code> or a permission set unused for 90 days is a ticket.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Monitoring and Alerting for an Account or Organization</td><td data-label="What this architecture demonstrates">EventBridge alerts on root and break-glass sign-ins in the right Regions; alerts on unexpected privileged assignments</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design and Implement Logging Solutions</td><td data-label="What this architecture demonstrates">Identity Center sign-in and administration events in the organization trail; audit of elevated sessions</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Authentication Strategies</td><td data-label="What this architecture demonstrates">Organization instance, external IdP with SAML and SCIM, MFA and session settings, customer managed policies by name and path, <code>aws sso login</code> and <code>aws login</code>, workload identity in contrast</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Authorization Strategies</td><td data-label="What this architecture demonstrates">RBAC permission sets with ABAC on session tags, protected tags, permissions boundaries, unused access analysis</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">Delegated administration and what stays in the management account, centralized root access, break-glass design</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Engineers need production administrator access only during approved change windows, with an audit trail and the least operational overhead" is <strong>temporary elevated access on IAM Identity Center</strong> (TEAM or a validated partner solution), not standing permission sets or shared IAM users. "One permission set must give each team access only to its own resources" is <strong>ABAC with attributes for access control</strong> and <code>aws:PrincipalTag</code>. "Users can't see a permission set in some accounts" is a <strong>missing customer managed policy with that name and path</strong>. "Keep console access if IAM Identity Center is disrupted" is the <strong>emergency access configuration with direct SAML federation</strong>, built and tested in advance.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/temporary-elevated-access-management-with-iam-identity-center/">Temporary elevated access management with IAM Identity Center</a> (June 2023): the TEAM solution, its personas, eligibility and approval policies, and where to deploy it.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/access-control-with-iam-identity-center-session-tags/">Access control with IAM Identity Center session tags</a> (April 2026): ABAC with user attributes passed as session tags through permission sets.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/delegating-permission-set-management-and-account-assignment-in-aws-iam-identity-center/">Delegating permission set management and account assignment in AWS IAM Identity Center</a> (October 2023): scoping which administrators manage which permission sets and accounts.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/implementing-just-in-time-privileged-access-to-aws-with-microsoft-entra-and-aws-iam-identity-center/">Implementing just-in-time privileged access to AWS with Microsoft Entra and AWS IAM Identity Center</a> (June 2025): the IdP group activation alternative to TEAM.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/introducing-aws-account-access-manager-iam-role-flexibility-with-centralized-workforce-access/">Introducing AWS account access manager: IAM role flexibility with centralized workforce access</a> (November 2026): assigning Identity Center users to your own IAM roles.</li>
+				<li><a href="https://docs.aws.amazon.com/singlesignon/latest/userguide/delegated-admin.html">IAM Identity Center delegated administration</a> (AWS documentation): best practices, the management account limits, and the SCPs for identity store and SCIM token control.</li>
+				<li><a href="https://docs.aws.amazon.com/singlesignon/latest/userguide/emergency-access.html">Set up emergency access to the AWS Management Console</a> (AWS documentation): the emergency operations account and direct federation design.</li>
+				<li><a href="https://aws-samples.github.io/iam-identity-center-team/">TEAM documentation</a> (AWS sample code, aws-samples): architecture, workflows, policies and security considerations of the TEAM solution.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
