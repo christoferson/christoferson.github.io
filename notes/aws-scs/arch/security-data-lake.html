@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Security logging and the security data lake | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: one logging design for an AWS organization. Organization CloudTrail trails with advanced event selectors, log file validation and KMS, service and network logs delivered to the log archive account, the CloudWatch unified data store in the security tooling account as the AWS SRA's recommended primary pattern, a WORM copy in S3 Object Lock, Amazon Security Lake with OCSF, rollup Regions and subscribers, SCPs against tampering, Athena and Logs Insights queries, retention evidence and troubleshooting missing logs.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Security data lake</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Security logging and the security data lake</h1>
+		<p>Detectors raise findings; logs are the evidence underneath them. This design gives the whole organization one logging system: every account and Region recorded from the day it is created, originals kept where nobody can change them, a central store the security team can search in seconds, a normalized lake for SIEMs and long hunts, and proof for the auditor that all of it is still switched on.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 5</span><span class="tag">Domain 6</span><span class="tag">CloudTrail</span><span class="tag">CloudWatch Logs</span><span class="tag">Security Lake</span><span class="tag">S3 Object Lock</span><span class="tag">KMS</span><span class="tag">Athena</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The organization trails</a></li>
+				<li class="sub"><a href="#b2">2. Service and network logs</a></li>
+				<li class="sub"><a href="#b3">3. The CloudWatch central store</a></li>
+				<li class="sub"><a href="#b4">4. The immutable archive</a></li>
+				<li class="sub"><a href="#b5">5. Security Lake</a></li>
+				<li class="sub"><a href="#b6">6. Query it</a></li>
+				<li class="sub"><a href="#b7">7. When logs go missing</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>, root <code>r-abcd</code>) already runs the <a href="security-baseline.html">security baseline</a>: Control Tower enrolls every account, delegated administrators sit in the security tooling account <code>222222222222</code>, and the log archive account <code>444444444444</code> holds the log buckets and is the Security Lake delegated administrator. The <a href="threat-detection-response.html">threat detection and response</a> page routes findings, and the <a href="incident-forensics.html">incident response and forensics</a> page queries the trail during case <code>IR-2026-117</code>. What was missing is the logging design itself: some logs lived only in workload accounts, the security team searched them one account at a time, and an auditor's request to prove seven years of API history were complete and unaltered took two weeks.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Every account and Region is logged, including accounts created later</td><td data-label="Design choice">Organization trails, telemetry enablement rules, organization-wide centralization rules</td></tr>
+						<tr><td data-label="Requirement">Seven years of API activity, provably complete and unchanged</td><td data-label="Design choice">Log file validation, SSE-KMS, S3 Object Lock in compliance mode in the log archive account</td></tr>
+						<tr><td data-label="Requirement">Search all accounts from one place within minutes</td><td data-label="Design choice">CloudWatch unified data store in the security tooling account, queried with Logs Insights</td></tr>
+						<tr><td data-label="Requirement">Long hunts and a partner SIEM over normalized data</td><td data-label="Design choice">Security Lake in OCSF with a rollup Region and two subscribers</td></tr>
+						<tr><td data-label="Requirement">No workload or security administrator can stop or alter logging</td><td data-label="Design choice">SCPs, key policies and bucket policies, changes only through a pipeline role</td></tr>
+						<tr><td data-label="Requirement">Evidence for auditors that the controls stay on</td><td data-label="Design choice">An organization conformance pack of logging rules, validation runs and retention checks</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused: <code>org-trail</code>, <code>org-cloudtrail-444444444444</code> and <code>org-flow-logs-444444444444</code> (<a href="../d1-task-1-2.html">Task 1.2</a>), the log group <code>org-trail-logs</code> (<a href="../d1-task-1-1.html">Task 1.1</a>), the baseline SCP, <code>prod-eks</code>, and the managed SIEM provider in the vendor account <code>999999999999</code>. New on this page: the Security OU <code>ou-abcd-66666666</code>; the pipeline role <code>log-pipeline-deploy</code>, the only principal allowed to change logging; keys <code>ARCHIVE_KEY_ID</code> (log archive), <code>TOOLING_LOGS_KEY_ID</code> (security tooling) and <code>LAKE_KEY_ID</code> (Security Lake); the WORM bucket <code>org-cwl-archive-444444444444</code> fed by the Firehose stream <code>cwl-to-archive</code>; the ALB log bucket <code>org-elb-logs-444444444444-us-east-1</code>.</p>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgL-wide-t">
+<title id="dgL-wide-t">Security data lake: every account delivers its trails and logs to locked buckets in the log archive account, a centralization rule copies its log groups into the CloudWatch store in the security tooling account, Firehose streams a WORM copy back to an Object Lock bucket in the log archive, and Security Lake in the log archive normalizes sources to OCSF for Athena and Logs Insights in the security tooling account.</title>
+<rect x="205" y="15" width="580" height="120" rx="12" class="dg-grp"/>
+<text x="215" y="31" class="dg-lbl">log archive 444444444444</text>
+<rect x="205" y="215" width="580" height="120" rx="12" class="dg-grp"/>
+<text x="215" y="231" class="dg-lbl">security tooling 222222222222</text>
+<path d="M170.0 168.0 L188.0 168.0 Q195.0 168.0 195.0 161.0 L195.0 82.0 Q195.0 75.0 202.0 75.0 L220.0 75.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 182.0 L188.0 182.0 Q195.0 182.0 195.0 189.0 L195.0 268.0 Q195.0 275.0 202.0 275.0 L220.0 275.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M90.0 152.0 L90.0 15.0 Q90.0 8.0 97.0 8.0 L693.0 8.0 Q700.0 8.0 700.0 15.0 L700.0 52.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M380.0 275.0 L420.0 275.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M500.0 252.0 L500.0 98.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="506" y="179" class="dg-lbl dg-halo" text-anchor="start" fill="var(--warn)">WORM copy</text>
+<path d="M700.0 98.0 L700.0 252.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="694" y="179" class="dg-lbl dg-halo" text-anchor="end" fill="var(--info)">query subscriber</text>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Every account</text>
+<text x="90" y="189" class="dg-s dg-sm2">trails, VPC, DNS, WAF</text>
+<rect x="220" y="52" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="72" class="dg-t dg-sm">Log buckets</text>
+<text x="300" y="89" class="dg-s dg-sm2">Object Lock, digests</text>
+<rect x="420" y="52" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="72" class="dg-t dg-sm">WORM archive</text>
+<text x="500" y="89" class="dg-s dg-sm2">org-cwl-archive</text>
+<rect x="620" y="52" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="700" y="72" class="dg-t dg-sm">Security Lake</text>
+<text x="700" y="89" class="dg-s dg-sm2">OCSF, us-east-1 rollup</text>
+<rect x="220" y="252" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="272" class="dg-t dg-sm">CloudWatch store</text>
+<text x="300" y="289" class="dg-s dg-sm2">centralization rule</text>
+<rect x="420" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="272" class="dg-t dg-sm">Firehose</text>
+<text x="500" y="289" class="dg-s dg-sm2">cwl-to-archive</text>
+<rect x="620" y="252" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="272" class="dg-t dg-sm">Athena, Logs Insights</text>
+<text x="700" y="289" class="dg-s dg-sm2">security team</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 535" role="img" aria-labelledby="dgL-tall-t">
+<title id="dgL-tall-t">Security data lake: every account delivers its trails and logs to locked buckets in the log archive account, a centralization rule copies its log groups into the CloudWatch store in the security tooling account, Firehose streams a WORM copy back to an Object Lock bucket in the log archive, and Security Lake in the log archive normalizes sources to OCSF for Athena and Logs Insights in the security tooling account.</title>
+<rect x="10" y="95" width="380" height="200" rx="12" class="dg-grp"/>
+<text x="200" y="111" class="dg-lbl" text-anchor="middle">log archive 444444444444</text>
+<rect x="10" y="325" width="380" height="195" rx="12" class="dg-grp"/>
+<text x="20" y="341" class="dg-lbl">security tooling 222222222222</text>
+<path d="M193.0 63.0 L193.0 83.0 Q193.0 90.0 186.0 90.0 L107.0 90.0 Q100.0 90.0 100.0 97.0 L100.0 117.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M207.0 63.0 L207.0 83.0 Q207.0 90.0 214.0 90.0 L293.0 90.0 Q300.0 90.0 300.0 97.0 L300.0 117.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M120.0 40.0 L13.0 40.0 Q6.0 40.0 6.0 47.0 L6.0 363.0 Q6.0 370.0 13.0 370.0 L20.0 370.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 370.0 L220.0 370.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 347.0 L300.0 314.5 Q300.0 307.5 293.0 307.5 L107.0 307.5 Q100.0 307.5 100.0 300.5 L100.0 268.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M380.0 140.0 L386.0 140.0 Q392.0 140.0 392.0 146.0 L392.0 469.0 Q392.0 475.0 386.0 475.0 L380.0 475.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="120" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="200" y="37" class="dg-t dg-sm">Every account</text>
+<text x="200" y="54" class="dg-s dg-sm2">trails, VPC, DNS, WAF</text>
+<rect x="20" y="117" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="137" class="dg-t dg-sm">Log buckets</text>
+<text x="100" y="154" class="dg-s dg-sm2">Object Lock, digests</text>
+<rect x="20" y="222" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="242" class="dg-t dg-sm">WORM archive</text>
+<text x="100" y="259" class="dg-s dg-sm2">org-cwl-archive</text>
+<rect x="220" y="117" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="137" class="dg-t dg-sm">Security Lake</text>
+<text x="300" y="154" class="dg-s dg-sm2">OCSF, us-east-1 rollup</text>
+<rect x="20" y="347" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="367" class="dg-t dg-sm">CloudWatch store</text>
+<text x="100" y="384" class="dg-s dg-sm2">centralization rule</text>
+<rect x="220" y="347" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="367" class="dg-t dg-sm">Firehose</text>
+<text x="300" y="384" class="dg-s dg-sm2">cwl-to-archive</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">Athena, Logs Insights</text>
+<text x="300" y="489" class="dg-s dg-sm2">security team</text>
+</svg>
+				<figcaption>Figure: the AWS SRA's current pattern, with the company's accounts. The original logs land in KMS-encrypted, Object Lock buckets in <code>444444444444</code>, with CloudTrail's signed digests (blue). A centralization rule copies every account's log groups into the CloudWatch store in <code>222222222222</code>, the recommended primary store (green); because CloudWatch Logs is not write-once, Firehose streams a copy to an Object Lock bucket (yellow). Security Lake, now the secondary option, normalizes sources to OCSF in the log archive and serves the security team through a query subscriber.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>One log event, from the account where it happens to the analyst who reads it. Steps marked <span class="who auto">AWS</span> happen without anyone acting.</p>
+			<ol class="flow">
+				<li class="group">Record</li>
+				<li class="auto"><span class="name">Activity is recorded at the source<span class="who auto">AWS</span></span><span class="desc">An API call in prod <code>111111111111</code> is captured by the organization trails; flow logs, Resolver query logs, WAF, ALB, Network Firewall and EKS audit logs capture the traffic around it.</span></li>
+				<li class="auto"><span class="name">Logging is switched on everywhere<span class="who auto">AWS</span></span><span class="desc">Telemetry enablement rules turn on VPC, DNS, WAF and EKS logging for new resources and new accounts.</span></li>
+				<li class="group">Keep the original</li>
+				<li class="auto"><span class="name">Delivered to the log archive<span class="who auto">AWS</span></span><span class="desc">CloudTrail, flow logs, ALB, WAF and firewall logs land in S3 buckets in <code>444444444444</code>, encrypted with KMS and locked in compliance mode; CloudTrail adds hourly signed digests.</span></li>
+				<li class="group">Centralize</li>
+				<li class="auto"><span class="name">Copied to the central store<span class="who auto">AWS</span></span><span class="desc">A centralization rule copies new events from every account's log groups into the CloudWatch unified data store in <code>222222222222</code>, with a backup copy in <code>us-west-2</code>.</span></li>
+				<li class="auto"><span class="name">WORM copy of CloudWatch-only logs<span class="who auto">AWS</span></span><span class="desc">An account-level subscription filter streams them through Firehose to an Object Lock bucket in the log archive.</span></li>
+				<li class="auto"><span class="name">Normalized into the lake<span class="who auto">AWS</span></span><span class="desc">Security Lake in <code>444444444444</code> converts native sources to OCSF Parquet and replicates <code>us-west-2</code> into the rollup Region <code>us-east-1</code>.</span></li>
+				<li class="group">Use</li>
+				<li><span class="name">Searched and hunted<span class="who">Security team</span></span><span class="desc">Logs Insights on the central store, Athena on the lake through a query subscriber and on the trail bucket for exact evidence.</span></li>
+				<li class="auto"><span class="name">Fed to the SIEM<span class="who auto">AWS</span></span><span class="desc">A data access subscriber notifies the managed SIEM in <code>999999999999</code> of new objects.</span></li>
+				<li class="group">Prove</li>
+				<li><span class="name">Evidence for the auditor<span class="who">Compliance team</span></span><span class="desc">Conformance pack results, <code>validate-logs</code> runs and the Object Lock configuration show the controls were on throughout.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+			<p>Each step is deployed by the logging pipeline as <code>log-pipeline-deploy</code>, not by hand; Step 4 makes that the only way.</p>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The organization trails: what to record, and who owns them</h3>
+				<p><strong>Two trails, one job each.</strong> Control Tower's organization trail records read and write management events in every Region into the log archive account, which is also what Security Lake needs before it can collect CloudTrail management events. The second trail, <code>org-trail</code>, records only data events and network activity events: only the first copy of management events is free, so a second copy would be paid for twice. This matches the baseline's split (the trail by Control Tower, data events by the SRA's <code>cloudtrail_org</code> solution).</p>
+				<p><strong>Who manages them.</strong> The AWS SRA says the organization trail SHOULD be managed from a CloudTrail delegated administrator, the security tooling account, with the bucket in log archive "to separate the management and usage of CloudTrail log privileges". The trail still belongs to the management account <code>555555555555</code>, so its ARN and the <code>aws:SourceArn</code> conditions use that ID. Member accounts can't stop, change or delete organization trails.</p>
+				<span class="file">Data events for the customer-data and data platform buckets, Lambda invocations, and endpoint calls that a VPC endpoint policy denied (AWS CLI, CloudTrail delegated administrator 222222222222)</span>
+<pre><code><span class="c"># Advanced selectors replace any basic selectors on the trail. No wildcards: S3 prefixes use StartsWith with a trailing slash.</span>
+<span class="c"># The trail's own bucket isn't selected: logging writes to it would create events about themselves.</span>
+aws cloudtrail put-event-selectors \
+  --trail-name arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail \
+  --advanced-event-selectors '[
+    {
+      "Name": "S3 data events on sensitive buckets",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["Data"] },
+        { "Field": "resources.type", "Equals": ["AWS::S3::Object"] },
+        { "Field": "resources.ARN", "StartsWith": ["arn:aws:s3:::customer-data-111111111111/", "arn:aws:s3:::prod-data-platform-111111111111/"] }
+      ]
+    },
+    {
+      "Name": "Lambda invocations",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["Data"] },
+        { "Field": "resources.type", "Equals": ["AWS::Lambda::Function"] }
+      ]
+    },
+    {
+      "Name": "S3 calls denied by an endpoint policy",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["NetworkActivity"] },
+        { "Field": "eventSource", "Equals": ["s3.amazonaws.com"] },
+        { "Field": "errorCode", "Equals": ["VpceAccessDenied"] }
+      ]
+    },
+    {
+      "Name": "KMS calls denied by an endpoint policy",
+      "FieldSelectors": [
+        { "Field": "eventCategory", "Equals": ["NetworkActivity"] },
+        { "Field": "eventSource", "Equals": ["kms.amazonaws.com"] },
+        { "Field": "errorCode", "Equals": ["VpceAccessDenied"] }
+      ]
+    }
+  ]'</code></pre>
+				<p>Network activity events need one selector per event source, and <code>VpceAccessDenied</code> is the only error code they can filter on. Logging only denials shows outside credentials trying the company's endpoints (the <a href="data-perimeter.html">data perimeter</a>) without paying for every allowed call.</p>
+				<p><strong>Integrity and encryption.</strong> Log file validation makes CloudTrail write an hourly signed digest of every log file's SHA-256 hash, chained to the previous digest. With a KMS key, log and (since May 2025) digest files use SSE-KMS; the key policy lets <code>cloudtrail.amazonaws.com</code> generate data keys for the trail's <code>aws:SourceArn</code> and readers decrypt only CloudTrail logs (<a href="../d1-task-1-2.html#s2">Task 1.2</a>), so reading needs both object and key permissions.</p>
+				<span class="file">The bucket policy statement that lets the organization trail write every member account's logs, and one that refuses plain HTTP (S3 bucket policy, org-cloudtrail-444444444444)</span>
+<pre><code>[
+  {
+    "Sid": "AWSCloudTrailOrganizationWrite20150319",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudtrail.amazonaws.com" },
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/*",
+    "Condition": {
+      "StringEquals": {
+        "s3:x-amz-acl": "bucket-owner-full-control",
+        "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail"
+      }
+    }
+  },
+  {
+    "Sid": "DenyInsecureTransport",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": ["arn:aws:s3:::org-cloudtrail-444444444444", "arn:aws:s3:::org-cloudtrail-444444444444/*"],
+    "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+  }
+]</code></pre>
+				<p>The full policy adds the <code>GetBucketAcl</code> statement and AWS's statement for <code>AWSLogs/555555555555/</code> (<a href="../d1-task-1-2.html#s2">Task 1.2</a>). The trail also delivers to <code>org-trail-logs</code> for the CIS alarms (<a href="../d1-task-1-1.html">Task 1.1</a>); that log group must be in the trail's own account, the management account, and Step 3 collects it from there.</p>
+				<div class="callout retired"><p><strong>CloudTrail Lake is closed to new customers from 31 May 2026.</strong> Existing customers get critical fixes and security updates only, and AWS points to Amazon CloudWatch instead (event data can be imported with <code>aws logs create-import-task</code>). Trails and Insights are unaffected. New designs query CloudTrail with Athena on S3, CloudWatch Logs or Security Lake, as here.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Service and network logs, turned on everywhere</h3>
+				<p>The AWS SRA's primary log types are the organization trail, VPC flow logs, CloudFront and WAF logs and Route 53 DNS logs. Each source has its own delivery rules, which is where most "missing logs" questions come from (<a href="../d1-task-1-3.html">Task 1.3</a>):</p>
+				<ul>
+					<li><strong>VPC flow logs</strong> go to <code>org-flow-logs-444444444444</code> in a custom format (<code>pkt-srcaddr</code>, <code>tcp-flags</code>, <code>traffic-path</code>), as Parquet with hourly partitions; the bucket policy admits <code>delivery.logs.amazonaws.com</code> with <code>aws:SourceAccount</code> and <code>aws:SourceArn</code>. Transit gateway flow logs show traffic between accounts.</li>
+					<li><strong>Route 53 Resolver query logs</strong> reach every VPC through a Route 53 Profile and carry DNS Firewall actions; flow logs never show DNS traffic to the Amazon resolver.</li>
+					<li><strong>WAF logs</strong> are set by a Firewall Manager policy, which the SRA says SHOULD log centrally to log archive; destinations start with <code>aws-waf-logs-</code>.</li>
+					<li><strong>ALB access logs</strong> need a same-Region bucket with SSE-S3 only; <strong>CloudFront</strong> standard logs v2 are configured in <code>us-east-1</code>.</li>
+					<li><strong>Network Firewall</strong> alert and flow logs go to S3; stateless-only traffic leaves no record.</li>
+					<li><strong>EKS audit logs</strong> for <code>prod-eks</code> go to CloudWatch Logs and feed Security Lake's <code>EKS_AUDIT</code> source.</li>
+					<li><strong>Findings</strong>: GuardDuty exports to a KMS-encrypted bucket in log archive for retention beyond 90 days, as the SRA recommends; Security Hub CSPM findings go to the lake (Step 5).</li>
+				</ul>
+				<span class="file">Let ALB log delivery write prod's access logs (one statement of the S3 bucket policy, org-elb-logs-444444444444-us-east-1)</span>
+<pre><code>{
+  "Sid": "AllowELBLogDelivery",
+  "Effect": "Allow",
+  "Principal": { "Service": "logdelivery.elasticloadbalancing.amazonaws.com" },
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::org-elb-logs-444444444444-us-east-1/prod/AWSLogs/111111111111/*"
+}</code></pre>
+				<p><strong>Turning logging on everywhere.</strong> CloudWatch <strong>telemetry enablement rules</strong> from the CloudWatch delegated administrator turn on flow logs, Resolver, WAF, EKS control plane, load balancer and CloudFront logs for the organization, an OU or an account, including resources created later; OU and account rules can add to the organization rule but not reduce it. A Config rule with automatic remediation covers anything else.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The CloudWatch unified data store in the security tooling account</h3>
+				<p><strong>What the AWS SRA now recommends.</strong> The SRA's update of 30 October 2026 changed where central log analysis lives. In its words, "Amazon CloudWatch Unified Data Store is the recommended primary option, deployed in Security Tooling account under the Security OU", and "Amazon Security Lake remains available as a secondary option for organizations with existing investments or specific subscriber-based access requirements". The security tooling account becomes the CloudWatch delegated administrator for pipelines, centralization rules and organization-wide collection. Because "CloudWatch Logs does not provide write-once-read-many (WORM) immutability", CloudWatch MUST send a copy of logs needing immutability to S3 Object Lock (compliance mode) in the log archive account, which "serves as a storage sink only". Users MUST NOT read log data directly; they use scoped grants or Lake Formation-governed S3 Tables.</p>
+				<div class="callout note"><p>The task pages and older material centralize CloudWatch Logs into the log archive account instead. The exam guide predates the October 2026 update, so recognize both; in both, the immutable originals live in log archive.</p></div>
+				<p><strong>Centralization rules.</strong> A rule copies new log events from source accounts and Regions into one destination account and Region, with an optional backup Region. It is forward-only, so the SRA says to set it up early, through the landing zone. The first copy is free; each extra copy costs $0.05 per GB. Trusted access for CloudWatch must be on in Organizations.</p>
+				<span class="file">Copy every account's security log groups from both Regions into the security tooling account, encrypted with its own key (AWS CLI, CloudWatch delegated administrator 222222222222)</span>
+<pre><code><span class="c"># Scope keys: OrganizationId, OrganizationalUnitId, AccountId. The organization scope includes the management account, home of org-trail-logs.</span>
+<span class="c"># The destination key must carry the tag LogsManaged = true so the centralization service can use it.</span>
+aws observabilityadmin create-centralization-rule-for-organization \
+  --rule-name org-security-logs \
+  --rule '{
+    "Source": {
+      "Regions": ["us-east-1", "us-west-2"],
+      "Scope": "OrganizationId = '\''o-exampleorgid'\''",
+      "SourceLogsConfiguration": {
+        "LogGroupSelectionCriteria": "LogGroupName LIKE '\''org-trail-logs%'\'' OR LogGroupName LIKE '\''/aws/eks/%'\'' OR LogGroupName LIKE '\''aws-waf-logs-%'\'' OR LogGroupName LIKE '\''/prod/%'\''",
+        "EncryptedLogGroupStrategy": "ALLOW"
+      }
+    },
+    "Destination": {
+      "Region": "us-east-1",
+      "Account": "222222222222",
+      "DestinationLogsConfiguration": {
+        "LogsEncryptionConfiguration": {
+          "EncryptionStrategy": "CUSTOMER_MANAGED",
+          "KmsKeyArn": "arn:aws:kms:us-east-1:222222222222:key/TOOLING_LOGS_KEY_ID",
+          "EncryptionScope": "NEW_DESTINATION_LOG_GROUPS"
+        },
+        "BackupConfiguration": { "Region": "us-west-2" },
+        "LogGroupNameConfiguration": { "LogGroupNamePattern": "/central/${source.accountId}/${source.region}${source.logGroup}" },
+        "LogGroupDeletionProtection": "ENABLED"
+      }
+    }
+  }'</code></pre>
+				<p>Without the name pattern, same-named groups from every account merge into one. <code>ALLOW</code> copies groups under customer managed keys too, so those keys must allow CloudWatch Logs. Deletion protection covers only groups the rule creates after it is set.</p>
+				<p><strong>Pipelines and OCSF.</strong> The SRA also uses CloudWatch pipelines to collect AWS vended logs and third-party sources and convert them to OCSF with the built-in processor; for a few log groups, a <code>parseToOCSF</code> transformer does the same and keeps the original event (<a href="../d1-task-1-2.html#s5">Task 1.2</a>).</p>
+				<p><strong>The WORM copy.</strong> S3 deliveries are already locked (Step 4), so the copy is needed only for logs whose only home is CloudWatch: agent, EKS audit and Lambda logs. The SRA names no mechanism; the company uses an account-level subscription filter in security tooling (these work on centralized log groups) to the Firehose stream <code>cwl-to-archive</code>, which writes to <code>org-cwl-archive-444444444444</code>.</p>
+				<span class="file">Stream every log group in the security tooling account to the archive stream, except the stream's own error logs (AWS CLI, 222222222222)</span>
+<pre><code><span class="c"># One account-level subscription filter per Region; only Standard log groups can be subscribed.</span>
+aws logs put-account-policy \
+  --policy-name worm-archive-feed \
+  --policy-type SUBSCRIPTION_FILTER_POLICY \
+  --scope ALL \
+  --selection-criteria 'LogGroupName NOT IN ["/aws/kinesisfirehose/cwl-to-archive"]' \
+  --policy-document '{"DestinationArn": "arn:aws:firehose:us-east-1:222222222222:deliverystream/cwl-to-archive", "RoleArn": "arn:aws:iam::222222222222:role/CWLtoFirehoseRole", "FilterPattern": ""}'</code></pre>
+				<p>Excluding the stream's own log group avoids a loop; dynamic partitioning, set when the stream is created, writes by account and date.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The immutable archive and the guardrails around it</h3>
+				<p>The SRA's first objective for the log archive account is that log storage MUST be immutable, with access limited to controlled, automated and monitored mechanisms. Four layers do that here.</p>
+				<p><strong>S3 Object Lock in compliance mode.</strong> The log buckets are created with Object Lock (and so versioning) and a default retention: seven years for CloudTrail, one year for the others. Nobody, the root user included, can delete or overwrite a locked version or shorten its retention; the only early way out is closing the account, so settings are tried in governance mode on a test bucket first.</p>
+				<span class="file">Seven-year compliance-mode default on the trail bucket, then lifecycle to Glacier storage classes (AWS CLI, log archive account 444444444444)</span>
+<pre><code>aws s3api create-bucket \
+  --bucket org-cloudtrail-444444444444 \
+  --region us-east-1 \
+  --object-lock-enabled-for-bucket
+
+aws s3api put-object-lock-configuration \
+  --bucket org-cloudtrail-444444444444 \
+  --object-lock-configuration '{ "ObjectLockEnabled": "Enabled", "Rule": { "DefaultRetention": { "Mode": "COMPLIANCE", "Years": 7 }}}'
+
+<span class="c"># lifecycle.json: Glacier Instant Retrieval at 90 days, Deep Archive at 1 year, expire after 7 years (2557 days)</span>
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket org-cloudtrail-444444444444 \
+  --lifecycle-configuration file://lifecycle.json</code></pre>
+				<p>Locks win: an expiration only adds a delete marker until retention ends (lifecycle JSON on <a href="../d5-task-5-2.html">Task 5.2</a>). Default encryption is SSE-KMS with <code>ARCHIVE_KEY_ID</code> and an S3 Bucket Key, which cuts KMS request costs for millions of small objects.</p>
+				<p><strong>No MFA delete.</strong> Only the root user can enable it, only through the CLI or API, and never on a bucket with lifecycle rules, which every log bucket needs.</p>
+				<p><strong>The key is part of the archive.</strong> A deleted or disabled key makes locked logs unreadable and stops CloudTrail delivering. Only logging services may encrypt, reader roles decrypt, and <code>log-pipeline-deploy</code> administer it.</p>
+				<p><strong>SCPs.</strong> The baseline SCP on the root already denies <code>cloudtrail:StopLogging</code> and <code>cloudtrail:DeleteTrail</code> (<a href="security-baseline.html#b4">security baseline, Step 4</a>). SCPs don't apply to the management account, and member accounts can't change organization trails anyway; the gap is the rest of the Security OU, including the trail's delegated administrator, so a second SCP goes on <code>ou-abcd-66666666</code>:</p>
+				<span class="file">Only the logging pipeline may change trails, log buckets, the lake, log retention or the log keys in the Security OU (SCP, attached to ou-abcd-66666666)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectLogConfiguration",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:UpdateTrail",
+        "cloudtrail:PutEventSelectors",
+        "securitylake:DeleteDataLake",
+        "securitylake:DeleteAwsLogSource",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DeleteRetentionPolicy",
+        "kms:DisableKey",
+        "kms:ScheduleKeyDeletion",
+        "kms:PutKeyPolicy"
+      ],
+      "Resource": "*",
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/log-pipeline-deploy" } }
+    },
+    {
+      "Sid": "ProtectLogBuckets",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteBucket",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:PutLifecycleConfiguration",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::org-*-444444444444*",
+      "Condition": { "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/log-pipeline-deploy" } }
+    }
+  ]
+}</code></pre>
+				<p>The SRA asks for this: configuration changed only through pipelines, console and CLI changes denied with IAM policies or SCPs, and <code>AWSCloudTrail_FullAccess</code> on the minimal set of principals. Rollout goes through the Policy Staging OU <code>ou-abcd-44444444</code> first, checking that Security Lake's service roles still work.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Amazon Security Lake in the log archive account</h3>
+				<p><strong>Where it lives, and why.</strong> The baseline registered <code>444444444444</code> as the Security Lake delegated administrator with <code>register-data-lake-delegated-administrator</code> (removing it deletes the lake). The SCS guide and the SRA agree on the account: the SRA says it SHOULD be log archive, next to the other security logs. What changed is its role: since October 2026 it is the SRA's secondary option, for existing deployments or subscriber-based access. The company keeps it because its managed SIEM ingests Security Lake natively and analysts want OCSF tables for long hunts.</p>
+				<span class="file">Enable the lake in both Regions with a customer managed key, keep a year of data, and roll us-west-2 up into us-east-1 (AWS CLI, Security Lake delegated administrator 444444444444)</span>
+<pre><code>aws securitylake create-data-lake \
+  --configurations '[
+    {"region": "us-east-1",
+     "encryptionConfiguration": {"kmsKeyId": "LAKE_KEY_ID"},
+     "lifecycleConfiguration": {"expiration": {"days": 365}, "transitions": [{"days": 30, "storageClass": "ONEZONE_IA"}]}},
+    {"region": "us-west-2",
+     "encryptionConfiguration": {"kmsKeyId": "LAKE_KEY_ID"},
+     "lifecycleConfiguration": {"expiration": {"days": 30}},
+     "replicationConfiguration": {"regions": ["us-east-1"], "roleArn": "arn:aws:iam::444444444444:role/SecurityLakeReplicationRole"}}
+  ]' \
+  --meta-store-manager-role-arn arn:aws:iam::444444444444:role/service-role/AmazonSecurityLakeMetaStoreManager</code></pre>
+				<p>Retention and transitions are set per Region in Security Lake, never with S3 lifecycle rules on its buckets, which can remove its metadata. <code>us-west-2</code> keeps 30 days; the rollup Region a year. One Zone-IA sits in a single Availability Zone, acceptable for an analysis copy. The replication role name is new on this page. Security Lake doesn't support Object Lock (a default retention interrupts delivery), so the originals stay in Step 4's buckets.</p>
+				<p><strong>Sources.</strong> The native sources are below; GuardDuty, Inspector and Macie findings arrive through <code>SH_FINDINGS</code>. Only CloudTrail management events need a trail of your own (Step 1).</p>
+				<span class="file">Collect the native sources from every account in both Regions (AWS CLI, 444444444444)</span>
+<pre><code><span class="c"># Leaving out "accounts" means every account in the organization; version 2.0 sources use OCSF 1.1</span>
+aws securitylake create-aws-log-source \
+  --sources '[
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "CLOUD_TRAIL_MGMT", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "S3_DATA", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "LAMBDA_EXECUTION", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "VPC_FLOW", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "ROUTE53", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "EKS_AUDIT", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "WAF", "sourceVersion": "2.0"},
+    {"regions": ["us-east-1", "us-west-2"], "sourceName": "SH_FINDINGS", "sourceVersion": "2.0"}
+  ]'</code></pre>
+				<p><strong>Custom sources.</strong> Network Firewall, ALB and CloudFront logs join as custom sources (up to 50), written as OCSF Parquet in Security Lake's partition layout. The SRA runs that ETL in the security tooling account, through a cross-account role Security Lake creates.</p>
+				<p><strong>Subscribers.</strong> Each is an account plus external ID, limited to chosen sources and to its own Region, so both are created in the rollup Region:</p>
+				<span class="file">A query access subscriber for the security tooling account, and a data access subscriber for the managed SIEM (AWS CLI, 444444444444, us-east-1)</span>
+<pre><code><span class="c"># Query access: Lake Formation shares the tables through AWS RAM; accept the invitation in 222222222222 within 12 hours</span>
+aws securitylake create-subscriber \
+  --access-types "LAKEFORMATION" \
+  --sources '[{"awsLogSource": {"sourceName": "CLOUD_TRAIL_MGMT", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "VPC_FLOW", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "ROUTE53", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "SH_FINDINGS", "sourceVersion": "2.0"}}]' \
+  --subscriber-name 'security-tooling-athena' \
+  --subscriber-identity '{"principal": "222222222222", "externalId": "security-tooling-athena"}'
+
+<span class="c"># Data access: the SIEM reads the S3 objects and is told about new ones through SQS or an HTTPS endpoint</span>
+aws securitylake create-subscriber \
+  --access-types "S3" \
+  --sources '[{"awsLogSource": {"sourceName": "CLOUD_TRAIL_MGMT", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "VPC_FLOW", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "WAF", "sourceVersion": "2.0"}}, {"awsLogSource": {"sourceName": "SH_FINDINGS", "sourceVersion": "2.0"}}]' \
+  --subscriber-name 'managed-siem' \
+  --subscriber-identity '{"principal": "999999999999", "externalId": "SIEM_EXTERNAL_ID"}'</code></pre>
+				<p>This follows the SRA: nobody reads the lake directly in log archive; security teams use subscribers in security tooling, which pay for their own queries (cross-account data sharing settings version 2 or 3). For per-OU views, Lake Formation row and column permissions are AWS's pattern.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Query it: Logs Insights, Athena on the lake, Athena on the trail</h3>
+				<p><strong>Logs Insights, for minutes-old events.</strong> Logs Insights (QL, PPL or SQL, charged per GB scanned) queries many central log groups at once, so the <a href="../d1-task-1-2.html#s4">Task 1.2</a> <code>AccessDenied</code> query runs once instead of in each account.</p>
+				<p><strong>Athena on the lake, for normalized hunts.</strong> Version 2 tables are in the Glue Data Catalog, partitioned on <code>time_dt</code>, <code>region</code> and <code>accountid</code>; the caller needs Lake Formation <code>SELECT</code>. OCSF field names are shared across sources, so the attacker IP from case <code>IR-2026-117</code> is one value to search:</p>
+				<span class="file">Everything one IP did against AWS APIs in the last 30 days, every account (Athena SQL, query subscriber 222222222222, CloudTrail management events, source version 2)</span>
+<pre><code>SELECT time_dt, accountid, region, api.service.name, api.operation,
+       api.response.error, actor.user.uid, http_request.user_agent
+FROM "amazon_security_lake_glue_db_us_east_1"."amazon_security_lake_table_us_east_1_cloud_trail_mgmt_2_0"
+WHERE time_dt &gt; CURRENT_TIMESTAMP - INTERVAL '30' DAY
+  AND src_endpoint.ip = '198.51.100.7'
+ORDER BY time_dt DESC
+LIMIT 100;</code></pre>
+				<p>The same filter works on <code>vpc_flow_2_0</code> and <code>route53_2_0</code>, and the version 2 <code>observables</code> array finds an indicator wherever it appears. Keep time filters inside the retention window.</p>
+				<p><strong>Athena on the trail bucket, for exact evidence.</strong> The evidential copy is the original CloudTrail JSON in the locked bucket. The <a href="../d1-task-1-2.html#s4">Task 1.2</a> table covers one account and Region; projecting account and Region as well as date makes one table cover the organization, with no partitions to add:</p>
+				<span class="file">The partition projection properties that make one table cover every account and Region of the organization trail (Athena SQL, TBLPROPERTIES of the cloudtrail_org table; columns as in Task 1.2)</span>
+<pre><code>PARTITIONED BY (`account` STRING, `region` STRING, `timestamp` STRING)
+LOCATION 's3://org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/'
+TBLPROPERTIES (
+  'projection.enabled' = 'true',
+  'projection.account.type' = 'enum',
+  'projection.account.values' = '111111111111,222222222222,333333333333,444444444444,555555555555',
+  'projection.region.type' = 'enum',
+  'projection.region.values' = 'us-east-1,us-west-2',
+  'projection.timestamp.type' = 'date',
+  'projection.timestamp.format' = 'yyyy/MM/dd',
+  'projection.timestamp.range' = '2024/01/01,NOW',
+  'projection.timestamp.interval' = '1',
+  'projection.timestamp.interval.unit' = 'DAYS',
+  'storage.location.template' = 's3://org-cloudtrail-444444444444/AWSLogs/o-exampleorgid/${account}/CloudTrail/${region}/${timestamp}'
+);</code></pre>
+				<p>The account vending pipeline extends the account list. Athena charges per TB scanned, so the date filter is the cost control. Investigation queries on this table are on the <a href="incident-forensics.html#b5">forensics page</a> and <a href="../d2-task-2-2.html">Task 2.2</a>.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>When logs go missing</h3>
+				<p>Every delivery path can break silently. Use the <a href="../d1-task-1-3.html">Task 1.3</a> order: is it on, is the writer allowed, is it going where you're looking, does the consumer match, has it had time. Here the likely causes are:</p>
+				<ul>
+					<li><strong>CloudTrail to S3</strong>: a changed bucket or key policy, shown by <code>get-trail-status</code>.</li>
+					<li><strong>Flow logs</strong>: <code>DeliverLogsErrorMessage</code> in <code>describe-flow-logs</code>; "undeliverable" when the bucket's default key is a key ID, not an ARN.</li>
+					<li><strong>Vended logs to CloudWatch</strong>: a missing resource policy for <code>delivery.logs.amazonaws.com</code> (10 per Region per account).</li>
+					<li><strong>Centralization</strong>: rule health <code>UNHEALTHY</code> with a <code>FailureReason</code>, typically a destination key without CloudWatch Logs permissions or the <code>LogsManaged = true</code> tag, <code>DestinationEncryptionMismatch</code>, trusted access off, or selection criteria that miss the group. Alarm on <code>CentralizationError</code> and <code>IncomingCopiedBytes</code>.</li>
+					<li><strong>The WORM feed</strong>: an Essentials (formerly Infrequent Access) log group can't be subscribed, and its class can't be changed.</li>
+					<li><strong>Security Lake</strong>: management events stop when their trail stops; Object Lock or lifecycle rules on its bucket break delivery.</li>
+				</ul>
+				<span class="file">The org trail's status, checked from a member account with the trail's full ARN (AWS CLI; status is per Region)</span>
+<pre><code>aws cloudtrail get-trail-status \
+  --name arn:aws:cloudtrail:us-east-1:555555555555:trail/org-trail \
+  --region us-east-1
+
+<span class="c"># In the output: IsLogging, LatestDeliveryError (S3: bucket or key policy), LatestDigestDeliveryError,</span>
+<span class="c"># LatestNotificationError (SNS topic policy) and LatestCloudWatchLogsDeliveryError (role or log group)</span></code></pre>
+				<p>CloudTrail retries a misconfigured bucket for 30 days, and charges for it. The trail shows who made the <code>PutBucketPolicy</code> or <code>PutKeyPolicy</code> call, Config shows the previous configuration, and the Step 4 SCP prevents a repeat.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Store the record in log archive, analyse in security tooling</h4>
+				<p>The log archive account holds data and nothing else, so its few administrators aren't the people whose actions the logs record; analysis and its users live in security tooling. The cost is cross-account plumbing: bucket and key policies, RAM shares, cross-account Firehose delivery.</p>
+			</div>
+			<div class="entry">
+				<h4>CloudWatch as primary, Security Lake kept for its subscribers</h4>
+				<p>Following the SRA's October 2026 update, searches run in CloudWatch, where alarms and Logs Insights already are. The lake stays because it feeds the SIEM without a custom pipeline. Running both stores some logs twice; without a Security Lake-native SIEM the company would drop the lake.</p>
+			</div>
+			<div class="entry">
+				<h4>Compliance mode with lifecycle, not MFA delete</h4>
+				<p>Compliance mode stops even root and works with lifecycle rules; MFA delete needs root and rules lifecycle out. The trade is irreversibility, hence governance-mode testing and the pipeline.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>The large items are CloudWatch ingestion (Essentials ingests at half the price but can't feed subscriptions or metric filters), extra centralization copies, data events ($0.10 per 100,000, so only sensitive buckets are selected; the CloudTrail Data Event Coverage console page shows what is left out), Security Lake normalization and Athena scans ($5 per TB in AWS's examples). Controls: Parquet, partition projection, Bucket Keys, Glacier and lake transitions, and the CloudWatch Logs Intelligent Tiering the SRA suggests.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Security Lake as the primary store</h4>
+				<p>The pre-October 2026 SRA pattern most exam material assumes: everything normalized in log archive, consumed through subscribers. Near-real-time alarms still need CloudWatch Logs.</p>
+			</div>
+			<div class="entry">
+				<h4>Subscription filters to a destination in log archive</h4>
+				<p>The older pattern from <a href="../d1-task-1-2.html#s2">Task 1.2</a>: a CloudWatch Logs destination with an <code>aws:PrincipalOrgID</code> policy and an account-level subscription filter in every account. It fits streaming to a third-party tool; centralization rules need nothing in source accounts.</p>
+			</div>
+			<div class="entry">
+				<h4>OpenSearch Service as the SIEM</h4>
+				<p>A Security Lake ingestion blueprint, Sigma rules in Security Analytics and direct query over CloudWatch Logs and Security Lake, if detection engineering moves in-house.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Vend an account and watch it appear</span><span class="desc">A new test account in <code>ou-abcd-22222222</code> must, within the hour, have a CloudTrail folder under <code>AWSLogs/o-exampleorgid/</code>, a flow log from the telemetry rule, log groups under <code>/central/</code> in <code>222222222222</code>, and an <code>accountid</code> partition in the lake.</span></li>
+				<li><span class="name">Prove integrity</span><span class="desc">Run <code>aws cloudtrail validate-logs</code> with the trail ARN and <code>--account-id 111111111111</code>; in a test copy, alter a log file and confirm it is reported modified.</span></li>
+				<li><span class="name">Try to break it</span><span class="desc">As an administrator in log archive and security tooling, try <code>PutBucketPolicy</code> on the trail bucket, <code>PutEventSelectors</code>, deleting a locked version and <code>ScheduleKeyDeletion</code> on the archive key: each must fail and appear in the trail.</span></li>
+				<li><span class="name">Check access</span><span class="desc">IAM Access Analyzer should show only the subscriber shares to <code>222222222222</code> and <code>999999999999</code> and the logging service principals; the policy simulator confirms analysts can't read <code>org-cloudtrail-444444444444</code> directly.</span></li>
+				<li><span class="name">Break a delivery on purpose</span><span class="desc">Remove CloudTrail's key statement on a test trail: <code>LatestDeliveryError</code> must appear and page the on-call engineer.</span></li>
+				<li><span class="name">Collect the audit evidence</span><span class="desc">An organization conformance pack from <code>222222222222</code> runs the managed Config rules <code>multi-region-cloudtrail-enabled</code>, <code>cloud-trail-log-file-validation-enabled</code>, <code>cloud-trail-encryption-enabled</code>, <code>s3-bucket-default-lock-enabled</code>, <code>cw-loggroup-retention-period-check</code>, <code>vpc-flow-logs-enabled</code>, <code>route53-query-logging-enabled</code>, <code>eks-cluster-logging-enabled</code>, <code>wafv2-logging-enabled</code> and <code>netfw-logging-enabled</code>. Its compliance history, validation output and the Object Lock configuration are the evidence for <a href="../d6-task-6-3.html">Task 6.3</a>; Audit Manager isn't open to new accounts.</span></li>
+				<li><span class="name">Run the hunt</span><span class="desc">In a game day, the team must find every call a sandbox key made from a known IP, across accounts, within 30 minutes.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design and Implement Logging Solutions</td><td data-label="What this architecture demonstrates">Organization trails and advanced event selectors, network activity events, log sources by question, centralization rules and the SRA's CloudWatch store, Security Lake sources, rollup Regions, retention and subscribers, Athena and Logs Insights</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Troubleshoot Monitoring, Logging and Alerting</td><td data-label="What this architecture demonstrates">get-trail-status errors, bucket and key policies, flow log delivery errors, vended log resource policies, centralization rule health, Standard versus Essentials log classes</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Respond to Security Events</td><td data-label="What this architecture demonstrates">One query across every account on OCSF tables, Athena with partition projection on the original trail for evidence</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">Object Lock compliance mode versus MFA delete, lifecycle under locks, SSE-KMS with Bucket Keys, digest validation, Security Lake without Object Lock</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">Log archive as storage only, security tooling as delegated administrator, SCPs on the Security OU</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-3.html">6.3</a> Evaluate Compliance</td><td data-label="What this architecture demonstrates">Logging rules in an organization conformance pack, retention evidence, CloudTrail Lake and Audit Manager status</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Prove CloudTrail logs weren't modified" is <strong>log file validation and validate-logs</strong>; "nobody, not even root, can delete them" is <strong>S3 Object Lock in compliance mode</strong>. "All accounts, including new ones" is an <strong>organization trail</strong> plus <strong>organization-wide rules</strong>. "A partner SIEM needs all security logs without pipelines" is a <strong>Security Lake data access subscriber in the rollup Region</strong>; "analysts query in place from their own account" is a <strong>query access subscriber</strong>. "Normalize to one schema" is <strong>OCSF</strong>. "Logs stopped after a policy change" is <strong>get-trail-status, then the bucket or key policy</strong>. "Query a year of CloudTrail with SQL" for a new customer is <strong>Athena or Security Lake</strong>, not CloudTrail Lake.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/mt/optimize-querying-aws-cloudtrail-logs-with-partitioning-in-amazon-athena/">Optimize querying AWS CloudTrail logs with partitioning in Amazon Athena</a> (August 2025): partition projection over organization trail logs, the basis of the Step 6 table.</li>
+				<li><a href="https://aws.amazon.com/blogs/mt/aws-cloudtrail-lake-import-historical-data-to-amazon-cloudwatch/">Import Historical data from AWS CloudTrail Lake to Amazon CloudWatch</a> (May 2026): moving existing CloudTrail Lake data into CloudWatch after the closure to new customers.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/accelerate-incident-response-with-amazon-security-lake/">Accelerate incident response with Amazon Security Lake</a> (May 2024): Athena queries on Security Lake for each incident response phase (predates the SRA's October 2026 move to CloudWatch as the primary pattern).</li>
+				<li><a href="https://aws.amazon.com/blogs/security/patterns-for-consuming-custom-log-sources-in-amazon-security-lake/">Patterns for consuming custom log sources in Amazon Security Lake</a> (July 2024): Firehose, Glue and Lambda ingestion patterns for sources such as Network Firewall and ALB logs.</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/security-reference-architecture/log-archive.html">Security OU &ndash; Log Archive account</a> (AWS SRA, prescriptive guidance): immutable log storage, S3 controls, Security Lake as the supported secondary option, and the WORM archive requirement.</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/security-reference-architecture/security-tooling.html">Security OU &ndash; Security Tooling account</a> (AWS SRA, prescriptive guidance): the CloudWatch unified data store as the primary pattern, CloudTrail delegated administration and Security Lake subscribers.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatchLogs_Centralization.html">Cross-account cross-Region log centralization</a> (Amazon CloudWatch Logs User Guide): centralization rules, encryption, naming patterns and troubleshooting.</li>
+				<li><a href="https://github.com/aws-samples/aws-security-reference-architecture-examples/tree/main/aws_sra_examples/solutions/security_lake/security_lake_org">security_lake_org</a> (AWS sample code, AWS SRA examples repository): Security Lake delegated administrator configuration for accounts and governed Regions.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
