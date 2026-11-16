@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Encryption and Key Management at Scale | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: one AWS KMS key management design for the whole organization. Which customer managed keys exist and who owns them, aliases and tags, key policies with separation of duties, kms:ViaService, kms:CallerAccount and encryption context conditions, grants, cross-account use, multi-Region keys for disaster recovery, rotation, imported material and custom key stores, deletion protection with SCPs and EventBridge, default encryption for EBS and S3 with Bucket Keys, Secrets Manager keys, and monitoring with Config and Security Hub CSPM.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Key management at scale</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Encryption and key management at scale</h1>
+		<p>One key management design for every account: customer managed keys per workload, classification and environment, key policies that keep the people who manage keys apart from the code that uses them, guardrails that make a deleted key almost impossible, and evidence that every bucket, volume and secret is encrypted with the key it should be.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 5</span><span class="tag">Domain 4</span><span class="tag">Domain 6</span><span class="tag">AWS KMS</span><span class="tag">Secrets Manager</span><span class="tag">S3 Bucket Keys</span><span class="tag">EBS encryption</span><span class="tag">SCPs</span><span class="tag">EventBridge</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Key inventory, aliases and tags</a></li>
+				<li class="sub"><a href="#b2">2. The key policy template</a></li>
+				<li class="sub"><a href="#b3">3. Grants and cross-account use</a></li>
+				<li class="sub"><a href="#b4">4. Default encryption and secrets</a></li>
+				<li class="sub"><a href="#b5">5. Rotation, multi-Region and imported keys</a></li>
+				<li class="sub"><a href="#b6">6. Guardrails and monitoring</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) runs its web app, EKS containers, S3 data platform and GenAI assistant in production account <code>111111111111</code>, in <code>us-east-1</code> with <code>us-west-2</code> as the disaster recovery Region. The analytics account <code>777777777777</code> reads the data platform, and the DR account <code>888888888888</code> receives replicated data and backup copies. An audit found hand-made keys whose administrators could also delete them, data under AWS managed keys that can't be shared with other accounts, and no record of which key protected what.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Keys the company controls and can audit, and that can be shared with other accounts</td><td data-label="Design choice">Customer managed keys for all company data; AWS managed keys only where nothing leaves the account</td></tr>
+						<tr><td data-label="Requirement">A compromised application key affects one workload, one classification and one environment</td><td data-label="Design choice">One key per workload, classification and environment, named and tagged to a standard</td></tr>
+						<tr><td data-label="Requirement">People who manage keys can't decrypt data, and code can use keys only through the expected service</td><td data-label="Design choice">Key policy template with separate administrator, user and service statements, <code>kms:ViaService</code> and encryption context conditions</td></tr>
+						<tr><td data-label="Requirement">No key is deleted by mistake or by an attacker</td><td data-label="Design choice">SCP allowing only a break-glass custodian to schedule deletion, full 30-day waiting period, alarms and Security Hub CSPM KMS.3</td></tr>
+						<tr><td data-label="Requirement">Everything new is encrypted without relying on each team</td><td data-label="Design choice">EBS encryption by default with a customer managed key, S3 default SSE-KMS with Bucket Keys, Config rules as evidence</td></tr>
+						<tr><td data-label="Requirement">Data can be read in the DR Region and account during an outage</td><td data-label="Design choice">Single-Region keys in the DR account for service-side copies; one multi-Region key only for client-side encrypted data</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused: the data platform key <code>1234abcd-12ab-34cd-56ef-1234567890ab</code> and bucket <code>shop-data-111111111111</code>, the roles <code>orders-app</code> and <code>analytics-etl</code>, the DR key <code>5678efgh-56ef-78gh-90ij-5678efgh90ij</code> and bucket <code>shop-data-dr-888888888888</code> (Tasks 4.2 and 5.2), the multi-Region key <code>mrk-1234abcd12ab34cd56ef1234567890ab</code> and break-glass role <code>key-custodian</code> (Task 5.3), the forensics sharing key (<a href="incident-forensics.html">incident response and forensics</a>), the log keys (<a href="security-data-lake.html">security data lake</a>), and the root <code>r-abcd</code> and Policy Staging OU <code>ou-abcd-44444444</code> from the <a href="security-baseline.html">security baseline</a>. New on this page:</p>
+			<ul>
+				<li><strong>Roles</strong>: <code>kms-key-admin</code>, the key administrator role that the platform pipeline deploys to every account, and <code>s3-batch-reencrypt</code>, a temporary S3 Batch Operations role in <code>111111111111</code>.</li>
+				<li><strong>Aliases</strong>: <code>alias/prod/data-platform/confidential</code> for the data platform key, <code>alias/prod/web-app/internal</code> for the web app's EBS and RDS key (placeholder <code>WEB_APP_KEY_ID</code>) and <code>alias/prod/secrets/confidential</code> for production secrets (placeholder <code>SECRETS_KEY_ID</code>).</li>
+				<li><strong>Tags</strong> on every key: <code>data-classification</code>, <code>environment</code>, <code>workload</code> and <code>owner</code>.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 290" role="img" aria-labelledby="dgK-wide-t">
+<title id="dgK-wide-t">Key management at scale: analytics-etl in the analytics account reads the shop-data bucket, and S3 calls KMS on its behalf to decrypt with the data platform key, which needs both the key policy and the role's IAM policy; EC2 creates a grant on the web app key to use an encrypted-by-default volume; replication copies data to the DR account under its own key; an administrator's attempt to delete a key is denied by an SCP.</title>
+<rect x="10" y="15" width="180" height="110" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">analytics 777777777777</text>
+<rect x="205" y="15" width="390" height="230" rx="12" class="dg-grp"/>
+<text x="585" y="31" class="dg-lbl" text-anchor="end">prod 111111111111</text>
+<rect x="605" y="15" width="180" height="110" rx="12" class="dg-grp"/>
+<text x="615" y="118" class="dg-lbl">DR 888888888888</text>
+<path d="M180.0 70.0 L220.0 70.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 93.0 L300.0 167.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<text x="306" y="134" class="dg-lbl dg-halo" text-anchor="start" fill="var(--accent)">Decrypt via S3</text>
+<path d="M500.0 93.0 L500.0 167.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<text x="506" y="134" class="dg-lbl dg-halo" text-anchor="start" fill="var(--accent)">CreateGrant</text>
+<path d="M300.0 47.0 L300.0 15.0 Q300.0 8.0 307.0 8.0 L693.0 8.0 Q700.0 8.0 700.0 15.0 L700.0 47.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M180.0 250.0 L193.0 250.0 Q200.0 250.0 200.0 243.0 L200.0 197.0 Q200.0 190.0 207.0 190.0 L220.0 190.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="220" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 216l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="214" y="224" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">SCP denies deletion</text>
+<rect x="20" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="67" class="dg-t dg-sm">analytics-etl</text>
+<text x="100" y="84" class="dg-s dg-sm2">777777777777</text>
+<rect x="620" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="67" class="dg-t dg-sm">DR bucket</text>
+<text x="700" y="84" class="dg-s dg-sm2">its own DR key</text>
+<rect x="220" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="67" class="dg-t dg-sm">shop-data bucket</text>
+<text x="300" y="84" class="dg-s dg-sm2">SSE-KMS, Bucket Key</text>
+<rect x="220" y="167" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="187" class="dg-t dg-sm">Data platform key</text>
+<text x="300" y="204" class="dg-s dg-sm2">admins vs users</text>
+<rect x="420" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="67" class="dg-t dg-sm">Web server</text>
+<text x="500" y="84" class="dg-s dg-sm2">EBS by default</text>
+<rect x="420" y="167" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="187" class="dg-t dg-sm">Web app key</text>
+<text x="500" y="204" class="dg-s dg-sm2">grant for EC2</text>
+<rect x="20" y="227" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="247" class="dg-t dg-sm">Administrator</text>
+<text x="100" y="264" class="dg-s dg-sm2">not key-custodian</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 430" role="img" aria-labelledby="dgK-tall-t">
+<title id="dgK-tall-t">Key management at scale: analytics-etl in the analytics account reads the shop-data bucket, and S3 calls KMS on its behalf to decrypt with the data platform key, which needs both the key policy and the role's IAM policy; EC2 creates a grant on the web app key to use an encrypted-by-default volume; replication copies data to the DR account under its own key; an administrator's attempt to delete a key is denied by an SCP.</title>
+<rect x="10" y="15" width="180" height="90" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">analytics 777777777777</text>
+<rect x="210" y="15" width="180" height="90" rx="12" class="dg-grp"/>
+<text x="220" y="31" class="dg-lbl">DR 888888888888</text>
+<rect x="10" y="125" width="380" height="210" rx="12" class="dg-grp"/>
+<text x="380" y="141" class="dg-lbl" text-anchor="end">prod 111111111111</text>
+<path d="M100.0 83.0 L100.0 152.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 198.0 L100.0 262.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 198.0 L300.0 262.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M107.0 152.0 L107.0 124.5 Q107.0 117.5 114.0 117.5 L293.0 117.5 Q300.0 117.5 300.0 110.5 L300.0 83.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M100.0 372.0 L100.0 308.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="100" cy="340" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M96 336l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="114" y="344" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">SCP denies deletion</text>
+<rect x="20" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="57" class="dg-t dg-sm">analytics-etl</text>
+<text x="100" y="74" class="dg-s dg-sm2">777777777777</text>
+<rect x="220" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="57" class="dg-t dg-sm">DR bucket</text>
+<text x="300" y="74" class="dg-s dg-sm2">its own DR key</text>
+<rect x="20" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="172" class="dg-t dg-sm">shop-data bucket</text>
+<text x="100" y="189" class="dg-s dg-sm2">SSE-KMS, Bucket Key</text>
+<rect x="20" y="262" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="282" class="dg-t dg-sm">Data platform key</text>
+<text x="100" y="299" class="dg-s dg-sm2">admins vs users</text>
+<rect x="220" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="172" class="dg-t dg-sm">Web server</text>
+<text x="300" y="189" class="dg-s dg-sm2">EBS by default</text>
+<rect x="220" y="262" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="282" class="dg-t dg-sm">Web app key</text>
+<text x="300" y="299" class="dg-s dg-sm2">grant for EC2</text>
+<rect x="20" y="372" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="392" class="dg-t dg-sm">Administrator</text>
+<text x="100" y="409" class="dg-s dg-sm2">not key-custodian</text>
+</svg>
+				<figcaption>Figure: green is KMS used on the caller's behalf. When <code>analytics-etl</code> reads the bucket (blue), S3 calls <code>Decrypt</code> with the bucket ARN as encryption context, so the key policy can require <code>kms:ViaService</code> and that context, and the role's own IAM policy must allow the key too. EC2 uses a grant for the web app key, limited by <code>kms:GrantIsForAWSResource</code>. Replicas in the DR account use that account's key, because a multi-Region key can't be replicated to another account (dashed). Only <code>key-custodian</code> may schedule deletion, with at least 30 days' wait (red).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Three paths show the design at work: a cross-account read of SSE-KMS data, an encrypted EBS volume that relies on a grant, and an attempt to delete a key. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">The analytics account reads the data platform</li>
+				<li><span class="name">ETL job calls S3<span class="who">Workload</span></span><span class="desc"><code>analytics-etl</code> in <code>777777777777</code> calls <code>s3:GetObject</code> on <code>shop-data-111111111111</code>; bucket and IAM policies allow it (and the <a href="data-perimeter.html">data perimeter</a> applies).</span></li>
+				<li class="auto"><span class="name">S3 asks KMS for the data key<span class="who auto">AWS</span></span><span class="desc">S3 calls <code>Decrypt</code> on the caller's behalf with encryption context <code>aws:s3:arn</code> = the bucket ARN (a Bucket Key is in use), so <code>kms:ViaService</code> is <code>s3.us-east-1.amazonaws.com</code>.</span></li>
+				<li class="auto"><span class="name">Both accounts must allow<span class="who auto">AWS</span></span><span class="desc">The key policy names <code>analytics-etl</code> for <code>kms:Decrypt</code> through S3 for this bucket only, and the role's IAM policy allows the key ARN. If either is missing, S3 returns <code>AccessDenied</code>.</span></li>
+				<li class="auto"><span class="name">Logged with its context<span class="who auto">AWS</span></span><span class="desc">The organization trail records the <code>Decrypt</code> with the encryption context, showing which bucket the key was used for.</span></li>
+				<li class="group">A web server boots from an encrypted volume</li>
+				<li><span class="name">Auto Scaling launches an instance<span class="who">Workload</span></span><span class="desc">EBS encryption by default is on in <code>us-east-1</code>, with <code>alias/prod/web-app/internal</code> as the account's default key, so the new root volume is encrypted with it.</span></li>
+				<li class="auto"><span class="name">EC2 creates a grant<span class="who auto">AWS</span></span><span class="desc">EC2 calls <code>CreateGrant</code> on the caller's behalf, allowed only when <code>kms:GrantIsForAWSResource</code> is true. The grant lets EC2 decrypt the volume's data key at each attach.</span></li>
+				<li class="group">Someone tries to delete a key</li>
+				<li><span class="name">ScheduleKeyDeletion<span class="who">Administrator</span></span><span class="desc">An administrator tries to schedule deletion of the data platform key. The SCP denies it: only <code>key-custodian</code> may, and never with fewer than 30 days.</span></li>
+				<li class="auto"><span class="name">Alerts and findings<span class="who auto">AWS</span></span><span class="desc">If the custodian does schedule it, EventBridge pages the security team, an alarm fires on any use during the waiting period, and Security Hub CSPM raises KMS.3 (Critical).</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Key inventory, aliases and tags</h3>
+				<p><strong>Which kind of key.</strong> An AWS managed key (alias <code>aws/&lt;service&gt;</code>) is visible and logged, and rotates yearly, but you can't change its policy. That policy allows only principals in the same account, through that service (the <code>aws/ebs</code> policy combines <code>kms:CallerAccount</code> with <code>kms:ViaService</code>), so data under it can't be shared with another account: snapshots for the DR or forensics accounts fail under <code>aws/ebs</code>, and S3 objects under <code>aws/s3</code> can't be shared. RCPs don't restrict AWS managed keys either. The standard is therefore a customer managed key for all company data (<a href="../d5-task-5-2.html">Task 5.2</a>).</p>
+				<p><strong>How many keys.</strong> Following AWS's guidance, there are separate keys per data classification, application and environment. The production inventory (non-prod accounts mirror it with <code>nonprod</code> in the alias):</p>
+				<div class="table-wrap">
+					<table class="stack labeled">
+						<thead><tr><th>Key (alias)</th><th>Account, owner and what it protects</th></tr></thead>
+						<tbody>
+							<tr><td data-label="Key (alias)"><code>alias/prod/data-platform/confidential</code></td><td data-label="Account, owner and what it protects"><code>111111111111</code>, data platform team: <code>shop-data-111111111111</code>, its Glue catalog and Athena results</td></tr>
+							<tr><td data-label="Key (alias)"><code>alias/prod/web-app/internal</code></td><td data-label="Account, owner and what it protects"><code>111111111111</code>, web team: EBS volumes, the Aurora cluster and their snapshots</td></tr>
+							<tr><td data-label="Key (alias)"><code>alias/prod/secrets/confidential</code></td><td data-label="Account, owner and what it protects"><code>111111111111</code>, platform team: Secrets Manager secrets for every production workload</td></tr>
+							<tr><td data-label="Key (alias)">Client-side multi-Region key (<code>mrk-</code>)</td><td data-label="Account, owner and what it protects"><code>111111111111</code>, orders team: order attributes encrypted by the application before they're stored, readable in <code>us-west-2</code> (Step 5)</td></tr>
+							<tr><td data-label="Key (alias)">DR and backup keys</td><td data-label="Account, owner and what it protects"><code>888888888888</code>, platform team: replica bucket and backup vault copies in <code>us-west-2</code></td></tr>
+							<tr><td data-label="Key (alias)">Log and evidence keys</td><td data-label="Account, owner and what it protects"><code>444444444444</code>, <code>222222222222</code> and <code>666666666666</code>, security team (security data lake and forensics pages)</td></tr>
+						</tbody>
+					</table>
+				</div>
+				<p>The platform pipeline creates every key from one module, never in the console, so the Step 2 policy and the tags are always there. The same alias name exists in each account and Region, and moving an alias to a new key is how keys that can't rotate automatically are replaced. Cross-account callers must use the key ARN, because an alias is looked up in the caller's own account.</p>
+				<span class="file">Create the data platform key with its policy and tags, then name it (AWS CLI, production account 111111111111, run by the pipeline as kms-key-admin)</span>
+<pre><code>aws kms create-key \
+  --description "Data platform, confidential, prod" \
+  --policy file://data-platform-key-policy.json \
+  --tags TagKey=data-classification,TagValue=confidential TagKey=environment,TagValue=prod TagKey=workload,TagValue=data-platform TagKey=owner,TagValue=data-platform-team
+
+<span class="c"># The returned key ID is 1234abcd-12ab-34cd-56ef-1234567890ab</span>
+aws kms create-alias \
+  --alias-name alias/prod/data-platform/confidential \
+  --target-key-id 1234abcd-12ab-34cd-56ef-1234567890ab</code></pre>
+				<div class="callout trap"><p>Tags and aliases are not just labels. KMS supports attribute-based access control, so a policy can allow use of keys by tag or alias, and AWS warns that principals who can change tags or aliases can change who can use a key. In this design only <code>kms-key-admin</code> may tag keys or change aliases.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The key policy template: administrators, users and services apart</h3>
+				<p>A key policy grants nothing to the account automatically; the <code>Enable IAM User Permissions</code> statement is what lets IAM policies count at all (<a href="../d4-task-4-2.html">Task 4.2</a>). The console's default policy adds key administrators, who manage but can't use the key, and key users. The template keeps that split and tightens it three ways:</p>
+				<ul>
+					<li><strong>Administrators can't delete.</strong> The console's administrator statement includes <code>kms:ScheduleKeyDeletion</code> and <code>kms:CancelKeyDeletion</code> unless you clear "allow key administrators to delete this key". The template gives them to <code>key-custodian</code> only.</li>
+					<li><strong>Use only through a service.</strong> <code>kms:ViaService</code> limits <code>orders-app</code> to requests S3 makes on its behalf, so it can't call <code>kms:Decrypt</code> directly on a stolen ciphertext.</li>
+					<li><strong>Use only for its data.</strong> <code>kms:EncryptionContext:aws:s3:arn</code> ties the key to one bucket. With S3 Bucket Keys the context is the <em>bucket</em> ARN, not the object ARN.</li>
+				</ul>
+				<span class="file">Data platform key policy: account statement, administrators without deletion, the custodian, and in-account and cross-account users through S3 for one bucket (KMS key policy, data-platform-key-policy.json)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Id": "data-platform-key-policy",
+  "Statement": [
+    {
+      "Sid": "Enable IAM User Permissions",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Allow access for Key Administrators",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:role/kms-key-admin" },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*",
+        "kms:Update*", "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*",
+        "kms:TagResource", "kms:UntagResource", "kms:RotateKeyOnDemand"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowKeyCustodianDeletion",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:role/key-custodian" },
+      "Action": ["kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion", "kms:DescribeKey"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowOrdersAppThroughS3ForThisBucket",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:role/orders-app" },
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.us-east-1.amazonaws.com",
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::shop-data-111111111111"
+        }
+      }
+    },
+    {
+      "Sid": "AllowAnalyticsReadThroughS3ForThisBucket",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::777777777777:role/analytics-etl" },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.us-east-1.amazonaws.com",
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::shop-data-111111111111"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>S3 needs <code>kms:GenerateDataKey</code> to write and <code>kms:Decrypt</code> to read (both for multipart uploads), so those are the only user actions. Administrators can still change the policy and create grants, and so could give themselves use of the key, as AWS warns. That's why <code>kms:PutKeyPolicy</code> is limited to the pipeline's <code>kms-key-admin</code> role by SCP (Step 6).</p>
+				<p>The account statement stays: without it, deleting the named roles leaves the key unmanageable until AWS Support helps. The cost is that an IAM policy in <code>111111111111</code> could grant direct <code>kms:Decrypt</code>. IAM changes go only through the pipeline, and Security Hub CSPM KMS.1 and KMS.2 flag IAM policies allowing decryption on all keys.</p>
+				<div class="callout tip"><p><code>kms:ViaService</code> answers "the role may use the key only through S3 (or EBS, RDS, Secrets Manager)". <code>kms:CallerAccount</code> together with <code>"Principal": {"AWS": "*"}</code> answers "every principal in this account". Encryption context conditions answer "only for this bucket, this secret, this tenant".</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Grants and cross-account use</h3>
+				<p><strong>Grants</strong> are the third way, after key policies and IAM policies, to allow use of a key, and suit temporary or service-driven permissions: create, use, retire, with no policy edit. Services such as EBS and Redshift create grants on the caller's behalf, which is what the <code>Allow attachment of persistent resources</code> statement allows: <code>kms:CreateGrant</code>, <code>kms:ListGrants</code> and <code>kms:RevokeGrant</code> only when <code>kms:GrantIsForAWSResource</code> is true, so a role can't hand itself a grant directly.</p>
+				<p>Grants also cover one-off jobs. Objects written before the key standard (under <code>aws/s3</code>) are re-encrypted by an S3 Batch Operations copy in place running as <code>s3-batch-reencrypt</code>, which gets a grant for the bucket's encryption context instead of a key policy entry.</p>
+				<span class="file">A temporary grant for the re-encryption job, limited to the bucket's encryption context and retirable by the key administrator (AWS CLI, production account 111111111111)</span>
+<pre><code>aws kms create-grant \
+  --key-id arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab \
+  --grantee-principal arn:aws:iam::111111111111:role/s3-batch-reencrypt \
+  --operations Decrypt GenerateDataKey \
+  --constraints '{"EncryptionContextSubset": {"aws:s3:arn": "arn:aws:s3:::shop-data-111111111111"}}' \
+  --retiring-principal arn:aws:iam::111111111111:role/kms-key-admin \
+  --name s3-batch-reencrypt-2026-11</code></pre>
+				<p>The command returns a <code>GrantId</code> and a <code>GrantToken</code>. Grants are eventually consistent (usually under five minutes), so a job starting at once passes the token, and <code>--name</code> stops retries creating duplicates. When the job ends, the grant is retired, or revoked by its <code>GrantId</code>.</p>
+				<p><strong>Cross-account use</strong> needs both sides: the key policy names the other account or role (Step 2), and an IAM policy there allows the key ARN. Only cryptographic, grant and describe operations work across accounts, never <code>ScheduleKeyDeletion</code> or <code>PutKeyPolicy</code>, so a compromised analytics account can't delete or rewrite the key.</p>
+				<span class="file">The analytics side: allow decryption with the production data platform key only (IAM policy on analytics-etl, account 777777777777)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowUseOfProdDataKey",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    }
+  ]
+}</code></pre>
+				<p>The forensics sharing key applies the same pattern to snapshots (<a href="incident-forensics.html">incident response and forensics</a>).</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Default encryption for EBS and S3, and keys for secrets</h3>
+				<p><strong>EBS.</strong> Encryption by default is a per-Region account setting: new volumes are always encrypted, existing ones are unchanged, and instance types without encryption support can't launch. The AWS SRA code example <code>ec2_default_ebs_encryption</code> turns it on in every account and governed Region with the default key; the company then sets its customer managed key as the default, so snapshots and AMIs can be shared.</p>
+				<span class="file">Encrypt every new volume, with the web app key as the default (AWS CLI, run per account and Region by StackSets)</span>
+<pre><code>aws ec2 enable-ebs-encryption-by-default --region us-east-1
+
+aws ec2 modify-ebs-default-kms-key-id --region us-east-1 \
+  --kms-key-id alias/prod/web-app/internal</code></pre>
+				<p>The key must be symmetric, and if it's disabled or deleted, instances fail to launch. EC2 checks it asynchronously, so a wrong alias appears to succeed and fails later. Its policy copies the shape of the <code>aws/ebs</code> policy:</p>
+				<span class="file">Any principal in the production account may use the web app key, but only through EC2 (EBS) and RDS (KMS key policy statement for WEB_APP_KEY_ID)</span>
+<pre><code>{
+  "Sid": "AllowUseThroughEc2AndRdsForThisAccount",
+  "Effect": "Allow",
+  "Principal": { "AWS": "*" },
+  "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:CreateGrant", "kms:DescribeKey"],
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {
+      "kms:CallerAccount": "111111111111",
+      "kms:ViaService": ["ec2.us-east-1.amazonaws.com", "rds.us-east-1.amazonaws.com"]
+    }
+  }
+}</code></pre>
+				<p><strong>S3.</strong> The data platform default is SSE-KMS with its key (by ARN, in the bucket's Region), a Bucket Key, and SSE-C blocked; the bucket policy refuses uploads naming any other key.</p>
+				<span class="file">Default SSE-KMS with the data platform key and a Bucket Key, SSE-C blocked (AWS CLI, production account)</span>
+<pre><code>aws s3api put-bucket-encryption --bucket shop-data-111111111111 \
+  --server-side-encryption-configuration '{
+    "Rules": [{
+      "ApplyServerSideEncryptionByDefault": {
+        "SSEAlgorithm": "aws:kms",
+        "KMSMasterKeyID": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+      },
+      "BucketKeyEnabled": true,
+      "BlockedEncryptionTypes": { "EncryptionType": ["SSE-C"] }
+    }]
+  }'</code></pre>
+				<span class="file">Refuse uploads that ask for any other KMS key (S3 bucket policy statement)</span>
+<pre><code>{
+  "Sid": "RequireDataPlatformKey",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::shop-data-111111111111/*",
+  "Condition": {
+    "StringNotEqualsIfExists": {
+      "s3:x-amz-server-side-encryption-aws-kms-key-id": "arn:aws:kms:us-east-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    }
+  }
+}</code></pre>
+				<p>This is envelope encryption: S3 asks KMS for a data key, encrypts the object with the plaintext copy, discards it and stores the encrypted copy with the object. A Bucket Key adds a short-lived bucket-level key from which object data keys are derived, cutting KMS requests by up to 99 percent, which matters for millions of small objects. The trade-offs: the encryption context (and CloudTrail) shows the bucket, not the object, and DSSE-KMS can't use Bucket Keys. <code>IfExists</code> lets header-less uploads through to the bucket default. Changing the default doesn't re-encrypt existing objects; that's the Step 3 batch job.</p>
+				<p><strong>Secrets.</strong> Secrets Manager encrypts each secret version with its own data key. Production secrets use <code>alias/prod/secrets/confidential</code>, not <code>aws/secretsmanager</code>, which can't be used across accounts or narrowed. Requests carry the encryption context <code>SecretARN</code> and <code>SecretVersionId</code>, so the policy limits each workload to its own secrets:</p>
+				<span class="file">The orders application may decrypt only production secrets under prod/orders/, only through Secrets Manager (KMS key policy statement for SECRETS_KEY_ID)</span>
+<pre><code>{
+  "Sid": "AllowOrdersSecretsThroughSecretsManager",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::111111111111:role/orders-app" },
+  "Action": "kms:Decrypt",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": { "kms:ViaService": "secretsmanager.us-east-1.amazonaws.com" },
+    "StringLike": { "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:us-east-1:111111111111:secret:prod/orders/*" }
+  }
+}</code></pre>
+				<p>Secret rotation itself is on <a href="../d5-task-5-3.html">Task 5.3</a>; the rotation function also needs <code>kms:GenerateDataKey</code> through Secrets Manager to write new versions. When a secret's key changes, Secrets Manager re-encrypts the current, pending and previous versions and keeps older versions readable with the old key, so the old key stays until nothing depends on it.</p>
+				<div class="callout note"><p>Certificates are the other key material. Internal TLS uses ACM private certificates from AWS Private CA subordinate CAs, which renew themselves on load balancers; CA keys stay in Private CA's HSMs, outside the KMS inventory (<a href="../d5-task-5-3.html">Task 5.3</a>, <a href="../d5-task-5-1.html">Task 5.1</a>).</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Rotation, multi-Region keys and imported material</h3>
+				<p><strong>Rotation.</strong> Automatic rotation creates new material every 90 to 2,560 days (365 by default); on-demand rotation does it at once, up to 25 times per key. Key ID, aliases and policy stay the same, and old material is kept so existing ciphertext still decrypts. Rotation does <em>not</em> re-encrypt data, doesn't help if a <em>data key</em> was exposed, and doesn't apply to asymmetric, HMAC or custom key store keys, which are replaced by a new key and an alias move.</p>
+				<span class="file">Rotate the confidential key every 180 days, and rotate now after a suspected exposure of key administrator credentials (AWS CLI, production account)</span>
+<pre><code>aws kms enable-key-rotation \
+  --key-id 1234abcd-12ab-34cd-56ef-1234567890ab \
+  --rotation-period-in-days 180
+
+aws kms rotate-key-on-demand \
+  --key-id 1234abcd-12ab-34cd-56ef-1234567890ab</code></pre>
+				<p><code>kms:RotationPeriodInDays</code> can limit the periods teams choose, and each rotation sends a <code>KMS CMK Rotation</code> event to EventBridge as audit evidence.</p>
+				<p><strong>Multi-Region keys.</strong> AWS says single-Region keys fit most needs, and the design uses them for every service-side copy: S3 replication to <code>shop-data-dr-888888888888</code> re-encrypts under the DR account's own key <code>5678efgh-56ef-78gh-90ij-5678efgh90ij</code>, since most services treat multi-Region keys as single-Region keys anyway, and backup and snapshot copies also re-encrypt in the destination Region. A multi-Region key earns its place only where the <em>application</em> encrypts data that is copied between Regions: the orders team's client-side encrypted attributes, which the DR copy decrypts in <code>us-west-2</code> without a call to <code>us-east-1</code>.</p>
+				<span class="file">Create the multi-Region primary and replicate it to the DR Region with its own policy (AWS CLI, production account 111111111111)</span>
+<pre><code>aws kms create-key --multi-region \
+  --description "Orders client-side encryption, confidential, prod" \
+  --policy file://orders-cse-key-policy.json \
+  --tags TagKey=data-classification,TagValue=confidential TagKey=environment,TagValue=prod
+
+aws kms replicate-key \
+  --key-id arn:aws:kms:us-east-1:111111111111:key/mrk-1234abcd12ab34cd56ef1234567890ab \
+  --replica-region us-west-2 \
+  --policy file://orders-cse-replica-policy.json \
+  --tags TagKey=data-classification,TagValue=confidential TagKey=environment,TagValue=prod</code></pre>
+				<p>The replica is in the <em>same account</em>: <code>ReplicateKey</code> can't replicate to another account. When the DR runbook runs the application in <code>888888888888</code>, the replica's own policy (not copied from the primary; without <code>--policy</code> it gets the default policy) names the DR role, whose IAM policy allows the replica ARN. Material, key ID and rotation are shared; policy, grants, aliases, tags and enabled state are set per Region. Each replica is billed as a key.</p>
+				<p>Elsewhere multi-Region keys are avoided: the same material in several Regions can conflict with data residency, single-Region keys can't be converted, and interoperable keys widen the impact of a policy mistake. An SCP lets only <code>kms-key-admin</code> create them (Step 6).</p>
+				<p><strong>Imported material and custom key stores.</strong> A payments key in <code>prod-payments</code> (<code>121212121212</code>) must use material from the company's HSM, so it has origin <code>EXTERNAL</code> and material imported with an expiry at most 365 days ahead (commands on <a href="../d5-task-5-3.html">Task 5.3</a>). The company must keep every version of the material; if any is lost, the key is unusable. Expired material is deleted and the key returns to <code>PendingImport</code> until re-imported, so a scheduled check reads <code>ValidTo</code> from <code>DescribeKey</code> 30 days ahead, with the <code>KMS Imported Key Material Expiration</code> event as a backstop. For the one market whose regulator requires material outside AWS, an external key store (XKS) serves only that market's low-volume EBS and RDS keys; a CloudHSM key store would fit a single-tenant HSM requirement inside AWS. Both support only symmetric keys, have no SLA and can't hold multi-Region keys.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Guardrails, alarms and evidence</h3>
+				<p>Key deletion is irreversible: a deleted symmetric key can't be recreated, and everything under it is lost, including Object Lock-protected logs and backups. Deletion waits 7 to 30 days (30 by default) in <code>PendingDeletion</code>, when it can be cancelled. The SCP below, tested in Policy Staging <code>ou-abcd-44444444</code> and then attached to <code>r-abcd</code>, forces the full 30 days, lets only <code>key-custodian</code> start it, and keeps key policies and special key types with the pipeline.</p>
+				<span class="file">Organization guardrails for KMS keys (SCP, attached to the root r-abcd)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectKmsKeysFromDeletion",
+      "Effect": "Deny",
+      "Action": ["kms:ScheduleKeyDeletion", "kms:DeleteImportedKeyMaterial"],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/key-custodian" }
+      }
+    },
+    {
+      "Sid": "RequireFullWaitingPeriod",
+      "Effect": "Deny",
+      "Action": "kms:ScheduleKeyDeletion",
+      "Resource": "*",
+      "Condition": {
+        "NumericLessThan": { "kms:ScheduleKeyDeletionPendingWindowInDays": "30" }
+      }
+    },
+    {
+      "Sid": "OnlyPipelineChangesKeyPolicies",
+      "Effect": "Deny",
+      "Action": "kms:PutKeyPolicy",
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/kms-key-admin" }
+      }
+    },
+    {
+      "Sid": "OnlyPipelineCreatesMultiRegionKeys",
+      "Effect": "Deny",
+      "Action": "kms:CreateKey",
+      "Resource": "*",
+      "Condition": {
+        "Bool": { "kms:MultiRegion": "true" },
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/kms-key-admin" }
+      }
+    },
+    {
+      "Sid": "OnlyPipelineCreatesCustomKeyStoreKeys",
+      "Effect": "Deny",
+      "Action": "kms:CreateKey",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "kms:KeyOrigin": ["EXTERNAL_KEY_STORE", "AWS_CLOUDHSM"] },
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/kms-key-admin" }
+      }
+    }
+  ]
+}</code></pre>
+				<p><code>kms:ScheduleKeyDeletionPendingWindowInDays</code> limits the waiting period a caller may request; <code>kms:KeyOrigin</code> and <code>kms:MultiRegion</code> apply to <code>CreateKey</code>. The custodian role is assumable only through the break-glass process. SCPs don't cover the management account, which holds no workload keys, and the <a href="security-data-lake.html">security data lake</a> adds a stricter SCP for the log keys. AWS's unused-keys blog adds a key policy layer: deny deletion and disabling of keys used recently, with <code>kms:TrailingDaysWithoutKeyUsage</code>.</p>
+				<span class="file">Page the security team when anyone schedules deletion, disables a key, changes a key policy or deletes imported material (EventBridge event pattern, deployed to every account and Region)</span>
+<pre><code>{
+  "source": ["aws.kms"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventSource": ["kms.amazonaws.com"],
+    "eventName": ["ScheduleKeyDeletion", "DisableKey", "PutKeyPolicy", "DeleteImportedKeyMaterial"]
+  }
+}</code></pre>
+				<p>These are write management events, which a rule in the default <code>ENABLED</code> state matches while a trail is logging. A second rule forwards KMS's own <code>KMS CMK Deletion</code> and <code>KMS Imported Key Material Expiration</code> events; both target the security tooling account <code>222222222222</code> (<a href="threat-detection-response.html">threat detection and response</a>).</p>
+				<p>During a waiting period, the question is whether anything still uses the key. KMS documents a metric filter on the trail's log group for requests failing with "is pending deletion", alarmed at 1 or more:</p>
+				<span class="file">Metric filter pattern for use of a key pending deletion (CloudWatch Logs, organization trail log group)</span>
+<pre><code>{ $.eventSource = kms* &amp;&amp; $.errorMessage = "* is pending deletion."}</code></pre>
+				<p>Before any deletion the runbook disables the key and watches for failures, checks <em>Last used</em> (<code>GetKeyLastUsage</code>, tracked since April 2026 in most Regions), and confirms no EBS volumes or snapshots use the key, since volumes can depend on a key without calling KMS for long periods.</p>
+				<p><strong>Evidence.</strong> Config rules in the organization conformance pack (<a href="../d6-task-6-3.html">Task 6.3</a>): <code>ec2-ebs-encryption-by-default</code>, <code>encrypted-volumes</code> with <code>kmsId</code>, <code>s3-default-encryption-kms</code> with <code>kmsKeyArns</code> and <code>cmk-backing-key-rotation-enabled</code>. Security Hub CSPM adds:</p>
+				<ul>
+					<li><strong>KMS.1, KMS.2</strong> (Medium): IAM policies must not allow <code>kms:Decrypt</code> or <code>kms:ReEncryptFrom</code> on all keys (conditions are ignored).</li>
+					<li><strong>KMS.3</strong> (Critical): keys not scheduled for deletion.</li>
+					<li><strong>KMS.4</strong> (Medium): rotation enabled, a CIS item.</li>
+					<li><strong>KMS.5</strong> (Critical): no public key policy; it also fails if Config can't read the policy.</li>
+				</ul>
+				<p>Behind it all, CloudTrail logs every <code>GenerateDataKey</code>, <code>Decrypt</code> and <code>CreateGrant</code> with the caller, the calling service (<code>invokedBy</code>) and the encryption context (<a href="security-data-lake.html">security data lake</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Workload-owned keys, central templates</h4>
+				<p>AWS describes decentralized ownership as the usual default, with centralized ownership for organizations that need strict central compliance oversight, and a hybrid in between. The company runs the hybrid. Keys live in the account of the data they protect, so the account boundary limits who can reach them, and applications in different accounts get separate keys, as the AWS guidance recommends. The security team owns the template, the SCP and the evidence. A central key account was rejected: every use would become cross-account, needing a key policy statement and an IAM policy for each consumer, and a mistake in one key policy would expose many workloads (<a href="../d6-task-6-1.html">Task 6.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Key granularity: classification, workload, environment</h4>
+				<p>Per classification, confidential data gets narrower users and shorter rotation; per workload, one team's administrators stay out of another's data; per environment, no non-prod role can decrypt production data. Going finer (per bucket or tenant) adds monthly key charges and policies to review; an encryption context condition per tenant on one key gives most of the benefit.</p>
+			</div>
+			<div class="entry">
+				<h4>Separation of duties inside the key policy</h4>
+				<p>Administrators manage but can't use, users use but can't manage, the custodian alone deletes, and services get grants only for AWS resources. Because administrators can rewrite the policy, <code>PutKeyPolicy</code> is pipeline-only and reviewed as code, and EventBridge reports any other change (<a href="../d4-task-4-2.html">Task 4.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Rotation period by classification</h4>
+				<p>Confidential keys rotate every 180 days and others yearly. Rotation is cheap and invisible to applications, but it isn't a response to a leaked data key. That needs re-encryption of the affected data under a new key, which is why the Batch Operations grant pattern exists.</p>
+			</div>
+			<div class="entry">
+				<h4>Bucket Keys on by default</h4>
+				<p>Bucket Keys cut KMS request costs for the data platform and log buckets, at the price of coarser logging and policies that name the bucket ARN. Data needing per-object KMS audit goes in a separate bucket without them.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>AWS managed keys everywhere</h4>
+				<p>No key policies to write and yearly rotation for free. But they can't be shared across accounts, used for cross-account replication or backup copies, or restricted beyond the account, and RCPs don't restrict them. They fit data that never leaves one account, which in this design is almost nothing.</p>
+			</div>
+			<div class="entry">
+				<h4>One central key account</h4>
+				<p>All keys in one security-owned account, with key policies granting each workload account. It gives one place to audit and a strict separation between key owners and data owners, which some regulated organizations require. The costs are cross-account permissions for every consumer, a large blast radius for policy errors, and one team on the critical path for every new workload.</p>
+			</div>
+			<div class="entry">
+				<h4>CloudHSM directly, or custom key stores</h4>
+				<p>CloudHSM gives single-tenant HSMs managed outside IAM, for PKCS #11, TLS offload or Oracle TDE; custom key stores put KMS keys on HSMs you control. AWS recommends them only when regulation requires, preferring CloudHSM key stores to external ones, and with XKS the company owns availability and latency (<a href="../d5-task-5-2.html">Task 5.2</a>, <a href="../d5-task-5-3.html">Task 5.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Multi-Region keys for all DR data</h4>
+				<p>Simpler on paper, but S3 replication re-encrypts under the destination key anyway, the replica can't live in the DR account, and the material spreads further. Single-Region keys in <code>888888888888</code> keep DR copies independent of production, as ransomware resilience needs.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Check the policies before they deploy</span><span class="desc">The pipeline runs Access Analyzer policy validation and a custom policy check that fails the build if a key policy grants new access compared to the approved template.</span></li>
+				<li><span class="name">Prove the conditions work</span><span class="desc">As <code>orders-app</code>, call <code>aws kms decrypt</code> directly on an object's ciphertext: expect <code>AccessDeniedException</code>, because the request isn't through S3. As <code>analytics-etl</code>, read an SSE-KMS object from a second test bucket encrypted with the same key: expect a denial, because the encryption context names a different bucket.</span></li>
+				<li><span class="name">Try to delete a key</span><span class="desc">In the test account <code>101010101010</code> in Policy Staging, try <code>ScheduleKeyDeletion</code> as <code>kms-key-admin</code> (expect an explicit SCP deny), as <code>key-custodian</code> with 7 days (deny) and with 30 days (allowed). The EventBridge rule must page within minutes and KMS.3 must appear. Then encrypt with the pending key, check that the metric filter alarm fires, and cancel the deletion.</span></li>
+				<li><span class="name">Find unintended access</span><span class="desc">IAM Access Analyzer external access findings for KMS keys should list only the intended grants: the data platform key to <code>777777777777</code> and the forensics sharing key to <code>666666666666</code>, both archived by archive rules. Any other finding is fixed in the key policy. <code>GetKeyLastUsage</code> shows keys nobody uses.</span></li>
+				<li><span class="name">Read the compliance evidence</span><span class="desc">The Config aggregator shows the four encryption rules compliant everywhere and Security Hub CSPM shows no failed KMS controls; an unencrypted test volume must turn non-compliant.</span></li>
+				<li><span class="name">Game day in the DR Region</span><span class="desc">Disable the primary multi-Region key in <code>us-east-1</code> and run the DR application in <code>888888888888</code>: it must decrypt with the replica, and the replicated bucket must be readable with the DR key.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Authorization Strategies</td><td data-label="What this architecture demonstrates">Key policies that must allow explicitly, the account statement that enables IAM, cross-account key use needing both sides, grants and <code>kms:GrantIsForAWSResource</code>, Access Analyzer findings for keys</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-1.html">5.1</a> Controls for Data in Transit</td><td data-label="What this architecture demonstrates">ACM private certificates from Private CA for internal TLS, kept apart from the KMS inventory</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">Customer managed versus AWS managed keys, envelope encryption, EBS default encryption, S3 default SSE-KMS with Bucket Keys, <code>kms:ViaService</code>, enforcing a key in bucket policies</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-3.html">5.3</a> Secrets, Credentials and Key Material</td><td data-label="What this architecture demonstrates">Rotation and its limits, multi-Region keys and when not to use them, imported material expiry, XKS and CloudHSM key stores, deletion protection, Secrets Manager keys and encryption context</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">Keys owned per workload account, organization SCPs protecting keys with a break-glass exception, rollout through Policy Staging</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-3.html">6.3</a> Evaluate Compliance</td><td data-label="What this architecture demonstrates">Config rules for encryption and rotation, Security Hub CSPM KMS.1 to KMS.5, CloudTrail and EventBridge evidence of key changes</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Share an encrypted snapshot or replicate encrypted objects to another account" fails with <code>aws/ebs</code> or <code>aws/s3</code>: use a <strong>customer managed key, a key policy statement for the other account and an IAM policy there</strong>. "The role may use the key only through S3" is <strong><code>kms:ViaService</code></strong>; "only for this bucket or secret" is an <strong>encryption context condition</strong>. "Prevent anyone from deleting KMS keys except an approved process" is an <strong>SCP denying <code>kms:ScheduleKeyDeletion</code> except a break-glass role</strong>, plus an alarm on use during the waiting period. "Rotate keys yearly with the least effort" is <strong>automatic rotation</strong>, but "a data key was exposed" needs re-encryption under a new key, not rotation. "Reduce KMS costs for SSE-KMS buckets" is <strong>S3 Bucket Keys</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/aws-kms-how-many-keys-do-i-need/">AWS KMS: How many keys do I need?</a> (December 2024): key granularity by classification, application, environment and service, and centralized versus decentralized ownership.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/managing-permissions-with-grants-in-aws-key-management-service/">Managing permissions with grants in AWS Key Management Service</a> (November 2021): how grants work, constraints, retiring and revoking, and how services use them.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/identify-unused-aws-kms-keys-and-prevent-accidental-key-deletions/">Identify unused AWS KMS keys and prevent accidental key deletions</a> (June 2026): <code>GetKeyLastUsage</code>, disabling before deleting, and a key policy that blocks deletion of recently used keys.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/the-curious-case-of-faster-aws-kms-symmetric-key-rotation/">The curious case of faster AWS KMS symmetric key rotation</a> (April 2024): configurable rotation periods, on-demand rotation and rotation visibility.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/encrypt-global-data-client-side-with-aws-kms-multi-region-keys/">Encrypt global data client-side with AWS KMS multi-Region keys</a> (June 2021): the client-side case that justifies a multi-Region key.</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/aws-kms-best-practices/introduction.html">AWS Key Management Service best practices</a> (AWS Prescriptive Guidance): key policies, least privilege, encryption context, rotation and monitoring; it replaces the withdrawn KMS best practices whitepaper.</li>
+				<li><a href="https://docs.aws.amazon.com/kms/latest/cryptographic-details/intro.html">Introduction to the cryptographic details of AWS KMS</a> (AWS KMS documentation): how keys, HSMs and envelope encryption work underneath, formerly a whitepaper.</li>
+				<li><a href="https://github.com/aws-samples/aws-security-reference-architecture-examples/tree/main/aws_sra_examples/solutions/ec2/ec2_default_ebs_encryption">aws-samples AWS SRA examples: EC2 default EBS encryption</a> (AWS sample code): turns on EBS encryption by default in every account and governed Region.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
