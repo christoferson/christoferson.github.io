@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Ransomware Resilience and Data Recovery | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: defending data and backups against an attacker with administrator credentials in a production account. The ransomware threat model on AWS, SCP and RCP guardrails, organization backup policies from a delegated administrator, Vault Lock compliance and governance modes, cross-account and cross-Region copies, logically air-gapped vaults shared through AWS RAM, S3 versioning, Object Lock and replication, EBS Snapshot Lock and locked Recycle Bin rules, RDS and DynamoDB point-in-time recovery, GuardDuty and EventBridge detection, AWS Backup Audit Manager, and restore testing into a clean recovery account.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Ransomware resilience</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Ransomware resilience and data recovery</h1>
+		<p>Assume the attacker already has administrator credentials in production. The design makes sure they can't delete, shorten, re-encrypt or hide the company's backups, that the security team hears about every attempt within minutes, and that a clean copy can be restored into an account the attacker never touched.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 5</span><span class="tag">Domain 2</span><span class="tag">Domain 6</span><span class="tag">AWS Backup</span><span class="tag">Vault Lock</span><span class="tag">Logically air-gapped vault</span><span class="tag">S3 Object Lock</span><span class="tag">EBS Snapshot Lock</span><span class="tag">Recycle Bin</span><span class="tag">EventBridge</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Guardrails before backups</a></li>
+				<li class="sub"><a href="#b2">2. Organization backup policies</a></li>
+				<li class="sub"><a href="#b3">3. Vaults, keys and Vault Lock</a></li>
+				<li class="sub"><a href="#b4">4. The logically air-gapped vault</a></li>
+				<li class="sub"><a href="#b5">5. S3, EBS, RDS and DynamoDB</a></li>
+				<li class="sub"><a href="#b6">6. Detection and evidence</a></li>
+				<li class="sub"><a href="#b7">7. Recovery into a clean account</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>) runs its web app, EKS containers, S3 data platform and GenAI assistant in production account <code>111111111111</code> in <code>us-east-1</code>, with <code>us-west-2</code> as the disaster recovery Region. AWS says ransomware on AWS starts with valid stolen credentials, usually long-term access keys, not a flaw in a service. So the design assumes the worst case: an attacker holds an administrator role in production and wants to make the company pay. On AWS that looks like:</p>
+			<ul>
+				<li><strong>Destroying the way back</strong>: <code>DeleteRecoveryPoint</code>, <code>DeleteBackupVault</code>, shortening lifecycles with <code>UpdateRecoveryPointLifecycle</code>, deleting EBS snapshots, AMIs and RDS snapshots, or turning off versioning.</li>
+				<li><strong>Making data unreadable</strong>: <code>CopyObject</code> over every object with SSE-C and a key only the attacker holds (the pattern in AWS's January 2025 post), or re-encryption under an attacker's KMS key in another account.</li>
+				<li><strong>Taking the keys away</strong>: <code>ScheduleKeyDeletion</code> on the customer managed keys, so data and backups under them become unreadable after the waiting period.</li>
+				<li><strong>Opening or locking the door</strong>: <code>PutBucketPolicy</code> to grant an outside account or deny the owner, and lifecycle rules that quietly expire data.</li>
+			</ul>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">An administrator in a workload account can't destroy backups or the controls that protect them</td><td data-label="Design choice">SCPs on the Workloads and Business Continuity OUs, with a single break-glass exception, plus the KMS deletion guardrails</td></tr>
+						<tr><td data-label="Requirement">Every production resource is backed up, whatever the team does</td><td data-label="Design choice">An organization backup policy selecting by tag, managed from a delegated administrator</td></tr>
+						<tr><td data-label="Requirement">Copies survive the loss of the production account and Region</td><td data-label="Design choice">Cross-account, cross-Region copies to a compliance-mode locked vault and a logically air-gapped vault in the DR account</td></tr>
+						<tr><td data-label="Requirement">Data outside AWS Backup is protected too</td><td data-label="Design choice">S3 versioning, Object Lock and replication; EBS Snapshot Lock and locked Recycle Bin rules; PITR for RDS and DynamoDB</td></tr>
+						<tr><td data-label="Requirement">Every attempt is seen within minutes</td><td data-label="Design choice">GuardDuty, EventBridge rules on destructive API calls, AWS Backup Audit Manager and Security Hub CSPM controls</td></tr>
+						<tr><td data-label="Requirement">Recovery is proven, clean and happens away from the compromised account</td><td data-label="Design choice">Malware-scanned recovery points, restore testing, and a recovery account that receives the air-gapped vault through AWS RAM</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused: the DR account <code>888888888888</code> in the Business Continuity OU and the test account <code>101010101010</code> in Policy Staging <code>ou-abcd-44444444</code> (<a href="security-baseline.html">security baseline</a>); root <code>r-abcd</code>, Workloads OU <code>ou-abcd-33333333</code> with Prod <code>ou-abcd-11111111</code>; the data platform key <code>alias/prod/data-platform/confidential</code>, bucket <code>shop-data-111111111111</code>, its replica <code>shop-data-dr-888888888888</code> under the DR key, and the <code>key-custodian</code> role (<a href="kms-at-scale.html">key management at scale</a>); <code>prod-vault</code> (Task 2.2), <code>backup-admin</code> and <code>s3-replication</code> (Task 5.2); the evidence bucket <code>ir-evidence-666666666666-us-east-1</code> (<a href="incident-forensics.html">incident response and forensics</a>). New on this page:</p>
+			<ul>
+				<li><strong>OU and account</strong>: the Business Continuity OU is <code>ou-abcd-77777777</code>; it holds <code>888888888888</code> and a new recovery account <code>141414141414</code>, which hosts the isolated recovery environment.</li>
+				<li><strong>Vaults</strong>: <code>central-vault</code> (standard vault, Vault Lock in compliance mode) and <code>dr-lag-vault</code> (logically air-gapped), both in <code>888888888888</code>, <code>us-west-2</code>. The DR account's backup key is the placeholder <code>DR_BACKUP_KEY_ARN</code>.</li>
+				<li><strong>Roles and tags</strong>: <code>backup-service</code>, the role AWS Backup assumes in every account (deployed by StackSets), and the resource tag <code>backup=daily</code> that puts a resource under the policy.</li>
+			</ul>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 370" role="img" aria-labelledby="dgR-wide-t">
+<title id="dgR-wide-t">Ransomware resilience: an attacker with administrator credentials in production is denied deleting backups by an SCP and the compliance-mode Vault Lock, and denied re-encrypting or exposing data by the bucket policy and Object Lock; nightly copies sit in central-vault and the logically air-gapped dr-lag-vault in the DR account, which the recovery account restores from into an isolated VPC; destructive calls raise alerts in the security tooling account.</title>
+<rect x="10" y="15" width="380" height="285" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">prod 111111111111</text>
+<rect x="405" y="15" width="190" height="235" rx="12" class="dg-grp"/>
+<text x="415" y="31" class="dg-lbl">DR 888888888888</text>
+<rect x="605" y="120" width="180" height="110" rx="12" class="dg-grp"/>
+<text x="615" y="136" class="dg-lbl">recovery 141414141414</text>
+<path d="M180.0 158.0 L193.0 158.0 Q200.0 158.0 200.0 151.0 L200.0 77.0 Q200.0 70.0 207.0 70.0 L220.0 70.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="114" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 110l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="214" y="118" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">SCP + Vault Lock</text>
+<path d="M180.0 172.0 L193.0 172.0 Q200.0 172.0 200.0 179.0 L200.0 253.0 Q200.0 260.0 207.0 260.0 L220.0 260.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="200" cy="216" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M196 212l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="214" y="220" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">bucket policy</text>
+<path d="M380.0 63.0 L420.0 63.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M380.0 77.0 L393.0 77.0 Q400.0 77.0 400.0 84.0 L400.0 168.0 Q400.0 175.0 407.0 175.0 L420.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 188.0 L100.0 312.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="106" y="254" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">detected</text>
+<rect x="20" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="162" class="dg-t dg-sm">Attacker</text>
+<text x="100" y="179" class="dg-s dg-sm2">admin credentials</text>
+<rect x="220" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="67" class="dg-t dg-sm">prod-vault</text>
+<text x="300" y="84" class="dg-s dg-sm2">compliance lock</text>
+<rect x="220" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="257" class="dg-t dg-sm">shop-data bucket</text>
+<text x="300" y="274" class="dg-s dg-sm2">Object Lock, versions</text>
+<rect x="420" y="47" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="67" class="dg-t dg-sm">central-vault</text>
+<text x="500" y="84" class="dg-s dg-sm2">Vault Lock</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="172" class="dg-t dg-sm">dr-lag-vault</text>
+<text x="500" y="189" class="dg-s dg-sm2">logically air-gapped</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Clean restore</text>
+<text x="700" y="189" class="dg-s dg-sm2">isolated VPC</text>
+<rect x="20" y="312" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="332" class="dg-t dg-sm">Security alerts</text>
+<text x="100" y="349" class="dg-s dg-sm2">222222222222</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 470" role="img" aria-labelledby="dgR-tall-t">
+<title id="dgR-tall-t">Ransomware resilience: an attacker with administrator credentials in production is denied deleting backups by an SCP and the compliance-mode Vault Lock, and denied re-encrypting or exposing data by the bucket policy and Object Lock; nightly copies sit in central-vault and the logically air-gapped dr-lag-vault in the DR account, which the recovery account restores from into an isolated VPC; destructive calls raise alerts in the security tooling account.</title>
+<rect x="10" y="15" width="380" height="200" rx="12" class="dg-grp"/>
+<text x="20" y="31" class="dg-lbl">prod 111111111111</text>
+<rect x="10" y="235" width="380" height="110" rx="12" class="dg-grp"/>
+<text x="20" y="338" class="dg-lbl">DR 888888888888</text>
+<rect x="210" y="365" width="180" height="90" rx="12" class="dg-grp"/>
+<text x="220" y="448" class="dg-lbl">recovery 141414141414</text>
+<path d="M100.0 83.0 L100.0 142.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="100" cy="112" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M96 108l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="114" y="116" class="dg-lbl dg-halo" text-anchor="start" fill="#f87171">bucket policy</text>
+<path d="M180.0 60.0 L293.0 60.0 Q300.0 60.0 300.0 67.0 L300.0 142.0" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="4 4"/>
+<circle cx="240" cy="60" r="9" fill="var(--bg)" stroke="#f87171" stroke-width="2"/>
+<path d="M236 56l8 8m0 -8l-8 8" stroke="#f87171" stroke-width="2.2"/>
+<text x="240" y="92" class="dg-lbl dg-halo" text-anchor="middle" fill="#f87171">SCP + Vault Lock</text>
+<path d="M293.0 188.0 L293.0 220.5 Q293.0 227.5 286.0 227.5 L107.0 227.5 Q100.0 227.5 100.0 234.5 L100.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M307.0 188.0 L307.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 313.0 L300.0 387.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M20.0 60.0 L13.0 60.0 Q6.0 60.0 6.0 67.0 L6.0 403.0 Q6.0 410.0 13.0 410.0 L20.0 410.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="20" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="57" class="dg-t dg-sm">Attacker</text>
+<text x="100" y="74" class="dg-s dg-sm2">admin credentials</text>
+<rect x="220" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="162" class="dg-t dg-sm">prod-vault</text>
+<text x="300" y="179" class="dg-s dg-sm2">compliance lock</text>
+<rect x="20" y="142" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="162" class="dg-t dg-sm">shop-data bucket</text>
+<text x="100" y="179" class="dg-s dg-sm2">Object Lock, versions</text>
+<rect x="20" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="287" class="dg-t dg-sm">central-vault</text>
+<text x="100" y="304" class="dg-s dg-sm2">Vault Lock</text>
+<rect x="220" y="267" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="287" class="dg-t dg-sm">dr-lag-vault</text>
+<text x="300" y="304" class="dg-s dg-sm2">logically air-gapped</text>
+<rect x="220" y="387" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="407" class="dg-t dg-sm">Clean restore</text>
+<text x="300" y="424" class="dg-s dg-sm2">isolated VPC</text>
+<rect x="20" y="387" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="407" class="dg-t dg-sm">Security alerts</text>
+<text x="100" y="424" class="dg-s dg-sm2">222222222222</text>
+</svg>
+				<figcaption>Figure: the attack against the controls (red) and the recovery. Backup deletion in <code>prod-vault</code> is denied by an SCP and, failing that, by the compliance-mode lock, which even the root user can't remove; S3 data is protected by the bucket policy, versioning and Object Lock. Every night AWS Backup copies recovery points to <code>central-vault</code> and the logically air-gapped <code>dr-lag-vault</code> in <code>888888888888</code> (blue), which no production role can reach. The recovery account, which already has the air-gapped vault through AWS RAM, restores a clean point into an isolated VPC (green), while the destructive calls page the security team (dashed).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The attack is played out against the controls, then the recovery. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">An attacker with administrator credentials in production</li>
+				<li><span class="name">Deletes backups<span class="who">Attacker</span></span><span class="desc">Calls <code>DeleteRecoveryPoint</code> and <code>UpdateRecoveryPointLifecycle</code> on <code>prod-vault</code>. The SCP denies both before AWS Backup looks at them; even without it, the vault's compliance-mode lock refuses, root user included.</span></li>
+				<li><span class="name">Deletes snapshots and AMIs<span class="who">Attacker</span></span><span class="desc">Deletes EBS snapshots made outside AWS Backup and deregisters AMIs. The locked Region-level Recycle Bin rules keep them recoverable for 30 days, and locked snapshots can't be deleted at all.</span></li>
+				<li><span class="name">Re-encrypts or exposes S3 data<span class="who">Attacker</span></span><span class="desc">SSE-C writes are blocked, uploads naming another KMS key are denied by the bucket policy, and overwrites only create new versions; Object Lock keeps earlier versions for 14 days. <code>PutBucketPolicy</code> and lifecycle changes are denied by SCP.</span></li>
+				<li><span class="name">Schedules key deletion<span class="who">Attacker</span></span><span class="desc">The KMS SCP lets only <code>key-custodian</code> schedule deletion, with a 30-day wait (<a href="kms-at-scale.html#b6">key management at scale</a>).</span></li>
+				<li class="group">Detection</li>
+				<li class="auto"><span class="name">Findings and alerts<span class="who auto">AWS</span></span><span class="desc">GuardDuty raises <code>Impact:IAMUser/AnomalousBehavior</code> and S3 <code>Impact:S3/AnomalousBehavior.Delete</code> findings; the EventBridge rule on destructive Backup, S3, EC2 and KMS calls pages the security team in <code>222222222222</code>, which starts the ransomware playbook.</span></li>
+				<li class="group">Recovery, away from production</li>
+				<li class="auto"><span class="name">Copies are untouched<span class="who auto">AWS</span></span><span class="desc">Last night's copies sit in <code>central-vault</code> and <code>dr-lag-vault</code> in <code>888888888888</code>, <code>us-west-2</code>. No role in <code>111111111111</code> can reach them; cross-account calls other than <code>backup:CopyIntoBackupVault</code> are rejected.</span></li>
+				<li><span class="name">Pick a clean point<span class="who">Recovery team</span></span><span class="desc">GuardDuty Malware Protection for AWS Backup scan results and the CloudTrail timeline identify the last recovery point before the attacker's first action.</span></li>
+				<li><span class="name">Restore and cut over<span class="who">Recovery team</span></span><span class="desc">In <code>141414141414</code>, which already has the air-gapped vault through AWS RAM, the team restores into a VPC with no path to production, validates, and only then moves traffic.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Guardrails before backups</h3>
+				<p>Backups are the last line; the first is stopping the destructive calls. Least privilege comes first: no human has standing administrator access in production, and long-term access keys are banned (<a href="workforce-identity.html">workforce identity</a>). The <a href="data-perimeter.html">data perimeter</a> stops data leaving for outside accounts, and the <a href="kms-at-scale.html#b6">KMS guardrails</a> protect the keys. This page adds an SCP for the data protection controls themselves.</p>
+				<p>The AWS Backup docs say why each part is needed. A vault access policy only governs AWS Backup APIs, so EBS and RDS snapshots can still be reached through EC2 and RDS. Vault Lock doesn't govern sharing or tier changes made through EC2: a snapshot recovery point can still be shared with <code>ModifySnapshotAttribute</code> or re-tiered with <code>ModifySnapshotTier</code>. And disabling an AMI blocks restores of EC2 backups even in a locked vault. AWS recommends denying those EC2 actions except to the roles backup plans use, because AWS Backup itself uses them for cross-account copies and cold storage.</p>
+				<span class="file">Protect backup vaults, recovery points, snapshots, Recycle Bin rules and S3 data protection settings; only backup-admin and the AWS Backup role are exempt (SCP, attached to ou-abcd-33333333 and ou-abcd-77777777)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProtectBackupVaultsAndRecoveryPoints",
+      "Effect": "Deny",
+      "Action": [
+        "backup:DeleteRecoveryPoint",
+        "backup:UpdateRecoveryPointLifecycle",
+        "backup:DeleteBackupVault",
+        "backup:PutBackupVaultAccessPolicy",
+        "backup:DeleteBackupVaultAccessPolicy",
+        "backup:PutBackupVaultLockConfiguration",
+        "backup:DeleteBackupVaultLockConfiguration",
+        "backup:PutBackupVaultNotifications",
+        "backup:DeleteBackupVaultNotifications",
+        "backup:DeleteBackupPlan",
+        "backup:UpdateBackupPlan"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/backup-admin" }
+      }
+    },
+    {
+      "Sid": "ProtectSnapshotsAmisAndRecycleBin",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:ModifySnapshotAttribute",
+        "ec2:ModifySnapshotTier",
+        "ec2:UnlockSnapshot",
+        "ec2:DisableImage",
+        "rbin:UpdateRule",
+        "rbin:DeleteRule",
+        "rbin:UnlockRule"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": ["arn:aws:iam::*:role/backup-admin", "arn:aws:iam::*:role/backup-service"]
+        }
+      }
+    },
+    {
+      "Sid": "ProtectS3DataProtectionSettings",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutBucketVersioning",
+        "s3:PutLifecycleConfiguration",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:BypassGovernanceRetention",
+        "s3:PutReplicationConfiguration",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/backup-admin" }
+      }
+    }
+  ]
+}</code></pre>
+				<p>Plans that come from the organization backup policy are managed by AWS Backup, not by IAM principals in the account, so the deny on plan changes doesn't break them. In practice the platform pipeline role is added to the S3 exception, because bucket policies and lifecycle rules change through it; nothing else is. <code>backup-admin</code> is a break-glass role assumable only through the same approval process as <code>key-custodian</code>, and every use of it pages the security team. The rollout follows the baseline: Policy Staging, one account, then the OUs (<a href="../d6-task-6-1.html">Task 6.1</a>).</p>
+				<p><strong>SSE-C.</strong> S3 has blocked SSE-C by default for new buckets (and existing buckets in accounts that never used it) since April 2026, and the data platform bucket sets <code>BlockedEncryptionTypes</code> explicitly (<a href="kms-at-scale.html#b4">key management at scale</a>). Because the company never uses SSE-C, AWS's RCP from the January 2025 post also goes on the root, so a bucket created with an older setting is still covered:</p>
+				<span class="file">Deny any upload that carries an SSE-C key, in every account (RCP, attached to r-abcd)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RestrictSSECObjectUploads",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "*",
+      "Condition": {
+        "Null": { "s3:x-amz-server-side-encryption-customer-algorithm": "false" }
+      }
+    }
+  ]
+}</code></pre>
+				<p><code>CopyObject</code> is authorized as <code>s3:PutObject</code> on the destination, which is why this one action covers the copy-over-itself attack.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Organization backup policies from a delegated administrator</h3>
+				<p>A backup plan created by hand in each account is one forgotten setting away from a gap. An Organizations <strong>backup policy</strong> is a declarative policy that AWS Backup turns into a backup plan in every account it reaches; the plan is visible but owned by the organization.</p>
+				<p>The management account enables cross-account management in AWS Backup (backup policies, cross-account monitoring, cross-account backup) and registers a delegated administrator. Registering only enables cross-account job monitoring; to edit backup policies too, the delegated account also needs the <code>AWSBackupOrganizationAdminAccess</code> managed policy on its roles and a resource-based delegation policy in Organizations. The company delegates to the DR account <code>888888888888</code>, run by the platform team's data protection group, keeping the management account out of daily work.</p>
+				<span class="file">Register the DR account as the AWS Backup delegated administrator (AWS CLI, management account 555555555555)</span>
+<pre><code>aws organizations register-delegated-administrator \
+  --account-id 888888888888 \
+  --service-principal "backup.amazonaws.com"</code></pre>
+				<p>The policy can't create the vault or the IAM role: both must already exist in every account and Region it covers, which is why a service-managed StackSet deploys <code>prod-vault</code> and <code>backup-service</code> to the Prod OU first (<a href="../d6-task-6-2.html">Task 6.2</a>). Selection is by tag or resource type, not by individual ARN.</p>
+				<span class="file">Daily backups of everything tagged backup=daily, kept 35 days, copied to the locked vault and the air-gapped vault in the DR account and Region (backup policy, attached to the Prod OU ou-abcd-11111111)</span>
+<pre><code>{
+  "plans": {
+    "org-daily": {
+      "regions": { "@@assign": ["us-east-1"] },
+      "rules": {
+        "daily": {
+          "schedule_expression": { "@@assign": "cron(0 5 ? * * *)" },
+          "start_backup_window_minutes": { "@@assign": "60" },
+          "complete_backup_window_minutes": { "@@assign": "1440" },
+          "target_backup_vault_name": { "@@assign": "prod-vault" },
+          "lifecycle": {
+            "delete_after_days": { "@@assign": "35" }
+          },
+          "copy_actions": {
+            "arn:aws:backup:us-west-2:888888888888:backup-vault:central-vault": {
+              "target_backup_vault_arn": { "@@assign": "arn:aws:backup:us-west-2:888888888888:backup-vault:central-vault" },
+              "lifecycle": { "delete_after_days": { "@@assign": "90" } }
+            },
+            "arn:aws:backup:us-west-2:888888888888:backup-vault:dr-lag-vault": {
+              "target_backup_vault_arn": { "@@assign": "arn:aws:backup:us-west-2:888888888888:backup-vault:dr-lag-vault" },
+              "lifecycle": { "delete_after_days": { "@@assign": "90" } }
+            }
+          }
+        }
+      },
+      "selections": {
+        "tags": {
+          "daily-tagged": {
+            "iam_role_arn": { "@@assign": "arn:aws:iam::$account:role/backup-service" },
+            "tag_key": { "@@assign": "backup" },
+            "tag_value": { "@@assign": ["daily"] }
+          }
+        }
+      }
+    }
+  }
+}</code></pre>
+				<p><code>$account</code> becomes each member's own account ID, while the copy targets use the real DR account ID, as the syntax requires for cross-account copies. A second rule with <code>enable_continuous_backup</code> gives RDS, Aurora and S3 point-in-time restore (at most 35 days' retention, so it has no long-term copies). The policy can also carry <code>scan_actions</code> with <code>scan_settings</code> so GuardDuty Malware Protection for AWS Backup scans new recovery points. Resource types differ in whether they support a copy that is both cross-account and cross-Region; the AWS Backup feature availability table is checked for each one, and anything that can't do both is copied in two hops.</p>
+				<div class="callout tip"><p>Backup policies are one of the Organizations management policy types, like tag policies (<a href="../d6-task-6-1.html">Task 6.1</a>). "Ensure every account backs up its resources the same way, even new ones" is a <strong>backup policy attached to an OU</strong>, not an SCP and not a Config rule.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Vaults, keys and Vault Lock</h3>
+				<p>Each vault has its own KMS key. For fully managed resource types (S3, EFS, DynamoDB with advanced backup and others) recovery points are encrypted with the vault's key, independent of the source. EBS, RDS, Aurora and FSx backups keep the source's encryption, so those sources must use customer managed keys for cross-account copies. That's one more reason for the <a href="kms-at-scale.html#b1">no AWS managed keys</a> rule. In <code>888888888888</code>, <code>central-vault</code> uses the DR backup key, owned there with its own deletion SCP, so a key problem in production can't make the copies unreadable.</p>
+				<p>The destination vault must let the source accounts copy in; <code>backup:CopyIntoBackupVault</code> is the only action AWS Backup accepts across accounts:</p>
+				<span class="file">Let accounts in the organization copy into central-vault, and nothing else (backup vault access policy, DR account 888888888888)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCopyFromOrganization",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "backup:CopyIntoBackupVault",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:PrincipalOrgID": "o-exampleorgid" }
+      }
+    }
+  ]
+}</code></pre>
+				<p><strong>Vault Lock</strong> makes the vault write-once-read-many: nobody, the root user included, can delete a backup or change its lifecycle in a locked vault until its retention ends. It comes in two modes:</p>
+				<ul>
+					<li><strong>Governance mode</strong> (no <code>ChangeableForDays</code>): users with enough IAM permissions can remove or change the lock. Good for testing and for internal policy, not against an administrator.</li>
+					<li><strong>Compliance mode</strong> (<code>ChangeableForDays</code>, 3 to 36,500): during this grace time, the cooling-off period, the lock can still be changed or removed. After it, the vault and lock are immutable; nobody, not even AWS, can change or delete them while recovery points remain.</li>
+				</ul>
+				<span class="file">Lock central-vault in compliance mode after a 3-day grace time; copies must keep 30 to 400 days (AWS CLI, DR account 888888888888, us-west-2)</span>
+<pre><code>aws backup put-backup-vault-lock-configuration --region us-west-2 \
+  --backup-vault-name central-vault \
+  --changeable-for-days 3 \
+  --min-retention-days 30 \
+  --max-retention-days 400</code></pre>
+				<p>Minimum and maximum retention apply to new jobs, which fail if their lifecycle falls outside them; recovery points already in the vault keep their lifecycle. Before the grace time ends, the team checks <code>describe-backup-vault</code> (<code>Locked</code> and <code>LockDate</code>) and that no rule keeps points "always", since in a compliance vault those can never be deleted and keep costing money. <code>prod-vault</code> is locked the same way (<a href="../d2-task-2-2.html#s4">Task 2.2</a>). One limit remains: if an account is closed, AWS deletes its vault contents after the 90-day post-closure period, Vault Lock or not. That is why copies live in a second account.</p>
+				<div class="callout trap"><p>AWS Backup Vault Lock is not S3 Glacier Vault Lock. The Glacier feature (24-hour test, then a permanent vault lock policy) belongs to the original Glacier vault service, which no longer accepts new customers (<a href="../d5-task-5-2.html">Task 5.2</a>).</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The logically air-gapped vault, shared with the recovery account</h3>
+				<p>A <strong>logically air-gapped vault</strong> is a second type of AWS Backup vault. It always has Vault Lock in compliance mode, its recovery points are stored in AWS service-owned accounts, and it can be shared with other accounts, in or outside the organization, through AWS RAM. A shared account can view and restore, but not copy. So the company's recovery account can restore directly from it without copying first, even if the owning account is compromised.</p>
+				<p>Encryption defaults to an AWS owned key, which AWS Backup recommends; since November 2025 a customer managed key is optional, preferably in a different account. The company keeps the AWS owned key: AWS's August 2026 post notes this removes the risk of losing access through a deleted or misconfigured customer managed key. Sources of non fully managed types (EBS, RDS) must still be under customer managed keys to be copied in, and unencrypted Aurora clusters aren't supported.</p>
+				<span class="file">Create the air-gapped vault with 30 to 400 days' retention (AWS CLI, DR account 888888888888)</span>
+<pre><code>aws backup create-logically-air-gapped-backup-vault \
+  --region us-west-2 \
+  --backup-vault-name dr-lag-vault \
+  --min-retention-days 30 \
+  --max-retention-days 400</code></pre>
+				<p>The minimum accepted is 7 days; copies with retention outside the range fail. The vault starts in <code>CREATING</code>. Next it is shared, by account ID only (RAM can't share it with an OU or the whole organization), with the recovery account and the forensics account, as in AWS's 2024 reference design. The recipient has 12 hours to accept.</p>
+				<span class="file">Share the air-gapped vault with the recovery and forensics accounts (AWS CLI, DR account 888888888888)</span>
+<pre><code>aws ram create-resource-share \
+  --name dr-lag-vault-share \
+  --resource-arns arn:aws:backup:us-west-2:888888888888:backup-vault:dr-lag-vault \
+  --principals 141414141414 666666666666 \
+  --region us-west-2</code></pre>
+				<p>RAM sharing depends on the owning account. <strong>Multi-party approval</strong> covers the case where it is lost: an approval team, signing in through a separate identity path, can grant another account access to the vault, and that access can't be revoked from the source account. Backups stay reachable through it until the post-closure period ends. AWS's May 2026 cyber recovery post recommends putting the approval team in a second organization, because a compromised management account could disable approval in the same one. The company runs RAM sharing now and has MPA onboarding on its roadmap. With MPA, a backup policy can also send backups straight into an air-gapped vault (<code>target_logically_air_gapped_backup_vault_arn</code>) to save the cost of a second copy.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Service-level protection: S3, EBS, RDS and DynamoDB</h3>
+				<p><strong>S3.</strong> The data platform bucket has versioning, so an overwrite or delete creates a new version or delete marker instead of destroying data (<a href="../d5-task-5-2.html">Task 5.2</a>). Versioning alone isn't enough, because anyone with <code>s3:DeleteObjectVersion</code> can remove versions. <strong>MFA delete</strong> would add a second factor, but only the root user can enable it, only through the CLI or API, and it can't be used on a bucket with lifecycle rules, which the data platform needs. Security Hub CSPM S3.20 doesn't report buckets with lifecycle rules for that reason. The bucket uses <strong>Object Lock</strong> instead:</p>
+				<span class="file">Keep every version of the data platform for at least 14 days in governance mode (AWS CLI, production account 111111111111)</span>
+<pre><code>aws s3api put-object-lock-configuration \
+  --bucket shop-data-111111111111 \
+  --object-lock-configuration '{ "ObjectLockEnabled": "Enabled", "Rule": { "DefaultRetention": { "Mode": "GOVERNANCE", "Days": 14 }}}'</code></pre>
+				<p>Governance mode, not compliance, because privacy requests sometimes need a record deleted early. Doing that requires <code>s3:BypassGovernanceRetention</code>, which the Step 1 SCP leaves only to <code>backup-admin</code>, so a production administrator can't. Object Lock protects versions but not their key, so the key guardrails matter as much.</p>
+				<p><strong>S3 Replication</strong> copies new versions to <code>shop-data-dr-888888888888</code> in <code>us-west-2</code> through <code>s3-replication</code>, opting in to SSE-KMS objects and re-encrypting under the DR account's key (<a href="../d5-task-5-2.html">Task 5.2</a>). Two settings make it ransomware-relevant. The owner override (<code>"Owner": "Destination"</code>) makes the DR account own replicas, so the production account has no rights over them. Delete marker replication is off, and deletes of specific versions never replicate, so a mass deletion in production doesn't reach the copy. The DR bucket has Object Lock, so replicated objects keep their retention.</p>
+				<p><strong>EBS snapshots and AMIs.</strong> AWS Backup's own EBS snapshots can't be deleted through EC2, but the golden AMIs and snapshots from other tools can. Two controls cover them. <strong>Recycle Bin</strong> keeps deleted EBS snapshots and EBS-backed AMIs for 1 to 365 days (EBS volumes 1 to 7 days). A Region-level rule (no resource tags) covers everything of its type, and a <strong>locked</strong> rule can't be changed or deleted until an unlock delay of 7 to 30 days has passed after someone unlocks it.</p>
+				<span class="file">Keep deleted snapshots and AMIs for 30 days, with rules that need a 14-day unlock delay (AWS CLI, every workload account and Region, by StackSets)</span>
+<pre><code>aws rbin create-rule --resource-type EBS_SNAPSHOT \
+  --retention-period RetentionPeriodValue=30,RetentionPeriodUnit=DAYS \
+  --description "Region-level: keep deleted snapshots for 30 days" \
+  --lock-configuration 'UnlockDelay={UnlockDelayUnit=DAYS,UnlockDelayValue=14}'
+
+aws rbin create-rule --resource-type EC2_IMAGE \
+  --retention-period RetentionPeriodValue=30,RetentionPeriodUnit=DAYS \
+  --description "Region-level: keep deregistered AMIs for 30 days" \
+  --lock-configuration 'UnlockDelay={UnlockDelayUnit=DAYS,UnlockDelayValue=14}'</code></pre>
+				<p><strong>EBS Snapshot Lock</strong> goes further for the snapshots behind the golden AMI: locked for 1 to 36,500 days, in governance mode (changeable by authorized users) or compliance mode, where changes are possible only during an optional cooling-off period of up to 72 hours. After that the lock can only be extended.</p>
+				<span class="file">Lock the golden AMI's snapshot in compliance mode for a year after a 24-hour cooling-off (AWS CLI, production account)</span>
+<pre><code>aws ec2 lock-snapshot --snapshot-id snap-0abcdef1234567890 \
+  --lock-mode compliance --cool-off-period 24 --lock-duration 365</code></pre>
+				<p><strong>RDS and Aurora.</strong> The orders database is an encrypted Aurora cluster under the web app key, backed up by the policy's continuous rule for point-in-time restore. Restores always create a new cluster or instance, so the damaged one stays for investigation (<a href="../d2-task-2-2.html#s4">Task 2.2</a>).</p>
+				<p><strong>DynamoDB.</strong> The GenAI assistant's tables have point-in-time recovery (restore to any second in a window of 1 to 35 days, always into a new table) and deletion protection. They are also tagged for the backup policy, because PITR lives in the same account and dies with it.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Detection and evidence</h3>
+				<p><strong>GuardDuty</strong>, delegated to <code>222222222222</code> (<a href="threat-detection-response.html">threat detection and response</a>), is the anomaly layer. <code>Impact:IAMUser/AnomalousBehavior</code> (High) covers unusual delete, update and put calls such as <code>PutBucketPolicy</code>. <code>Exfiltration:IAMUser/AnomalousBehavior</code> covers calls like <code>PutBucketReplication</code> and <code>CreateSnapshot</code> that copy data out. <code>DefenseEvasion:IAMUser/AnomalousBehavior</code> covers delete, disable and stop calls, and <code>Stealth:IAMUser/CloudTrailLoggingDisabled</code> covers logging changes. With S3 Protection, <code>Impact:S3/AnomalousBehavior.Delete</code> (High), <code>.Write</code> and <code>.Permission</code> flag mass deletion, mass overwriting and policy changes, and Extended Threat Detection links them into an attack sequence.</p>
+				<p><strong>EventBridge</strong> covers the attempts that matter even when they fail or look normal. AWS Backup's own events (<code>source</code> <code>aws.backup</code>, such as <code>Backup Vault State Change</code>) say what happened; the CloudTrail events say who called what:</p>
+				<span class="file">Page the security team on any attempt to delete or weaken backups, Recycle Bin rules, snapshot locks, bucket protection or keys (EventBridge event pattern, every account and Region, forwarded to 222222222222)</span>
+<pre><code>{
+  "source": ["aws.backup", "aws.ec2", "aws.s3", "aws.kms"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventName": [
+      "DeleteBackupVault", "DeleteRecoveryPoint", "UpdateRecoveryPointLifecycle",
+      "DeleteBackupVaultLockConfiguration", "PutBackupVaultAccessPolicy", "DeleteBackupVaultAccessPolicy",
+      "DeleteBackupPlan", "UnlockSnapshot", "DisableImage",
+      "PutBucketPolicy", "DeleteBucketPolicy", "PutBucketVersioning", "PutBucketLifecycle",
+      "ScheduleKeyDeletion", "DisableKey"
+    ]
+  }
+}</code></pre>
+				<p>Each event name belongs to one of the four services, so a single rule covers them all; a similar rule watches Recycle Bin rule changes. Calls the SCP denied are still recorded in CloudTrail with an <code>errorCode</code>, and a burst of them from one principal is itself a finding; the security data lake keeps the history (<a href="security-data-lake.html">security data lake</a>). A second rule watches AWS Backup's <code>Scan Job State Change</code> events for <code>"scanResultStatus": "THREATS_FOUND"</code>, so an infected recovery point is marked before anyone restores it.</p>
+				<p><strong>AWS Backup Audit Manager</strong> is a feature of AWS Backup that runs controls and produces daily reports:</p>
+				<ul>
+					<li>Resources are included in at least one backup plan.</li>
+					<li>Vaults prevent manual deletion of recovery points (except up to five roles, here <code>backup-admin</code>).</li>
+					<li>Cross-account and cross-Region backup copies are scheduled.</li>
+					<li>Resources are in a backup plan with Vault Lock.</li>
+					<li>Resources have a recovery point in a logically air-gapped vault within, here, 7 days.</li>
+					<li>Restore time for resources meets the target (fed by restore testing).</li>
+				</ul>
+				<div class="callout retired"><p>Don't confuse it with <strong>AWS Audit Manager</strong>, the separate evidence-collection service, which is in maintenance and has accepted no new accounts since 30 April 2026 (<a href="../d6-task-6-3.html">Task 6.3</a>). AWS Backup Audit Manager is part of AWS Backup and not affected.</p></div>
+				<p><strong>Security Hub CSPM</strong> adds the configuration view across accounts: Backup.1 (recovery points encrypted), S3.14 (versioning), S3.15 (Object Lock, with the <code>mode</code> parameter), S3.7 (cross-Region replication), S3.20 (MFA delete), DynamoDB.2 (PITR), DynamoDB.4 (in a backup plan, with <code>backupVaultLockCheck</code> set to <code>true</code> to require a locked vault) and DynamoDB.6 (deletion protection), next to the KMS controls.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Recovery into a clean account</h3>
+				<p>A backup that has never been restored is a hope, not a control. <strong>AWS Backup restore testing</strong> runs scheduled restores, from chosen vaults, of the latest or a random recovery point within a selection window of up to 365 days. It records how long each restore takes and deletes the restored resources after an optional validation window of 1 to 168 hours. AWS recommends a designated account for restore tests. The company runs plans in <code>888888888888</code> against <code>central-vault</code>, weekly for the orders database and monthly for the rest, and the "restore time meets target" control turns the timings into evidence. The plan and selection are created with <code>create-restore-testing-plan</code> and <code>create-restore-testing-selection</code>; the restore role needs the permissions in <code>AWSBackupServiceRolePolicyForRestores</code> and use of the vault's key. Every quarter the recovery team also restores by hand from the shared <code>dr-lag-vault</code> in <code>141414141414</code>, the path a real incident would use.</p>
+				<p><strong>The isolated recovery environment</strong> in <code>141414141414</code> follows AWS's cyber recovery reference approach: no trust relationship with production, no peering or transit gateway attachment, no internet-facing resources, and AWS APIs only through VPC endpoints. Its IAM Identity Center permission set is assigned only to the recovery team; production roles have no path in. The <a href="incident-forensics.html">incident response and forensics</a> playbook decides when recovery starts. Investigation, containment and the CloudTrail timeline happen there; this page adds the recovery runbook:</p>
+				<ol class="flow">
+					<li><span class="name">Contain first</span><span class="desc">Revoke the attacker's sessions and isolate <code>111111111111</code> as the forensics playbook says. Nothing is restored into it.</span></li>
+					<li><span class="name">Choose the recovery point</span><span class="desc">The last point before the first malicious call in the CloudTrail timeline, with a clean GuardDuty Malware Protection scan.</span></li>
+					<li><span class="name">Restore in isolation</span><span class="desc">In <code>141414141414</code>, from the RAM-shared <code>dr-lag-vault</code>, into the isolated VPC, with keys owned by the recovery account.</span></li>
+					<li><span class="name">Validate</span><span class="desc">Application checks, data integrity checks against the replica bucket, and a vulnerability scan; the entry point (often a leaked key) is closed before anything goes live.</span></li>
+					<li><span class="name">Cut over</span><span class="desc">DNS moves to the restored stack; production becomes the forensics team's evidence until the case closes.</span></li>
+				</ol>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Copies in a second account, not just a locked vault in production</h4>
+				<p>A compliance-mode vault in production survives an administrator, but not the closure of the account, and keeps the copy under the same identity boundary as the attack. AWS's CIRT guidance and its 2026 posts both put copies in a separate account. The cost is a second copy's storage and cross-account transfer, plus a destination vault policy and key to maintain (<a href="../d5-task-5-2.html">Task 5.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Compliance mode for copies, governance mode for live S3 data</h4>
+				<p>Compliance mode is the only setting an attacker with full rights can't undo, so it protects every copy. It is also unforgiving: a wrong retention can't be fixed and costs money for its whole life, which is why the grace time is used to check it. Live data platform objects need early deletion for privacy requests, so they get governance mode guarded by an SCP on the bypass permission.</p>
+			</div>
+			<div class="entry">
+				<h4>Both a locked standard vault and an air-gapped vault</h4>
+				<p><code>central-vault</code> uses the company's key and supports every copy type and restore testing in the DR account; <code>dr-lag-vault</code> adds service-owned storage, an AWS owned key and RAM sharing to the recovery account. Both double the copy cost, accepted for production; non-prod uses only <code>central-vault</code>.</p>
+			</div>
+			<div class="entry">
+				<h4>Delegated administrator in the DR account</h4>
+				<p>Running backup policies from the management account would mean daily use of the most powerful account. The DR account is the natural owner, but whoever controls it could weaken future plans. Vault Lock protects the existing copies, policy changes go through the pipeline, and EventBridge reports any change to the policies.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Per-account backup plans or Control Tower's backup integration</h4>
+				<p>Teams could deploy plans with StackSets, but a team can change its own plan. The Control Tower landing zone's optional backup integration sets up a central backup account, cross-Region copies and organization backup policies, a good start for new landing zones (<a href="../d6-task-6-1.html">Task 6.1</a>). The company still adds the air-gapped vault and the SCPs itself.</p>
+			</div>
+			<div class="entry">
+				<h4>Primary backups straight into a logically air-gapped vault</h4>
+				<p>Since November 2025, after onboarding to multi-party approval, backups can go directly into an air-gapped vault, so there is one copy instead of two, as AWS's April 2026 post describes. Fully managed types write there directly; others still make a temporary, billed snapshot first. It cuts cost but leaves a single copy in one Region, so AWS still recommends cross-Region copies for resilience.</p>
+			</div>
+			<div class="entry">
+				<h4>AWS Elastic Disaster Recovery for servers</h4>
+				<p>For whole servers, Elastic Disaster Recovery keeps continuous replication and recovers to a point in time before the attack, with drills that don't disrupt replication (<a href="../d2-task-2-2.html#s4">Task 2.2</a>). It suits lift-and-shift servers; the company's containerized and managed services fit AWS Backup better.</p>
+			</div>
+			<div class="entry">
+				<h4>Data Lifecycle Manager only</h4>
+				<p>DLM snapshots EBS volumes and AMIs for free, with cross-Region copies, and cross-account sharing for snapshots under customer managed keys. But it covers only EBS, has no vault lock or air gap, and the policies live in the account under attack. It stays for the golden AMI pipeline, protected by Snapshot Lock and Recycle Bin.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Attack the guardrails</span><span class="desc">In <code>101010101010</code> (Policy Staging), as an administrator role, try <code>delete-recovery-point</code>, <code>update-recovery-point-lifecycle</code>, <code>put-bucket-versioning</code> with <code>Status=Suspended</code>, <code>rbin delete-rule</code> and an SSE-C <code>copy-object</code>. Pass: each fails with an explicit deny from the SCP or RCP, and the EventBridge rule pages within minutes.</span></li>
+				<li><span class="name">Prove the lock without the SCP</span><span class="desc">On a test vault locked in governance mode, detach the SCP for the test account and delete a recovery point as an administrator: expect a denial from Vault Lock. Then remove the governance lock as <code>backup-admin</code> to show why production uses compliance mode.</span></li>
+				<li><span class="name">Fire the findings</span><span class="desc"><code>aws guardduty create-sample-findings</code> with <code>Impact:S3/AnomalousBehavior.Delete</code> and <code>Impact:IAMUser/AnomalousBehavior</code> must reach the security team and start the ransomware playbook, as on the threat detection page.</span></li>
+				<li><span class="name">Read the evidence</span><span class="desc">The AWS Backup Audit Manager report for the Prod OU accounts shows every control compliant, with the air-gapped vault control at 7 days. Security Hub CSPM shows no failed Backup.1, S3.14, S3.15, DynamoDB.2 or DynamoDB.4 findings. An untagged test table must show up as not in a backup plan.</span></li>
+				<li><span class="name">Delete and get it back</span><span class="desc">Delete a test snapshot and deregister a test AMI, restore both from Recycle Bin; overwrite S3 test objects and restore earlier versions.</span></li>
+				<li><span class="name">Game day: production is gone</span><span class="desc">Assume <code>111111111111</code> is unusable. From <code>141414141414</code>, restore the orders database and the data platform from <code>dr-lag-vault</code> into the isolated VPC. Measure recovery time against the target and record every missing permission or key grant as a fix.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Monitoring and Alerting for an Account or Organization</td><td data-label="What this architecture demonstrates">GuardDuty impact and S3 anomaly findings, EventBridge rules on destructive API calls and Backup scan results</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design and Test an Incident Response Plan</td><td data-label="What this architecture demonstrates">A ransomware playbook with a recovery account prepared in advance, restore testing and game days</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Respond to Security Events</td><td data-label="What this architecture demonstrates">Contain first, choose a clean recovery point, restore as new resources in isolation, reconnect after eradication</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">Vault Lock modes, logically air-gapped vaults, Object Lock, versioning and MFA delete, replication with owner override, Snapshot Lock, Recycle Bin, PITR</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">Organization backup policies, an AWS Backup delegated administrator, a Business Continuity OU, SCPs and an RCP protecting data protection controls</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-3.html">6.3</a> Evaluate Compliance</td><td data-label="What this architecture demonstrates">AWS Backup Audit Manager controls and reports, Security Hub CSPM Backup, S3 and DynamoDB controls</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Backups that nobody can delete, not even the root user or AWS" is <strong>Vault Lock in compliance mode</strong> after the grace time (at least 3 days); "only authorized administrators may remove the lock" is <strong>governance mode</strong>. "Backups must survive a full compromise or closure of the production account" is a <strong>copy to another account</strong>, ideally a <strong>logically air-gapped vault shared through AWS RAM</strong> with a recovery account, or multi-party approval if the owner is lost. "Enforce backups in every account" is an <strong>Organizations backup policy</strong>. "Recover snapshots someone deleted" is <strong>Recycle Bin</strong>, and "stop anyone changing that rule" is a <strong>locked rule</strong>. "An attacker re-encrypted objects with their own key" points to <strong>versioning plus blocking SSE-C</strong>. "Prove restores work regularly" is <strong>AWS Backup restore testing</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/storage/securing-backup-data-against-modern-threats-with-aws-backup/">Securing backup data against modern threats with AWS Backup</a> (August 2026): layered controls by threat, from accidental deletion to a compromised backup administrator and full account compromise.</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/cyber-resilience-on-aws-a-reference-approach-for-recovery-from-ransomware-and-destructive-events/">Cyber recovery on AWS: A reference approach for recovering from ransomware and destructive events</a> (May 2026): isolated recovery environment, RAM sharing and the two-organization multi-party approval model.</li>
+				<li><a href="https://aws.amazon.com/blogs/storage/building-cyber-resiliency-with-aws-backup-logically-air-gapped-vault/">Building cyber resiliency with AWS Backup logically air-gapped vault</a> (August 2024): workload, data bunker, recovery and forensics accounts around a shared air-gapped vault.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/preventing-unintended-encryption-of-amazon-s3-objects/">Preventing unintended encryption of Amazon S3 objects</a> (January 2025): the SSE-C re-encryption attack, the bucket policy and RCP that stop it, and detection.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/anatomy-of-a-ransomware-event-targeting-data-in-amazon-s3/">The anatomy of ransomware event targeting data residing in Amazon S3</a> (February 2023): how S3 ransomware unfolds and which control stops each step.</li>
+				<li><a href="https://docs.aws.amazon.com/aws-backup/latest/devguide/logicallyairgappedvault.html">Logically air-gapped vault</a> (AWS Backup Developer Guide): encryption options, sharing, copy rules, limitations and CLI.</li>
+				<li><a href="https://docs.aws.amazon.com/aws-backup/latest/devguide/vault-lock.html">AWS Backup Vault Lock</a> (AWS Backup Developer Guide): governance and compliance modes, grace time, retention limits and what the lock doesn't cover.</li>
+				<li><a href="https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_backup_syntax.html">Backup policy syntax and examples</a> (AWS Organizations User Guide): plan elements, copy actions, air-gapped targets and inheritance operators.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
