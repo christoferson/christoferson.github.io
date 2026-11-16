@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Incident response and forensics | AWS SCS-C03 Notes</title>
+	<meta name="description" content="End-to-end SCS-C03 architecture: a Forensics OU and forensics account prepared before any incident, memory and disk evidence from a compromised EC2 instance, snapshots re-encrypted with a customer managed key and shared, evidence from EKS, Lambda, RDS and S3, an Object Lock evidence bucket with legal holds, CloudTrail investigation with Athena, identity containment with revoked sessions and centralized root access, then eradication, recovery and lessons learned, alongside the AWS Security Incident Response service.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../scs.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SCS-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Incident response and forensics</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Incident response and forensics</h1>
+		<p>Detection and automated containment hand the security team a case: an isolated instance, a few snapshots and a finding. This design is what happens next. A forensics account that already exists, evidence captured in the right order and kept where nobody can change it, logs that answer what the attacker did, identities shut out without breaking the workload, and a clean rebuild that feeds lessons back into the plan.</p>
+		<div class="tags"><span class="tag code">SCS-C03</span><span class="tag">Domain 2</span><span class="tag">Domain 1</span><span class="tag">Domain 5</span><span class="tag">Security Incident Response</span><span class="tag">EBS snapshots</span><span class="tag">KMS</span><span class="tag">S3 Object Lock</span><span class="tag">Systems Manager</span><span class="tag">Athena</span><span class="tag">Detective</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Prepare the forensics account</a></li>
+				<li class="sub"><a href="#b2">2. The evidence bucket</a></li>
+				<li class="sub"><a href="#b3">3. EC2 memory and disk</a></li>
+				<li class="sub"><a href="#b4">4. EKS, Lambda, RDS and S3</a></li>
+				<li class="sub"><a href="#b5">5. Logs and chain of custody</a></li>
+				<li class="sub"><a href="#b6">6. Contain the identities</a></li>
+				<li class="sub"><a href="#b7">7. Eradicate, recover, learn</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company (organization <code>o-exampleorgid</code>, root <code>r-abcd</code>) runs the <a href="security-baseline.html">security baseline</a> and the <a href="threat-detection-response.html">threat detection and response</a> pipeline. In the incident this page follows (case <code>IR-2026-117</code> from <a href="../d2-task-2-2.html">Task 2.2</a>), GuardDuty reports that credentials of <code>web-server-role</code>, the role on web server <code>i-0abc1234def567890</code> in production <code>111111111111</code>, are being used from outside AWS. The <code>ec2-compromise-response</code> workflow in the security tooling account <code>222222222222</code> tags the instance, protects it, snapshots its volumes, waits for a responder, and swaps it into the isolation group <code>sg-0123456789abcdef0</code>. That is where the detection page stops and this one starts. In the previous incident the forensics account <code>666666666666</code> had no tooling, the <code>aws/ebs</code> snapshots couldn't be shared, and the stolen role kept working for hours.</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Requirement</th><th>Design choice</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Requirement">Responders can start within minutes, at any hour</td><td data-label="Design choice">Forensics OU and account, tooling AMI, isolated VPC and roles built in advance; an IR permission set plus tested emergency access</td></tr>
+						<tr><td data-label="Requirement">Volatile evidence isn't lost</td><td data-label="Design choice">Memory captured through Systems Manager before isolation, then snapshots of every volume</td></tr>
+						<tr><td data-label="Requirement">Evidence leaves the compromised account safely</td><td data-label="Design choice">Snapshots re-encrypted with a dedicated customer managed key, shared, and copied by the forensics account with its own key</td></tr>
+						<tr><td data-label="Requirement">Nobody can alter or delete evidence, and its integrity can be shown</td><td data-label="Design choice">Object Lock in compliance mode, legal holds, SHA-256 checksums, CloudTrail data events on the bucket</td></tr>
+						<tr><td data-label="Requirement">Stolen credentials stop working without an outage</td><td data-label="Design choice">Deactivate keys, deny older role sessions, centralized root access for locked buckets</td></tr>
+						<tr><td data-label="Requirement">The same attacker can't come back</td><td data-label="Design choice">Rebuild from clean images, rotate secrets, restore from locked backups, feed root cause into playbooks</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused: <code>IRAutomationRole</code>, <code>IR-IsolateInstance</code>, <code>app-user</code>, <code>prod-eks</code>, the Workloads OU <code>ou-abcd-33333333</code> with the Prod OU <code>ou-abcd-11111111</code>. New on this page: the Forensics OU is <code>ou-abcd-55555555</code>; the evidence bucket is <code>ir-evidence-666666666666-us-east-1</code>; the forensics account's role <code>IRForensicsRole</code> trusts the workflow's execution role <code>ec2-compromise-response-sfn</code>; production holds a dedicated sharing key (<code>IR_SHARE_KEY_ID</code>) and the forensics account an evidence key (<code>FORENSICS_KEY_ID</code>); the re-encrypted snapshot copy is <code>snap-0fedcba9876543210</code>.</p>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 400" role="img" aria-labelledby="dgF-wide-t">
+<title id="dgF-wide-t">Incident response and forensics: the response workflow runs a memory capture on the compromised instance in the production account before isolation and writes the hashed image to the Object Lock evidence bucket in the forensics account; the instance's snapshots are re-encrypted with a sharing key and copied into the forensics account, where an analysis instance with no internet path examines disk and memory, and the organization trail and flow logs are queried with Athena.</title>
+<rect x="10" y="95" width="180" height="215" rx="12" class="dg-grp"/>
+<text x="20" y="303" class="dg-lbl">prod 111111111111</text>
+<rect x="405" y="95" width="380" height="215" rx="12" class="dg-grp"/>
+<text x="415" y="111" class="dg-lbl">forensics 666666666666</text>
+<path d="M220.0 45.0 L107.0 45.0 Q100.0 45.0 100.0 52.0 L100.0 127.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="160" y="39" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--warn)">Run Command</text>
+<path d="M180.0 150.0 L420.0 150.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="300" y="144" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--info)">memory image, hashed</text>
+<path d="M100.0 173.0 L100.0 242.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M180.0 265.0 L420.0 265.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="300" y="259" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--info)">re-encrypted copy</text>
+<path d="M580.0 150.0 L593.0 150.0 Q600.0 150.0 600.0 157.0 L600.0 191.0 Q600.0 198.0 607.0 198.0 L620.0 198.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 265.0 L593.0 265.0 Q600.0 265.0 600.0 258.0 L600.0 219.0 Q600.0 212.0 607.0 212.0 L620.0 212.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M700.0 342.0 L700.0 228.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="706" y="289" class="dg-lbl dg-halo" text-anchor="start" fill="var(--muted)">Athena</text>
+<rect x="220" y="22" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="42" class="dg-t dg-sm">Response workflow</text>
+<text x="300" y="59" class="dg-s dg-sm2">Security Tooling</text>
+<rect x="20" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="147" class="dg-t dg-sm">Compromised instance</text>
+<text x="100" y="164" class="dg-s dg-sm2">i-0abc1234def567890</text>
+<rect x="20" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="262" class="dg-t dg-sm">EBS snapshots</text>
+<text x="100" y="279" class="dg-s dg-sm2">sharing key</text>
+<rect x="420" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="147" class="dg-t dg-sm">Evidence bucket</text>
+<text x="500" y="164" class="dg-s dg-sm2">Object Lock, compliance</text>
+<rect x="420" y="242" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="262" class="dg-t dg-sm">Snapshot copy</text>
+<text x="500" y="279" class="dg-s dg-sm2">evidence key</text>
+<rect x="620" y="182" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="202" class="dg-t dg-sm">Analysis instance</text>
+<text x="700" y="219" class="dg-s dg-sm2">no internet, read-only</text>
+<rect x="620" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="362" class="dg-t dg-sm">Org trail, flow logs</text>
+<text x="700" y="379" class="dg-s dg-sm2">444444444444</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgF-tall-t">
+<title id="dgF-tall-t">Incident response and forensics: the response workflow runs a memory capture on the compromised instance in the production account before isolation and writes the hashed image to the Object Lock evidence bucket in the forensics account; the instance's snapshots are re-encrypted with a sharing key and copied into the forensics account, where an analysis instance with no internet path examines disk and memory, and the organization trail and flow logs are queried with Athena.</title>
+<rect x="10" y="95" width="380" height="90" rx="12" class="dg-grp"/>
+<text x="380" y="111" class="dg-lbl" text-anchor="end">prod 111111111111</text>
+<rect x="10" y="215" width="380" height="200" rx="12" class="dg-grp"/>
+<text x="20" y="408" class="dg-lbl">forensics 666666666666</text>
+<path d="M120.0 40.0 L107.0 40.0 Q100.0 40.0 100.0 47.0 L100.0 117.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M100.0 163.0 L100.0 237.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 140.0 L220.0 140.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 163.0 L300.0 237.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 283.0 L100.0 308.0 Q100.0 315.0 107.0 315.0 L186.0 315.0 Q193.0 315.0 193.0 322.0 L193.0 347.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 283.0 L300.0 308.0 Q300.0 315.0 293.0 315.0 L214.0 315.0 Q207.0 315.0 207.0 322.0 L207.0 347.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M200.0 457.0 L200.0 393.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="120" y="17" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="200" y="37" class="dg-t dg-sm">Response workflow</text>
+<text x="200" y="54" class="dg-s dg-sm2">Security Tooling</text>
+<rect x="20" y="117" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="137" class="dg-t dg-sm">Compromised instance</text>
+<text x="100" y="154" class="dg-s dg-sm2">i-0abc1234def567890</text>
+<rect x="220" y="117" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="137" class="dg-t dg-sm">EBS snapshots</text>
+<text x="300" y="154" class="dg-s dg-sm2">sharing key</text>
+<rect x="20" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="257" class="dg-t dg-sm">Evidence bucket</text>
+<text x="100" y="274" class="dg-s dg-sm2">Object Lock, compliance</text>
+<rect x="220" y="237" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="257" class="dg-t dg-sm">Snapshot copy</text>
+<text x="300" y="274" class="dg-s dg-sm2">evidence key</text>
+<rect x="120" y="347" width="160" height="46" rx="10" class="dg-box"/>
+<text x="200" y="367" class="dg-t dg-sm">Analysis instance</text>
+<text x="200" y="384" class="dg-s dg-sm2">no internet, read-only</text>
+<rect x="120" y="457" width="160" height="46" rx="10" class="dg-box"/>
+<text x="200" y="477" class="dg-t dg-sm">Org trail, flow logs</text>
+<text x="200" y="494" class="dg-s dg-sm2">444444444444</text>
+</svg>
+				<figcaption>Figure: the evidence path for case IR-2026-117. Before isolation, the response workflow uses Run Command (yellow) to capture and hash the instance's memory into the evidence bucket in <code>666666666666</code>, which uses Object Lock in compliance mode. The volumes are snapshotted, re-encrypted with a customer managed sharing key (the default <code>aws/ebs</code> key can't be shared) and copied into the forensics account with its own evidence key (blue). An analysis instance with no internet path mounts them read-only (green), and the organization trail and flow logs in the log archive account are queried with Athena (dashed).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The evidence path for case <code>IR-2026-117</code>, from the moment the detection workflow opens it to the after action report. Steps marked <span class="who auto">AWS</span> run as automation.</p>
+			<ol class="flow">
+				<li class="group">Hand-off</li>
+				<li class="auto"><span class="name">Case opened with first evidence<span class="who auto">AWS</span></span><span class="desc">The <code>ec2-compromise-response</code> workflow has tagged and protected the instance and snapshotted its volumes.</span></li>
+				<li class="group">Capture</li>
+				<li class="auto"><span class="name">Memory captured<span class="who auto">AWS</span></span><span class="desc">A Run Command captures and hashes memory and uploads it to the evidence bucket in <code>666666666666</code>.</span></li>
+				<li class="auto"><span class="name">Metadata recorded<span class="who auto">AWS</span></span><span class="desc">Instance details, console output and the finding's JSON go to the same case prefix.</span></li>
+				<li><span class="name">Isolation approved<span class="who">On-call responder</span></span><span class="desc">Only now is the security group swap approved.</span></li>
+				<li class="group">Transfer</li>
+				<li class="auto"><span class="name">Snapshots re-encrypted and shared<span class="who auto">AWS</span></span><span class="desc">Each snapshot is copied with the sharing key and the copy shared with <code>666666666666</code>.</span></li>
+				<li class="auto"><span class="name">Forensics account takes ownership<span class="who auto">AWS</span></span><span class="desc"><code>IRForensicsRole</code> copies it with the evidence key, in the same Region.</span></li>
+				<li class="group">Analyze</li>
+				<li><span class="name">Disk and memory examined<span class="who">Forensic analyst</span></span><span class="desc">An analysis instance with no internet path mounts the volumes read-only.</span></li>
+				<li><span class="name">Logs examined<span class="who">Security team</span></span><span class="desc">Athena over the organization trail in <code>444444444444</code>, flow logs and Detective show what the credentials did.</span></li>
+				<li class="group">Respond</li>
+				<li><span class="name">Identities contained<span class="who">Security team</span></span><span class="desc">Older role sessions denied, a key deactivated, a locked bucket reopened.</span></li>
+				<li><span class="name">Eradicate and recover<span class="who">Workload team</span></span><span class="desc">Clean rebuilds, rotated secrets, point-in-time restores.</span></li>
+				<li class="group">Learn</li>
+				<li><span class="name">After action report<span class="who">Incident lead</span></span><span class="desc">Root cause, metrics and changes to playbooks and controls.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+			<p>Steps 1 and 2 happen before any incident; steps 3 to 7 are the playbook the responders run, with the repeatable parts automated.</p>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Prepare the forensics account, access and tooling</h3>
+				<p>Creating an account takes time, so AWS says to create and instrument forensics accounts well before they are needed. The Forensics OU <code>ou-abcd-55555555</code> sits directly under <code>r-abcd</code>, away from the Workloads OU, and holds one forensics account, <code>666666666666</code>. AWS also allows one account per Region; the company instead builds an analysis VPC in each Region it uses (<code>us-east-1</code>, <code>us-west-2</code>), because evidence should stay in the Region of the incident (moving data between jurisdictions can have legal consequences).</p>
+				<p><strong>What the account holds.</strong></p>
+				<ul>
+					<li>An <strong>analysis VPC</strong> per Region with private subnets only (no internet gateway, NAT or transit gateway). Systems Manager reaches instances through interface endpoints for <code>ssm</code>, <code>ec2messages</code> and <code>ssmmessages</code>, and an S3 gateway endpoint serves the evidence bucket. Analysts use Session Manager; no inbound port is open.</li>
+					<li>A <strong>forensic tooling AMI</strong> built with EC2 Image Builder, with the disk and memory analysis tools installed.</li>
+					<li><strong>SageMaker AI notebooks</strong> for log investigation (AWS's notebook-for-incident-response sample), querying Athena with the notebook's role instead of keys on a laptop, on the <code>notebook-al2023-v1</code> platform (Amazon Linux 2 notebook instances can't be created or restarted from 1 July 2026).</li>
+					<li>The <strong>evidence key</strong> and <strong>evidence bucket</strong> (Step 2).</li>
+				</ul>
+				<p><strong>Access.</strong> Responders get an <code>IncidentResponder</code> permission set from IAM Identity Center (identity account <code>666600006666</code>) in every account, including the forensics account: documented, tested before an incident, monitored and never used day to day, as AWS recommends. If Identity Center itself is unavailable, AWS's emergency access guidance is direct SAML federation to a few accounts, set up in advance; that is the company's break-glass path to the security tooling and forensics accounts, alerted on every use.</p>
+				<p><strong>Pre-provisioned roles.</strong> <code>IRAutomationRole</code> already exists in every workload account (StackSets to <code>ou-abcd-33333333</code>). The forensics account adds <code>IRForensicsRole</code>, which the workflow in the security tooling account assumes to copy shared snapshots and write case records.</p>
+				<span class="file">Trust policy of IRForensicsRole: only the response workflow's role in the security tooling account may assume it (IAM, forensics account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::222222222222:role/ec2-compromise-response-sfn" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}</code></pre>
+				<p><strong>AWS Security Incident Response.</strong> The organization is also enrolled in the managed service. It triages GuardDuty findings and third-party findings arriving through Security Hub CSPM and opens proactive cases for real threats; responders open reactive cases, either AWS-supported (the Security Incident Response engineering team, 24 hours a day, 15-minute engagement objective) or self-managed. Containment runs only once pre-authorized, with its roles deployed by StackSets, through reversible runbooks such as <code>AWSSupport-ContainEC2Instance</code> that default to a dry run; case events go to EventBridge. Its engineers investigate from logs only: no disk or memory forensics, and recovery is recommended, not carried out. The forensics account stays the company's job.</p>
+				<p>The plan (team and RACI, an out-of-band channel such as AWS Wickr, severity definitions) and the playbooks, started from AWS's sample playbooks, are on <a href="../d2-task-2-1.html#s1">Task 2.1</a>.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The evidence bucket: write once, encrypted, per case</h3>
+				<p>Memory images, exported logs, finding JSON and case notes go to one bucket in the forensics account, laid out with one prefix per case (<code>IR-2026-117/</code>), as AWS's April 2026 post on collecting forensic artifacts recommends. It combines four controls:</p>
+				<ul>
+					<li><strong>S3 Object Lock</strong> (with versioning) and a default retention in <strong>compliance mode</strong>: nobody, the root user included, can delete or overwrite a locked version or shorten its retention.</li>
+					<li><strong>SSE-KMS with the customer managed evidence key</strong>, so reading needs both bucket and key permissions.</li>
+					<li>A <strong>bucket policy</strong> that refuses non-TLS requests and lets writers add objects only under the prefix of an open case.</li>
+					<li><strong>CloudTrail data events</strong> recording every read and write.</li>
+				</ul>
+				<span class="file">Create the bucket with Object Lock, then set a 90-day compliance-mode default (AWS CLI, forensics account)</span>
+<pre><code>aws s3api create-bucket \
+  --bucket ir-evidence-666666666666-us-east-1 \
+  --region us-east-1 \
+  --object-lock-enabled-for-bucket
+
+aws s3api put-object-lock-configuration \
+  --bucket ir-evidence-666666666666-us-east-1 \
+  --object-lock-configuration '{ "ObjectLockEnabled": "Enabled", "Rule": { "DefaultRetention": { "Mode": "COMPLIANCE", "Days": 90 }}}'</code></pre>
+				<p>Test in governance mode on a test bucket first: a compliance-mode object can only be removed early by closing the account.</p>
+				<span class="file">Evidence bucket policy: TLS only, and the compromised instance's role may only add objects to its own case prefix while the case is open (bucket policy, forensics account)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::ir-evidence-666666666666-us-east-1",
+        "arn:aws:s3:::ir-evidence-666666666666-us-east-1/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    },
+    {
+      "Sid": "CaseIR2026117Upload",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111111111111:role/web-server-role" },
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::ir-evidence-666666666666-us-east-1/IR-2026-117/*"
+    }
+  ]
+}</code></pre>
+				<p>The workflow adds the second statement when the case opens and removes it when capture ends. Letting the compromised role write sounds risky, but the upload must use credentials on the instance, and the role can only add objects: it can't read, delete or overwrite a locked version (a second write just creates a newer version). The evidence key grants it <code>kms:GenerateDataKey</code> only with <code>kms:ViaService</code> for S3.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>EC2: memory first, then disks, then move the evidence</h3>
+				<p>AWS's EC2 forensics playbook says to capture memory before isolation or shutdown. The isolation group has no outbound rules, and SSM Agent connects out to the Systems Manager endpoints, so once the instance is isolated Run Command can't reach it. This page therefore adds memory capture to <code>ec2-compromise-response</code> in parallel with the snapshot state and before approval, as the AWS Guidance for Automated Forensics Orchestrator for Amazon EC2 and EKS does. Nothing stops the instance: that would destroy memory and erase instance store volumes.</p>
+				<p><strong>The tool.</strong> AWS names third-party acquisition tools: the EKS Best Practices Guide names LiME (and Volatility for analysis), the aws-samples EKS forensics playbook uses Microsoft's AVML, and the forensics guidance supports both. The company keeps a pinned copy of AVML in a tools bucket, fetched through the VPC's S3 endpoint, rather than downloading it from the internet mid-incident. The only usage shown is the playbook's: AVML given an output path.</p>
+				<span class="file">Capture memory through Run Command, hash it and upload it to the case prefix (AWS CLI, run by the workflow through IRAutomationRole in 111111111111)</span>
+<pre><code><span class="c"># The capture is written to /mnt/ir, a scratch EBS volume the workflow attaches, so the root volume changes as little as possible</span>
+aws ssm send-command \
+  --instance-ids "i-0abc1234def567890" \
+  --document-name "AWS-RunShellScript" \
+  --comment "IR-2026-117 memory capture" \
+  --timeout-seconds 600 \
+  --parameters 'commands=["aws s3 cp s3://ir-tools-666666666666-us-east-1/avml /mnt/ir/avml", "chmod +x /mnt/ir/avml", "/mnt/ir/avml /mnt/ir/memory.dmp", "sha256sum /mnt/ir/memory.dmp > /mnt/ir/memory.dmp.sha256", "aws s3 cp /mnt/ir/memory.dmp s3://ir-evidence-666666666666-us-east-1/IR-2026-117/i-0abc1234def567890/memory.dmp --sse aws:kms --sse-kms-key-id arn:aws:kms:us-east-1:666666666666:key/FORENSICS_KEY_ID --checksum-algorithm SHA256", "aws s3 cp /mnt/ir/memory.dmp.sha256 s3://ir-evidence-666666666666-us-east-1/IR-2026-117/i-0abc1234def567890/memory.dmp.sha256 --sse aws:kms --sse-kms-key-id arn:aws:kms:us-east-1:666666666666:key/FORENSICS_KEY_ID"]' \
+  --output-s3-bucket-name "ir-evidence-666666666666-us-east-1" \
+  --output-s3-key-prefix "IR-2026-117/run-command"</code></pre>
+				<p>The command output lands under the case prefix too, and two hashes exist: the one computed on the instance and the SHA-256 checksum S3 verifies on upload. The tools bucket <code>ir-tools-666666666666-us-east-1</code> is new on this page. The same state saves instance metadata (ID, type, AMI, IPs, security groups, subnet, role, launch time, tags), console output and a screenshot (<a href="../d2-task-2-2.html#s1">Task 2.2</a>).</p>
+				<p><strong>Disks.</strong> The detection workflow already made crash-consistent snapshots of every attached volume. Snapshots encrypted with the AWS managed key <code>aws/ebs</code> can't be shared, only those under a customer managed key, which must be shared too. Rather than letting the forensics account use production's everyday EBS key, the workflow copies each snapshot with a dedicated sharing key.</p>
+				<span class="file">Re-encrypt with the sharing key, share the copy, and take ownership in the forensics account (AWS CLI)</span>
+<pre><code><span class="c"># In prod (111111111111): copy the evidence snapshot, re-encrypting it with the IR sharing key</span>
+aws ec2 copy-snapshot --source-region us-east-1 --source-snapshot-id snap-0abcdef1234567890 \
+  --encrypted --kms-key-id arn:aws:kms:us-east-1:111111111111:key/IR_SHARE_KEY_ID \
+  --description "IR-2026-117 share copy"
+
+<span class="c"># In prod: let the forensics account create volumes from (and copy) the new snapshot</span>
+aws ec2 modify-snapshot-attribute --snapshot-id snap-0fedcba9876543210 \
+  --attribute createVolumePermission --operation-type add --user-ids 666666666666
+
+<span class="c"># In the forensics account (666666666666), as IRForensicsRole: its own copy, under its own key, same Region</span>
+aws ec2 copy-snapshot --source-region us-east-1 --source-snapshot-id snap-0fedcba9876543210 \
+  --encrypted --kms-key-id arn:aws:kms:us-east-1:666666666666:key/FORENSICS_KEY_ID \
+  --description "IR-2026-117 working copy"</code></pre>
+				<span class="file">Two statements in the sharing key's policy that let the forensics account use it, and create grants only for AWS resources such as EBS (KMS key policy, prod account)</span>
+<pre><code>[
+  {
+    "Sid": "AllowForensicsAccountToUseTheKey",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::666666666666:root" },
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+    "Resource": "*"
+  },
+  {
+    "Sid": "AllowForensicsAccountToCreateGrantsForEBS",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::666666666666:root" },
+    "Action": ["kms:CreateGrant", "kms:ListGrants", "kms:RevokeGrant"],
+    "Resource": "*",
+    "Condition": { "Bool": { "kms:GrantIsForAWSResource": true } }
+  }
+]</code></pre>
+				<p>Inside the forensics account, an IAM policy limits use of the key to <code>IRForensicsRole</code>. CloudTrail in production records <code>SharedSnapshotCopyInitiated</code>, which goes into the case record. Once the forensics copy exists, production's share copy is deleted, and the forensics copy can be locked with EBS Snapshot Lock in compliance mode (<a href="../d5-task-5-2.html">Task 5.2</a>). Analysts mount volumes made from it read-only on an analysis instance, and note who did what, when, with which results.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Other workloads: EKS pods and nodes, Lambda, RDS, S3</h3>
+								<p><strong>EKS pods and nodes.</strong> On <code>prod-eks</code>, the evidence lives on the node: find the pod's node and its instance ID, label pod and node for the case, capture container state and logs with <code>crictl</code> on the node through Run Command, then capture node memory and snapshot its volumes exactly as in Step 3. If one pod of a Deployment is compromised, assume all are. The control plane audit log (<a href="../d1-task-1-2.html">Task 1.2</a>) shows what the attacker asked the API server to do.</p>
+				<span class="file">Find the node behind a compromised pod and record container state (kubectl from the responder's workstation, then commands on the node)</span>
+<pre><code><span class="c"># Which node runs the pod, and which EC2 instance that node is</span>
+kubectl get pods POD_NAME --namespace shop -o=jsonpath='{.spec.nodeName}{"\n"}'
+kubectl get nodes NODE_NAME -o custom-columns=NAME:.metadata.name,INSTANCEID:.spec.providerID
+
+<span class="c"># Mark the node for the investigation</span>
+kubectl label node NODE_NAME status=quarantine
+
+<span class="c"># On the node, through Run Command: running containers and one container's logs</span>
+crictl ps
+crictl logs CONTAINER_ID</code></pre>
+				<p><strong>Lambda.</strong> There's no host: the evidence is the version that ran, its configuration and its code, which <code>get-function</code> returns as a link valid for 10 minutes. Save it before anyone redeploys.</p>
+				<span class="file">Preserve the function version that ran (AWS CLI, workload account)</span>
+<pre><code>aws lambda get-function --function-name orders-api --qualifier 7</code></pre>
+				<p><strong>RDS and Aurora.</strong> A manual snapshot (<code>aws rds create-db-snapshot</code>) plus the database's audit and error logs. As with EBS, snapshots under the default RDS key can't be shared.</p>
+				<p><strong>S3.</strong> With versioning, earlier versions of changed objects are the evidence; CloudTrail data events and server access logs show who read and wrote what. Macie findings show whether sensitive data was exposed.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Logs and chain of custody</h3>
+				<p><strong>What to pull.</strong> CloudTrail, VPC Flow Logs and Resolver query logs are AWS's basic logging trifecta. The organization trail in <code>444444444444</code> holds data events, every Region and more than 90 days, which Event history can't give.</p>
+				<span class="file">Every call made with the web server's role from outside the VPC since the day before the finding (Athena SQL, table from Task 1.2 over the organization trail)</span>
+<pre><code>SELECT eventtime, awsregion, sourceipaddress, useragent, eventsource, eventname, errorcode,
+       useridentity.accesskeyid
+FROM cloudtrail_prod_use1
+WHERE "timestamp" &gt;= '2026/11/07'
+  AND useridentity.sessioncontext.sessionissuer.arn = 'arn:aws:iam::111111111111:role/web-server-role'
+  AND sourceipaddress NOT LIKE '10.%'
+ORDER BY eventtime;</code></pre>
+				<p>The query needs <code>sessioncontext</code> inside <code>useridentity</code>, which the full documented CloudTrail table has (the <a href="../d1-task-1-2.html#s4">Task 1.2</a> version is shortened). Each returned ASIA key, searched for in <code>AssumeRole</code> response elements, follows the attacker into the next role; the attacker's IP becomes the pivot in VPC Flow Logs, WAF, ALB and Resolver logs. Detective compares the role's activity with its 45-day baseline, and the GuardDuty finding JSON is saved to the case, as are query results. The security data lake page covers Security Lake for longer hunts.</p>
+				<p><strong>Chain of custody.</strong> For each artifact the case record shows origin, time, handler and integrity:</p>
+				<ul>
+					<li><strong>Hashes</strong>: SHA-256 computed at capture and stored next to the artifact, and the S3 checksum on the object. For snapshots, the EBS direct API <code>GetSnapshotBlock</code> returns a SHA-256 checksum per block.</li>
+					<li><strong>Tags</strong>: the case ID tag on the instance and on every snapshot and copy.</li>
+					<li><strong>Records of access</strong>: CloudTrail data events on the evidence bucket and the <code>SharedSnapshotCopyInitiated</code> event in production.</li>
+					<li><strong>Immutability</strong>: compliance-mode Object Lock, plus a legal hold when counsel says the evidence may go to court.</li>
+				</ul>
+				<span class="file">Keep the memory image beyond its 90-day retention while legal proceedings are possible (AWS CLI, forensics account, legal role)</span>
+<pre><code>aws s3api put-object-legal-hold \
+  --bucket ir-evidence-666666666666-us-east-1 \
+  --key IR-2026-117/i-0abc1234def567890/memory.dmp \
+  --legal-hold Status=ON</code></pre>
+				<p>A legal hold has no end date and anyone with <code>s3:PutObjectLegalHold</code> can remove it, so only the legal role has that permission. Without a hold, evidence expires after 90 days and a lifecycle rule removes it, in line with AWS's playbook advice to delete forensic copies unless a legal or regulatory requirement says otherwise.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Contain the identities</h3>
+				<p>Isolation stops the instance, not the credentials copied off it, so identity containment runs as soon as memory is captured.</p>
+				<p><strong>Role sessions.</strong> Temporary credentials can't be deleted. Revoke active sessions on <code>web-server-role</code> attaches an inline policy named <code>AWSRevokeOlderSessions</code> that denies everything to sessions issued before that moment; new sessions, including the replacement instances', keep working.</p>
+				<span class="file">What revoking active sessions attaches to the role (IAM inline policy AWSRevokeOlderSessions, with the time of revocation)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": {
+    "Effect": "Deny",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {
+      "DateLessThan": { "aws:TokenIssueTime": "2026-11-09T14:32:00Z" }
+    }
+  }
+}</code></pre>
+				<p>Resource-based policies can still grant old sessions access, so sensitive buckets and keys get the same deny. While the root cause (IMDSv1 and a server-side request forgery bug) is open, the attacker can fetch fresh credentials, so the same-VPC credential policy from <a href="../d2-task-2-2.html#s4">Task 2.2</a> goes on the role too.</p>
+				<p><strong>Access keys.</strong> <code>app-user</code>'s key, seen in the attacker's activity, is deactivated, not deleted: that is reversible, keeps the key ID for the investigation, and invalidates presigned URLs it signed. If AWS attached <code>AWSCompromisedKeyQuarantineV3</code>, the team follows the support case and leaves the policy alone.</p>
+				<span class="file">Deactivate the user's key (AWS CLI, prod account)</span>
+<pre><code>aws iam update-access-key --user-name app-user --access-key-id AKIAIOSFODNN7EXAMPLE --status Inactive</code></pre>
+				<p><strong>A bucket locked against its owner.</strong> In this incident the attacker had replaced the policy on a production bucket with one that denies every principal, administrators included. Centralized root access, delegated to the identity account <code>666600006666</code>, removes it without anyone signing in as root: a short session scoped by the <code>S3UnlockBucketPolicy</code> task policy, through a Regional STS endpoint (the global endpoint isn't supported). Identity Center users are contained differently, with a pre-staged SCP on <code>identitystore:userId</code> (<a href="../d2-task-2-2.html#s4">Task 2.2</a>).</p>
+				<span class="file">Delete a bucket policy that locks everyone out (AWS CLI, from the identity account with sts:AssumeRoot)</span>
+<pre><code><span class="c"># A 15-minute privileged session in prod, allowed only the S3 bucket policy task</span>
+aws sts assume-root \
+  --region us-east-1 \
+  --target-principal 111111111111 \
+  --task-policy-arn arn=arn:aws:iam::aws:policy/root-task/S3UnlockBucketPolicy \
+  --duration-seconds 900
+
+<span class="c"># With the AccessKeyId, SecretAccessKey and SessionToken from the response set as the CLI's credentials:</span>
+aws s3api get-bucket-policy --bucket prod-data-platform-111111111111
+aws s3api delete-bucket-policy --bucket prod-data-platform-111111111111</code></pre>
+				<p>The policy text is saved to the case first: it is evidence. <code>IAMDeleteRootUserCredentials</code> does the same for a member account's root credentials.</p>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Eradicate, recover and learn</h3>
+				<p><strong>Eradicate.</strong> AWS recommends a phased approach: high-value changes first, longer-term hardening later. The team searches every Region, unused ones included, for persistence: new IAM users, keys, roles, identity providers, instances, AMIs, functions, EventBridge rules, and anything that weakens detection. Compromised instances are rebuilt, not cleaned: replacements come from the golden AMI with IMDSv2 required and the SSRF fix deployed. Everything the role could read is rotated.</p>
+				<span class="file">Rotate the database secret the role could read (AWS CLI, prod account)</span>
+<pre><code>aws secretsmanager rotate-secret --secret-id prod/orders/db</code></pre>
+								<p><strong>Recover.</strong> Backups go to a Vault Lock vault in compliance mode with a copy in a logically air-gapped vault, and GuardDuty Malware Protection for AWS Backup scans the recovery point first. The orders database is restored to a point before the first malicious call as a new instance, so the compromised one stays for the investigation. Restored systems reconnect only after eradication is complete (<a href="../d2-task-2-2.html#s4">Task 2.2</a>).</p>
+				<p><strong>Learn.</strong> The after action report records the root cause chain (an SSRF request in the ALB and WAF logs, then IMDSv1 credentials used outside the VPC minutes later), the timeline, and the metrics AWS lists: time to detect, acknowledge, contain and recover, and dwell time. Each lesson becomes a change with an owner (IMDSv2 required by policy, the WAF rule, memory capture ahead of isolation, the playbook), tested at the next game day.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>A separate OU and account, not a forensics VPC in production</h4>
+				<p>An account is the strongest boundary AWS has: production administrators, and an attacker holding production credentials, have no path into <code>666666666666</code>. Its own OU keeps workload SCPs and StackSets out. The cost is the cross-account plumbing: a sharing key, <code>IRForensicsRole</code> and bucket policy grants, all built and tested before they are needed.</p>
+			</div>
+			<div class="entry">
+				<h4>Memory before isolation, even though isolation waits</h4>
+				<p>An isolated instance can't run Run Command, and stopping it loses memory. Capturing first adds minutes of exposure; when a live attacker session must be cut at once, a network ACL deny does it.</p>
+			</div>
+			<div class="entry">
+				<h4>A dedicated sharing key</h4>
+				<p>Granting the forensics account use of the production EBS key would let it decrypt every production volume. A dedicated key keeps the grant narrow, for one extra snapshot copy and a monthly key charge.</p>
+			</div>
+			<div class="entry">
+				<h4>Short compliance retention plus legal holds</h4>
+				<p>Compliance mode makes evidence unchangeable, but a long default would keep every case's memory images (and the personal data in them) for years. A 90-day default covers most cases; a legal hold, removable only by the legal role, keeps what matters for longer. Governance mode can be bypassed by privileged users.</p>
+			</div>
+			<div class="entry">
+				<h4>Cost</h4>
+				<p>Standing cost is small: interface endpoints (hourly), AMI snapshots, keys and a near-empty bucket; analysis instances run only during a case. Memory images are as large as the instance's RAM, so retention matters. Security Incident Response is priced per finding ingested, with the first 10,000 a month free, and is free with Enterprise Support.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Rely on AWS Security Incident Response alone</h4>
+				<p>Triage, cases, AWS responders and pre-authorized containment suit a team without round-the-clock cover, but disk and memory forensics, recovery and legal guidance are out of its scope: it complements this design.</p>
+			</div>
+			<div class="entry">
+				<h4>The Automated Forensics Orchestrator guidance</h4>
+				<p>The AWS Guidance for Automated Forensics Orchestrator for Amazon EC2 and EKS automates what Step 3 does: triage, parallel memory capture through SSM and disk snapshots shared to the forensics account, then analysis on an instance from a forensic AMI. The company kept its own workflow because it already had the approval states.</p>
+			</div>
+			<div class="entry">
+				<h4>Terminate and rebuild without forensics</h4>
+				<p>Fast for a stateless instance, but it destroys the evidence of how the attacker got in, so the hole stays open. Never the answer when a question asks to preserve evidence.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Rehearse the whole chain on a test instance</span><span class="desc">In the test account <code>101010101010</code>, a GuardDuty sample finding with the sample check off starts the workflow against a tagged instance. Pass: memory image and hash under the case prefix, a forensics copy under the evidence key, and an isolated instance.</span></li>
+				<li><span class="name">Prove the evidence is immutable</span><span class="desc">As an administrator of the forensics account, try to delete a version of a test artifact and to shorten its retention: both must fail, and CloudTrail data events must show the attempts.</span></li>
+				<li><span class="name">Check the access is as narrow as designed</span><span class="desc">IAM Access Analyzer external access findings should show only the expected grants: the sharing key in production to <code>666666666666</code>, and the evidence bucket's case-prefix write to production. The policy simulator confirms <code>web-server-role</code> can put but not get or delete.</span></li>
+				<li><span class="name">Test the people and the break-glass path</span><span class="desc">Each quarter every responder signs in to the forensics account with <code>IncidentResponder</code>, the emergency SAML path is exercised, and a tabletop walks the bucket-lockout scenario including <code>assume-root</code>.</span></li>
+				<li><span class="name">Game day</span><span class="desc">Generated findings, purple team exercises (after reviewing AWS's penetration testing policy) and FIS (<a href="../d2-task-2-1.html#s3">Task 2.1</a>), each ending in an after action report.</span></li>
+				<li><span class="name">Measure</span><span class="desc">Time from hand-off to memory captured, evidence transferred and identities contained.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design and Implement Logging Solutions</td><td data-label="What this architecture demonstrates">Object Lock evidence storage, CloudTrail data events as chain of custody, Athena over the organization trail, EKS audit logs</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design and Test an Incident Response Plan</td><td data-label="What this architecture demonstrates">Forensics OU and account prepared in advance, responder access and emergency access, tooling AMI, notebooks, Security Incident Response, game days and tabletops</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Respond to Security Events</td><td data-label="What this architecture demonstrates">Memory before isolation, snapshot sharing with a customer managed key, evidence per workload type, revoking sessions, deactivating keys, assume-root, rebuild and restore</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Controls for Data at Rest</td><td data-label="What this architecture demonstrates">Compliance mode versus governance mode, legal holds, checksums, EBS Snapshot Lock, aws/ebs snapshots that can't be shared</td></tr>
+						<tr><td data-label="Task"><a href="../d6-task-6-1.html">6.1</a> Account Strategy</td><td data-label="What this architecture demonstrates">A dedicated Forensics OU outside the Workloads OU, centralized root access in a delegated account</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Share an encrypted EBS snapshot with the forensics account" fails with <strong>aws/ebs</strong>: copy it with a <strong>customer managed key</strong>, grant the other account in the key policy, then <strong>modify-snapshot-attribute</strong>. "Preserve evidence with minimal data loss" is <strong>memory first, then snapshots, then isolation</strong>, never stop the instance. "Evidence nobody can delete, not even the root user" is <strong>S3 Object Lock in compliance mode</strong>, and "keep it indefinitely for litigation" is a <strong>legal hold</strong>. "Stolen role credentials must stop working without an outage" is <strong>revoke active sessions</strong> (aws:TokenIssueTime). "A bucket policy denies everyone, including administrators" is <strong>sts:AssumeRoot with S3UnlockBucketPolicy</strong>. "AWS should do disk forensics for us" is not something AWS Security Incident Response does.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/security/forensic-investigation-environment-strategies-in-the-aws-cloud/">Forensic investigation environment strategies in the AWS Cloud</a> (October 2021): the Forensics OU, per-Region forensic VPCs, tooling AMIs and evidence handling behind Step 1 (predates the AWS Security Incident Response service; the design still holds).</li>
+				<li><a href="https://aws.amazon.com/blogs/security/a-framework-for-securely-collecting-forensic-artifacts-into-s3-buckets/">A framework for securely collecting forensic artifacts into S3 buckets</a> (April 2026): per-case prefixes, customer managed keys, scoped write credentials and data events for the evidence bucket.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/how-to-automate-forensic-disk-collection-in-aws/">How to automate forensic disk collection in AWS</a> (August 2021): Step Functions snapshotting a flagged instance and copying the volumes to a forensics account.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/incident-response-guide-for-aws-cloudtrail-investigations-part-1/">Incident response guide for AWS CloudTrail investigations - Part 1</a> (September 2026): which CloudTrail fields matter and how to follow an attacker through them.</li>
+				<li><a href="https://aws.amazon.com/blogs/security/optimize-security-operations-with-aws-security-incident-response/">Optimize security operations with AWS Security Incident Response</a> (September 2025): triage, cases, engaging AWS responders and containment actions in the managed service.</li>
+				<li><a href="https://docs.aws.amazon.com/security-ir/latest/userguide/what-is.html">AWS Security Incident Response User Guide</a> (AWS documentation): the service, and where the former incident response whitepaper's guidance on containment, eradication and recovery now lives.</li>
+				<li><a href="https://docs.aws.amazon.com/eks/latest/best-practices/incident-response-and-forensics.html">Incident response and forensics</a> (Amazon EKS Best Practices Guide): finding, labelling and isolating compromised pods and nodes, and capturing their evidence.</li>
+				<li><a href="https://docs.aws.amazon.com/solutions/automated-forensics-orchestrator-for-amazon-ec2/">Guidance for Automated Forensics Orchestrator for Amazon EC2 and EKS</a> (AWS Guidance): automated memory and disk acquisition into a forensics account.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Security &ndash; Specialty (SCS-C03) exam guide.</div>
+</footer>
+
+</body>
+</html>
