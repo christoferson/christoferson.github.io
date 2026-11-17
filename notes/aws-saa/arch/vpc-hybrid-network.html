@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Secure VPC and hybrid connectivity | AWS SAA-C03 Notes</title>
+	<meta name="description" content="SAA-C03 reference architecture: the network under the company's workloads. A three-AZ production VPC with public, private app and isolated data subnets, NAT gateways, free S3 and DynamoDB gateway endpoints and interface endpoints, chained security groups, network ACLs and VPC Flow Logs, a transit gateway in the shared-network account shared with AWS RAM, Site-to-Site VPN to the office with Direct Connect planned, and hybrid DNS through Route 53 VPC Resolver endpoints.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../saa.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAA-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">VPC and hybrid network</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Secure VPC and hybrid connectivity</h1>
+		<p>The network under every other architecture page: a production VPC split into public, private and isolated subnets across three AZs, private paths to AWS services, layered filtering between the tiers, and a hub in the shared-network account that connects the VPCs and the head office.</p>
+		<div class="tags"><span class="tag code">SAA-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">Amazon VPC</span><span class="tag">NAT gateway</span><span class="tag">VPC endpoints</span><span class="tag">AWS Transit Gateway</span><span class="tag">Site-to-Site VPN</span><span class="tag">AWS Direct Connect</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Address plan and subnet tiers</a></li>
+				<li class="sub"><a href="#b2">2. Egress and private access to AWS</a></li>
+				<li class="sub"><a href="#b3">3. Layered filtering and flow logs</a></li>
+				<li class="sub"><a href="#b4">4. The hub: Transit Gateway shared with RAM</a></li>
+				<li class="sub"><a href="#b5">5. The office: VPN now, Direct Connect next, hybrid DNS</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The <a href="ha-web-app.html">highly available web application</a>, the <a href="serverless-api.html">serverless API</a> and <a href="order-processing.html">order processing</a> all run in the production account <code>111111111111</code> in us-east-1. This page is the network they sit in: the production VPC <code>vpc-0prod11111111111</code>, the shared-network account that owns the connections between VPCs, and the link to the head office. Its job is to let the right traffic in, keep the rest out and keep AWS service traffic off the internet (<a href="../d1-task-1-2.html">Task 1.2</a>).</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>Only the load balancer faces the internet</strong>: application servers, containers and Aurora have no inbound path from it.</li>
+				<li><strong>Losing one AZ doesn't cut off the others</strong>, including their outbound internet access (<a href="../d2-task-2-2.html">Task 2.2</a>).</li>
+				<li><strong>Calls to S3, DynamoDB and other AWS services stay private</strong> and don't pay NAT processing where they don't have to.</li>
+				<li><strong>Staff in the head office reach internal tools</strong> over an encrypted link now, with a steadier private link later.</li>
+				<li><strong>Room to grow</strong>: new VPCs join without re-addressing (<a href="../d3-task-3-4.html">Task 3.4</a>).</li>
+				<li><strong>No surprise network bills</strong>: NAT, cross-AZ and connection charges are chosen on purpose (<a href="../d4-task-4-4.html">Task 4.4</a>).</li>
+			</ul>
+			<p>Reused: <code>vpc-0prod11111111111</code> with its security groups, app route tables, public NACL and S3 endpoint (Task 1.2); the app and database subnets and <code>sg-0proxy1111111111</code> (the web application page); the shared-services VPC <code>vpc-0shared1111111111</code> (Task 4.4). New on this page: the prod VPC range <code>10.1.0.0/16</code>, the office range <code>172.16.0.0/16</code>, the shared-network account <code>444444444444</code>, which owns the transit gateway and <code>vpc-0shared1111111111</code>, and the flow-log bucket <code>example-network-logs</code>.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> A Regional NAT gateway (November 2025) is now an option next to one zonal NAT gateway per AZ. Route 53 Resolver is now called Route 53 VPC Resolver in newer documentation; the endpoints work the same way. Large-bandwidth VPN tunnels now carry up to 5 Gbps; 1.25 Gbps is the standard tunnel.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 460" role="img" aria-labelledby="dgN-wide-t">
+<title id="dgN-wide-t">Secure VPC and hybrid connectivity: customer traffic reaches web-alb in the public subnets of the prod VPC, then the app tier in private subnets and Aurora in isolated subnets; the app tier reaches AWS services through gateway and interface endpoints and the internet through NAT gateways; a transit gateway in the shared-network account connects the VPC to the office over a two-tunnel Site-to-Site VPN, and office DNS forwards to a VPC Resolver inbound endpoint.</title>
+<rect x="205" y="8" width="390" height="330" rx="12" class="dg-grp"/>
+<text x="585" y="24" class="dg-lbl" text-anchor="end">Prod VPC 10.1.0.0/16, three AZs</text>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M290.0 83.0 L290.0 152.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M290.0 198.0 L290.0 267.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 182.0 L420.0 182.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 168.0 L388.0 168.0 Q395.0 168.0 395.0 161.0 L395.0 67.0 Q395.0 60.0 402.0 60.0 L420.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M90.0 198.0 L90.0 267.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M90.0 313.0 L90.0 382.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M170.0 405.0 L210.0 405.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">Customers</text>
+<text x="90" y="74" class="dg-s dg-sm2">CloudFront + WAF</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">web-alb</text>
+<text x="290" y="74" class="dg-s dg-sm2">public subnets</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">App tier</text>
+<text x="290" y="189" class="dg-s dg-sm2">private subnets</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">Aurora</text>
+<text x="290" y="304" class="dg-s dg-sm2">isolated subnets</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">NAT gateway</text>
+<text x="500" y="74" class="dg-s dg-sm2">internet egress</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">VPC endpoints</text>
+<text x="500" y="189" class="dg-s dg-sm2">gateway + interface</text>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="90" y="172" class="dg-t dg-sm">Transit gateway</text>
+<text x="90" y="189" class="dg-s dg-sm2">shared via RAM</text>
+<rect x="10" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="287" class="dg-t dg-sm">Site-to-Site VPN</text>
+<text x="90" y="304" class="dg-s dg-sm2">2 tunnels, DX later</text>
+<rect x="10" y="382" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="402" class="dg-t dg-sm">Office</text>
+<text x="90" y="419" class="dg-s dg-sm2">172.16.0.0/16</text>
+<rect x="210" y="382" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="402" class="dg-t dg-sm">VPC Resolver</text>
+<text x="290" y="419" class="dg-s dg-sm2">inbound endpoint</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgN-tall-t">
+<title id="dgN-tall-t">Secure VPC and hybrid connectivity: customer traffic reaches web-alb in the public subnets of the prod VPC, then the app tier in private subnets and Aurora in isolated subnets; the app tier reaches AWS services through gateway and interface endpoints and the internet through NAT gateways; a transit gateway in the shared-network account connects the VPC to the office over a two-tunnel Site-to-Site VPN, and office DNS forwards to a VPC Resolver inbound endpoint.</title>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M220.0 145.0 L180.0 145.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M293.0 168.0 L293.0 193.0 Q293.0 200.0 286.0 200.0 L107.0 200.0 Q100.0 200.0 100.0 207.0 L100.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M307.0 168.0 L307.0 232.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M300.0 388.0 L300.0 452.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M220.0 475.0 L180.0 475.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Customers</text>
+<text x="100" y="54" class="dg-s dg-sm2">CloudFront + WAF</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">web-alb</text>
+<text x="300" y="54" class="dg-s dg-sm2">public subnets</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="142" class="dg-t dg-sm">App tier</text>
+<text x="300" y="159" class="dg-s dg-sm2">private subnets</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">Aurora</text>
+<text x="100" y="269" class="dg-s dg-sm2">isolated subnets</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">NAT + endpoints</text>
+<text x="100" y="159" class="dg-s dg-sm2">egress paths</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="252" class="dg-t dg-sm">Transit gateway</text>
+<text x="300" y="269" class="dg-s dg-sm2">shared via RAM</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">Site-to-Site VPN</text>
+<text x="300" y="379" class="dg-s dg-sm2">2 tunnels, DX later</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">Office</text>
+<text x="300" y="489" class="dg-s dg-sm2">172.16.0.0/16</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="472" class="dg-t dg-sm">VPC Resolver</text>
+<text x="100" y="489" class="dg-s dg-sm2">inbound endpoint</text>
+</svg>
+				<figcaption>Figure: three tiers of subnets in three AZs, each tier allowed in only by the security group in front of it (grey and green). Calls to AWS services stay private through endpoints (blue) and only internet calls use the NAT gateways (yellow). The office reaches the VPC through the transit gateway shared from the shared-network account over Site-to-Site VPN (dashed), with Direct Connect added later, and resolves private names through the VPC Resolver inbound endpoint.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>Three paths cross this network: a customer request coming in, an application call going out, and an office user reaching an internal tool. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Inbound from customers</li>
+				<li><span class="name">Reach the ALB<span class="who">Customer</span></span><span class="desc">After CloudFront and AWS WAF, the request reaches <code>web-alb</code> in the public subnets on 443, passing the NACL and <code>sg-0alb1111111111111</code>.</span></li>
+				<li class="auto"><span class="name">Forward to a target<span class="who auto">AWS</span></span><span class="desc">The ALB sends the request by private IP to an instance or task in a private app subnet, where <code>sg-0app1111111111111</code> accepts 8080 only from the ALB's group.</span></li>
+				<li class="auto"><span class="name">Query the data tier<span class="who auto">AWS</span></span><span class="desc">The application connects through <code>orders-proxy</code> to Aurora in the isolated database subnets, which have only the local VPC route.</span></li>
+				<li class="group">Outbound from the application</li>
+				<li class="auto"><span class="name">AWS services privately<span class="who auto">AWS</span></span><span class="desc">Calls to S3 and DynamoDB follow the prefix-list route to the free gateway endpoints; calls to Secrets Manager and other services resolve, through private DNS, to interface endpoints in the same AZ.</span></li>
+				<li class="auto"><span class="name">Internet through NAT<span class="who auto">AWS</span></span><span class="desc">A call to the payment provider follows <code>0.0.0.0/0</code> to the NAT gateway and out through the internet gateway; nothing outside can start a connection in.</span></li>
+				<li class="group">From the office</li>
+				<li><span class="name">Resolve the name<span class="who">Office user</span></span><span class="desc">The office DNS server forwards queries for the company's private zone to the VPC Resolver inbound endpoint in the shared-services VPC and gets back a private IP.</span></li>
+				<li class="auto"><span class="name">Cross the link<span class="who auto">AWS</span></span><span class="desc">Traffic for <code>10.1.0.0/16</code> takes one of two IPsec tunnels to the transit gateway, which routes it to the prod VPC attachment; the security groups on the target decide the rest.</span></li>
+				<li class="auto"><span class="name">Record it<span class="who auto">AWS</span></span><span class="desc">VPC Flow Logs record accepted and rejected flows to S3 for every hop inside the VPC.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Address plan and subnet tiers</h3>
+				<p><strong>Plan addresses before the first VPC.</strong> A VPC's IPv4 range is between a /16 and a /28 and can't be resized, only extended with secondary blocks. Overlapping ranges block peering, Direct Connect gateways and clean routing (<a href="../d3-task-3-4.html">Task 3.4</a>). The prod VPC uses <code>10.1.0.0/16</code>, inside the us-east-1 prod block <code>10.0.0.0/12</code> from Task 3.4, and the office keeps <code>172.16.0.0/16</code>, so the two never collide. New VPCs take ranges from IPAM pools.</p>
+				<span class="file">How the next VPC gets a non-overlapping range: a /20 taken automatically from the us-east-1 prod IPAM pool (AWS CLI, from Task 3.4)</span>
+<pre><code>aws ec2 create-vpc --ipv4-ipam-pool-id ipam-pool-0prodeast1111111111 \
+    --ipv4-netmask-length 20 \
+    --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=orders-prod}]'</code></pre>
+				<p><strong>Three tiers in each of three AZs.</strong> Public subnets route <code>0.0.0.0/0</code> to the internet gateway and hold only the ALB's nodes (and zonal NAT gateways, if used). Private app subnets hold EC2 and ECS tasks and route the default route to NAT. Isolated database subnets have only the local route. A small dedicated subnet per AZ holds the transit gateway attachment. The main route table keeps only local routes, and each subnet is explicitly associated with its own custom table. Every subnet loses five addresses (a /24 gives 251).</p>
+				<p><strong>Public IPv4 costs money.</strong> Every public IPv4 address costs US$0.005 an hour, in use or idle (<a href="../d3-task-3-4.html">Task 3.4</a>). Nothing in the private tiers has one, and administrators use Session Manager instead of bastion hosts.</p>
+				<p><strong>A guardrail above the routes.</strong> VPC Block Public Access, in ingress-only mode, blocks inbound internet traffic for every VPC in the Region while still allowing outbound through NAT gateways; it overrides security groups, NACLs and route tables. The ALB's public subnets are excluded, and an EC2 declarative policy enforces it across the organization (<a href="../d1-task-1-2.html">Task 1.2</a>, <a href="../d1-task-1-1.html">Task 1.1</a>).</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Egress and private access to AWS</h3>
+				<p><strong>NAT that survives an AZ.</strong> A zonal NAT gateway is redundant only inside its AZ, so the classic design is one per AZ, with each app route table pointing at the one in its own AZ. The Regional NAT gateway is one ID that expands across AZs as workloads appear and needs no public subnet; it doesn't support private NAT and is billed per AZ it runs in (<a href="../d1-task-1-2.html">Task 1.2</a>). Prod uses the Regional NAT gateway for simpler routing.</p>
+				<span class="file">Create a Regional NAT gateway for the prod VPC (AWS CLI, from Task 1.2)</span>
+<pre><code># Automatic mode manages the addresses and the AZ expansion for you
+aws ec2 create-nat-gateway --vpc-id vpc-0prod11111111111 --availability-mode regional</code></pre>
+				<p><strong>Gateway endpoints for S3 and DynamoDB.</strong> They're free, work through a prefix-list route, and take the app tier's largest traffic (uploads and DynamoDB order data) off NAT. They reach only the same Region and can't be used from the office, peered VPCs or a transit gateway.</p>
+				<span class="file">Add an S3 gateway endpoint to the three private app route tables (AWS CLI, from Task 1.2; DynamoDB uses the same form with com.amazonaws.us-east-1.dynamodb)</span>
+<pre><code>aws ec2 create-vpc-endpoint --vpc-id vpc-0prod11111111111 \
+    --vpc-endpoint-type Gateway \
+    --service-name com.amazonaws.us-east-1.s3 \
+    --route-table-ids rtb-0appa111111111111 rtb-0appb111111111111 rtb-0appc111111111111</code></pre>
+				<p><strong>Policies on both ends.</strong> An endpoint policy limits what can be done through the endpoint and never grants more than IAM and bucket policies allow. Here it allows only the company's buckets, so a compromised instance can't copy data to someone else's bucket; the uploads bucket in turn denies requests not arriving through <code>vpce-0s3a1111111111111</code> (Task 1.2).</p>
+				<span class="file">Endpoint policy for the S3 gateway endpoint: object access to the company's own buckets only (JSON)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CompanyBucketsOnly",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::example-prod-uploads", "arn:aws:s3:::example-prod-uploads/*",
+        "arn:aws:s3:::example-order-archive", "arn:aws:s3:::example-order-archive/*"
+      ]
+    }
+  ]
+}</code></pre>
+				<p><strong>Interface endpoints for everything else.</strong> Secrets Manager, KMS, ECR and CloudWatch Logs are reached through interface endpoints (AWS PrivateLink): an elastic network interface in each chosen subnet, private DNS so code doesn't change, and a security group that allows 443 from the app tier. At US$0.01 per AZ-hour plus US$0.01 per GB, against NAT's US$0.045 per GB, they pay off on busy paths such as ECR pulls (<a href="../d4-task-4-4.html">Task 4.4</a>).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Layered filtering and flow logs</h3>
+				<p><strong>Security groups chained by reference.</strong> Security groups are stateful, allow-only and attached to each network interface. The ALB's group allows 443 from the internet (or from CloudFront's managed prefix list); the app group allows 8080 only from the ALB's group; <code>sg-0proxy1111111111</code> allows 5432 only from the app group, and the database allows 5432 only from the proxy. References keep working as Auto Scaling replaces instances (<a href="../d1-task-1-2.html">Task 1.2</a>).</p>
+				<span class="file">Allow the app tier to receive traffic only from the load balancer (AWS CLI, from Task 1.2)</span>
+<pre><code>aws ec2 authorize-security-group-ingress \
+    --group-id sg-0app1111111111111 \
+    --protocol tcp --port 8080 \
+    --source-group sg-0alb1111111111111</code></pre>
+				<p><strong>NACLs as a coarse subnet guard.</strong> Network ACLs are stateless, numbered, first match wins, and can deny. The public subnets' NACL is where the company blocks an abusive range, because security groups have no deny rules. Return traffic must be allowed explicitly on ephemeral ports: Amazon Linux uses 32768&ndash;61000 while ELB, NAT gateways and Lambda use 1024&ndash;65535, so AWS suggests allowing 1024&ndash;65535.</p>
+				<span class="file">Block one abusive range before the allow rule on the public subnets' NACL (AWS CLI, from Task 1.2)</span>
+<pre><code>aws ec2 create-network-acl-entry --network-acl-id acl-0pub111111111111 \
+    --ingress --rule-number 90 --protocol tcp --port-range From=443,To=443 \
+    --cidr-block 203.0.113.0/24 --rule-action deny
+aws ec2 create-network-acl-entry --network-acl-id acl-0pub111111111111 \
+    --ingress --rule-number 100 --protocol tcp --port-range From=443,To=443 \
+    --cidr-block 0.0.0.0/0 --rule-action allow</code></pre>
+				<p><strong>Network Firewall only if needed.</strong> Filtering outbound traffic by domain or intrusion prevention would mean AWS Network Firewall, in a firewall subnet per AZ or attached to the transit gateway (since June 2025). The company has no such requirement yet; DNS Firewall covers DNS-based exfiltration.</p>
+				<p><strong>Flow logs for evidence.</strong> VPC Flow Logs record metadata about accepted and rejected traffic without affecting performance; they show a rule that is too strict and who sends traffic through NAT.</p>
+				<span class="file">Record all traffic in the prod VPC to S3 with one-minute aggregation (AWS CLI; options checked on the create-flow-logs reference)</span>
+<pre><code>aws ec2 create-flow-logs \
+    --resource-type VPC \
+    --resource-ids vpc-0prod11111111111 \
+    --traffic-type ALL \
+    --log-destination-type s3 \
+    --log-destination arn:aws:s3:::example-network-logs/prod/ \
+    --max-aggregation-interval 60</code></pre>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The hub: Transit Gateway shared with RAM</h3>
+				<p><strong>A hub, not a mesh.</strong> Prod, staging, dev and the shared-services VPC all need the office, and some need shared services. Peering is one non-transitive link per pair; a transit gateway needs one attachment per VPC (<a href="../d3-task-3-4.html">Task 3.4</a>). It lives in the shared-network account <code>444444444444</code>, so the network team owns routing and the workload teams only attach. With default association off, each attachment goes into the right route table on purpose, and blackhole routes keep dev from prod.</p>
+				<span class="file">In the shared-network account: a transit gateway that doesn't auto-associate attachments (AWS CLI, from Task 3.4)</span>
+<pre><code>aws ec2 create-transit-gateway --description "us-east-1 hub" \
+    --options AmazonSideAsn=64512,AutoAcceptSharedAttachments=disable,DefaultRouteTableAssociation=disable,DefaultRouteTablePropagation=disable,VpnEcmpSupport=enable,DnsSupport=enable</code></pre>
+				<p><strong>Share it, then attach.</strong> AWS RAM shares the transit gateway with the organization. Each attachment uses one subnet per AZ (only those AZs reach the hub), and each app route table gets a route for <code>172.16.0.0/16</code> to the transit gateway.</p>
+				<span class="file">Share the transit gateway with the organization only, then attach the prod VPC from account 111111111111 (AWS CLI; options checked on the create-resource-share and create-transit-gateway-vpc-attachment references; replace TGW_ID, MANAGEMENT_ACCOUNT_ID and the attachment subnet IDs)</span>
+<pre><code># In 444444444444: share with every account in the organization, nobody outside it
+aws ram create-resource-share --name tgw-us-east-1 \
+    --resource-arns arn:aws:ec2:us-east-1:444444444444:transit-gateway/TGW_ID \
+    --principals arn:aws:organizations::MANAGEMENT_ACCOUNT_ID:organization/o-exampleorg \
+    --no-allow-external-principals
+
+# In 111111111111: one small attachment subnet per AZ
+aws ec2 create-transit-gateway-vpc-attachment \
+    --transit-gateway-id TGW_ID \
+    --vpc-id vpc-0prod11111111111 \
+    --subnet-ids TGW_SUBNET_A TGW_SUBNET_B TGW_SUBNET_C</code></pre>
+				<p>Security group references across a transit gateway work since September 2024, but only in inbound rules and only when enabled on the transit gateway and the attachment (<a href="../d1-task-1-2.html">Task 1.2</a>). The deeper design, with segmented route tables, is the ANS <a href="../../aws-ans/arch/tgw-hub-spoke.html">Transit Gateway hub and spoke</a> page.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>The office: VPN now, Direct Connect next, hybrid DNS</h3>
+				<p><strong>Site-to-Site VPN first.</strong> A VPN can be set up in minutes, is encrypted with IPsec, and every connection has two tunnels to different AWS endpoints, so the office router should run both. Ending it on the transit gateway rather than a virtual private gateway means it reaches every attached VPC and can use ECMP across tunnels with BGP, which a virtual private gateway can't (<a href="../d3-task-3-4.html">Task 3.4</a>). A standard tunnel carries up to 1.25 Gbps; large-bandwidth tunnels carry up to 5 Gbps.</p>
+				<span class="file">Connect the office router to the transit gateway with dynamic (BGP) routing (AWS CLI; options checked on the create-vpn-connection reference; OFFICE_CGW_ID is the customer gateway for the office router)</span>
+<pre><code>aws ec2 create-vpn-connection \
+    --type ipsec.1 \
+    --customer-gateway-id OFFICE_CGW_ID \
+    --transit-gateway-id TGW_ID \
+    --tag-specifications 'ResourceType=vpn-connection,Tags=[{Key=Name,Value=office-vpn}]'</code></pre>
+				<p><strong>Direct Connect when volume and consistency justify it.</strong> Direct Connect gives consistent bandwidth and latency over a private link, but ordering takes weeks and it isn't encrypted by default. The plan is a transit VIF through a Direct Connect gateway to the transit gateway, keeping the VPN as backup; the transit gateway prefers Direct Connect routes over VPN routes for the same prefix. For encryption, run the VPN over Direct Connect or MACsec on a dedicated 10 Gbps or faster port (<a href="../d1-task-1-2.html">Task 1.2</a>). The ANS <a href="../../aws-ans/arch/dx-resilient-hybrid.html">resilient Direct Connect</a> and <a href="../../aws-ans/arch/encrypted-hybrid.html">encrypted hybrid</a> pages go further.</p>
+				<p><strong>Hybrid DNS.</strong> The VPC's built-in resolver, Route 53 VPC Resolver, can't be reached from the office directly. An inbound endpoint in <code>vpc-0shared1111111111</code> gives the office DNS servers IP addresses to forward the company's private hosted zone to; an outbound endpoint with forwarding rules sends queries for the office's own domain back to its DNS servers. Rules are shared through AWS RAM, so one pair of endpoints serves every VPC (ANS <a href="../../aws-ans/arch/hybrid-dns.html">hybrid DNS</a> page).</p>
+				<p><strong>Remote staff.</strong> Client VPN gives home workers' devices a VPN into the VPC; Verified Access gives users specific internal applications without a VPN, checking identity and device state on every request (ANS <a href="../../aws-ans/arch/remote-access.html">remote access</a>).</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Regional NAT gateway, plus endpoints to keep traffic off it</h4>
+				<p>A zonal NAT gateway costs US$0.045 an hour plus US$0.045 per GB, and the Regional NAT gateway is billed per AZ it runs in, so it costs about the same as three zonal ones: it saves management, not money (<a href="../d4-task-4-4.html">Task 4.4</a>). The real saving is what never touches NAT: free gateway endpoints for S3 and DynamoDB and interface endpoints for heavy service traffic. One shared NAT gateway saves hours but adds cross-AZ charges and an AZ single point of failure: dev only.</p>
+			</div>
+			<div class="entry">
+				<h4>Transit Gateway over peering</h4>
+				<p>Peering has no hourly or processing charge and same-AZ traffic is free, so it's the cheaper choice for two VPCs exchanging a lot of data. A transit gateway costs US$0.05 per attachment-hour plus US$0.02 per GB processed, but gives transitive routing, one place to attach the VPN and Direct Connect, and route tables for segmentation (<a href="../d4-task-4-4.html">Task 4.4</a>). With four VPCs today and more coming, plus the office, the hub wins.</p>
+			</div>
+			<div class="entry">
+				<h4>VPN first, Direct Connect when the numbers say so</h4>
+				<p>A VPN costs US$0.05 per connection-hour, about US$36 a month, plus internet egress rates. A 1 Gbps dedicated Direct Connect port costs about US$219 a month and saves US$0.07 per GB on outbound traffic, so it pays for its port at roughly 3.1 TB out a month, before the carrier circuit and colocation (<a href="../d4-task-4-4.html">Task 4.4</a>). Inbound data is free either way, so uploads into AWS don't count, and an idle port still bills.</p>
+			</div>
+			<div class="entry">
+				<h4>Watching inter-AZ and DNS charges</h4>
+				<p>Traffic between AZs costs US$0.01 per GB in each direction, as is traffic to a public IP inside the VPC, so tiers use private IPs. Resolver endpoints cost about US$182 a month each, which is why there is one shared pair. Cost Explorer usage types and Flow Logs show where the money goes.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>A single shared egress VPC</h4>
+				<p>With many VPCs, one egress VPC in the shared-network account can hold the NAT gateways, and spokes send <code>0.0.0.0/0</code> to the transit gateway. It saves NAT hours in every VPC but adds US$0.02 per GB of transit gateway processing, so a busy VPC like prod can be cheaper with its own NAT (<a href="../d3-task-3-4.html">Task 3.4</a>). The ANS <a href="../../aws-ans/arch/centralized-egress.html">centralized egress</a> page has the full design.</p>
+			</div>
+			<div class="entry">
+				<h4>AWS Cloud WAN for a larger network</h4>
+				<p>Cloud WAN builds a global network from one core network policy, with segments such as prod and dev mapped to attachments by tag. It suits many Regions; with two, the company stays on Transit Gateway (ANS <a href="../../aws-ans/arch/multi-region-network.html">multi-Region network</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>VPC Lattice or shared VPCs for service-to-service traffic</h4>
+				<p>VPC Lattice connects services across VPCs and accounts at the application layer, priced per service-hour and US$0.025 per GB, without routing whole networks together (<a href="../d4-task-4-4.html">Task 4.4</a>; ANS <a href="../../aws-ans/arch/lattice-service-network.html">Lattice service network</a>). Shared VPCs, subnets shared through RAM, reduce the number of VPCs to connect at all (ANS <a href="../../aws-ans/arch/vpc-sharing.html">VPC sharing</a>). Neither replaces the office link.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">No path from the internet</span><span class="desc">Network Access Analyzer must find no path from the internet gateway to the app or database subnets; Reachability Analyzer from an app instance to Aurora on 5432 must pass.</span></li>
+				<li><span class="name">AZ loss keeps egress</span><span class="desc">During an AZ zonal shift or a FIS test that disrupts one AZ's subnets, instances in the other AZs must still reach the payment provider through NAT.</span></li>
+				<li><span class="name">Endpoints actually used</span><span class="desc">Upload a test object from an app instance and check the flow logs and the NAT gateway's bytes: S3 traffic must not appear on NAT. A request to the uploads bucket from outside the endpoint must be denied.</span></li>
+				<li><span class="name">NACL return traffic</span><span class="desc">After any NACL change, load-test the ALB: rejected flows in the logs on ports 1024&ndash;65535 mean the ephemeral range is missing.</span></li>
+				<li><span class="name">Tunnel failover</span><span class="desc">Take one VPN tunnel down from the office router: traffic must continue on the second tunnel, and a CloudWatch alarm on tunnel state must fire. Once Direct Connect is live, disable its BGP session and confirm traffic moves to the VPN.</span></li>
+				<li><span class="name">Hybrid DNS</span><span class="desc">From an office workstation, resolve an internal name in the private hosted zone; from an app instance, resolve an office server's name through the outbound rule.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design secure workloads and applications</td><td data-label="What this architecture demonstrates">Public, private and isolated subnets; chained security groups; NACL deny rules and ephemeral ports; gateway and interface endpoints with policies; VPC Block Public Access; Flow Logs; VPN, Direct Connect, Client VPN and Verified Access</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Design highly available and/or fault-tolerant architectures</td><td data-label="What this architecture demonstrates">Every tier and NAT path in three AZs; two VPN tunnels; VPN as backup for Direct Connect</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-4.html">3.4</a> Determine high-performing and/or scalable network architectures</td><td data-label="What this architecture demonstrates">Non-overlapping CIDRs and IPAM; Transit Gateway over a peering mesh, shared with RAM; VPN on a transit gateway for ECMP; Direct Connect gateway; VPC Resolver endpoints for hybrid DNS; Cloud WAN for global networks</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-4.html">4.4</a> Design cost-optimized network architectures</td><td data-label="What this architecture demonstrates">NAT per AZ versus shared, endpoints to cut NAT processing, peering versus transit gateway charges, VPN versus Direct Connect break-even, public IPv4 and Resolver endpoint costs</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Private instances must reach S3 without internet access. Which solution meets these requirements MOST cost-effectively?" is an <strong>S3 gateway endpoint</strong>, not a NAT gateway or an interface endpoint. "Private instances lost internet access when one AZ failed" is <strong>a NAT gateway per AZ or a Regional NAT gateway</strong>. "Connect dozens of VPCs and the data center with the LEAST operational overhead" is a <strong>transit gateway</strong>. "An encrypted connection to the office that can be set up quickly" is <strong>Site-to-Site VPN</strong>; "consistent performance for large daily transfers" is <strong>Direct Connect</strong>, with a VPN as the low-cost backup. "On-premises servers must resolve private hosted zone names" is a <strong>VPC Resolver inbound endpoint</strong>.</p></div>
+			<p>Deeper material: the <a href="../../aws-ans/index.html">ANS-C01 guide</a> and its architectures, especially <a href="../../aws-ans/arch/shared-endpoints.html">shared endpoints</a>, <a href="../../aws-ans/arch/inbound-perimeter.html">inbound perimeter</a> and <a href="../../aws-ans/arch/network-observability.html">network observability</a>.</p>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/architecture/reduce-cost-and-increase-security-with-amazon-vpc-endpoints/">Reduce Cost and Increase Security with Amazon VPC Endpoints</a> (March 2022): gateway and interface endpoints to cut NAT processing and keep traffic private, with endpoint policies.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/build-scalable-ipv4-addressing-with-aws-nat-gateway-in-regional-availability-mode-amazon-vpc-ipam-policies-and-prefix-lists/">Build scalable IPv4 addressing with AWS NAT gateway in regional availability mode, Amazon VPC IPAM policies and Prefix Lists</a> (November 2025): the Regional NAT gateway used in Step 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/vpc-block-public-access/">Enhancing VPC Security with Amazon VPC Block Public Access</a> (November 2024): the Region-wide internet block and its exclusions.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/introducing-security-group-referencing-for-aws-transit-gateway/">Introducing security group referencing for AWS Transit Gateway</a> (September 2024): chained security groups across the hub.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/selecting-the-right-aws-vpn-solution-a-decision-framework/">Selecting the Right AWS VPN Solution: A Decision Framework</a> (May 2026): Site-to-Site VPN, Client VPN or Verified Access.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/explore-the-aws-direct-connect-resiliency-toolkit/">Explore the AWS Direct Connect Resiliency Toolkit</a> (April 2021): the resiliency models behind the Direct Connect plan.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/building-scalable-secure-multi-vpc-network-infrastructure/welcome.html">Building a Scalable and Secure Multi-VPC AWS Network Infrastructure</a> (AWS whitepaper, April 2024): Transit Gateway, centralized egress and endpoints, hybrid DNS and Cloud WAN (predates the Regional NAT gateway and the Route 53 VPC Resolver name).</li>
+				<li><a href="https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs.html">VPC Flow Logs</a> (AWS documentation): what flow logs capture and where they can be delivered.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Associate (SAA-C03) exam guide, version 1.1.</div>
+</footer>
+
+</body>
+</html>
