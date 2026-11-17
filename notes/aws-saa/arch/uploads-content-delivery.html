@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Uploads and content delivery | AWS SAA-C03 Notes</title>
+	<meta name="description" content="SAA-C03 reference architecture: customers upload photos and documents with presigned S3 URLs issued by the API after Cognito sign-in, S3 event notifications feed an SQS queue and a Lambda processor that writes to a separate prefix, CloudFront with origin access control serves product images and private documents, and SSE-KMS with Bucket Keys, versioning, cross-Region replication and lifecycle rules protect the data and move it to cheaper storage classes.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../saa.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAA-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Uploads and delivery</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Uploads and content delivery</h1>
+		<p>Customers upload photos and documents straight to S3 with short-lived presigned URLs, a queue-driven function scans them and makes thumbnails, and CloudFront serves product images and private documents worldwide from buckets nobody can reach directly, with encryption, replication and lifecycle rules keeping the data safe and cheap.</p>
+		<div class="tags"><span class="tag code">SAA-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">Amazon S3</span><span class="tag">Amazon CloudFront</span><span class="tag">Amazon SQS</span><span class="tag">AWS Lambda</span><span class="tag">AWS KMS</span><span class="tag">Amazon Cognito</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The upload path: presigned URLs</a></li>
+				<li class="sub"><a href="#b2">2. Processing: events, queue, function</a></li>
+				<li class="sub"><a href="#b3">3. Delivery: CloudFront with OAC</a></li>
+				<li class="sub"><a href="#b4">4. Caching, private files and updates</a></li>
+				<li class="sub"><a href="#b5">5. Encryption, replication and lifecycle</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>Customers of the web application and the mobile API attach photos and documents to their accounts and orders: profile pictures, product reviews with photos, receipts and delivery paperwork. The company also serves its own product images, scripts and stylesheets to shoppers around the world. Everything lives in S3 in the production account <code>111111111111</code> in us-east-1, with a copy in the DR Region us-west-2 (<a href="../d1-task-1-3.html">Task 1.3</a>, <a href="../d3-task-3-1.html">Task 3.1</a>).</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>Uploads don't pass through the servers</strong>: a 200 MB file must not tie up the API, and the API's 10 MB payload limit rules that out anyway (<a href="../d2-task-2-1.html">Task 2.1</a>).</li>
+				<li><strong>Only signed-in customers upload</strong>, only into their own area, for a few minutes at a time.</li>
+				<li><strong>Nothing reaches other customers unchecked</strong>: every file is scanned and resized before anyone sees it.</li>
+				<li><strong>Fast worldwide reads</strong> of product images, and private documents visible only to their owner.</li>
+				<li><strong>No public buckets</strong>, encryption with the company key for customer data, and a recoverable copy in us-west-2.</li>
+				<li><strong>Storage costs fall as files age</strong>: most photos are read in the first weeks, some for years.</li>
+			</ul>
+			<p>Reused from the SAA pages: the buckets <code>example-prod-uploads</code> (customer files), <code>example-dr-uploads</code> (its replica in us-west-2) and <code>example-order-archive</code> (seven-year order records with Object Lock), and the KMS key <code>alias/prod-data</code>. New on this page: the bucket <code>example-prod-assets</code> for product images and static files; the prefixes <code>incoming/</code> and <code>processed/</code> in the uploads bucket; the function <code>upload-url</code> behind the <a href="serverless-api.html">serverless API</a> and its role <code>upload-url-role</code>; the queue <code>upload-events</code> with <code>upload-events-dlq</code>; the processing function <code>upload-processor</code>; and one CloudFront distribution, shown as <code>E1EXAMPLE</code>.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> Since April 2023 new buckets block public access and disable ACLs (Bucket owner enforced), and since January 2023 every new object is encrypted with SSE-S3 by default. CloudFront origin access control (OAC) replaced the legacy origin access identity (OAI). S3 objects can be up to 50 TB since December 2025. S3 Select and S3 Object Lambda are closed to new customers, and the original Glacier vault service is closed; the S3 Glacier storage classes are unaffected.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgU-wide-t">
+<title id="dgU-wide-t">Uploads and content delivery: a signed-in customer gets a five-minute presigned PUT URL from the upload-url function and uploads straight to the uploads bucket; an event notification queues each new object on upload-events for upload-processor to scan and resize; CloudFront with origin access control serves product images from the assets bucket and customers' own files with signed URLs; replication copies uploads to the DR bucket in us-west-2.</title>
+<path d="M90.0 152.0 L90.0 83.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M90.0 198.0 L90.0 267.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M290.0 83.0 L290.0 152.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 198.0 L290.0 267.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Customer</text>
+<text x="90" y="189" class="dg-s dg-sm2">phone or browser</text>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">upload-url</text>
+<text x="90" y="74" class="dg-s dg-sm2">presigned PUT, 5 min</text>
+<rect x="10" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="287" class="dg-t dg-sm">Cognito</text>
+<text x="90" y="304" class="dg-s dg-sm2">user pool</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">Uploads bucket</text>
+<text x="290" y="189" class="dg-s dg-sm2">incoming/, processed/</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">upload-events</text>
+<text x="500" y="189" class="dg-s dg-sm2">SQS + DLQ</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">upload-processor</text>
+<text x="700" y="189" class="dg-s dg-sm2">scan, thumbnail</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">CloudFront</text>
+<text x="290" y="74" class="dg-s dg-sm2">OAC, signed URLs</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Assets bucket</text>
+<text x="500" y="74" class="dg-s dg-sm2">product images</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">DR bucket</text>
+<text x="290" y="304" class="dg-s dg-sm2">us-west-2 replica</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 410" role="img" aria-labelledby="dgU-tall-t">
+<title id="dgU-tall-t">Uploads and content delivery: a signed-in customer gets a five-minute presigned PUT URL from the upload-url function and uploads straight to the uploads bucket; an event notification queues each new object on upload-events for upload-processor to scan and resize; CloudFront with origin access control serves product images from the assets bucket and customers' own files with signed URLs; replication copies uploads to the DR bucket in us-west-2.</title>
+<path d="M100.0 122.0 L100.0 63.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 145.0 L220.0 145.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">Customer</text>
+<text x="100" y="159" class="dg-s dg-sm2">phone or browser</text>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">upload-url</text>
+<text x="100" y="54" class="dg-s dg-sm2">presigned PUT, 5 min</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">Cognito</text>
+<text x="100" y="269" class="dg-s dg-sm2">user pool</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="142" class="dg-t dg-sm">Uploads bucket</text>
+<text x="300" y="159" class="dg-s dg-sm2">incoming/, processed/</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">upload-events</text>
+<text x="300" y="269" class="dg-s dg-sm2">SQS + DLQ</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">upload-processor</text>
+<text x="300" y="379" class="dg-s dg-sm2">scan, thumbnail</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">CloudFront</text>
+<text x="300" y="54" class="dg-s dg-sm2">OAC, signed URLs</text>
+</svg>
+				<figcaption>Figure: the files never pass through the application servers. After Cognito sign-in (yellow) the app asks <code>upload-url</code> for a short-lived presigned URL and puts the file straight into <code>example-prod-uploads</code> (grey). New objects under <code>incoming/</code> queue a message for <code>upload-processor</code> (blue), which writes clean files and thumbnails under <code>processed/</code>. CloudFront reads both buckets only through origin access control (green), and replication copies uploads to <code>example-dr-uploads</code> (dashed; desktop view).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>One photo travels from the phone to S3, through processing, and out through CloudFront. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Upload</li>
+				<li><span class="name">Sign in<span class="who">Customer</span></span><span class="desc">The app signs the customer in with the Cognito user pool and calls <code>POST /uploads</code> with the JWT, the file type and its size.</span></li>
+				<li><span class="name">Issue a URL<span class="who">upload-url</span></span><span class="desc">The function checks the type and size, chooses the key <code>incoming/USER_ID/UUID.jpg</code> and returns a presigned PUT URL that expires in five minutes.</span></li>
+				<li><span class="name">PUT to S3<span class="who">Customer</span></span><span class="desc">The app uploads straight to <code>example-prod-uploads</code>; large files use multipart upload. S3 encrypts the object with <code>alias/prod-data</code>.</span></li>
+				<li class="group">Process</li>
+				<li class="auto"><span class="name">Notify<span class="who auto">AWS</span></span><span class="desc">An event notification for objects created under <code>incoming/</code> sends a message to <code>upload-events</code>.</span></li>
+				<li><span class="name">Scan and resize<span class="who">upload-processor</span></span><span class="desc">Lambda polls the queue; the function checks the real file type, scans it, writes the clean file and a thumbnail under <code>processed/</code> and records the result. Failures land in <code>upload-events-dlq</code>.</span></li>
+				<li class="group">Deliver and protect</li>
+				<li class="auto"><span class="name">Serve<span class="who auto">AWS</span></span><span class="desc">CloudFront serves product images from <code>example-prod-assets</code> and, with a signed URL, the customer's own files from <code>processed/</code>, signing every origin request with OAC.</span></li>
+				<li class="auto"><span class="name">Replicate and tier<span class="who auto">AWS</span></span><span class="desc">Cross-Region Replication copies new uploads to <code>example-dr-uploads</code>; lifecycle rules expire raw uploads, old versions and abandoned multipart uploads.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The upload path: presigned URLs</h3>
+				<p><strong>Signed by the API, used by the phone.</strong> A presigned URL carries the permissions of the principal that created it, for one bucket, one key, one HTTP method and a limited time. The phone needs no AWS credentials and the bucket policy needs no change. URLs made with the CLI or SDKs can last up to 7 days, but a URL signed with role credentials dies when the role session ends, so a Lambda function's URLs never outlive its credentials. Five minutes is plenty for an upload that starts at once; S3 checks expiry when the request starts, so a long upload already under way finishes.</p>
+				<p><strong>Limits before the URL, checks after the upload.</strong> <code>upload-url</code> refuses unknown types and oversized files, chooses the key itself (the customer never names the object), and signs the content type into the URL. A presigned POST form can also carry a policy with a size range; the upload patterns blog compares both. The client can still lie, so <code>upload-processor</code> checks the real type and size afterwards. A bucket policy condition on <code>s3:signatureAge</code> can reject old signatures across the bucket.</p>
+				<span class="file">upload-url: return a five-minute presigned PUT URL for a key the server chooses (Python, AWS SDK for Python; user_id comes from the validated Cognito JWT)</span>
+<pre><code>import uuid, boto3
+
+s3 = boto3.client("s3")
+ALLOWED = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}
+
+def handler(event, context):
+    user_id = event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]
+    content_type = event["queryStringParameters"]["type"]
+    if content_type not in ALLOWED:
+        return {"statusCode": 400, "body": "file type not allowed"}
+    # The server picks the key: incoming/ is the only prefix customers can write to
+    key = f"incoming/{user_id}/{uuid.uuid4()}.{ALLOWED[content_type]}"
+    url = s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": "example-prod-uploads", "Key": key, "ContentType": content_type},
+        ExpiresIn=300)                      # five minutes
+    return {"statusCode": 200, "body": f'{{"url": "{url}", "key": "{key}"}}'}</code></pre>
+				<p><strong>Large files and distant customers.</strong> A single PUT takes at most 5 GB; AWS recommends multipart upload above 100 MB, with parts of 5 MiB to 5 GiB uploaded in parallel and only failed parts retried (<a href="../d3-task-3-1.html">Task 3.1</a>). For multipart, the API presigns each part. Transfer Acceleration routes uploads through the nearest edge location and can be 50% to 500% faster for large objects over long distances, at US$0.04 per GB charged only when it is faster (<a href="../d4-task-4-4.html">Task 4.4</a>). Most uploads here are phone photos of a few MB, so it stays off; a team that handled large video from overseas would turn it on for that bucket.</p>
+				<p><strong>Locked buckets.</strong> Both buckets keep Block Public Access on and Object Ownership at Bucket owner enforced, so ACLs are disabled and only policies decide access (<a href="../d1-task-1-1.html">Task 1.1</a>). <code>upload-url-role</code> may only <code>s3:PutObject</code> on <code>example-prod-uploads/incoming/*</code> and use the KMS key to encrypt.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Processing: events, queue, function</h3>
+				<p><strong>Event notification to a queue.</strong> S3 publishes an event for each new object under <code>incoming/</code> to <code>upload-events</code>, which needs a queue policy allowing <code>s3.amazonaws.com</code> to send messages for this bucket. The queue absorbs bursts, keeps failed messages for retry and parks poison files in the DLQ, exactly like order processing (<a href="order-processing.html">Decoupled order processing</a>).</p>
+				<span class="file">Send an event to upload-events for every object created under incoming/ (notification.json for aws s3api put-bucket-notification-configuration; structure checked on the CLI reference)</span>
+<pre><code># aws s3api put-bucket-notification-configuration \
+#     --bucket example-prod-uploads --notification-configuration file://notification.json
+{
+  "QueueConfigurations": [
+    {
+      "Id": "new-uploads",
+      "QueueArn": "arn:aws:sqs:us-east-1:111111111111:upload-events",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": { "Key": { "FilterRules": [ { "Name": "prefix", "Value": "incoming/" } ] } }
+    }
+  ]
+}</code></pre>
+				<p>The call replaces the bucket's whole notification configuration, so keep every destination in the one file.</p>
+				<p><strong>No recursive triggers.</strong> <code>upload-processor</code> writes its output under <code>processed/</code>, which the prefix filter ignores. If the function wrote back into <code>incoming/</code>, each output would trigger another invocation and the bill would climb until someone noticed. A separate output bucket is the stricter version of the same rule.</p>
+				<span class="file">Connect upload-events to upload-processor with per-message failure reporting and a concurrency cap (AWS CLI; same options as on the order processing page)</span>
+<pre><code>aws lambda create-event-source-mapping \
+    --function-name upload-processor \
+    --event-source-arn arn:aws:sqs:us-east-1:111111111111:upload-events \
+    --batch-size 10 \
+    --function-response-types ReportBatchItemFailures \
+    --scaling-config MaximumConcurrency=20</code></pre>
+				<p>The queue's visibility timeout is six times the function timeout and its redrive policy moves a message to <code>upload-events-dlq</code> after five receives, as for <code>order-intake</code>. Files that fail the scan are left in <code>incoming/</code> and expire there (Step 5); nothing under <code>incoming/</code> is ever served.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Delivery: CloudFront with OAC</h3>
+				<p><strong>One distribution, two private origins.</strong> The default behaviour reads <code>example-prod-assets</code>; a <code>/files/*</code> behaviour reads <code>processed/</code> in <code>example-prod-uploads</code>. Both buckets stay private: CloudFront signs every origin request with origin access control (SigV4, signing behaviour <code>always</code>). AWS recommends OAC over OAI because OAC works in every Region, supports SSE-KMS and supports PUT and DELETE requests. OAC needs a regular bucket endpoint, not an S3 website endpoint, and Object Ownership at Bucket owner enforced (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+				<span class="file">The origin access control (CloudFormation YAML, from the CloudFront developer guide)</span>
+<pre><code>AssetsOAC:
+  Type: AWS::CloudFront::OriginAccessControl
+  Properties:
+    OriginAccessControlConfig:
+      Name: prod-s3-oac
+      OriginAccessControlOriginType: s3
+      SigningBehavior: always        # sign every request; CloudFront to S3 is always HTTPS
+      SigningProtocol: sigv4</code></pre>
+				<p><strong>Only this distribution may read.</strong> The bucket policy allows the CloudFront service principal, but only on behalf of distribution <code>E1EXAMPLE</code>, so another customer's distribution can't point at the bucket.</p>
+				<span class="file">example-prod-assets bucket policy: read-only access for one distribution (JSON, the AWS OAC example)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipalReadOnly",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudfront.amazonaws.com" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::example-prod-assets/*",
+      "Condition": {
+        "StringEquals": { "AWS:SourceArn": "arn:aws:cloudfront::111111111111:distribution/E1EXAMPLE" }
+      }
+    }
+  ]
+}</code></pre>
+				<p>The uploads bucket gets the same statement for <code>processed/*</code>. Its objects are encrypted with <code>alias/prod-data</code>, so the key policy also needs a statement letting <code>cloudfront.amazonaws.com</code> use the key under the same <code>AWS:SourceArn</code> condition; without it CloudFront gets an access error from S3.</p>
+				<span class="file">Statement added to the prod-data key policy so the distribution can decrypt (JSON fragment, the AWS OAC example)</span>
+<pre><code>{
+  "Sid": "AllowCloudFrontServicePrincipalSSE-KMS",
+  "Effect": "Allow",
+  "Principal": { "Service": ["cloudfront.amazonaws.com"] },
+  "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*"],
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": { "AWS:SourceArn": "arn:aws:cloudfront::111111111111:distribution/E1EXAMPLE" }
+  }
+}</code></pre>
+				<p>AWS WAF attaches to the distribution with a global web ACL created in us-east-1, and Shield Standard protects every distribution at no charge (<a href="../d1-task-1-2.html">Task 1.2</a>).</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Caching, private files and updates</h3>
+				<p><strong>Cache behaviours and TTLs.</strong> Each behaviour has a cache policy that sets the minimum, default and maximum TTL and the cache key. Product images and versioned scripts get long TTLs; the cache key includes only the headers, cookies and query strings that change the response, which raises the hit ratio and cuts origin requests (<a href="../d4-task-4-4.html">Task 4.4</a>). If most shoppers are in North America and Europe, Price Class 100 lowers the CloudFront bill; Origin Shield adds a central cache layer when misses from many edges overload the origin.</p>
+				<p><strong>Private documents with signed URLs.</strong> The <code>/files/*</code> behaviour requires signed URLs from a trusted key group. When a signed-in customer opens a receipt, the API checks ownership and returns a CloudFront signed URL valid for a few minutes. Signed URLs suit single files and clients without cookies; signed cookies suit many files at once, such as a whole gallery or video, without changing the URLs. If both are present, the signed URL wins. An S3 presigned GET URL would also work, but it bypasses the cache and the edge.</p>
+				<p><strong>Versioned file names over invalidations.</strong> The build pipeline names files by content (<code>app.3f9c2b.js</code>, <code>sku-1042-v7.jpg</code>) and changes the reference in the HTML. AWS recommends versioning for files that change often: browsers and corporate proxies can't serve a stale copy, rolling back is changing a name, and there is no invalidation charge. Invalidation is for mistakes, such as a wrong price on a banner image.</p>
+				<span class="file">Remove a wrong banner from every edge cache now (AWS CLI; options checked on the create-invalidation reference)</span>
+<pre><code>aws cloudfront create-invalidation \
+    --distribution-id E1EXAMPLE \
+    --paths "/banners/sale.jpg"</code></pre>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Encryption, replication and lifecycle</h3>
+				<p><strong>Two buckets, two encryption choices.</strong> Product images are public content, so <code>example-prod-assets</code> keeps the free SSE-S3 default. Customer files are personal data, so <code>example-prod-uploads</code> uses SSE-KMS with <code>alias/prod-data</code>: every use of the key is in CloudTrail and the key policy decides who may decrypt. S3 Bucket Keys cut KMS requests by up to 99%, which lowers cost and avoids KMS throttling during upload bursts (<a href="../d1-task-1-3.html">Task 1.3</a>).</p>
+				<span class="file">Default encryption for the uploads bucket: SSE-KMS with the company key and a Bucket Key (AWS CLI, as on Task 1.3)</span>
+<pre><code>aws s3api put-bucket-encryption --bucket example-prod-uploads \
+    --server-side-encryption-configuration '{
+      "Rules": [{
+        "ApplyServerSideEncryptionByDefault": {
+          "SSEAlgorithm": "aws:kms",
+          "KMSMasterKeyID": "arn:aws:kms:us-east-1:111111111111:alias/prod-data"
+        },
+        "BucketKeyEnabled": true
+      }]
+    }'</code></pre>
+				<p><strong>Versioning and replication.</strong> Versioning keeps every version, so an overwritten or deleted photo can be restored, and replication needs it on both buckets. Task 1.3's replication rule copies new uploads to <code>example-dr-uploads</code> in us-west-2: SSE-KMS objects only replicate when opted in with a key in the destination Region, objects that existed before the rule need S3 Batch Replication, and deletes of specific versions are never replicated. Replication Time Control adds a 15-minute target with metrics. Product images can be rebuilt from the catalogue, so <code>example-prod-assets</code> isn't replicated; the DR plan is on the <a href="dr-on-a-budget.html">Disaster recovery on a budget</a> page.</p>
+				<p><strong>Lifecycle.</strong> <code>upload-processor</code> writes processed files to S3 Intelligent-Tiering, because some photos are re-read for years and others never (<a href="../d4-task-4-1.html">Task 4.1</a>). It moves objects by their own access history, with no retrieval fees and no minimum duration, but objects under 128 KB are never tiered, so thumbnails effectively stay at Standard rates. The lifecycle rules below clean up the rest.</p>
+				<span class="file">Expire raw uploads after 7 days, old versions after 30, and abandoned multipart uploads after 7 (lifecycle JSON for aws s3api put-bucket-lifecycle-configuration)</span>
+<pre><code>{
+  "Rules": [
+    {
+      "ID": "expire-raw-uploads",
+      "Filter": { "Prefix": "incoming/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 7 },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+    },
+    {
+      "ID": "processed-versions-and-multipart",
+      "Filter": { "Prefix": "" },
+      "Status": "Enabled",
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}</code></pre>
+				<p>Incomplete multipart uploads are billed until aborted, and S3 Storage Lens flags those older than 7 days. Where files have a known pattern, such as delivery paperwork read for a month and kept for years, a transition rule to Glacier Instant Retrieval or Deep Archive is cheaper than Intelligent-Tiering, but mind the 90- and 180-day minimum durations and the per-object transition charge on millions of small files.</p>
+				<div class="callout trap"><p><strong>Object Lock only where a rule demands it.</strong> Order records in <code>example-order-archive</code> use compliance mode for seven years because nobody may delete them. Customer photos must be deletable when a customer closes the account, so the uploads bucket has versioning but no Object Lock, which can't be turned off once enabled.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Presigned URLs over identity pool credentials</h4>
+				<p>The <a href="serverless-api.html">serverless API</a> mentions a Cognito identity pool for photo uploads: it trades the user's token for temporary AWS credentials scoped to their own prefix. That works, but puts AWS credentials on the device and leaves key names to the client. Presigned URLs from <code>upload-url</code> give one key, one method and five minutes, the same for web and mobile, so the identity pool is only needed where the app calls other AWS services directly.</p>
+			</div>
+			<div class="entry">
+				<h4>A queue from the event notification, EventBridge when consumers multiply</h4>
+				<p>A direct notification to SQS is the simplest path with a prefix filter and retries. Sending S3 events to EventBridge instead (<code>EventBridgeConfiguration</code> in the same call, events with source <code>aws.s3</code> and detail type <code>Object Created</code>) allows content filtering and several targets per event, such as an analytics feed or a moderation queue. The company would switch when a second team needs upload events.</p>
+			</div>
+			<div class="entry">
+				<h4>The endpoint-only bucket policy, narrowed</h4>
+				<p><a href="../d1-task-1-2.html">Task 1.2</a> and the <a href="vpc-hybrid-network.html">secure VPC</a> page deny requests to <code>example-prod-uploads</code> that don't arrive through the prod VPC's gateway endpoint. Applied to everyone, that Deny would also block the customers' presigned PUTs (they come from the internet) and CloudFront's reads. So the endpoint condition stays on the application roles, while <code>upload-url-role</code> is limited to <code>PutObject</code> on <code>incoming/*</code> and CloudFront to <code>GetObject</code> on <code>processed/*</code> for one distribution.</p>
+			</div>
+			<div class="entry">
+				<h4>Two buckets by data class</h4>
+				<p>Company content and customer data differ in encryption, replication, retention and deletion rules. Separate buckets keep each policy simple: SSE-S3, no replication and long caches for assets; SSE-KMS, versioning, replication and signed URLs for uploads. The cost is a second origin and bucket policy.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Uploading through the API or web servers</h4>
+				<p>Sending files through API Gateway hits the 10 MB payload limit and the 29-second timeout, and through the <a href="ha-web-app.html">ALB and EC2 fleet</a> it ties up instances and pays to move every byte twice. Direct uploads into S3 are free and scale without the servers.</p>
+			</div>
+			<div class="entry">
+				<h4>EFS or FSx for shared files</h4>
+				<p>EFS gives Linux instances a shared POSIX file system and FSx for Windows File Server gives SMB shares; they suit applications that need file semantics. For files that customers upload and browsers download over HTTP, S3 is far cheaper (US$0.023 against US$0.30 per GB-month in the standard classes) and works with CloudFront (<a href="../d3-task-3-1.html">Task 3.1</a>, <a href="../d4-task-4-1.html">Task 4.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>S3 website hosting or Amplify Hosting</h4>
+				<p>An S3 website endpoint serves HTTP only and needs a public bucket, and CloudFront must treat it as a custom origin without OAC. Amplify Hosting packages build, CDN and HTTPS for a front-end team and is the least effort for a single-page app. For a private bucket, signed URLs and fine cache control, CloudFront with OAC is the answer.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Direct access denied</span><span class="desc">Request a product image and a processed file by their S3 URLs: both must return 403. The same image through CloudFront returns 200, and a <code>/files/</code> request without a signed URL returns 403.</span></li>
+				<li><span class="name">URL limits</span><span class="desc">Use a presigned URL after six minutes, with a different content type, and for a key outside <code>incoming/</code>: all three must fail. A request for an unsupported file type must be refused by <code>upload-url</code>.</span></li>
+				<li><span class="name">Processing and poison files</span><span class="desc">Upload a photo and confirm exactly one clean file and one thumbnail under <code>processed/</code>, and no new event from them. Upload a corrupt file: it is retried five times, lands in <code>upload-events-dlq</code> and the DLQ alarm fires.</span></li>
+				<li><span class="name">Replication and recovery</span><span class="desc">Overwrite a test photo and restore the previous version; check that the new object reaches <code>example-dr-uploads</code> within 15 minutes and that the replication metrics show no failures.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design secure workloads and applications</td><td data-label="What this architecture demonstrates">Cognito sign-in before uploads, CloudFront with OAC and signed URLs instead of public buckets, WAF on the distribution</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Determine appropriate data security controls</td><td data-label="What this architecture demonstrates">SSE-KMS with Bucket Keys versus SSE-S3, versioning, Cross-Region Replication with KMS, lifecycle expiration, Object Lock only where required</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Determine high-performing and/or scalable storage solutions</td><td data-label="What this architecture demonstrates">Direct uploads to S3, multipart upload for large files, Transfer Acceleration for distant clients, S3 versus EFS and FSx</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-4.html">3.4</a> Determine high-performing and/or scalable network architectures</td><td data-label="What this architecture demonstrates">CloudFront edge caching, cache behaviours and TTLs, versioned file names versus invalidations</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Design cost-optimized storage solutions</td><td data-label="What this architecture demonstrates">Intelligent-Tiering for unpredictable access, lifecycle rules for raw files, old versions and incomplete multipart uploads, small-object and minimum-duration traps</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Users upload large files through the web servers, which slows the application. Which solution meets these requirements with the LEAST operational overhead?" is <strong>presigned URLs for direct upload to S3</strong>. "Serve S3 content worldwide; users must not access the bucket directly" is <strong>CloudFront with origin access control</strong>. "Paid subscribers only, for many files" is <strong>signed cookies</strong>. "Process each upload as it arrives" is an <strong>S3 event notification to SQS and Lambda</strong>. "Access patterns are unknown" is <strong>S3 Intelligent-Tiering</strong>.</p></div>
+			<p>Deeper material: the SCS <a href="../../aws-scs/arch/data-perimeter.html">data perimeter</a> and <a href="../../aws-scs/arch/kms-at-scale.html">KMS at scale</a> architectures cover bucket and key policies across an organization, and the DVA guide covers SDK uploads and event handling (<a href="../../aws-dva/d1-task-1-1.html">DVA Task 1.1</a>).</p>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/compute/patterns-for-building-an-api-to-upload-files-to-amazon-s3/">Patterns for building an API to upload files to Amazon S3</a> (May 2023): API Gateway direct, presigned URLs and CloudFront with Lambda@Edge, with size limits and trade-offs.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/uploading-to-amazon-s3-directly-from-a-web-or-mobile-application/">Uploading to Amazon S3 directly from a web or mobile application</a> (September 2020): a Lambda function issues the presigned URL as in Step 1; the AWS sample code it uses (amazon-s3-presigned-urls-aws-sam) is archived.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/amazon-cloudfront-introduces-origin-access-control-oac/">Amazon CloudFront introduces Origin Access Control (OAC)</a> (August 2022): why OAC replaced OAI, including SSE-KMS support.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/new-use-amazon-s3-event-notifications-with-amazon-eventbridge/">New - Use Amazon S3 Event Notifications with Amazon EventBridge</a> (November 2021): the EventBridge option for upload events.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/heads-up-amazon-s3-security-changes-are-coming-in-april-of-2023/">Heads-Up: Amazon S3 Security Changes Are Coming in April of 2023</a> (December 2022): Block Public Access and Bucket owner enforced by default.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html">Download and upload objects with presigned URLs</a> (AWS documentation): expiry limits by credential type and ways to restrict presigned URLs.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html">Restrict access to an Amazon S3 origin</a> (AWS documentation): OAC setup, the bucket policy and the KMS key policy statement.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html">Invalidate files to remove content</a> (AWS documentation): invalidations versus versioned file names.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Associate (SAA-C03) exam guide, version 1.1.</div>
+</footer>
+
+</body>
+</html>

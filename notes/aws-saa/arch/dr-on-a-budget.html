@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Disaster recovery on a budget | AWS SAA-C03 Notes</title>
+	<meta name="description" content="SAA-C03 reference architecture: surviving the loss of us-east-1 at modest cost by recovering in us-west-2, with RTO and RPO set per workload, AWS Backup cross-Region and cross-account copies, backup and restore versus pilot light and warm standby, Aurora Global Database switchover and failover, DynamoDB global tables, AMI and ECR copies, an infrastructure-as-code DR VPC and Route 53 failover records.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../saa.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAA-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">DR on a budget</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Disaster recovery on a budget</h1>
+		<p>The company must keep taking orders if the whole of us-east-1 is lost, without paying for a second production site. Each workload gets its own recovery target and the cheapest strategy that meets it: live replicas for order data, a small standby for the order path, and tested backups for everything else, all recoverable in us-west-2.</p>
+		<div class="tags"><span class="tag code">SAA-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">AWS Backup</span><span class="tag">Aurora Global Database</span><span class="tag">DynamoDB global tables</span><span class="tag">Route 53</span><span class="tag">AWS CloudFormation</span><span class="tag">Elastic Disaster Recovery</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Backups copied out of the Region</a></li>
+				<li class="sub"><a href="#b2">2. Live data: Aurora and DynamoDB</a></li>
+				<li class="sub"><a href="#b3">3. Compute and network ready to go</a></li>
+				<li class="sub"><a href="#b4">4. Failover: database first, then traffic</a></li>
+				<li class="sub"><a href="#b5">5. Failback</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>Everything on the other architecture pages runs in the production account <code>111111111111</code> in us-east-1: the <a href="ha-web-app.html">web application</a> behind CloudFront, the <a href="serverless-api.html">serverless mobile API</a>, <a href="order-processing.html">order processing</a> and <a href="uploads-content-delivery.html">customer uploads</a>. Multi-AZ already handles the loss of one AZ. The board now asks what happens if the whole Region is unavailable, and wants an answer that doesn't double the AWS bill. us-west-2 is the DR Region (<a href="../d2-task-2-2.html">Task 2.2</a>).</p>
+			<p><strong>Targets first.</strong> RTO is the longest acceptable time until service is back; RPO is how much recent data the business can afford to lose. They are business decisions, set per workload, and they pick the strategy. AWS's four strategies, in order of rising cost and falling recovery time:</p>
+			<ul>
+				<li><strong>Backup and restore</strong>: only backups live in the DR Region; RPO since the last backup, recovery in hours. Lowest cost.</li>
+				<li><strong>Pilot light</strong>: data replicates continuously; application servers are off or not deployed. Seconds to minutes of data lost, recovery in tens of minutes.</li>
+				<li><strong>Warm standby</strong>: a scaled-down but working copy of production. Seconds of data, recovery in minutes, and it can take some traffic at once.</li>
+				<li><strong>Multi-site active/active</strong>: full copies serving live traffic. Near-zero RPO and RTO for an outage, at the highest cost.</li>
+			</ul>
+			<p>The company sets one tier per workload:</p>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Workload</th><th>Target and strategy</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Workload">Ordering: <code>web-asg</code>, <code>mobile-api</code>, <code>carts</code>, <code>order-requests</code>, Aurora <code>orders-east</code></td><td data-label="Target and strategy">RTO 1 hour, RPO a few seconds (the Task 2.2 target): warm standby at minimum size, data replicating live</td></tr>
+						<tr><td data-label="Workload">Order processing: <code>order-intake</code>, <code>order-fulfilment</code></td><td data-label="Target and strategy">Same RTO; deployed but idle in us-west-2, which costs almost nothing because it is serverless</td></tr>
+						<tr><td data-label="Workload">Customer uploads: <code>example-prod-uploads</code></td><td data-label="Target and strategy">RPO 15 minutes: Cross-Region Replication to <code>example-dr-uploads</code>, already in place</td></tr>
+						<tr><td data-label="Workload">Internal tools: the EC2 reporting server and its EBS volumes</td><td data-label="Target and strategy">RTO 24 hours, RPO 24 hours: backup and restore</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<p>Reused from the SAA pages: <code>web-asg</code>, <code>web-lt</code>, <code>orders-east</code>, <code>orders-proxy</code>, <code>web-cache</code> and the CloudFront distribution (<a href="ha-web-app.html">web application</a>); <code>mobile-api</code>, <code>carts</code>, <code>order-requests</code> and <code>order-intake</code> (<a href="serverless-api.html">serverless API</a>); <code>order-fulfilment</code> (<a href="order-processing.html">order processing</a>); the shared-network account <code>444444444444</code> and its transit gateway (<a href="vpc-hybrid-network.html">VPC and hybrid network</a>); the backup plan <code>prod-daily</code>, vaults <code>prod-vault</code> and <code>dr-vault</code> (<a href="../d1-task-1-3.html">Task 1.3</a>); the global cluster <code>orders-global</code>, its secondary <code>orders-west</code> and the <code>web-dr</code> load balancer (Task 2.2). New on this page: the security account <code>333333333333</code> and its vault <code>security-dr-vault</code> in us-west-2; the DR VPC range <code>10.16.0.0/16</code>; the CloudFormation stack <code>web-dr</code>; the origin name <code>origin.example.com</code>; and a customer managed key with the alias <code>alias/prod-data</code> in us-west-2 (aliases are Regional).</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> CloudEndure Disaster Recovery was replaced by AWS Elastic Disaster Recovery. Route 53 ARC is now Amazon Application Recovery Controller (ARC); its readiness check closed to new customers on 30 April 2026, while routing controls, zonal shift and Region switch (August 2025) continue. Aurora Global Database's "managed planned failover" is now called switchover. Launch configurations are deprecated: use launch templates.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 470" role="img" aria-labelledby="dgB-wide-t">
+<title id="dgB-wide-t">Disaster recovery on a budget: us-west-2 holds a minimum-size copy of the web tier and API built from copied images and infrastructure as code, an Aurora Global Database secondary, DynamoDB global table replicas, the replicated uploads bucket and AWS Backup copies in dr-vault; Route 53 failover records move customers to us-west-2 when us-east-1 is lost.</title>
+<rect x="210" y="6" width="180" height="452" rx="12" class="dg-grp"/>
+<text x="220" y="22" class="dg-lbl">us-east-1 primary</text>
+<rect x="550" y="6" width="180" height="452" rx="12" class="dg-grp"/>
+<text x="560" y="22" class="dg-lbl">us-west-2 recovery</text>
+<path d="M380.0 60.0 L560.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<text x="470" y="54" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--warn)">AMIs, images, IaC</text>
+<path d="M380.0 150.0 L560.0 150.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="470" y="144" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--info)">Global Database</text>
+<path d="M380.0 240.0 L560.0 240.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<text x="470" y="234" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--accent)">global tables</text>
+<path d="M380.0 330.0 L560.0 330.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="470" y="324" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--info)">replication</text>
+<path d="M380.0 420.0 L560.0 420.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<text x="470" y="414" class="dg-lbl dg-halo" text-anchor="middle" fill="var(--muted)">backup copy</text>
+<path d="M170.0 60.0 L220.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="90" y="57" class="dg-t dg-sm">Route 53</text>
+<text x="90" y="74" class="dg-s dg-sm2">failover records</text>
+<rect x="220" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="57" class="dg-t dg-sm">web-asg + API</text>
+<text x="300" y="74" class="dg-s dg-sm2">full size</text>
+<rect x="560" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="640" y="57" class="dg-t dg-sm">web-dr stack</text>
+<text x="640" y="74" class="dg-s dg-sm2">minimum size</text>
+<rect x="220" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="147" class="dg-t dg-sm">orders-east</text>
+<text x="300" y="164" class="dg-s dg-sm2">Aurora writer</text>
+<rect x="560" y="127" width="160" height="46" rx="10" class="dg-box"/>
+<text x="640" y="147" class="dg-t dg-sm">orders-west</text>
+<text x="640" y="164" class="dg-s dg-sm2">global secondary</text>
+<rect x="220" y="217" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="237" class="dg-t dg-sm">DynamoDB tables</text>
+<text x="300" y="254" class="dg-s dg-sm2">carts, requests</text>
+<rect x="560" y="217" width="160" height="46" rx="10" class="dg-box"/>
+<text x="640" y="237" class="dg-t dg-sm">Table replicas</text>
+<text x="640" y="254" class="dg-s dg-sm2">global tables</text>
+<rect x="220" y="307" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="327" class="dg-t dg-sm">Uploads bucket</text>
+<text x="300" y="344" class="dg-s dg-sm2">versioned</text>
+<rect x="560" y="307" width="160" height="46" rx="10" class="dg-box"/>
+<text x="640" y="327" class="dg-t dg-sm">DR bucket</text>
+<text x="640" y="344" class="dg-s dg-sm2">replica</text>
+<rect x="220" y="397" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="417" class="dg-t dg-sm">AWS Backup</text>
+<text x="300" y="434" class="dg-s dg-sm2">nightly plans</text>
+<rect x="560" y="397" width="160" height="46" rx="10" class="dg-box"/>
+<text x="640" y="417" class="dg-t dg-sm">dr-vault</text>
+<text x="640" y="434" class="dg-s dg-sm2">+ locked copy</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 470" role="img" aria-labelledby="dgB-tall-t">
+<title id="dgB-tall-t">Disaster recovery on a budget: us-west-2 holds a minimum-size copy of the web tier and API built from copied images and infrastructure as code, an Aurora Global Database secondary, DynamoDB global table replicas, the replicated uploads bucket and AWS Backup copies in dr-vault; Route 53 failover records move customers to us-west-2 when us-east-1 is lost.</title>
+<rect x="10" y="6" width="180" height="452" rx="12" class="dg-grp"/>
+<text x="20" y="22" class="dg-lbl">us-east-1</text>
+<rect x="210" y="6" width="180" height="452" rx="12" class="dg-grp"/>
+<text x="220" y="22" class="dg-lbl">us-west-2</text>
+<path d="M180.0 50.0 L220.0 50.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 140.0 L220.0 140.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 230.0 L220.0 230.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 320.0 L220.0 320.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 410.0 L220.0 410.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="20" y="27" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="47" class="dg-t dg-sm">web-asg + API</text>
+<text x="100" y="64" class="dg-s dg-sm2">full size</text>
+<rect x="220" y="27" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="47" class="dg-t dg-sm">web-dr stack</text>
+<text x="300" y="64" class="dg-s dg-sm2">minimum size</text>
+<rect x="20" y="117" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="137" class="dg-t dg-sm">orders-east</text>
+<text x="100" y="154" class="dg-s dg-sm2">Aurora writer</text>
+<rect x="220" y="117" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="137" class="dg-t dg-sm">orders-west</text>
+<text x="300" y="154" class="dg-s dg-sm2">global secondary</text>
+<rect x="20" y="207" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="227" class="dg-t dg-sm">DynamoDB tables</text>
+<text x="100" y="244" class="dg-s dg-sm2">carts, requests</text>
+<rect x="220" y="207" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="227" class="dg-t dg-sm">Table replicas</text>
+<text x="300" y="244" class="dg-s dg-sm2">global tables</text>
+<rect x="20" y="297" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="317" class="dg-t dg-sm">Uploads bucket</text>
+<text x="100" y="334" class="dg-s dg-sm2">versioned</text>
+<rect x="220" y="297" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="317" class="dg-t dg-sm">DR bucket</text>
+<text x="300" y="334" class="dg-s dg-sm2">replica</text>
+<rect x="20" y="387" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="407" class="dg-t dg-sm">AWS Backup</text>
+<text x="100" y="424" class="dg-s dg-sm2">nightly plans</text>
+<rect x="220" y="387" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="407" class="dg-t dg-sm">dr-vault</text>
+<text x="300" y="424" class="dg-s dg-sm2">+ locked copy</text>
+</svg>
+				<figcaption>Figure: a warm standby for the customer-facing path, backup and restore for the rest. Images, container images and the <code>web-dr</code> stack keep a minimum fleet ready (yellow); Aurora Global Database, DynamoDB global tables and S3 replication keep the data seconds or minutes behind (blue and green); AWS Backup copies nightly backups to <code>dr-vault</code> and a locked vault in the security account (dashed). In an event, the team fails Aurora over, scales the stack and lets Route 53 failover records move traffic (desktop view).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The recovery path when us-east-1 is lost. Steps marked <span class="who auto">AWS</span> run all the time without anyone acting.</p>
+			<ol class="flow">
+				<li class="group">Always on</li>
+				<li class="auto"><span class="name">Replicate<span class="who auto">AWS</span></span><span class="desc">Aurora Global Database copies <code>orders-east</code> to <code>orders-west</code> at the storage layer, DynamoDB global tables copy <code>carts</code> and <code>order-requests</code>, and S3 replicates uploads, each with lag of about a second (S3 within 15 minutes).</span></li>
+				<li class="auto"><span class="name">Copy backups<span class="who auto">AWS</span></span><span class="desc">AWS Backup takes the nightly backups and copies them to <code>dr-vault</code> in us-west-2 and to the locked <code>security-dr-vault</code> in the security account.</span></li>
+				<li class="group">The event</li>
+				<li><span class="name">Detect and declare<span class="who">On-call lead</span></span><span class="desc">Route 53 health checks and CloudWatch alarms show us-east-1 failing; the lead declares a Regional event and starts the runbook, rather than letting a false alarm move production.</span></li>
+				<li><span class="name">Promote the data<span class="who">DBA</span></span><span class="desc">An unplanned failover makes <code>orders-west</code> the writer, accepting the replication lag as lost data. The DynamoDB replicas in us-west-2 already accept writes.</span></li>
+				<li><span class="name">Scale out<span class="who">Platform team</span></span><span class="desc">Updating stack <code>web-dr</code> raises the standby web fleet to production size and turns on the order queue consumers.</span></li>
+				<li class="auto"><span class="name">Move traffic<span class="who auto">AWS</span></span><span class="desc">Route 53 failover records answer with the us-west-2 load balancer and API once the primary is unhealthy; CloudFront and the mobile app follow the names.</span></li>
+				<li><span class="name">Restore the rest<span class="who">Platform team</span></span><span class="desc">The reporting server is rebuilt from its latest copy in <code>dr-vault</code>; later, a planned switchover brings production home.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Backups copied out of the Region</h3>
+				<p><strong>Every workload needs backups, even the replicated ones.</strong> Replication copies a bad deployment's damage or a deleted table as faithfully as good data, so Aurora and DynamoDB get backups as well as replicas. For the reporting server, backups are the whole DR plan. AWS Backup assigns resources by tag, so tagging a resource <code>backup=daily</code> puts it in the plan (<a href="../d1-task-1-3.html">Task 1.3</a>).</p>
+				<p><strong>Two copies away from production.</strong> The <code>prod-daily</code> plan from Task 1.3 already copies to <code>dr-vault</code> in us-west-2 for the Region loss. A second copy action sends each recovery point to the security account, for the case where prod's account itself is compromised. Cross-account copies need the accounts in one organization with cross-account backup turned on in the management account, a destination vault policy allowing <code>backup:CopyIntoBackupVault</code>, and a customer managed source key shared with the destination. The destination vault can't be the default vault, and backups in cold storage can't be copied across accounts. The external vault's ARN carries its Region, so one copy action can land in another account and Region.</p>
+				<span class="file">prod-daily with a second copy action to the security account's vault in us-west-2 (backup plan JSON for aws backup create-backup-plan; the first copy action is unchanged from Task 1.3)</span>
+<pre><code>{
+  "BackupPlan": {
+    "BackupPlanName": "prod-daily",
+    "Rules": [
+      {
+        "RuleName": "daily-0500-utc",
+        "TargetBackupVaultName": "prod-vault",
+        "ScheduleExpression": "cron(0 5 ? * * *)",
+        "StartWindowMinutes": 60,
+        "CompletionWindowMinutes": 480,
+        "Lifecycle": { "DeleteAfterDays": 35 },
+        "CopyActions": [
+          {
+            "DestinationBackupVaultArn": "arn:aws:backup:us-west-2:111111111111:backup-vault:dr-vault",
+            "Lifecycle": { "DeleteAfterDays": 35 }
+          },
+          {
+            "DestinationBackupVaultArn": "arn:aws:backup:us-west-2:333333333333:backup-vault:security-dr-vault",
+            "Lifecycle": { "DeleteAfterDays": 35 }
+          }
+        ]
+      }
+    ]
+  }
+}</code></pre>
+				<p><strong>Lock the last copy.</strong> <code>security-dr-vault</code> uses Vault Lock in compliance mode: after a grace time of at least three days nobody, not the root user and not AWS, can delete recovery points early or remove the lock. A logically air-gapped vault is the stronger option, always in compliance mode and shareable through AWS RAM for restores. Restore time is part of RTO: volumes restored from EBS snapshots load lazily and large database restores can take hours, which is why the order data doesn't rely on backups for the Region loss.</p>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Live data: Aurora and DynamoDB</h3>
+				<p><strong>Aurora Global Database for orders.</strong> A cross-Region snapshot copy would cost less, but restoring it takes hours and loses everything since the snapshot, which misses a one-hour RTO and a seconds RPO. Aurora Global Database replicates at the storage layer with lag typically under a second, supports up to 10 secondary Regions, and gives a global writer endpoint that follows the primary (<a href="../d2-task-2-2.html">Task 2.2</a>, <a href="../d3-task-3-3.html">Task 3.3</a>). The existing <code>orders-east</code> becomes the primary of <code>orders-global</code>, and <code>orders-west</code> joins as a read-only secondary with one instance.</p>
+				<span class="file">Turn orders-east into a global database, then add the secondary cluster in us-west-2 (AWS CLI; options checked on the create-global-cluster and create-db-cluster references)</span>
+<pre><code>aws rds create-global-cluster \
+    --global-cluster-identifier orders-global \
+    --source-db-cluster-identifier arn:aws:rds:us-east-1:111111111111:cluster:orders-east
+
+# Run in us-west-2: an encrypted secondary needs a KMS key in its own Region
+aws rds create-db-cluster --region us-west-2 \
+    --db-cluster-identifier orders-west \
+    --engine aurora-postgresql \
+    --global-cluster-identifier orders-global \
+    --kms-key-id arn:aws:kms:us-west-2:111111111111:alias/prod-data \
+    --db-subnet-group-name DB_SUBNET_GROUP \
+    --vpc-security-group-ids DB_SG_ID</code></pre>
+				<p>Like any Aurora cluster, <code>orders-west</code> starts empty of instances; one reader instance is added with <code>create-db-instance</code>. It serves product and order reads in us-west-2 all the time, so the standby web tier can show the catalogue even before promotion. An RDS Proxy like <code>orders-proxy</code> is created in us-west-2 too, because a proxy belongs to one Region.</p>
+				<p><strong>DynamoDB global tables for carts and order requests.</strong> Adding a replica turns an existing table into a global table (multi-Region eventual consistency, the default), with no performance impact on the source. Every replica accepts writes, replication usually takes under a second, and conflicts resolve as last writer wins. The SLA is 99.999%.</p>
+				<span class="file">Add a us-west-2 replica to carts (AWS CLI; the JSON form of --replica-updates from the update-table reference); repeat for order-requests</span>
+<pre><code>aws dynamodb update-table --table-name carts \
+    --replica-updates '[{"Create": {"RegionName": "us-west-2"}}]'</code></pre>
+				<p>Two details matter here. Point-in-time recovery is not synchronized between replicas, so it is turned on again for each us-west-2 replica. Conditional writes are checked against the item in the local Region, so the idempotency check in <code>order-requests</code> only holds while all requests for one order go to one Region, which active-passive routing ensures. Uploads already replicate to <code>example-dr-uploads</code> with Replication Time Control (<a href="uploads-content-delivery.html">uploads page</a>).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Compute and network ready to go</h3>
+				<p><strong>Images in the DR Region.</strong> AMIs and container images are Regional. An EC2 Image Builder pipeline can bake the web AMI and copy each new version to us-west-2; a one-off copy looks like this. Amazon ECR replication copies container images for the ECS services the same way.</p>
+				<span class="file">Copy the current web AMI to us-west-2, encrypted with the key there (AWS CLI, run in the destination Region; options from the copy-image reference)</span>
+<pre><code>aws ec2 copy-image --region us-west-2 \
+    --source-region us-east-1 \
+    --source-image-id AMI_ID \
+    --name web-ami-dr \
+    --encrypted \
+    --kms-key-id alias/prod-data</code></pre>
+				<span class="file">Replicate every repository in the registry to us-west-2 (replication.json for aws ecr put-replication-configuration --replication-configuration file://replication.json)</span>
+<pre><code>{
+  "rules": [
+    {
+      "destinations": [
+        { "region": "us-west-2", "registryId": "111111111111" }
+      ]
+    }
+  ]
+}</code></pre>
+				<p><strong>The DR VPC as code.</strong> The us-west-2 network, the web tier and the order queue come from the same CloudFormation templates as production, deployed as stack <code>web-dr</code>. The VPC uses <code>10.16.0.0/16</code>, a range chosen here outside the us-east-1 prod block <code>10.0.0.0/12</code> and the office range <code>172.16.0.0/16</code>, so it can attach to a transit gateway in us-west-2 from the shared-network account and peer back to us-east-1 without overlapping (<a href="../d3-task-3-4.html">Task 3.4</a>). The office VPN or Direct Connect also needs a path to us-west-2, or staff lose the internal tools along with the Region.</p>
+				<span class="file">Fragment of the web-dr template: the DR VPC and a web fleet whose size is a parameter (CloudFormation YAML; subnets, route tables, NAT and endpoints omitted)</span>
+<pre><code>Parameters:
+  WebMinSize:
+    Type: Number
+    Default: 2          # warm standby; production size is 6
+  WebAmiId:
+    Type: AWS::EC2::Image::Id
+Resources:
+  DrVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.16.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: web-lt
+      LaunchTemplateData:
+        ImageId: !Ref WebAmiId
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: web-asg
+      MinSize: !Ref WebMinSize
+      MaxSize: "30"
+      LaunchTemplate:
+        LaunchTemplateName: web-lt
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB, !Ref AppSubnetC]</code></pre>
+				<p><strong>Queues and functions.</strong> SQS queues are Regional and not replicated, so the same template creates <code>order-intake</code>, its DLQ and the <code>order-fulfilment</code> state machine in us-west-2. Messages still inside us-east-1's queue wait there until the Region returns, but every accepted order is also in the global table <code>order-requests</code>, so a reconciliation job can find and resubmit any that never completed. <code>mobile-api</code>, its Lambda functions, a Regional custom domain for <code>api.example.com</code> with an ACM certificate in us-west-2, and a regional web ACL are deployed too: idle API Gateway and Lambda cost nothing. Service quotas in us-west-2 are raised to production levels now, not during the event.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Failover: database first, then traffic</h3>
+				<p><strong>Failover records.</strong> CloudFront is global, so it keeps serving; what moves is its origin. The distribution's origin is <code>origin.example.com</code>, a pair of Route 53 failover records: primary the us-east-1 load balancer, secondary <code>web-dr</code> in us-west-2, each alias evaluating target health (the Task 2.2 change batch, with this name). <code>api.example.com</code> gets the same pair for the two API custom domains. Each load balancer needs a certificate for the origin name in its own Region. Health checks and failover answers are data plane operations, which keep working when a Region's management APIs are impaired.</p>
+				<p><strong>Database before traffic.</strong> Route 53 may move traffic before anyone has acted, but writes fail until <code>orders-west</code> is the writer. During that gap the us-west-2 tier serves reads from the secondary, and the order consumers in us-west-2 stay switched off so orders wait in the queue instead of failing into the DLQ. The runbook's first step is the unplanned failover, which promotes the secondary and accepts the replication lag as lost data.</p>
+				<span class="file">Unplanned failover of orders-global to us-west-2, accepting the lag as data loss (AWS CLI, run in us-west-2; from the failover-global-cluster reference)</span>
+<pre><code>aws rds failover-global-cluster --region us-west-2 \
+    --global-cluster-identifier orders-global \
+    --target-db-cluster-identifier arn:aws:rds:us-west-2:111111111111:cluster:orders-west \
+    --allow-data-loss</code></pre>
+				<p>Then the platform team updates stack <code>web-dr</code> with <code>WebMinSize=6</code> and production capacity for the ECS services, enables the queue consumers, and confirms the health checks. Applications connected through the global writer endpoint need no connection-string change. ARC routing controls are the higher-assurance on/off switch for this decision and Region switch can run the whole plan across accounts; they are more to set up and run, so the company starts with Route 53 failover and a written runbook (<a href="../d2-task-2-2.html">Task 2.2</a>).</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Failback</h3>
+				<p><strong>Coming home is planned, not rushed.</strong> When us-east-1 recovers, the old <code>orders-east</code> must be back in <code>orders-global</code> as a secondary and in sync before anything moves back. Once it is in sync, a switchover moves the primary with no data loss. The DynamoDB replicas resynchronize by themselves, and S3 replication from <code>example-dr-uploads</code> back to the primary bucket is needed only if customers uploaded during the event.</p>
+				<span class="file">Planned switchover back to us-east-1 with no data loss (AWS CLI; the Task 2.2 command pointed the other way)</span>
+<pre><code>aws rds switchover-global-cluster \
+    --global-cluster-identifier orders-global \
+    --target-db-cluster-identifier arn:aws:rds:us-east-1:111111111111:cluster:orders-east</code></pre>
+				<p>Traffic returns when the us-east-1 load balancer passes its health checks again, and <code>web-dr</code> is scaled back to <code>WebMinSize=2</code>. The incident review records the measured RTO and RPO against the targets.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Warm standby at minimum size, not pilot light at zero</h4>
+				<p>A pilot light with <code>web-asg</code> at zero is cheaper, but the first launch happens during the event, when launch templates, AMIs, quotas and user data have never run in that Region. Two small web instances that pass health checks every day prove the stack works and take some traffic at once, which keeps the one-hour RTO safe. Everything serverless is warm for free.</p>
+			</div>
+			<div class="entry">
+				<h4>What runs all the time, by tier</h4>
+				<p>Backup and restore pays for stored copies and cross-Region transfer only (<a href="../d4-task-4-1.html">Task 4.1</a>). Pilot light adds the replicated data stores: Aurora secondary storage and one instance, global table replicated writes, S3 replica storage. Warm standby adds the two web instances, a load balancer and a NAT gateway. Copying only what DR needs to us-west-2 and keeping the copies' retention short keeps backup cost down; Aurora backups beyond the free allowance cost less than RDS backups (<a href="../d4-task-4-3.html">Task 4.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Elastic Disaster Recovery for the reporting server</h4>
+				<p>Restoring the reporting server from AWS Backup meets its 24-hour target at the lowest cost. If that target tightened, AWS Elastic Disaster Recovery would replicate the server at block level into a low-cost staging area in us-west-2 and launch it full size on recovery, for RPOs of seconds and RTOs of minutes, with drills and failback and no code changes. It is a pilot light for whole servers.</p>
+			</div>
+			<div class="entry">
+				<h4>A human declares the event</h4>
+				<p>AWS notes that many teams start Regional failover manually, because automatic failover on a false alarm causes an outage of its own. Route 53 fails traffic over automatically, but the database promotion that makes it useful is a person's decision taken from the runbook.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Multi-site active/active</h4>
+				<p>Both Regions serve customers all the time, with latency routing and a write strategy such as DynamoDB global tables or Aurora write forwarding. Recovery is near instant, but it pays for full capacity in both Regions and needs the application to handle conflicts. For a one-hour RTO, it buys more than the business asked for. The <a href="../../aws-sap/arch/multi-region-dr.html">SAP multi-Region DR architecture</a> covers this at Professional depth.</p>
+			</div>
+			<div class="entry">
+				<h4>Multi-AZ in one Region only</h4>
+				<p>Three AZs survive an AZ loss with no action, which is the right first step and what the other pages build. But every copy shares one Region's control plane and fate, so it can't meet a requirement to survive the loss of the Region, however many AZs are used.</p>
+			</div>
+			<div class="entry">
+				<h4>Elastic Disaster Recovery for everything</h4>
+				<p>DRS protects EC2 servers with no code changes, so it suits the reporting server or a lift-and-shift estate. It doesn't replicate Aurora, DynamoDB, S3, Lambda or API Gateway, which are most of this company's workload; their own replication features are cheaper and faster for them.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Restore tests</span><span class="desc">AWS Backup restore testing restores the reporting server and a DynamoDB table from <code>dr-vault</code> on a schedule and records how long it took. The time must fit the 24-hour RTO, and Backup Audit Manager must show every tagged resource copied cross-Region.</span></li>
+				<li><span class="name">Database game day</span><span class="desc">Switch <code>orders-global</code> to us-west-2 and back during a quiet hour, and confirm that the application reconnects through the global writer endpoint. Watch replication lag and confirm the DynamoDB replicas have PITR on.</span></li>
+				<li><span class="name">Traffic failover drill</span><span class="desc">Force the primary origin unhealthy in staging and time how long until <code>origin.example.com</code> and <code>api.example.com</code> answer from us-west-2. Fault Injection Service experiments can pause global table replication to test the application's behaviour.</span></li>
+				<li><span class="name">Scale-out rehearsal</span><span class="desc">Update <code>web-dr</code> to production size and run a load test against us-west-2. Launch failures here usually mean a quota or missing AMI, both cheap to fix before a real event.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-3.html">1.3</a> Determine appropriate data security controls</td><td data-label="What this architecture demonstrates">AWS Backup cross-Region and cross-account copies, Vault Lock in compliance mode, KMS keys in the DR Region for encrypted copies and replicas</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Design highly available and/or fault-tolerant architectures</td><td data-label="What this architecture demonstrates">Choosing backup and restore, pilot light, warm standby or active/active from RTO and RPO; Route 53 failover records; Aurora switchover versus failover; quotas and testing</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Determine high-performing database solutions</td><td data-label="What this architecture demonstrates">Aurora Global Database secondaries serving reads in another Region, DynamoDB global tables as multi-active replicas</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Design cost-optimized storage solutions</td><td data-label="What this architecture demonstrates">Copying only what DR needs, backup retention and cross-Region transfer as the cost of backup and restore</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-3.html">4.3</a> Design cost-optimized database solutions</td><td data-label="What this architecture demonstrates">Backup retention that meets the RPO without excess, cross-Region snapshots versus a global database by RTO</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Recover in another Region within hours at the LOWEST cost" is <strong>backup and restore</strong> with AWS Backup copies and infrastructure as code. "Data must be current, servers can start on demand" is <strong>pilot light</strong>. "Recover within minutes and take some traffic immediately" is <strong>warm standby</strong>. "Multi-Region relational database with an RPO of seconds" is <strong>Aurora Global Database</strong>. "Replicate on-premises or EC2 servers for DR with the LEAST operational overhead" is <strong>AWS Elastic Disaster Recovery</strong>.</p></div>
+			<p>Deeper material: the <a href="../../aws-sap/arch/multi-region-dr.html">SAP multi-Region DR architecture</a> adds headless Aurora secondaries, ARC Region switch plans and multi-account recovery.</p>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-i-strategies-for-recovery-in-the-cloud/">Disaster Recovery (DR) Architecture on AWS, Part I: Strategies for Recovery in the Cloud</a> (April 2021): the four strategies against RTO and RPO (predates ARC Region switch).</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-iii-pilot-light-and-warm-standby/">Disaster Recovery (DR) Architecture on AWS, Part III: Pilot Light and Warm Standby</a> (May 2021): what each keeps running and how failover is triggered; its Route 53 ARC is now ARC.</li>
+				<li><a href="https://aws.amazon.com/blogs/storage/build-centralized-cross-region-backup-architecture-with-aws-control-tower/">Build centralized cross-Region backup architecture with AWS Control Tower</a> (September 2025): central backup account and cross-Region copies, as in Step 1.</li>
+				<li><a href="https://aws.amazon.com/blogs/database/diving-deep-into-the-new-amazon-aurora-global-database-writer-endpoint/">Diving deep into the new Amazon Aurora Global Database writer endpoint</a> (January 2025): why the application needs no connection change after failover.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/creating-disaster-recovery-mechanisms-using-amazon-route-53/">Creating Disaster Recovery Mechanisms Using Amazon Route 53</a> (October 2022): data-plane failover with health checks (predates ARC Region switch).</li>
+				<li><a href="https://aws.amazon.com/blogs/storage/validate-recovery-readiness-with-aws-backup-restore-testing/">Validate recovery readiness with AWS Backup restore testing</a> (April 2025): scheduled restores that prove backups meet the RTO.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-workloads-on-aws.html">Disaster Recovery of Workloads on AWS: Recovery in the Cloud</a> (AWS whitepaper): the source of the four strategies; read CloudEndure as Elastic Disaster Recovery.</li>
+				<li><a href="https://docs.aws.amazon.com/aws-backup/latest/devguide/create-cross-account-backup.html">Creating backup copies across AWS accounts</a> (AWS documentation): prerequisites and vault policies for cross-account copies.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Associate (SAA-C03) exam guide, version 1.1.</div>
+</footer>
+
+</body>
+</html>
