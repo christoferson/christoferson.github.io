@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Monolith to event-driven microservices | AWS SAP-C03 Notes</title>
+	<meta name="description" content="End-to-end SAP-C03 architecture: the rehosted order monolith on EC2 and Aurora PostgreSQL refactored gradually with the strangler fig pattern. ALB weighted path rules as the facade, orders, payments, inventory and notifications services with their own databases, a transactional outbox into an SQS FIFO queue, an EventBridge custom bus with rules, DLQs, schema discovery, archive and replay and cross-account delivery, a Step Functions saga with compensations, idempotent consumers, ECS Fargate with Service Connect versus Lambda, Application Signals tracing, pipelines and the cost of each choice.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../sap.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAP-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Event-driven modernization</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Monolith to event-driven microservices</h1>
+		<p>The order system came to AWS as a rehosted monolith. Now it is taken apart one capability at a time behind a routing facade: new services own their data, publish events instead of sharing tables, coordinate the order flow with a saga, and the monolith shrinks until the last route moves.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 4</span><span class="tag">Domain 5</span><span class="tag">Domain 3</span><span class="tag">EventBridge</span><span class="tag">SQS</span><span class="tag">Step Functions</span><span class="tag">Lambda</span><span class="tag">ECS Fargate</span><span class="tag">ALB</span><span class="tag">DynamoDB</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Put a facade in front of the monolith</a></li>
+				<li class="sub"><a href="#b2">2. Carve out services with their own data</a></li>
+				<li class="sub"><a href="#b3">3. Publish the monolith's changes with an outbox</a></li>
+				<li class="sub"><a href="#b4">4. The event backbone</a></li>
+				<li class="sub"><a href="#b5">5. The order saga</a></li>
+				<li class="sub"><a href="#b6">6. Idempotent consumers</a></li>
+				<li class="sub"><a href="#b7">7. Observe and deploy</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>During the data-centre exit the order monolith was rehosted to EC2 behind an Application Load Balancer, and its Oracle schema was refactored to Aurora PostgreSQL (the <a href="datacenter-migration.html">data-centre migration</a> architecture), following AWS's advice to migrate first and modernize after (<a href="../d4-task-4-1.html">Task 4.1</a>). It runs in the production orders account <code>111111111111</code> in us-east-1: one release train for everything, a slow inventory query that stalls payments, and nightly extracts for the analytics account <code>444444444444</code>.</p>
+			<p>The business asked for four things:</p>
+			<ul>
+				<li><strong>No big-bang rewrite</strong>: orders keep flowing, and each step can be rolled back.</li>
+				<li><strong>Independent teams</strong> for orders, payments, inventory and notifications, each deploying on its own schedule.</li>
+				<li><strong>Correctness</strong>: no charge for a failed order, no stock reserved twice, and each customer's order events in order.</li>
+				<li><strong>Events for others</strong>: analytics and partner accounts get order events within seconds.</li>
+			</ul>
+			<p>Reused from the SAP task pages: the <code>central-orders</code> bus and its organization-wide policy, the <code>order-events.fifo</code> queue with one message group per customer, the <code>prod-cluster</code> ECS cluster with the <code>orders-api</code> service (<a href="../d1-task-1-1.html">Task 1.1</a>), and the organization <code>o-a1b2c3d4e5</code>. New on this page:</p>
+			<ul>
+				<li><strong>Facade</strong>: the shop ALB's HTTPS listener (<code>$SHOP_LISTENER_ARN</code>) with target groups <code>monolith-web</code> and <code>orders-svc</code>.</li>
+				<li><strong>Data</strong>: Aurora PostgreSQL cluster <code>orders-svc-db</code>; DynamoDB tables <code>Payments</code>, <code>Inventory</code> and <code>ProcessedMessages</code>; an <code>outbox</code> table in the monolith's database.</li>
+				<li><strong>Messaging</strong>: <code>order-events-dlq.fifo</code>, the <code>notifications</code> queue, <code>central-orders-dlq</code>, KMS alias <code>alias/orders-events</code>, and queue <code>order-analytics</code> in <code>444444444444</code> reached with role <code>central-orders-to-analytics</code>.</li>
+				<li><strong>Workflow</strong>: state machine <code>order-saga</code> with Lambda functions <code>reserve-inventory</code>, <code>authorize-payment</code>, <code>confirm-order</code> and the compensations <code>release-inventory</code> and <code>void-payment</code>.</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> <strong>Migration Hub Refactor Spaces</strong>, which automated the strangler facade, is closed to new customers, so the facade is built with ALB rules or API Gateway. <strong>AWS App Mesh</strong> reached end of support on 30 September 2026; ECS services use <strong>ECS Service Connect</strong>, and EKS or mixed compute use VPC Lattice. EventBridge relaunched its <strong>custom event bus</strong> in September 2026 with FIFO subscribers and deduplication; the earlier bus is now "Custom Event Bus - Classic". The X-Ray SDKs entered maintenance on 25 February 2026 (use OpenTelemetry). Lambda durable functions arrived in December 2025.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 330" role="img" aria-labelledby="dgE-wide-t">
+<title id="dgE-wide-t">Event-driven modernization: an ALB facade sends legacy paths to the monolith and /orders/* to the new orders service on Fargate; the monolith publishes through a transactional outbox and an SQS FIFO queue, the orders service publishes to the central-orders EventBridge bus, which delivers to the analytics account, and the order-saga state machine calls payments and inventory with compensations.</title>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 168.0 L388.0 168.0 Q395.0 168.0 395.0 161.0 L395.0 67.0 Q395.0 60.0 402.0 60.0 L420.0 60.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M370.0 182.0 L420.0 182.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 60.0 L620.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M700.0 83.0 L700.0 152.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M500.0 198.0 L500.0 267.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M420.0 290.0 L370.0 290.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M700.0 198.0 L700.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<text x="706" y="236" class="dg-lbl dg-halo" text-anchor="start" fill="var(--info)">cross-account</text>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Customers</text>
+<text x="90" y="189" class="dg-s dg-sm2">web and mobile</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="172" class="dg-t dg-sm">ALB facade</text>
+<text x="290" y="189" class="dg-s dg-sm2">weighted path rules</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Monolith</text>
+<text x="500" y="74" class="dg-s dg-sm2">EC2 + Aurora, outbox</text>
+<rect x="620" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="57" class="dg-t dg-sm">order-events.fifo</text>
+<text x="700" y="74" class="dg-s dg-sm2">SQS FIFO, DLQ</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">orders service</text>
+<text x="500" y="189" class="dg-s dg-sm2">Fargate, own DB</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="700" y="172" class="dg-t dg-sm">central-orders</text>
+<text x="700" y="189" class="dg-s dg-sm2">EventBridge bus</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">order-saga</text>
+<text x="500" y="304" class="dg-s dg-sm2">Step Functions</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">payments, inventory</text>
+<text x="290" y="304" class="dg-s dg-sm2">Lambda + DynamoDB</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Analytics account</text>
+<text x="700" y="304" class="dg-s dg-sm2">444444444444</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 510" role="img" aria-labelledby="dgE-tall-t">
+<title id="dgE-tall-t">Event-driven modernization: an ALB facade sends legacy paths to the monolith and /orders/* to the new orders service on Fargate; the monolith publishes through a transactional outbox and an SQS FIFO queue, the orders service publishes to the central-orders EventBridge bus, which delivers to the analytics account, and the order-saga state machine calls payments and inventory with compensations.</title>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M180.0 145.0 L220.0 145.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 255.0 L220.0 255.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 342.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 388.0 L100.0 452.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Customers</text>
+<text x="100" y="54" class="dg-s dg-sm2">web and mobile</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">ALB facade</text>
+<text x="100" y="159" class="dg-s dg-sm2">weighted path rules</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Monolith</text>
+<text x="300" y="159" class="dg-s dg-sm2">EC2 + Aurora, outbox</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">orders service</text>
+<text x="100" y="269" class="dg-s dg-sm2">Fargate, own DB</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="252" class="dg-t dg-sm">central-orders</text>
+<text x="300" y="269" class="dg-s dg-sm2">EventBridge bus</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">order-saga</text>
+<text x="100" y="379" class="dg-s dg-sm2">Step Functions</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="472" class="dg-t dg-sm">payments, inventory</text>
+<text x="100" y="489" class="dg-s dg-sm2">Lambda + DynamoDB</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">Analytics account</text>
+<text x="300" y="379" class="dg-s dg-sm2">444444444444</text>
+</svg>
+				<figcaption>Figure: the strangler fig in progress. Weighted ALB rules move one path at a time from the monolith (grey) to new services with their own data (green). Both publish order events: the monolith through a transactional outbox and an SQS FIFO queue with a dead-letter queue (yellow; desktop view), the new orders service straight to the <code>central-orders</code> bus, which delivers to rules in other accounts (blue). The <code>order-saga</code> Standard workflow reserves inventory and authorizes payment, and runs the compensating steps if a later step fails; every consumer is idempotent.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>The state halfway through the programme: orders have moved to the new service, while catalogue and account pages still run in the monolith. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">A customer places an order</li>
+				<li class="auto"><span class="name">Route at the facade<span class="who auto">AWS</span></span><span class="desc">The ALB checks its listener rules: <code>/api/orders/*</code> goes to the <code>orders-svc</code> target group (ECS on Fargate); every other path falls through to the default rule and the monolith.</span></li>
+				<li><span class="name">Accept the order<span class="who">Orders service</span></span><span class="desc">The service writes the order to <code>orders-svc-db</code> as PENDING, starts an <code>order-saga</code> execution named after the order ID, and returns 202.</span></li>
+				<li class="auto"><span class="name">Run the saga<span class="who auto">AWS</span></span><span class="desc">Step Functions reserves stock, authorizes the payment and confirms the order. If a step fails, it runs the compensations in reverse order and the order ends FAILED.</span></li>
+				<li class="auto"><span class="name">Publish the outcome<span class="who auto">AWS</span></span><span class="desc">The confirm step puts an <code>OrderConfirmed</code> event on <code>central-orders</code>, with the order ID and a correlation ID.</span></li>
+				<li class="group">Everyone who cares about the order</li>
+				<li class="auto"><span class="name">Fan out by rule<span class="who auto">AWS</span></span><span class="desc">One rule sends the event to the <code>notifications</code> queue; another delivers it straight to <code>order-analytics</code> in <code>444444444444</code>. Deliveries that exhaust their retries land in <code>central-orders-dlq</code>.</span></li>
+				<li><span class="name">Consume once<span class="who">Notifications service</span></span><span class="desc">A Lambda function sends the e-mail only if a conditional write to <code>ProcessedMessages</code> succeeds, so a redelivered event does nothing.</span></li>
+				<li class="group">Meanwhile, in the monolith</li>
+				<li><span class="name">Keep old screens in sync<span class="who">Monolith</span></span><span class="desc">The monolith's own order edits go into an <code>outbox</code> row in the same transaction. A relay sends them to <code>order-events.fifo</code> in order per customer, and the orders service applies them until the monolith stops writing orders.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Put a facade in front of the monolith</h3>
+				<p><strong>The strangler fig.</strong> A routing layer sits in front of the monolith; each capability is rebuilt as a separate service, and its routes move one at a time until nothing is left for the monolith to serve (<a href="../d4-task-4-1.html">Task 4.1</a>). The existing ALB becomes the facade. Rules are evaluated lowest priority first, and the default rule (forward to <code>monolith-web</code>) catches everything else, so doing nothing keeps the old behaviour.</p>
+				<p><strong>Move routes gradually.</strong> The orders rule uses a weighted forward action, so a small share of <code>/api/orders/*</code> reaches the new service first. The weight rises while error rates and latency hold, and goes back to zero to roll back. Where the new service needs behaviour still in the monolith, an <strong>anti-corruption layer</strong> translates between the old model and the new one.</p>
+				<span class="file">conditions.json: match the orders API paths (input for aws elbv2 create-rule --conditions)</span>
+<pre><code>[
+  {
+    "Field": "path-pattern",
+    "PathPatternConfig": { "Values": ["/api/orders/*", "/api/orders"] }
+  }
+]</code></pre>
+				<span class="file">Send 10% of order traffic to the new service, the rest still to the monolith (AWS CLI, production account 111111111111)</span>
+<pre><code>aws elbv2 create-rule \
+  --listener-arn "$SHOP_LISTENER_ARN" \
+  --priority 10 \
+  --conditions file://conditions.json \
+  --actions '[{"Type":"forward","ForwardConfig":{"TargetGroups":[{"TargetGroupArn":"'"$ORDERS_SVC_TG_ARN"'","Weight":10},{"TargetGroupArn":"'"$MONOLITH_TG_ARN"'","Weight":90}]}}]'</code></pre>
+				<p>Path patterns are case-sensitive. Later capabilities get their own rules (<code>/api/payments/*</code>, <code>/api/stock/*</code>). When the monolith's target group gets no traffic, the default rule becomes a fixed 404 response and the monolith is retired.</p>
+				<div class="callout trap"><p>The facade and the anti-corruption layer are temporary; plan their removal, or they become a second monolith. Sharing the monolith's database with the new services defeats the point of decomposing. Refactor Spaces is closed to new customers, so it isn't the answer for new designs.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Carve out services with their own data</h3>
+				<p><strong>Where to cut.</strong> Domain-driven design and event storming found four business capabilities that change for different reasons. Orders moved first, because it changes most often and must scale separately at peak (<a href="../d4-task-4-1.html">Task 4.1</a>).</p>
+				<p><strong>Database per service.</strong> Each service owns its store and nobody else reads it; other services use its API or its events:</p>
+				<ul>
+					<li><strong>Orders</strong>: Aurora PostgreSQL (<code>orders-svc-db</code>), for relations, reporting queries and a schema the team knows.</li>
+					<li><strong>Payments</strong>: DynamoDB (<code>Payments</code>), keyed by order ID, where a conditional write makes "authorize once" safe.</li>
+					<li><strong>Inventory</strong>: DynamoDB (<code>Inventory</code>), keyed by product, with conditional updates so stock never goes below zero.</li>
+					<li><strong>Notifications</strong>: no business data, only <code>ProcessedMessages</code> for deduplication.</li>
+				</ul>
+				<p>Separate stores lose the monolith's ACID transactions, and a two-phase commit across them isn't an option, so Step 5 replaces the transaction with a saga and accepts eventual consistency.</p>
+				<p><strong>Compute per service.</strong> The orders API, with steady traffic and connection pools to Aurora, runs on ECS on Fargate, the default for containers without a Kubernetes requirement. Payments, inventory and notifications are short, event-triggered steps on Lambda, which scales to zero (<a href="../d1-task-1-1.html">Task 1.1</a>).</p>
+				<p><strong>Service-to-service calls.</strong> Calls back to the monolith go through the anti-corruption layer with timeouts and a circuit breaker. Between ECS services, <strong>ECS Service Connect</strong> gives short names from a Cloud Map namespace and a managed proxy in each task with retries, outlier detection, optional TLS through AWS Private CA, and per-service metrics, at no charge beyond the proxy's CPU and memory. Clients outside ECS can't resolve its names; for EKS, many VPCs and accounts, or IAM authorization between services, VPC Lattice is the fit.</p>
+				<div class="callout trap"><p>App Mesh is past end of support: an answer that adds it to a new design is wrong. An ECS service can't be in an App Mesh mesh and a Service Connect namespace at once, so migrating services are recreated, not converted in place.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Publish the monolith's changes with a transactional outbox</h3>
+				<p><strong>The dual-write problem.</strong> While the monolith still edits orders, the new service must hear about every change. Writing the database and then sending a message loses the event on a crash; sending first can announce a change that rolls back. The <strong>transactional outbox</strong> closes the gap: the monolith writes the order change and an <code>outbox</code> row (with a timestamp and a sequence number) in the same transaction, so a rollback removes both.</p>
+				<p><strong>The relay</strong> reads committed outbox rows in order, sends them to <code>order-events.fifo</code>, and deletes them once SQS accepts them. As in AWS's sample code, the message group ID is the aggregate (here the customer) and the deduplication ID is the outbox row ID, so a relay retry within five minutes is dropped. A crash between sending and deleting can still resend a row later, so consumers stay idempotent (Step 6).</p>
+				<span class="file">attributes.json: FIFO queue with high-throughput mode, KMS encryption and a FIFO dead-letter queue after 5 receives (input for aws sqs create-queue --queue-name order-events.fifo --attributes file://attributes.json)</span>
+<pre><code>{
+  "FifoQueue": "true",
+  "ContentBasedDeduplication": "true",
+  "DeduplicationScope": "messageGroup",
+  "FifoThroughputLimit": "perMessageGroupId",
+  "VisibilityTimeout": "180",
+  "KmsMasterKeyId": "alias/orders-events",
+  "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:111111111111:order-events-dlq.fifo\",\"maxReceiveCount\":\"5\"}"
+}</code></pre>
+				<p>A FIFO queue's DLQ must be FIFO; the two throughput settings turn on high-throughput mode; the visibility timeout is six times the consumer's 30-second timeout, as AWS advises for Lambda. Lambda concurrency on FIFO is capped at the number of message groups, so the group is the customer, not a constant.</p>
+				<p><strong>Change data capture instead?</strong> Services that own a DynamoDB table need no outbox table: DynamoDB Streams capture each item change in order, and a function or EventBridge Pipes (charged only for events that pass its filter) forwards it. DMS ongoing replication appears in the SAP sources as a migration tool that keeps a target database in sync until cutover, not as a way to publish business events.</p>
+				<div class="callout trap"><p>"Write to the database, then call SNS or EventBridge" in one request handler is the dual-write bug, not a design. A FIFO queue with one message group for all messages processes one message at a time, and a constant deduplication ID drops everything after the first.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>The event backbone: EventBridge, SQS and SNS</h3>
+				<p><strong>Which bus.</strong> Business events (<code>OrderPlaced</code>, <code>OrderConfirmed</code>, <code>PaymentFailed</code>) go to the <code>central-orders</code> custom bus, which already lets every account in <code>o-a1b2c3d4e5</code> put events (<a href="../d1-task-1-1.html">Task 1.1</a>). It stays a <strong>Classic</strong> bus on purpose: schema discovery and global endpoints both reject the new Custom Event Bus, and ordered streams already use the FIFO queue from Step 3. Classic delivery is at least once and unordered, with retries for up to 24 hours (185 attempts) by default.</p>
+				<p><strong>Rules and targets.</strong> A rule matches events by content and sends them to up to five targets, each with its own retry policy and dead-letter queue, so one failing consumer doesn't affect the others.</p>
+				<span class="file">Match confirmed orders from the orders account on the central bus (AWS CLI, production account 111111111111)</span>
+<pre><code>aws events put-rule \
+  --name order-confirmed-to-notifications \
+  --event-bus-name central-orders \
+  --event-pattern '{"source":["com.example.orders"],"detail-type":["OrderConfirmed"],"account":["111111111111"]}' \
+  --state ENABLED</code></pre>
+				<span class="file">targets.json: the notifications queue, retried for up to 2 hours and 20 attempts, then sent to the dead-letter queue (input for aws events put-targets --rule order-confirmed-to-notifications --event-bus-name central-orders --targets file://targets.json)</span>
+<pre><code>[
+  {
+    "Id": "notifications-queue",
+    "Arn": "arn:aws:sqs:us-east-1:111111111111:notifications",
+    "RetryPolicy": { "MaximumRetryAttempts": 20, "MaximumEventAgeInSeconds": 7200 },
+    "DeadLetterConfig": { "Arn": "arn:aws:sqs:us-east-1:111111111111:central-orders-dlq" }
+  }
+]</code></pre>
+				<p>Matching on <code>account</code> matters on a bus the whole organization can write to: without it, any account could publish an <code>OrderConfirmed</code> and trigger e-mails. Both queues use a customer managed key whose policy lets <code>events.amazonaws.com</code> use <code>kms:Decrypt</code> and <code>kms:GenerateDataKey</code>, because EventBridge can't deliver to a queue encrypted with an AWS owned key, as a target or as a DLQ.</p>
+				<p><strong>Other accounts.</strong> A second rule delivers the same events to <code>order-analytics</code> in <code>444444444444</code> as a direct cross-account target: an execution role (<code>central-orders-to-analytics</code>) in the sending account and a queue policy in the analytics account that allows it, with no receiving bus. The sender pays, at the custom event rate. Forwarded events don't chain a second time, so the design is hub and spoke: one rule per consumer on the central bus.</p>
+				<p><strong>Schemas.</strong> Schema discovery on <code>central-orders</code> adds every event shape, including cross-account events, to the discovered-schemas registry as versioned OpenAPI 3 or JSONSchema Draft4 schemas, with downloadable code bindings. The first five million processed events a month are free, and discovery doesn't work on a bus encrypted with a customer managed key. It documents contracts without enforcing them, so producers only add fields.</p>
+				<p><strong>Archive and replay.</strong> An archive keeps the bus's events for a set number of days. After a bug fix, a replay sends them back to the same bus (all rules or chosen ones), without their original order and with a <code>replay-name</code> field, so consumers must not assume order.</p>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>The order saga: orchestration with compensations</h3>
+				<p><strong>Why a saga.</strong> A saga runs a local transaction in each one and, if a later step fails, runs <strong>compensating</strong> actions that undo the earlier ones: release the stock, void the payment authorization. It is eventually consistent and lacks isolation, so the last item in stock is protected by a semantic lock (a RESERVED status other orders respect).</p>
+				<p><strong>Orchestration or choreography.</strong> In choreography each service reacts to events and nobody owns the flow, which suits listeners. The money path needs one place showing every order's state, so an <strong>orchestrator</strong> runs it. Step Functions runs across Availability Zones, so the orchestrator isn't the single point of failure a home-grown coordinator would be.</p>
+				<p><strong>Standard, not Express.</strong> The saga is a <strong>Standard</strong> workflow: exactly-once state transitions, up to a year per execution, 90 days of history for audits, waits for a task token (the card processor's callback) and redrive from the failed state. Express workflows (up to 5 minutes, at-least-once when asynchronous, no task-token waits) are cheaper for high-volume, short work such as rendering notification templates.</p>
+				<span class="file">order-saga.asl.json (excerpt): reserve stock, authorize payment, confirm; on failure, compensate in reverse order (Amazon States Language, JSONPath)</span>
+<pre><code>{
+  "Comment": "Order saga with compensations",
+  "StartAt": "ReserveInventory",
+  "States": {
+    "ReserveInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:111111111111:function:reserve-inventory",
+      "Retry": [ {
+        "ErrorEquals": ["Lambda.ServiceException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+        "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0, "JitterStrategy": "FULL"
+      } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "OrderFailed" } ],
+      "ResultPath": "$.reservation",
+      "Next": "AuthorizePayment"
+    },
+    "AuthorizePayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:111111111111:function:authorize-payment",
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseInventory" } ],
+      "ResultPath": "$.payment",
+      "Next": "ConfirmOrder"
+    },
+    "ConfirmOrder": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:111111111111:function:confirm-order",
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "VoidPayment" } ],
+      "End": true
+    },
+    "VoidPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:111111111111:function:void-payment",
+      "Retry": [ { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 5, "BackoffRate": 2.0 } ],
+      "ResultPath": "$.voided",
+      "Next": "ReleaseInventory"
+    },
+    "ReleaseInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:111111111111:function:release-inventory",
+      "Retry": [ { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 5, "BackoffRate": 2.0 } ],
+      "ResultPath": "$.released",
+      "Next": "OrderFailed"
+    },
+    "OrderFailed": { "Type": "Fail", "Error": "OrderFailed", "Cause": "A saga step failed; completed steps were compensated" }
+  }
+}</code></pre>
+				<p>How it reads: each forward step catches every error and jumps to the compensations for the steps already done, in reverse order. <code>"ResultPath": "$.error"</code> adds the error to the state's input instead of replacing it, so the compensations still have the order ID and reservation. Compensations retry hard; if one still fails, an alarm fires and an operator redrives the execution. Every step must be idempotent, because retries and redrives run it again.</p>
+				<p>Executions are named after the order ID, and the orders service checks the order's status before starting one, so a retried API call can't start a second saga.</p>
+				<div class="callout tip"><p>Lambda durable functions (December 2025) are the code-first alternative: checkpointed steps and waits of up to a year inside one function. AWS suggests them for Lambda-centred logic owned by developers, and Step Functions for orchestrating many AWS services with a visual workflow. The money path spans several teams' services, so it stays on Step Functions (<a href="../d1-task-1-1.html">Task 1.1</a>).</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Idempotent consumers</h3>
+				<p>Every hop on this page can deliver twice, so each consumer makes a second delivery harmless. The notifications function records each event ID with a conditional write before it acts and skips the event if the record already exists. A TTL attribute removes the records after about a week.</p>
+				<span class="file">Notifications consumer: act on each event once, keyed by the event's ID (Python, boto3)</span>
+<pre><code>import time
+
+import boto3
+
+dynamodb = boto3.client("dynamodb")
+
+
+def first_time(message_id: str) -&gt; bool:
+    try:
+        dynamodb.put_item(
+            TableName="ProcessedMessages",
+            Item={
+                "messageId": {"S": message_id},
+                "expiresAt": {"N": str(int(time.time()) + 7 * 86400)},
+            },
+            # Succeeds only for the first delivery of this ID
+            ConditionExpression="attribute_not_exists(messageId)",
+        )
+        return True
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        # Already handled: a retry, a redelivery or a replay
+        return False</code></pre>
+				<p>The key must be stable across retries: a business ID (order ID plus event type), never a timestamp or a fresh UUID. For payments, the provider receives the order ID as its idempotency key, and <code>Payments</code> records the outcome with a condition on the order's status. Powertools for AWS Lambda packages the same pattern (<code>@idempotent</code> with a DynamoDB persistence layer).</p>
+				<div class="callout trap"><p>An atomic counter (<code>SET n = n + :one</code>) is not idempotent; a conditional write that checks the attribute it updates is. Conditional writes protect nothing across DynamoDB global tables, which resolve conflicts with "last writer wins".</p></div>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Observe and deploy</h3>
+				<p><strong>Following one order.</strong> Every service is instrumented with OpenTelemetry (ADOT SDKs or auto-instrumentation), and Application Signals builds the service map with Latency, Fault and Error metrics per operation. Asynchronous hops break traces easily, so every event carries the order ID and a <code>correlationId</code> in its <code>detail</code>, and every log line includes them with the trace ID (<a href="../d5-task-5-3.html">Task 5.3</a>).</p>
+				<span class="file">Turn on OpenTelemetry auto-instrumentation for a saga function (AWS CLI)</span>
+<pre><code>aws lambda update-function-configuration \
+  --function-name authorize-payment \
+  --layers "$ADOT_LAMBDA_LAYER_ARN" \
+  --environment "Variables={AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument}"</code></pre>
+				<p>The execution role also needs <code>CloudWatchLambdaApplicationSignalsExecutionRolePolicy</code>. An SLO with burn-rate alarms covers "place order"; other alarms watch for messages in any DLQ, the age of the oldest message in <code>order-events.fifo</code>, EventBridge failed invocations and failed saga executions.</p>
+				<p><strong>Independent pipelines.</strong> Each service has its own repository and pipeline, deploying through dev and staging accounts into production (the DOP <a href="../../aws-dop/arch/multi-account-pipeline.html">multi-account pipeline</a> architecture). Lambda services shift traffic with alarm-guarded canaries on aliases and the orders API uses ECS blue/green (the DOP <a href="../../aws-dop/arch/serverless-deployments.html">serverless deployments</a> page and <a href="../d5-task-5-2.html">Task 5.2</a>). Because services deploy separately, event contracts and database schemas change backward-compatibly, in expand-then-contract steps.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Strangle, don't rewrite</h4>
+				<p>A full rewrite freezes features and cuts over in one risky weekend. The strangler fig delivers value per capability, and each step can be reversed with one rule weight; the cost is running two systems, the facade and the sync for the whole programme. Small applications are cheaper to rewrite than to strangle.</p>
+			</div>
+			<div class="entry">
+				<h4>Orchestrate the money path, choreograph the rest</h4>
+				<p>Payments and stock need an owner, compensations and an audit trail; notifications, analytics and partner feeds only react, so they subscribe without touching the orders service. Standard costs $0.025 per 1,000 state transitions (retries count as transitions), a few cents per thousand orders; Express costs $1.00 per million requests plus duration, which is why high-volume short work runs there.</p>
+			</div>
+			<div class="entry">
+				<h4>Lambda for spiky steps, Fargate for the steady API</h4>
+				<p>Lambda bills nothing while idle, which suits per-order steps. The orders API runs all day, where Fargate is usually cheaper than per-request billing. Compute Savings Plans cover both, and Arm (Graviton) is 20% cheaper than x86 for each (<a href="../d3-task-3-1.html">Task 3.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>The price of a database per service</h4>
+				<p>Several stores cost more than one. The small services use DynamoDB on demand, which costs little between orders, and only orders keeps an Aurora cluster; Database Savings Plans can cover the steady part. Cross-account events are charged to the sender, and Service Connect adds only proxy resources.</p>
+			</div>
+			<div class="entry">
+				<h4>FIFO only where order matters</h4>
+				<p>Only the monolith-to-service sync needs per-customer order, so only that path uses SQS FIFO, with one group per customer for parallelism. Everything else uses unordered, at-least-once delivery with idempotent consumers, which scales further and costs less.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>API Gateway as the facade</h4>
+				<p>A REST API gives the same route-by-route strangling, adds per-client API keys, usage plans, request validation and AWS WAF, and can send a route straight to Lambda or Step Functions. It's serverless and Multi-AZ, so it isn't a new single point of failure. The ALB was already there and shifts weights between two backends natively.</p>
+			</div>
+			<div class="entry">
+				<h4>The new Custom Event Bus</h4>
+				<p>FIFO subscribers per event group, five-minute deduplication ("exactly-once ingestion" with a FIFO subscriber), retention up to 365 days with replay by starting position, and RAM sharing could replace the FIFO queue for ordered order events. It lacks schema discovery and global endpoints today, and RAM sharing works only within a Region, but AWS recommends it for new applications, so it is the likely next step.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Canary the routes</span><span class="desc">Compare the new service's responses with the monolith's in staging, then hold 10% in production for a week; the 5XX rate and p99 latency of both target groups must match before the weight rises.</span></li>
+				<li><span class="name">Force every saga branch</span><span class="desc">In staging, make <code>authorize-payment</code> and then <code>confirm-order</code> fail on purpose. Execution histories must show the compensations in reverse order, and <code>Inventory</code> and <code>Payments</code> must end where they started.</span></li>
+				<li><span class="name">Send everything twice</span><span class="desc">Replay a day of archived events into staging and resend outbox rows: no second e-mail, no double charge, and <code>ConditionalCheckFailedException</code> counts show the duplicates were caught.</span></li>
+				<li><span class="name">Break a consumer</span><span class="desc">Remove the queue policy on <code>notifications</code> in staging: events must land in <code>central-orders-dlq</code> (within the 2-hour retry limit at the latest) and fire the DLQ alarm. Restore it, then redrive.</span></li>
+				<li><span class="name">Peak load and cost</span><span class="desc">Load-test at twice last year's peak, watching FIFO message age, Lambda throttles and Aurora connections; then compare the cost per thousand orders, by service tag, with the monolith baseline in Cost Explorer.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d4-task-4-1.html">4.1</a> Design Migration Strategies by Using AWS Frameworks</td><td data-label="What this architecture demonstrates">Refactor after rehosting, the strangler fig with an ALB or API Gateway facade, the anti-corruption layer, decomposition by business capability</td></tr>
+						<tr><td data-label="Task"><a href="../d1-task-1-1.html">1.1</a> Design Architectures Built for the Cloud</td><td data-label="What this architecture demonstrates">EventBridge rules, DLQs, schemas, archive and cross-account targets; SQS FIFO groups and deduplication; idempotent consumers; the saga, Standard versus Express, durable functions; Fargate, Lambda and Service Connect</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-2.html">5.2</a> Design CI/CD and DevSecOps Pipelines</td><td data-label="What this architecture demonstrates">A pipeline per service across accounts, canary and blue/green with alarm rollback, backward-compatible contracts</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-3.html">5.3</a> Design Observability and Monitoring Solutions</td><td data-label="What this architecture demonstrates">OpenTelemetry and Application Signals across services, correlation IDs in events and logs, SLOs, DLQ and saga alarms</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Design Architectures Based on AWS Pricing Models</td><td data-label="What this architecture demonstrates">Lambda versus Fargate, Step Functions Standard versus Express pricing, Savings Plans and Graviton for serverless compute</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Modernize a monolith gradually with minimal risk" is the <strong>strangler fig</strong> behind ALB path rules or API Gateway. "Keep data consistent across microservices without distributed transactions" is a <strong>saga</strong> on <strong>Step Functions Standard</strong> with compensating steps. "Publish an event reliably when the database changes" is the <strong>transactional outbox</strong> or DynamoDB Streams, never two writes in a row. "Each customer's events in order" is <strong>SQS FIFO with a message group per customer</strong>. "Duplicates must not cause double charges" is an <strong>idempotent consumer</strong> with a DynamoDB conditional write. "Route events to other accounts with the least code" is an <strong>EventBridge rule with a cross-account target</strong>. "Traffic between ECS services" is <strong>ECS Service Connect</strong>, not App Mesh.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/compute/building-event-driven-applications-at-scale-with-amazon-eventbridge/">Building event-driven applications at scale with Amazon EventBridge</a> (September 2026): current guidance on buses, rules, schemas and cross-account delivery for large systems.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/implementing-the-transactional-outbox-pattern-with-amazon-eventbridge-pipes/">Implementing the transactional outbox pattern with Amazon EventBridge Pipes</a> (August 2023): publish-after-commit between services with an outbox table and Pipes.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/building-a-serverless-distributed-application-using-a-saga-orchestration-pattern/">Building a serverless distributed application using a saga orchestration pattern</a> (September 2021): a Step Functions saga with compensating transactions (predates Lambda durable functions).</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/seamlessly-migrate-on-premises-legacy-workloads-using-a-strangler-pattern/">Seamlessly migrate on-premises legacy workloads using a strangler pattern</a> (April 2022): moving functions off a legacy system behind API Gateway routing and events.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/breaking-down-monolith-workflows-modularizing-aws-step-functions-workflows/">Breaking down monolith workflows: Modularizing AWS Step Functions workflows</a> (October 2025): splitting a large state machine into child workflows owned by separate teams.</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/best-practices-for-implementing-event-driven-architectures-in-your-organization/">Best practices for implementing event-driven architectures in your organization</a> (July 2023): bus ownership, single or multiple buses, and schema governance across accounts.</li>
+				<li><a href="https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/introduction.html">Cloud design patterns, architectures, and implementations</a> (AWS Prescriptive Guidance): strangler fig, anti-corruption layer, saga, transactional outbox and publish-subscribe with AWS implementations.</li>
+				<li><a href="https://docs.aws.amazon.com/whitepapers/latest/microservices-on-aws/microservices-on-aws.html">Implementing Microservices on AWS</a> (AWS Whitepaper): microservice architecture, data stores per service, distributed patterns and observability (predates Lambda durable functions and App Mesh end of support).</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026.</div>
+</footer>
+
+</body>
+</html>
