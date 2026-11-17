@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Decoupled order processing | AWS SAA-C03 Notes</title>
+	<meta name="description" content="SAA-C03 reference architecture: what happens after the mobile API accepts an order. The order-intake SQS queue with long polling, a dead-letter queue and redrive, a Lambda consumer with partial batch responses and maximum concurrency, a Step Functions Standard workflow for payment, stock and confirmation with retries and compensation, EventBridge rules fanning out to SQS queues for email, analytics and the warehouse, and idempotent consumers.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../saa.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAA-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Order processing</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Decoupled order processing</h1>
+		<p>What happens after the mobile API accepts an order: a queue that absorbs bursts and parks bad messages, a workflow that charges, reserves and confirms with retries and a compensation path, and an event fan-out to email, analytics and the warehouse, with every consumer safe to run twice.</p>
+		<div class="tags"><span class="tag code">SAA-C03</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">Amazon SQS</span><span class="tag">AWS Step Functions</span><span class="tag">Amazon EventBridge</span><span class="tag">Amazon SNS</span><span class="tag">AWS Lambda</span><span class="tag">DynamoDB</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The queue: order-intake and its DLQ</a></li>
+				<li class="sub"><a href="#b2">2. The consumer: batches, failures, concurrency</a></li>
+				<li class="sub"><a href="#b3">3. The workflow: Step Functions Standard</a></li>
+				<li class="sub"><a href="#b4">4. Fan-out: EventBridge rules to SQS</a></li>
+				<li class="sub"><a href="#b5">5. Idempotency, alarms and redrive</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The <a href="serverless-api.html">serverless API</a> accepts an order in well under a second: <code>order-api</code> records the request in the DynamoDB table <code>order-requests</code> with a conditional write, sends one message to the SQS queue <code>order-intake</code> and returns 202 Accepted. This page is everything after that message. Payment, stock and confirmation are slow, call outside systems and sometimes fail, so they run behind the queue in the production account <code>111111111111</code> in us-east-1, at their own pace (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>No lost orders</strong>: an order accepted by the API is processed even if payment or stock services are slow or down for a while.</li>
+				<li><strong>No double charges</strong>: delivery is at least once, so every step must be safe to repeat (<a href="../d2-task-2-2.html">Task 2.2</a>).</li>
+				<li><strong>Bad messages don't block good ones</strong>: a malformed order is set aside for inspection, then replayed once the bug is fixed.</li>
+				<li><strong>A failed payment or stock check undoes what already happened</strong>, and the customer sees a clear status.</li>
+				<li><strong>Other teams react without changing ordering code</strong>: email, the small Kinesis analytics feed (<a href="../d3-task-3-5.html">Task 3.5</a>) and the warehouse each get completed orders.</li>
+				<li><strong>Pay for work, not for idle servers</strong>: overnight there are almost no orders (<a href="../d4-task-4-2.html">Task 4.2</a>).</li>
+			</ul>
+			<p>Reused from the serverless API page: <code>order-api</code>, <code>order-requests</code> (keyed by <code>request_id</code>) and <code>order-intake</code>. Reused from Task 2.1: the <code>charge-card</code> task with its retry and <code>RefundPayment</code> catch. New on this page: the dead-letter queue <code>order-intake-dlq</code>; the consumer function <code>order-worker</code>; the Standard state machine <code>order-fulfilment</code> with functions <code>reserve-stock</code>, <code>confirm-order</code>, <code>refund-payment</code> and <code>release-stock</code>; the event source <code>com.example.orders</code> with detail type <code>OrderCompleted</code> on the default event bus; queues <code>order-email</code>, <code>order-analytics</code> and <code>order-warehouse</code> (each with a <code>-dlq</code>); the dedup table <code>order-dedup</code>; and the SNS topic <code>oncall</code> already used on Task 2.2.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> SQS messages can be up to 1 MiB since August 2025 (it was 256 KiB), and older posts still quote the old limit. EventBridge now offers a new Custom Event Bus alongside the rules-based bus (now called Custom Event Bus &ndash; Classic); the exam describes rules and targets, which is what this page uses. The X-Ray SDKs are in maintenance mode: trace new consumers with OpenTelemetry.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 460" role="img" aria-labelledby="dgO-wide-t">
+<title id="dgO-wide-t">Decoupled order processing: order-api queues each accepted order on order-intake; order-worker claims the request ID in order-dedup and starts an order-fulfilment Step Functions execution that charges the card, reserves stock and confirms the order, compensating on failure; the OrderCompleted event on the default bus fans out to the email, analytics and warehouse queues.</title>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M500.0 152.0 L500.0 83.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M700.0 152.0 L700.0 83.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M700.0 198.0 L700.0 225.5 Q700.0 232.5 693.0 232.5 L297.0 232.5 Q290.0 232.5 290.0 239.5 L290.0 267.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M210.0 290.0 L97.0 290.0 Q90.0 290.0 90.0 297.0 L90.0 382.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M290.0 313.0 L290.0 382.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 290.0 L493.0 290.0 Q500.0 290.0 500.0 297.0 L500.0 382.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">order-api</text>
+<text x="90" y="189" class="dg-s dg-sm2">returns 202</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="172" class="dg-t dg-sm">order-intake</text>
+<text x="290" y="189" class="dg-s dg-sm2">SQS, DLQ after 5</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">order-worker</text>
+<text x="500" y="189" class="dg-s dg-sm2">Lambda, batches</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">order-dedup</text>
+<text x="500" y="74" class="dg-s dg-sm2">claim request ID</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="700" y="172" class="dg-t dg-sm">order-fulfilment</text>
+<text x="700" y="189" class="dg-s dg-sm2">Step Functions</text>
+<rect x="620" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="57" class="dg-t dg-sm">Compensation</text>
+<text x="700" y="74" class="dg-s dg-sm2">release, refund</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="287" class="dg-t dg-sm">Default event bus</text>
+<text x="290" y="304" class="dg-s dg-sm2">OrderCompleted</text>
+<rect x="210" y="382" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="402" class="dg-t dg-sm">order-email</text>
+<text x="290" y="419" class="dg-s dg-sm2">SQS</text>
+<rect x="420" y="382" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="402" class="dg-t dg-sm">order-analytics</text>
+<text x="500" y="419" class="dg-s dg-sm2">SQS</text>
+<rect x="10" y="382" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="402" class="dg-t dg-sm">order-warehouse</text>
+<text x="90" y="419" class="dg-s dg-sm2">shipped orders only</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgO-tall-t">
+<title id="dgO-tall-t">Decoupled order processing: order-api queues each accepted order on order-intake; order-worker claims the request ID in order-dedup and starts an order-fulfilment Step Functions execution that charges the card, reserves stock and confirms the order, compensating on failure; the OrderCompleted event on the default bus fans out to the email, analytics and warehouse queues.</title>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M220.0 145.0 L180.0 145.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 255.0 L180.0 255.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 365.0 L180.0 365.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M307.0 388.0 L307.0 452.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M293.0 388.0 L293.0 413.0 Q293.0 420.0 286.0 420.0 L107.0 420.0 Q100.0 420.0 100.0 427.0 L100.0 452.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">order-api</text>
+<text x="100" y="54" class="dg-s dg-sm2">returns 202</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">order-intake</text>
+<text x="300" y="54" class="dg-s dg-sm2">SQS, DLQ after 5</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">order-worker</text>
+<text x="300" y="159" class="dg-s dg-sm2">Lambda, batches</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">order-dedup</text>
+<text x="100" y="159" class="dg-s dg-sm2">claim request ID</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="252" class="dg-t dg-sm">order-fulfilment</text>
+<text x="300" y="269" class="dg-s dg-sm2">Step Functions</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">Compensation</text>
+<text x="100" y="269" class="dg-s dg-sm2">release, refund</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="362" class="dg-t dg-sm">Default event bus</text>
+<text x="300" y="379" class="dg-s dg-sm2">OrderCompleted</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="472" class="dg-t dg-sm">order-email</text>
+<text x="100" y="489" class="dg-s dg-sm2">SQS</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">order-analytics</text>
+<text x="300" y="489" class="dg-s dg-sm2">SQS</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">order-warehouse</text>
+<text x="100" y="379" class="dg-s dg-sm2">shipped orders only</text>
+</svg>
+				<figcaption>Figure: every hop is asynchronous and every consumer is idempotent. The queue buffers orders and parks failures in a dead-letter queue (grey); <code>order-worker</code> claims each request ID before it starts the workflow (yellow), and <code>order-fulfilment</code> runs payment, stock and confirmation with retries (green), switching to the compensation steps when a step fails for good (dashed). The <code>OrderCompleted</code> event reaches three queues through EventBridge rules (blue), so each team consumes at its own pace.</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>One order travels from the queue through the workflow to its subscribers. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Buffer the order</li>
+				<li><span class="name">Enqueue<span class="who">order-api</span></span><span class="desc">After the conditional write, <code>order-api</code> sends a small JSON message with the request ID to <code>order-intake</code> and returns 202.</span></li>
+				<li class="auto"><span class="name">Poll<span class="who auto">AWS</span></span><span class="desc">The Lambda event source mapping long-polls the queue and invokes <code>order-worker</code> with batches, capped by a maximum concurrency so a sale can't flood payment and stock.</span></li>
+				<li><span class="name">Claim and start<span class="who">order-worker</span></span><span class="desc">For each message the worker claims the request ID in <code>order-dedup</code> with a conditional write, starts an <code>order-fulfilment</code> execution named after the request ID, and reports any failed messages back in a partial batch response.</span></li>
+				<li class="group">Run the workflow</li>
+				<li class="auto"><span class="name">Charge, reserve, confirm<span class="who auto">AWS</span></span><span class="desc">Step Functions runs <code>charge-card</code>, then <code>reserve-stock</code>, then <code>confirm-order</code>, retrying throttling and timeouts with exponential backoff.</span></li>
+				<li class="auto"><span class="name">Compensate<span class="who auto">AWS</span></span><span class="desc">If stock is unavailable or confirmation fails after retries, a Catch sends the run to <code>release-stock</code> and <code>refund-payment</code>, and the order is marked failed.</span></li>
+				<li class="auto"><span class="name">Announce<span class="who auto">AWS</span></span><span class="desc">On success, the last state puts an <code>OrderCompleted</code> event on the default event bus.</span></li>
+				<li class="group">Fan out and watch</li>
+				<li class="auto"><span class="name">Route<span class="who auto">AWS</span></span><span class="desc">Three EventBridge rules match the event and deliver it to <code>order-email</code>, <code>order-analytics</code> and, for shipped orders only, <code>order-warehouse</code>; each team's consumer reads its own queue.</span></li>
+				<li class="auto"><span class="name">Park and alarm<span class="who auto">AWS</span></span><span class="desc">A message that fails five times moves to <code>order-intake-dlq</code>; CloudWatch alarms on the age of the oldest message and on DLQ depth notify <code>oncall</code>.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The queue: order-intake and its DLQ</h3>
+				<p><strong>Standard, not FIFO.</strong> Standard queues take a nearly unlimited request rate, deliver at least once and order only on a best-effort basis. FIFO queues (names end in <code>.fifo</code>) keep strict order within a message group and use a deduplication ID for exactly-once processing, but handle 300 API calls per second per action, or 3,000 messages per second with batches of 10, more in high-throughput mode (<a href="../d2-task-2-1.html">Task 2.1</a>). Orders are independent of one another, so order doesn't matter, and the dedup table in Step 5 handles duplicates at any rate.</p>
+				<p><strong>The settings that matter.</strong> The <strong>visibility timeout</strong> (default 30 seconds, up to 12 hours) hides a received message from other consumers; if it isn't deleted in time it reappears and is processed again. For a Lambda consumer, the Lambda documentation says to set it to at least six times the function timeout, so <code>order-worker</code>'s 30-second timeout gives 180 seconds. <strong>Long polling</strong> (<code>ReceiveMessageWaitTimeSeconds</code> up to 20) cuts empty receives and cost. Messages can be up to 1 MiB; anything larger goes to S3 with a pointer in the message. Retention is 4 days by default and up to 14 days.</p>
+				<p><strong>A dead-letter queue.</strong> After a message has been received <code>maxReceiveCount</code> times without being deleted, SQS moves it to the DLQ instead of retrying forever. Lambda's guidance is at least 5, which gives a few retries before a message is parked. The DLQ keeps messages for the full 14 days so nobody loses evidence over a long weekend.</p>
+				<span class="file">Create the dead-letter queue with 14-day retention, then order-intake pointing at it after five failed receives (AWS CLI; same form as the payments queue on Task 2.1)</span>
+<pre><code># The DLQ: keep parked messages for 14 days (1,209,600 seconds)
+aws sqs create-queue --queue-name order-intake-dlq \
+    --attributes '{"MessageRetentionPeriod": "1209600"}'
+
+# The main queue: visibility 6 x the 30 s function timeout, long polling, redrive after 5 receives
+aws sqs create-queue --queue-name order-intake \
+    --attributes '{
+      "VisibilityTimeout": "180",
+      "ReceiveMessageWaitTimeSeconds": "20",
+      "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:111111111111:order-intake-dlq\",\"maxReceiveCount\":\"5\"}"
+    }'</code></pre>
+				<div class="callout tip"><p>"Messages are processed twice" is a <strong>visibility timeout</strong> shorter than processing time. "Poison messages block the queue" is a <strong>dead-letter queue</strong>. "Must be processed in order, exactly once" is a <strong>FIFO queue</strong>, whose DLQ must also be FIFO.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>The consumer: batches, failures, concurrency</h3>
+				<p><strong>An event source mapping, not a polling loop.</strong> Lambda polls the queue for you and invokes <code>order-worker</code> with batches (default 10, up to 10,000 for a standard queue; a batch size above 10 needs a batching window of at least 1 second). The worker's role gets the <code>AWSLambdaSQSQueueExecutionRole</code> managed policy for the queue, plus <code>states:StartExecution</code> on <code>order-fulfilment</code> and item writes on <code>order-dedup</code>.</p>
+				<p><strong>Partial batch responses.</strong> By default, one failed message sends the whole batch back to the queue, so nine good orders are retried with the bad one. With <code>ReportBatchItemFailures</code> the function returns the IDs of only the messages that failed, and only those return to the queue and count towards <code>maxReceiveCount</code> (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+				<p><strong>Maximum concurrency as a valve.</strong> Lambda starts with five concurrent batches and adds up to 300 concurrent invocations a minute while messages remain. The mapping's <code>MaximumConcurrency</code> (2 to 1,000) caps how many copies run, so a promotion lengthens the queue instead of overloading the payment provider. Provisioned mode, which adds dedicated pollers for faster scaling, can't be combined with maximum concurrency.</p>
+				<span class="file">Connect order-intake to order-worker: batches of 10, per-message failure reporting, at most 20 concurrent copies (AWS CLI; options checked on the create-event-source-mapping reference)</span>
+<pre><code>aws lambda create-event-source-mapping \
+    --function-name order-worker \
+    --event-source-arn arn:aws:sqs:us-east-1:111111111111:order-intake \
+    --batch-size 10 \
+    --function-response-types ReportBatchItemFailures \
+    --scaling-config MaximumConcurrency=20</code></pre>
+				<span class="file">What order-worker returns when one message in the batch failed (JSON; the identifier is the message ID)</span>
+<pre><code>{
+  "batchItemFailures": [
+    { "itemIdentifier": "MESSAGE_ID_OF_THE_FAILED_ORDER" }
+  ]
+}</code></pre>
+				<p><strong>Containers or EC2 instead.</strong> If the consumers were ECS tasks or an Auto Scaling group, they would scale on <strong>backlog per instance</strong>, not raw queue length: visible messages divided by running instances, against the backlog one instance clears within the acceptable delay. At 0.1 seconds per message and a 10-second acceptable delay the target is 100 per instance, so 1,500 messages on 10 instances means scaling to 15 (<a href="../d3-task-3-2.html">Task 3.2</a>).</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>The workflow: Step Functions Standard</h3>
+				<p><strong>Orchestration instead of glue code.</strong> Payment, stock and confirmation are a saga: a multi-step transaction where each step has a compensating action if a later one fails (<a href="../d2-task-2-1.html">Task 2.1</a>). Step Functions holds the state, the retries and the error paths in the definition, and shows each order's progress in the console, so nobody writes retry loops or status tables by hand.</p>
+				<p><strong>Standard, not Express.</strong> Standard workflows run up to a year, execute each step exactly once and are priced per state transition. Express workflows run up to 5 minutes, are priced by executions and duration, run at least once when started asynchronously, and support only request-response integrations. Charging a card must not happen twice, and a stock check might wait on a supplier, so <code>order-fulfilment</code> is Standard. Inputs and outputs are limited to 256 KiB, so the workflow carries the request ID, not the whole order.</p>
+				<p><strong>Retry with backoff, then Catch.</strong> Each task retries transient errors such as Lambda throttling with exponential backoff; any other error goes to the compensation branch. The fragment below follows Task 2.1's <code>ChargeCard</code> state for the next step.</p>
+				<span class="file">The stock step of order-fulfilment: retry throttling with backoff, release stock and refund on any other error (Amazon States Language JSON fragment, JSONata as on Task 2.1)</span>
+<pre><code>"ReserveStock": {
+  "Type": "Task",
+  "QueryLanguage": "JSONata",
+  "Resource": "arn:aws:states:::lambda:invoke",
+  "Arguments": { "FunctionName": "reserve-stock", "Payload": "{% $states.input %}" },
+  "Retry": [
+    { "ErrorEquals": ["Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "BackoffRate": 2.0, "MaxAttempts": 3 }
+  ],
+  "Catch": [
+    { "ErrorEquals": ["States.ALL"], "Next": "ReleaseStock" }
+  ],
+  "Next": "ConfirmOrder"
+}</code></pre>
+				<p><strong>Waiting for a person or a partner.</strong> If the warehouse had to approve large orders by hand, a Standard task could send a message with <code>.waitForTaskToken</code> and pause until the approver's system returns the token (Task 2.1 gives human approval as the example). Express workflows can't do this. The company doesn't need it today, so the workflow has no callback step.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Fan-out: EventBridge rules to SQS</h3>
+				<p><strong>Announce once, let others subscribe.</strong> The last state of <code>order-fulfilment</code> puts an <code>OrderCompleted</code> event on the default event bus with the EventBridge service integration. The workflow doesn't know who listens: adding a loyalty-points consumer later is a new rule, not a change to ordering (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+				<span class="file">The final state: publish OrderCompleted to EventBridge (Amazon States Language JSON fragment)</span>
+<pre><code>"AnnounceCompleted": {
+  "Type": "Task",
+  "QueryLanguage": "JSONata",
+  "Resource": "arn:aws:states:::events:putEvents",
+  "Arguments": {
+    "Entries": [
+      { "Source": "com.example.orders", "DetailType": "OrderCompleted", "Detail": "{% $states.input %}" }
+    ]
+  },
+  "End": true
+}</code></pre>
+				<p><strong>One rule per consumer, each to its own queue.</strong> A rule matches an event pattern and sends matching events to up to five targets. Each consumer gets a queue rather than a direct function target, so a slow email provider or a warehouse system down for maintenance just lets its queue grow while the others carry on. The warehouse rule adds a content filter, because digital orders have nothing to ship.</p>
+				<span class="file">Event patterns: all completed orders for email and analytics, shipped orders only for the warehouse (JSON)</span>
+<pre><code>// order-completed-email and order-completed-analytics
+{ "source": ["com.example.orders"], "detail-type": ["OrderCompleted"] }
+
+// order-completed-warehouse: only orders with physical delivery
+{
+  "source": ["com.example.orders"],
+  "detail-type": ["OrderCompleted"],
+  "detail": { "delivery": ["ship"] }
+}</code></pre>
+				<span class="file">The warehouse rule and its queue target with retries and a target DLQ (AWS CLI, same form as the SAP event-driven page)</span>
+<pre><code>aws events put-rule \
+    --name order-completed-warehouse \
+    --event-pattern '{"source":["com.example.orders"],"detail-type":["OrderCompleted"],"detail":{"delivery":["ship"]}}' \
+    --state ENABLED
+
+# targets.json: [{"Id": "warehouse-queue",
+#   "Arn": "arn:aws:sqs:us-east-1:111111111111:order-warehouse",
+#   "RetryPolicy": {"MaximumRetryAttempts": 20, "MaximumEventAgeInSeconds": 7200},
+#   "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-east-1:111111111111:order-warehouse-dlq"}}]
+aws events put-targets --rule order-completed-warehouse --targets file://targets.json</code></pre>
+				<p>Each target queue needs a queue policy that lets <code>events.amazonaws.com</code> send messages, scoped to the rule's ARN. The analytics consumer reads <code>order-analytics</code> and writes a record to the Kinesis analytics feed, where the Flink and Firehose consumers already read (<a href="../d3-task-3-5.html">Task 3.5</a>).</p>
+				<p><strong>The SNS version.</strong> The same fan-out works as an SNS topic with three SQS subscriptions, using a subscription <code>FilterPolicy</code> (matched against message attributes by default, or the body with <code>FilterPolicyScope</code> set to <code>MessageBody</code>) in place of the event pattern, and <code>RawMessageDelivery</code> so the queues receive the plain message without the SNS envelope.</p>
+				<span class="file">SNS alternative: subscribe the warehouse queue to a topic with a body filter (AWS CLI; replace ORDERS_TOPIC_ARN)</span>
+<pre><code>aws sns subscribe \
+    --topic-arn ORDERS_TOPIC_ARN \
+    --protocol sqs \
+    --notification-endpoint arn:aws:sqs:us-east-1:111111111111:order-warehouse \
+    --attributes '{"FilterPolicyScope": "MessageBody", "FilterPolicy": "{\"delivery\": [\"ship\"]}", "RawMessageDelivery": "true"}'</code></pre>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Idempotency, alarms and redrive</h3>
+				<p><strong>At least once means design for twice.</strong> A standard queue can deliver a message more than once, a consumer can crash after doing the work but before deleting the message, and EventBridge and SNS retry deliveries. Each consumer therefore records what it has done with a conditional write, the same technique <code>order-api</code> uses on <code>order-requests</code> (<a href="../d2-task-2-2.html">Task 2.2</a>). The key combines the consumer and the order, so the email and warehouse consumers each process an order once without blocking each other.</p>
+				<span class="file">Claim an order for one consumer; a duplicate delivery fails with ConditionalCheckFailedException and is deleted without redoing the work (AWS CLI; order-dedup is on-demand, keyed by dedup_id)</span>
+<pre><code>aws dynamodb put-item --table-name order-dedup \
+    --item '{"dedup_id": {"S": "order-worker#REQUEST_ID"}, "expires_at": {"N": "EPOCH_SECONDS_IN_7_DAYS"}}' \
+    --condition-expression "attribute_not_exists(dedup_id)"</code></pre>
+				<p>TTL on <code>expires_at</code> clears old claims at no charge. Powertools for AWS Lambda packages the same pattern as an idempotency utility backed by DynamoDB. Naming each execution after the request ID adds a second guard, because a Standard workflow won't run two executions with the same name.</p>
+				<p><strong>Alarms on age, not just depth.</strong> <code>ApproximateAgeOfOldestMessage</code> rising means consumers aren't keeping up or one message keeps failing; it's the earliest warning that customers are waiting. A DLQ should be empty, so any visible message there is an alarm.</p>
+				<span class="file">Page on-call when any message reaches the dead-letter queue (AWS CLI; same form as the alarms on the SOA and DVA guides; ONCALL_TOPIC_ARN is the oncall topic)</span>
+<pre><code>aws cloudwatch put-metric-alarm \
+    --alarm-name order-intake-dlq-not-empty \
+    --namespace AWS/SQS \
+    --metric-name ApproximateNumberOfMessagesVisible \
+    --dimensions Name=QueueName,Value=order-intake-dlq \
+    --statistic Maximum --period 60 \
+    --evaluation-periods 1 \
+    --threshold 0 \
+    --comparison-operator GreaterThanThreshold \
+    --treat-missing-data notBreaching \
+    --alarm-actions ONCALL_TOPIC_ARN</code></pre>
+				<p>A second alarm on <code>ApproximateAgeOfOldestMessage</code> for <code>order-intake</code>, with a threshold of a few minutes, catches a stalled workflow before customers start calling.</p>
+				<p><strong>Redrive after the fix.</strong> Once the bug behind the parked messages is fixed and deployed, a message move task sends them back. Leaving out the destination returns them to their original source queue; a rate cap (up to 500 messages per second) keeps the replay gentle on payment.</p>
+				<span class="file">Move parked orders back to order-intake at 50 messages per second (AWS CLI; options checked on the start-message-move-task reference)</span>
+<pre><code>aws sqs start-message-move-task \
+    --source-arn arn:aws:sqs:us-east-1:111111111111:order-intake-dlq \
+    --max-number-of-messages-per-second 50</code></pre>
+				<div class="callout trap"><p>Redriving before the fix just cycles the same poison messages through five more failures and back into the DLQ. Only one move task can run per queue at a time.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>EventBridge rules over SNS for the fan-out</h4>
+				<p>EventBridge filters on any field of the event content, can archive and replay events, and can route to other accounts or Regions; SNS is the choice for very high-throughput fan-out and for notifying people by email, SMS or push (<a href="../d2-task-2-1.html">Task 2.1</a>). Order events are moderate in volume and other teams will add rules, so content routing wins. Either way, each consumer reads its own SQS queue.</p>
+			</div>
+			<div class="entry">
+				<h4>A Lambda worker instead of EventBridge Pipes</h4>
+				<p>EventBridge Pipes could connect <code>order-intake</code> to the state machine with no code. The worker exists because it claims the request in the dedup table and reports per-message failures. A team with a simpler idempotency story could use a pipe and drop a function.</p>
+			</div>
+			<div class="entry">
+				<h4>Per-request pricing over always-on consumers</h4>
+				<p>Lambda, SQS, Step Functions and EventBridge charge for use, so an overnight lull costs close to nothing, and long polling keeps empty receives down. Task 4.2's comparison applies: at steady high volume, Fargate workers on a Compute Savings Plan can be cheaper than Lambda, and Standard workflows' per-transition price adds up for very short, high-rate work (<a href="../d4-task-4-2.html">Task 4.2</a>). Recheck with Pricing Calculator if traffic becomes steady.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Amazon MQ for existing broker applications</h4>
+				<p>If the warehouse system already spoke JMS or AMQP to an on-premises broker, Amazon MQ (managed ActiveMQ or RabbitMQ) would let it move without rewriting its messaging code. It runs on broker instances and doesn't scale like SQS and SNS, so it's for compatibility, not new designs (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Kinesis Data Streams when order and replay matter</h4>
+				<p>A stream keeps records in order per shard for 24 hours by default (up to 365 days), and several applications read and replay it independently; SQS deletes each message once processed. The analytics feed is a stream for that reason; order processing is a work queue (<a href="../d3-task-3-2.html">Task 3.2</a>, <a href="../d3-task-3-5.html">Task 3.5</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Direct synchronous calls</h4>
+				<p>If <code>order-api</code> called payment, stock and email in turn, the API would be as slow as its slowest dependency and fail whenever any of them did, and every tier would have to be sized for the peak. The API's 29-second timeout and the phone's patience would be the limit, and a failed call would lose the order. That breaks the first requirement, which is why the queue exists.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Duplicate delivery</span><span class="desc">Send the same <code>order-intake</code> message twice: one execution of <code>order-fulfilment</code>, one charge, one email, and the second delivery deleted after a failed condition on <code>order-dedup</code>.</span></li>
+				<li><span class="name">Poison message</span><span class="desc">Send a malformed message in a batch of ten good ones: the nine complete, the bad one is retried five times and lands in <code>order-intake-dlq</code>, and the DLQ alarm fires.</span></li>
+				<li><span class="name">Compensation</span><span class="desc">Make <code>reserve-stock</code> fail in staging: the execution history must show the Catch, <code>release-stock</code> and <code>refund-payment</code>, and the order status must read failed.</span></li>
+				<li><span class="name">Downstream outage</span><span class="desc">Stop the warehouse consumer for an hour: <code>order-warehouse</code> grows while email and analytics keep up, and nothing is lost when it restarts.</span></li>
+				<li><span class="name">Burst</span><span class="desc">Load-test ten times the normal order rate: concurrency stays at the cap of 20, the age of the oldest message rises and then falls, and payment sees no more than the agreed rate.</span></li>
+				<li><span class="name">Redrive</span><span class="desc">Fix the parser, start a move task from the DLQ and confirm every parked order completes exactly once.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design scalable and loosely coupled architectures</td><td data-label="What this architecture demonstrates">SQS standard versus FIFO, visibility timeout, long polling, DLQs; Step Functions Standard versus Express; EventBridge or SNS fan-out with filtering; Amazon MQ for JMS or AMQP</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Design highly available and/or fault-tolerant architectures</td><td data-label="What this architecture demonstrates">Retries with backoff, idempotent consumers with conditional writes, compensation on failure, alarms on queue age and DLQ depth</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Design high-performing and elastic compute solutions</td><td data-label="What this architecture demonstrates">Each tier scaled on its own metric: Lambda maximum concurrency on the queue, backlog per instance for container or EC2 workers; SQS versus Kinesis</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-5.html">3.5</a> Determine high-performing data ingestion and transformation solutions</td><td data-label="What this architecture demonstrates">Completed orders feeding the Kinesis analytics stream through their own queue</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Design cost-optimized compute solutions</td><td data-label="What this architecture demonstrates">Pay-per-use queues, functions and workflows instead of always-on workers; long polling; when steady load favours Fargate</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Orders are lost when the payment service is slow. Which solution meets these requirements with the LEAST operational overhead?" is an <strong>SQS queue with a Lambda consumer</strong>, not a bigger instance. "Coordinate payment, stock and shipping with retries and undo steps" is a <strong>Step Functions Standard workflow</strong>. "Several systems must each receive every completed order, at their own pace" is <strong>SNS or EventBridge fan-out to SQS queues</strong>. "One bad message makes the whole Lambda batch retry" is <strong>partial batch responses</strong>. "Migrate an application using JMS with minimal changes" is <strong>Amazon MQ</strong>.</p></div>
+			<p>Deeper material: the SAP <a href="../../aws-sap/arch/event-driven-modernization.html">monolith to event-driven microservices</a> architecture covers cross-account buses and a larger saga, and the DVA guide covers consumer code, error handling and event source mappings (<a href="../../aws-dva/d1-task-1-1.html">DVA Task 1.1</a>, <a href="../../aws-dva/d1-task-1-2.html">DVA Task 1.2</a>). The web tier that also sends orders is the <a href="ha-web-app.html">highly available web application</a>.</p>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/compute/choosing-between-messaging-services-for-serverless-applications/">Choosing between messaging services for serverless applications</a> (September 2020): SQS, SNS, EventBridge and Kinesis by throughput, ordering and routing (predates EventBridge Pipes, cross-account targets and the 1 MiB message size).</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/implementing-aws-lambda-error-handling-patterns/">Implementing AWS Lambda error handling patterns</a> (July 2023): retries, DLQs, destinations and partial batch responses by invocation type.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/introducing-maximum-concurrency-of-aws-lambda-functions-when-using-amazon-sqs-as-an-event-source/">Introducing maximum concurrency of AWS Lambda functions when using Amazon SQS as an event source</a> (January 2023): the valve that protects payment and stock in Step 2.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/a-new-set-of-apis-for-amazon-sqs-dead-letter-queue-redrive/">A New Set of APIs for Amazon SQS Dead-Letter Queue Redrive</a> (June 2023): the message move task used in Step 5.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/building-a-serverless-distributed-application-using-a-saga-orchestration-pattern/">Building a serverless distributed application using a saga orchestration pattern</a> (September 2021): Step Functions sagas with compensating transactions.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/handling-lambda-functions-idempotency-with-aws-lambda-powertools/">Handling Lambda functions idempotency with AWS Lambda Powertools</a> (April 2022): idempotency keys in DynamoDB, the library form of the dedup table.</li>
+				<li><a href="https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html">Creating and configuring an Amazon SQS event source mapping</a> (AWS documentation): visibility timeout at six times the function timeout, <code>maxReceiveCount</code> of at least 5, batch sizes and maximum concurrency.</li>
+				<li><a href="https://docs.aws.amazon.com/step-functions/latest/dg/connect-to-resource.html">Discover service integration patterns in Step Functions</a> (AWS documentation): request-response, <code>.sync</code> and <code>.waitForTaskToken</code>, and which work in Express workflows.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Associate (SAA-C03) exam guide, version 1.1.</div>
+</footer>
+
+</body>
+</html>
