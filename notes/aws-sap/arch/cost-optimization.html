@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Cost optimization at scale | AWS SAP-C03 Notes</title>
+	<meta name="description" content="End-to-end SAP-C03 architecture: an organization-wide cost programme run from the management account. Cost allocation tags enforced with tag policies and SCPs, cost categories with split charges, CUR 2.0 through AWS Data Exports with split cost allocation data, Budgets with SCP actions and Cost Anomaly Detection, Savings Plans and Reserved Instances bought centrally with RI and Savings Plans group sharing, Compute Optimizer, Graviton, Spot and Fargate Spot, dev schedules, NAT and inter-AZ charges, VPC endpoints, CloudFront, S3 tiering, gp3 and Aurora I/O-Optimized, and chargeback per business unit.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../sap.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAP-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Cost optimization</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Cost optimization at scale</h1>
+		<p>One cost programme for dozens of accounts: every dollar lands on a business unit's report, commitments are bought once and shared on purpose, waste is found by tools rather than by audits, and the expensive network and storage paths are designed out instead of explained afterwards.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Savings Plans</span><span class="tag">Reserved Instances</span><span class="tag">Cost Categories</span><span class="tag">Data Exports</span><span class="tag">Budgets</span><span class="tag">Compute Optimizer</span><span class="tag">Graviton</span><span class="tag">Spot</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Accounts, tags and enforcement</a></li>
+				<li class="sub"><a href="#b2">2. Cost categories and CUR 2.0</a></li>
+				<li class="sub"><a href="#b3">3. Budgets, actions and anomalies</a></li>
+				<li class="sub"><a href="#b4">4. Commitments bought once, shared on purpose</a></li>
+				<li class="sub"><a href="#b5">5. Rightsizing, Graviton and Spot</a></li>
+				<li class="sub"><a href="#b6">6. Data transfer and storage</a></li>
+				<li class="sub"><a href="#b7">7. Chargeback per business unit</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company's bill grew with its account count. Finance gets one consolidated invoice from the management account of organization <code>o-a1b2c3d4e5</code>, but can't say what the retail or payments business unit costs, who owns the shared network, or whether the Savings Plans bought last year still fit. <a href="../d3-task-3-3.html">Task 3.3</a> already set the target: each business unit sees its own spend, including its share of the shared-network account <code>666666666666</code>, enterprise support and the central GenAI account <code>222222222222</code>, and the CFO wants warning before a team's spend jumps. Basics are in the SAA cost notes for <a href="../../aws-saa/d4-task-4-1.html">storage</a>, <a href="../../aws-saa/d4-task-4-2.html">compute</a>, <a href="../../aws-saa/d4-task-4-3.html">databases</a> and <a href="../../aws-saa/d4-task-4-4.html">networks</a>, and <a href="../../aws-soa/d1-task-1-3.html">SOA-C03 Task 1.3</a> covers Compute Optimizer and EBS tuning. This page runs it as one programme.</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>Visibility first</strong>: every cost is allocated to a business unit, with line-item data to query.</li>
+				<li><strong>Guardrails, not tickets</strong>: untagged resources are blocked at creation, and a dev OU that overspends is stopped automatically.</li>
+				<li><strong>Commitments that fit</strong>: Savings Plans and RIs bought centrally for the steady baseline, with coverage and utilization tracked.</li>
+				<li><strong>Less waste</strong>: rightsizing first, Graviton and Spot where possible, dev off at night.</li>
+				<li><strong>Cheaper paths</strong>: data transfer and storage designed for cost (<a href="../d3-task-3-2.html">Task 3.2</a>, <a href="../d3-task-3-4.html">Task 3.4</a>).</li>
+				<li><strong>Fair chargeback</strong>: amortized commitment cost and shared costs reach the units that benefit.</li>
+			</ul>
+			<p>Reused from the SAP task pages: the tag keys <code>CostCenter</code>, <code>BusinessUnit</code> and <code>Environment</code>, the <code>CostCenter</code> values <code>BU-RETAIL</code>, <code>BU-PAYMENTS</code> and <code>BU-PLATFORM</code>, the tag policy and SCP, and the <code>BusinessUnit</code> cost category with its proportional split of <code>SharedNetwork</code> (<a href="../d3-task-3-3.html">Task 3.3</a>); the <code>web-tier</code> Auto Scaling group, the <code>image-workers</code> service on Fargate Spot and the <code>dev-web</code> schedules (<a href="../d3-task-3-1.html">Task 3.1</a>); the dev OU <code>ou-ab12-dev00001</code>; the retail development account <code>121212121212</code> (<a href="datacenter-migration.html">data-centre migration</a>). New on this page:</p>
+			<ul>
+				<li><strong>Management account</strong> <code>999999999999</code> (the payer; not used elsewhere in the SAP notes), with the export bucket <code>example-cur-999999999999</code> and the CUR 2.0 export <code>org-cur2-daily</code>.</li>
+				<li><strong>Budget controls</strong>: budget <code>dev-ou-monthly</code>, the SCP <code>p-denyruninst</code> (deny new EC2 launches) and the role <code>BudgetsActionRole</code> in <code>999999999999</code>.</li>
+				<li><strong>Sharing groups</strong>: cost category <code>CommitmentGroup</code>, with groups <code>Retail</code> and <code>Payments</code> built from account lists.</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> The legacy Cost and Usage Report is now a "legacy data export"; CUR 2.0 in AWS Data Exports is the recommended format, alongside FOCUS exports. Cost Anomaly Detection's custom monitors are now customer managed monitors, next to new AWS managed monitors, and <code>ThresholdExpression</code> replaces <code>Threshold</code>. New since the older blog posts: Database Savings Plans (December 2025), RI and Savings Plans group sharing (November 2025), account tags and IAM principal attribution for allocation, and billing views and billing transfer.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgC-wide-t">
+<title id="dgC-wide-t">Cost optimization at scale: enforced tags and cost categories label every line item; Data Exports writes CUR 2.0 to S3 for Athena chargeback per business unit; Cost Anomaly Detection watches each cost category and the dev OU budget attaches a deny SCP when spend crosses its limit; Compute Optimizer rightsizing and redesign come before Savings Plans and Reserved Instances bought in the management account.</title>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M580.0 60.0 L620.0 60.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 83.0 L290.0 152.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M500.0 83.0 L500.0 152.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M370.0 290.0 L420.0 290.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M580.0 290.0 L620.0 290.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">Tags + tag policy</text>
+<text x="90" y="74" class="dg-s dg-sm2">enforced by SCP</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="57" class="dg-t dg-sm">Cost categories</text>
+<text x="290" y="74" class="dg-s dg-sm2">BusinessUnit, splits</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">CUR 2.0 export</text>
+<text x="500" y="74" class="dg-s dg-sm2">Parquet in S3</text>
+<rect x="620" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="57" class="dg-t dg-sm">Athena chargeback</text>
+<text x="700" y="74" class="dg-s dg-sm2">per business unit</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="172" class="dg-t dg-sm">Anomaly Detection</text>
+<text x="290" y="189" class="dg-s dg-sm2">per cost category</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">dev-ou-monthly</text>
+<text x="500" y="189" class="dg-s dg-sm2">budget action</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Deny SCP</text>
+<text x="700" y="189" class="dg-s dg-sm2">dev OU</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">Compute Optimizer</text>
+<text x="290" y="304" class="dg-s dg-sm2">rightsize first</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">Redesign</text>
+<text x="500" y="304" class="dg-s dg-sm2">Graviton, Spot, gp3</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Savings Plans + RIs</text>
+<text x="700" y="304" class="dg-s dg-sm2">then commit</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 630" role="img" aria-labelledby="dgC-tall-t">
+<title id="dgC-tall-t">Cost optimization at scale: enforced tags and cost categories label every line item; Data Exports writes CUR 2.0 to S3 for Athena chargeback per business unit; Cost Anomaly Detection watches each cost category and the dev OU budget attaches a deny SCP when spend crosses its limit; Compute Optimizer rightsizing and redesign come before Savings Plans and Reserved Instances bought in the management account.</title>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M180.0 255.0 L220.0 255.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 145.0 L220.0 145.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 342.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M180.0 365.0 L220.0 365.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M180.0 475.0 L220.0 475.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 498.0 L300.0 562.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Tags + tag policy</text>
+<text x="100" y="54" class="dg-s dg-sm2">enforced by SCP</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="142" class="dg-t dg-sm">Cost categories</text>
+<text x="100" y="159" class="dg-s dg-sm2">BusinessUnit, splits</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">CUR 2.0 export</text>
+<text x="100" y="269" class="dg-s dg-sm2">Parquet in S3</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Athena chargeback</text>
+<text x="300" y="269" class="dg-s dg-sm2">per business unit</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Anomaly Detection</text>
+<text x="300" y="159" class="dg-s dg-sm2">per cost category</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">dev-ou-monthly</text>
+<text x="100" y="379" class="dg-s dg-sm2">budget action</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">Deny SCP</text>
+<text x="300" y="379" class="dg-s dg-sm2">dev OU</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="472" class="dg-t dg-sm">Compute Optimizer</text>
+<text x="100" y="489" class="dg-s dg-sm2">rightsize first</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">Redesign</text>
+<text x="300" y="489" class="dg-s dg-sm2">Graviton, Spot, gp3</text>
+<rect x="220" y="562" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="582" class="dg-t dg-sm">Savings Plans + RIs</text>
+<text x="300" y="599" class="dg-s dg-sm2">then commit</text>
+</svg>
+				<figcaption>Figure: measure, watch, optimize, charge back. Tags enforced at creation and the <code>BusinessUnit</code> cost category label every line item, and the CUR 2.0 export feeds the monthly Athena chargeback (grey and green). Anomaly Detection and budgets watch the spend, and the <code>dev-ou-monthly</code> budget action attaches a deny SCP to the dev OU (yellow and dashed). Rightsizing and redesign come first, so the Savings Plans and Reserved Instances bought in the management account cover the new, smaller baseline (blue).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>A month in the life of the programme. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Measure</li>
+				<li><span class="name">Tag at creation<span class="who">Workload teams</span></span><span class="desc">Stacks carry the tag set; the SCP and tag policy reject missing or misspelled tags.</span></li>
+				<li class="auto"><span class="name">Allocate<span class="who auto">AWS</span></span><span class="desc">Activated cost allocation tags, account tags and the <code>BusinessUnit</code> cost category label every line item; shared-network costs are split proportionally across the units.</span></li>
+				<li class="auto"><span class="name">Export line items<span class="who auto">AWS</span></span><span class="desc">Data Exports writes CUR 2.0 as Parquet to <code>example-cur-999999999999</code>, with resource IDs and container split cost.</span></li>
+				<li class="group">Watch</li>
+				<li class="auto"><span class="name">Alert<span class="who auto">AWS</span></span><span class="desc">Cost Anomaly Detection flags unexpected increases per account and per cost category value; budgets alert on forecast spend and, for the dev OU, attach a deny SCP when actual spend crosses the limit.</span></li>
+				<li class="group">Optimize</li>
+				<li><span class="name">Rightsize, then commit<span class="who">FinOps team</span></span><span class="desc">Compute Optimizer recommendations first; then Savings Plans and RIs in the management account for the new baseline.</span></li>
+				<li><span class="name">Redesign the expensive paths<span class="who">Platform team</span></span><span class="desc">Graviton, Spot and schedules for compute; endpoints and AZ-local paths for the network; Intelligent-Tiering, gp3 and the right Aurora configuration for storage.</span></li>
+				<li class="group">Charge back</li>
+				<li><span class="name">Report and bill<span class="who">Finance</span></span><span class="desc">Athena queries over CUR 2.0 produce amortized cost per business unit; units see their own numbers in billing views and Cost Explorer.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Accounts, tags and enforcement</h3>
+				<p><strong>Accounts are the strongest boundary.</strong> An account per workload and environment allocates everything in it exactly, including charges that can't be tagged, such as support and data transfer on shared paths. Account tags on the Organizations accounts (for example <code>BusinessUnit=retail</code> on <code>121212121212</code>) now allocate all usage in the account, credits and refunds included (<a href="../d3-task-3-3.html">Task 3.3</a>). Tags and cost categories fill the gaps: shared accounts and the shared EKS cluster.</p>
+				<p><strong>A small, fixed tag set, activated once.</strong> Tags appear in billing only after the management account activates them as cost allocation tags, within 24 hours, and aren't retroactive unless a backfill (up to 12 months) is requested.</p>
+				<span class="file">Management account 999999999999: activate the three keys for cost allocation (AWS CLI)</span>
+<pre><code>aws ce update-cost-allocation-tags-status \
+  --cost-allocation-tags-status \
+    TagKey=CostCenter,Status=Active \
+    TagKey=BusinessUnit,Status=Active \
+    TagKey=Environment,Status=Active</code></pre>
+				<p><strong>Enforcement in layers</strong> (<a href="../d3-task-3-3.html">Task 3.3</a>, <a href="../d2-task-2-3.html">Task 2.3</a>):</p>
+				<ul>
+					<li><strong>Tag policy</strong>: one spelling of <code>CostCenter</code> and its allowed values, with <code>enforced_for</code> blocking noncompliant values on listed resource types. It doesn't require the tag to exist; <code>report_required_tag_for</code> marks keys as required for IaC checks.</li>
+					<li><strong>SCP</strong>: deny <code>ec2:RunInstances</code> when <code>aws:RequestTag/CostCenter</code> is null. One required key per Deny statement, and only for actions that support tag-on-create.</li>
+					<li><strong>Proactive and detective</strong>: CloudFormation Guard rules or hooks fail a deployment without the tags; AWS Config <code>required-tags</code> in a conformance pack finds existing resources missing up to six tags.</li>
+				</ul>
+				<span class="file">Tag policy attached at the organization root: one spelling, three allowed values, enforced on EC2 instances (from Task 3.3)</span>
+<pre><code>{
+  "tags": {
+    "costcenter": {
+      "tag_key": { "@@assign": "CostCenter" },
+      "tag_value": { "@@assign": ["BU-RETAIL", "BU-PAYMENTS", "BU-PLATFORM"] },
+      "enforced_for": { "@@assign": ["ec2:instance"] }
+    }
+  }
+}</code></pre>
+				<div class="callout trap"><p>The organization-wide tag compliance report runs from the management account in us-east-1, refreshes every 48 hours, and doesn't list <strong>untagged</strong> resources as noncompliant. "Tag compliance looks fine but costs are unallocated" usually means resources without the key at all; the SCP and Config rule catch those, the tag policy doesn't.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Cost categories and CUR 2.0</h3>
+				<p><strong>Cost categories map spend to business values.</strong> The <code>BusinessUnit</code> category from <a href="../d3-task-3-3.html">Task 3.3</a> puts the shared-network account <code>666666666666</code> into <code>SharedNetwork</code>, the <code>CostCenter</code> tag values into <code>Retail</code> and <code>Payments</code>, and everything else into <code>Unallocated</code>. Rules are first match, so shared-cost rules go at the top; categories are created only in the management account, apply within 24 hours from the start of the month, and can be backdated up to 12 months. The split charge rule spreads <code>SharedNetwork</code> proportionally, but its results appear only on the category's details page and CSV, not in CUR, Cost Explorer or Budgets.</p>
+				<p><strong>CUR 2.0 for line items.</strong> CUR 2.0 has a fixed schema, and from the management account it covers every member account. Table configurations add resource IDs and split cost allocation data, which breaks shared EC2 instances behind ECS, EKS or Batch into per-task or per-pod cost (enable it in Cost Management preferences first; it isn't in Cost Explorer).</p>
+				<span class="file">Management account 999999999999: a daily-granularity CUR 2.0 export in Parquet for Athena, with resource IDs and split cost data (aws bcm-data-exports create-export --export file://export.json)</span>
+<pre><code>{
+  "Name": "org-cur2-daily",
+  "Description": "Organization line items for chargeback",
+  "DataQuery": {
+    "QueryStatement": "SELECT line_item_usage_account_id, line_item_usage_account_name, line_item_product_code, line_item_usage_type, line_item_line_item_type, line_item_resource_id, line_item_usage_start_date, line_item_unblended_cost, tags FROM COST_AND_USAGE_REPORT",
+    "TableConfigurations": {
+      "COST_AND_USAGE_REPORT": {
+        "TIME_GRANULARITY": "DAILY",
+        "INCLUDE_RESOURCES": "TRUE",
+        "INCLUDE_SPLIT_COST_ALLOCATION_DATA": "TRUE"
+      }
+    }
+  },
+  "DestinationConfigurations": {
+    "S3Destination": {
+      "S3Bucket": "example-cur-999999999999",
+      "S3Prefix": "cur2",
+      "S3Region": "us-east-1",
+      "S3OutputConfigurations": {
+        "OutputType": "CUSTOM",
+        "Format": "PARQUET",
+        "Compression": "PARQUET",
+        "Overwrite": "OVERWRITE_REPORT"
+      }
+    }
+  },
+  "RefreshCadence": { "Frequency": "SYNCHRONOUS" }
+}</code></pre>
+				<p>How it reads: <code>COST_AND_USAGE_REPORT</code> is the SQL table name of CUR 2.0. <code>INCLUDE_RESOURCES</code> adds <code>line_item_resource_id</code> and multiplies the row count. The <code>tags</code> map carries resource tags, account tags, cost categories, user attributes and IAM principals under prefixes such as <code>costCategory/</code> and <code>accountTag/</code>; add the <code>split_line_item_</code> columns to the <code>SELECT</code> to export the container split. <code>SYNCHRONOUS</code> refreshes up to three times a day.</p>
+				<p><strong>Who sees what.</strong> Units get no access to the management account: billing views show each unit only its own data in Cost Explorer and Budgets, and filtered exports (a <code>WHERE</code> on the unit's accounts) give it its own line items.</p>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Budgets, actions and anomalies</h3>
+				<p><strong>Budgets for planned limits.</strong> Each business unit gets a monthly cost budget filtered by its cost category value, alerting at 80% of forecast and 100% of actual to the unit's SNS topic. Budgets update up to three times a day, so they aren't real-time limits.</p>
+				<p><strong>Budget actions for the dev OU.</strong> A budget action can apply an IAM policy or an SCP, or stop EC2 and RDS instances in the same account, automatically or after approval. Stopping instances only works in the budget's own account, so for dev accounts across the OU the management account attaches a deny SCP instead.</p>
+				<span class="file">Management account 999999999999: when the dev OU's actual spend reaches 100% of its budget, attach an SCP that denies new instances, after manual approval (AWS CLI; the budget dev-ou-monthly exists already)</span>
+<pre><code>aws budgets create-budget-action \
+  --account-id 999999999999 \
+  --budget-name dev-ou-monthly \
+  --notification-type ACTUAL \
+  --action-type APPLY_SCP_POLICY \
+  --action-threshold ActionThresholdValue=100,ActionThresholdType=PERCENTAGE \
+  --definition '{"ScpActionDefinition":{"PolicyId":"p-denyruninst","TargetIds":["ou-ab12-dev00001"]}}' \
+  --execution-role-arn arn:aws:iam::999999999999:role/BudgetsActionRole \
+  --approval-model MANUAL \
+  --subscribers SubscriptionType=EMAIL,Address=finops@example.com</code></pre>
+				<p><code>MANUAL</code> means FinOps approves first; <code>AUTOMATIC</code> suits sandbox OUs. The execution role must be in the action's account. The SCP stops new launches, not running ones, so pair it with the Step 5 schedules.</p>
+				<p><strong>Cost Anomaly Detection for surprises.</strong> AWS managed monitors on <code>LINKED_ACCOUNT</code> and on the <code>BusinessUnit</code> cost category watch each value separately (up to 5,000) and pick up new values automatically; only the management account can create them. Subscriptions use <code>ThresholdExpression</code> with absolute and percentage impact (the Task 3.3 example: at least $500 and 20%). Immediate alerts go to SNS only; email is daily or weekly. One threshold applies to every value, so route per unit with EventBridge or User Notifications filters. A new service needs about 10 days of history, alerts can lag up to 24 hours, and support and most Marketplace charges aren't monitored.</p>
+				<div class="callout tip"><p>Billing data arrives hours late. For the central GenAI account, alarm on Bedrock token metrics in CloudWatch to catch a runaway agent loop quickly; the attribution pattern (application inference profiles, IAM principal data in CUR 2.0) is on the <a href="genai-platform.html">GenAI platform</a> page.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Commitments bought once, shared on purpose</h3>
+				<p><strong>Which commitment for which spend</strong> (<a href="../d3-task-3-1.html">Task 3.1</a>, <a href="../d3-task-3-4.html">Task 3.4</a>):</p>
+				<ul>
+					<li><strong>Compute Savings Plans</strong> (up to 66% off) follow the workload across instance families, Regions, Fargate and Lambda.</li>
+					<li><strong>EC2 Instance Savings Plans</strong> (up to 72%) lock to one family in one Region.</li>
+					<li><strong>Database Savings Plans</strong> (up to 35%, 1-year No Upfront only) cover Aurora, RDS, DynamoDB, ElastiCache and others across engines, for newer generations and serverless usage; they don't stack with RIs on the same usage.</li>
+					<li><strong>Reserved Instances and reserved nodes</strong> remain for RDS and Aurora 3-year terms and older generations, ElastiCache, OpenSearch and Redshift. RDS RIs are size-flexible within a family (not SQL Server or Oracle License Included).</li>
+					<li><strong>Spot</strong> never receives Savings Plans discounts, so Spot-heavy fleets lower the baseline to commit to.</li>
+				</ul>
+				<p><strong>Buy centrally, from data.</strong> Commit to the lowest steady hourly spend, buy small amounts often, and buy in an account with no usage, such as the management account, so the discount flows to wherever usage is. The <code>PAYER</code> account scope gives the organization-level recommendation, which differs from member-account views.</p>
+				<span class="file">Management account: 1-year Compute Savings Plan recommendation for the whole organization (from Task 3.1)</span>
+<pre><code>aws ce get-savings-plans-purchase-recommendation \
+  --savings-plans-type COMPUTE_SP \
+  --term-in-years ONE_YEAR \
+  --payment-option NO_UPFRONT \
+  --lookback-period-in-days THIRTY_DAYS \
+  --account-scope PAYER
+<span class="c"># The recommended commitment is the Savings Plans hourly rate, not On-Demand spend</span></code></pre>
+				<p><strong>Coverage and utilization targets.</strong> Utilization (commitment used) should stay near full, since unused hours are paid anyway. Coverage (eligible spend covered) stays deliberately below 100%, leaving peaks and workloads about to change uncommitted. Model purchases against a coverage target in the Savings Plans Purchase Analyzer, and track both in budgets.</p>
+				<span class="file">Management account: last month's Savings Plans coverage per member account (AWS CLI; granularity can't be combined with group-by)</span>
+<pre><code>aws ce get-savings-plans-coverage \
+  --time-period Start=2026-10-01,End=2026-11-01 \
+  --group-by Type=DIMENSION,Key=LINKED_ACCOUNT</code></pre>
+				<p><strong>Discount sharing preferences.</strong> By default commitments benefit the owner account first and then any account in the organization. The management account can deactivate sharing per account, or since November 2025 use <strong>group sharing</strong> with a cost category built only from the Accounts dimension:</p>
+				<ul>
+					<li><strong>Prioritized</strong>: owner first, then its group, then the rest of the organization.</li>
+					<li><strong>Restricted</strong>: shared only within the group, even if capacity is unused, so utilization can fall.</li>
+				</ul>
+				<p>Group rules: each account belongs to one group, the payer account can't be in a group, both the purchasing and receiving accounts must have sharing active, and the final bill uses the preferences set at 23:59:59 UTC on the last day of the month. Central purchases stay in the management account; Prioritized groups <code>Retail</code> and <code>Payments</code> (category <code>CommitmentGroup</code>) cover commitments a unit buys itself.</p>
+				<div class="callout trap"><p>"An account's bill rose after a security change in the management account" is often discount sharing switched off. Savings Plans can't be cancelled (small, recent ones can be returned within 7 days in the same month), and buying them for oversized instances locks in waste: rightsize first (Step 5).</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Rightsizing, Graviton and Spot</h3>
+				<p><strong>Compute Optimizer for the whole organization.</strong> It is opt-in and free at the standard level; enrolling from the management account (or a delegated administrator) covers the member accounts. It covers EC2, Auto Scaling groups, EBS, Lambda, ECS on Fargate, RDS and Aurora, DynamoDB and ElastiCache, and flags idle resources. Enhanced infrastructure metrics (paid) extend the lookback to 93 days; install the CloudWatch agent so memory is seen. Cost Optimization Hub gathers these with commitment recommendations.</p>
+				<span class="file">Management account 999999999999: opt in this account and all member accounts (AWS CLI)</span>
+<pre><code>aws compute-optimizer update-enrollment-status \
+  --status Active \
+  --include-member-accounts</code></pre>
+				<p><strong>Graviton.</strong> Instances cost up to 20% less than comparable x86 ones, Lambda and Fargate on Arm cost 20% less, and RDS, Aurora, ElastiCache and OpenSearch offer Graviton classes. Check every dependency has an Arm build; Compute Savings Plans follow the move, EC2 Instance Savings Plans don't.</p>
+				<p><strong>Spot for fault-tolerant work.</strong> The <code>web-tier</code> Auto Scaling group from <a href="../d3-task-3-1.html">Task 3.1</a> keeps four On-Demand instances as a base, then runs 25% On-Demand and 75% Spot across several Graviton types with the price-capacity-optimized strategy. Nightly reporting and image processing run on Spot or Fargate Spot (up to 70% off, 2-minute warning, ECS only) behind a regular Fargate base.</p>
+				<span class="file">ECS service in the reporting cluster: two tasks always on Fargate, extra tasks three-to-one on Fargate Spot (from Task 3.1)</span>
+<pre><code>aws ecs create-service \
+  --cluster reporting \
+  --service-name image-workers \
+  --task-definition image-worker:7 \
+  --desired-count 8 \
+  --capacity-provider-strategy \
+    capacityProvider=FARGATE,base=2,weight=1 \
+    capacityProvider=FARGATE_SPOT,weight=3 \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-0a1b2c3d4e5f60001],securityGroups=[sg-0a1b2c3d4e5f60001]}"</code></pre>
+				<p><strong>Serverless sizing.</strong> Lambda suits bursty traffic; sustained high-volume APIs are usually cheaper on containers with Savings Plans or on Lambda Managed Instances (a 15% management fee, no scale to zero). Aurora Serverless v2 suits variable load and can auto-pause to zero for idle dev clusters, but not with RDS Proxy, Global Database, replication or zero-ETL attached, which rules it out for the production orders cluster.</p>
+				<p><strong>Dev off at night.</strong> Dev Auto Scaling groups use their own scheduled actions (the <code>dev-web</code> group scales to zero at 19:00 and back to two at 08:00 on weekdays), because Instance Scheduler on AWS can't stop instances that belong to an Auto Scaling group. Instance Scheduler covers standalone EC2 and RDS instances across dev accounts (AWS claims up to 70% savings for business-hours-only instances).</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Data transfer and storage</h3>
+				<p><strong>Network paths</strong> (<a href="../d3-task-3-2.html">Task 3.2</a>; designs on <a href="../d1-task-1-4.html">Task 1.4</a>). In us-east-1, a NAT gateway adds $0.045 per GB processed, cross-AZ traffic $0.01 per GB each way, inter-Region about $0.02 per GB, and Transit Gateway $0.02 per GB processed. The programme cuts them:</p>
+				<ul>
+					<li><strong>Endpoints</strong>: free gateway endpoints for S3 and DynamoDB in every VPC; interface endpoints for ECR, CloudWatch and STS, cheaper than NAT once traffic is meaningful, and centralized in the shared-network account when that beats per-VPC endpoint hours.</li>
+					<li><strong>AZ-local paths</strong>: one NAT gateway per AZ, chatty tiers routed within an AZ, replicas read in the same AZ, private IPs instead of public or Elastic IPs inside the Region.</li>
+					<li><strong>Who pays</strong>: Transit Gateway metering policies charge processing to the source, the destination or the owner, so the network team in <code>666666666666</code> can show each unit its own share; a direct peering for a heavy VPC pair skips TGW processing.</li>
+					<li><strong>Edge and replication</strong>: CloudFront in front of S3 and ALB (origin fetches from AWS are free) with small cache keys; only the prefixes DR needs replicate to us-west-2, as Standard-IA.</li>
+				</ul>
+				<span class="file">Workload VPC: free S3 gateway endpoint on the private route tables (from Task 3.2)</span>
+<pre><code>aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-0a1b2c3d4e5f60001 \
+  --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --route-table-ids rtb-0a1b2c3d4e5f60001 rtb-0a1b2c3d4e5f60002 rtb-0a1b2c3d4e5f60003</code></pre>
+				<p><strong>Storage and databases</strong> (<a href="../d3-task-3-4.html">Task 3.4</a>):</p>
+				<ul>
+					<li><strong>S3</strong>: Intelligent-Tiering for unknown access, Lifecycle rules for known patterns, noncurrent-version expiry and aborted multipart uploads; objects under 128 KB don't tier.</li>
+					<li><strong>EBS</strong>: gp3 everywhere ($0.08 versus $0.10 per GB-month for gp2, 3,000 IOPS and 125 MiB/s included), migrated in place with Elastic Volumes and no downtime.</li>
+					<li><strong>Aurora</strong>: the orders cluster has a heavy, steady I/O load, so I/O-Optimized (no I/O charges, about 30% more per instance-hour and 2.25 times the storage price) beats Standard; low-I/O clusters stay on Standard.</li>
+					<li><strong>DynamoDB</strong>: provisioned with auto scaling and reserved capacity for steady tables; the Standard-IA table class for the storage-heavy <code>order-history</code> table.</li>
+				</ul>
+				<span class="file">A gp2 volume found by Compute Optimizer: move it to gp3 in place, with the included baseline (from Task 3.4)</span>
+<pre><code>aws ec2 modify-volume \
+  --volume-id vol-0a1b2c3d4e5f60001 \
+  --volume-type gp3 \
+  --iops 3000 \
+  --throughput 125</code></pre>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Chargeback per business unit</h3>
+				<p><strong>Showback first, then chargeback.</strong> Units first see their numbers without being billed, which surfaces untagged spend before money moves. Then:</p>
+				<ul>
+					<li><strong>Amortized cost</strong> for commitments: upfront Savings Plans and RI fees are spread over the term, and the discount lands on the account whose usage it covered.</li>
+					<li><strong>Shared costs</strong>: the shared-network account, support and the platform team. The split charge rule shows the split on the cost category page; a chargeback built on CUR must apply the same proportions itself, or use Billing Conductor.</li>
+					<li><strong>Containers</strong>: split cost allocation data gives per-namespace cost on the shared EKS cluster; pods without resource requests get no split cost under the requests method, so the platform team enforces requests.</li>
+					<li><strong>GenAI</strong>: the central GenAI account passes cost back through application inference profiles with cost allocation tags and IAM principal data (<a href="genai-platform.html">GenAI platform</a>).</li>
+				</ul>
+				<span class="file">Athena over the org-cur2-daily export: last month's unblended cost per business unit and account (SQL; the table name comes from your Glue crawler or table definition)</span>
+<pre><code>SELECT
+  tags['costCategory/BusinessUnit'] AS business_unit,
+  line_item_usage_account_id,
+  SUM(line_item_unblended_cost) AS unblended_cost
+FROM cur2_org
+WHERE line_item_usage_start_date &gt;= DATE '2026-10-01'
+  AND line_item_usage_start_date &lt; DATE '2026-11-01'
+GROUP BY 1, 2
+ORDER BY unblended_cost DESC;</code></pre>
+				<p>Unblended cost shows what was charged where; for chargeback the query adds the effective-cost columns from the Savings Plans and Reservation column groups to get amortized cost, and nets out credits for what was actually paid. <code>cur2_org</code> is a new name for the Athena table.</p>
+				<div class="callout trap"><p>Billing Conductor produces pro forma bills per billing group with your own pricing rules, credits and fees; it doesn't change the AWS invoice or discount sharing.</p></div>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Commitments bought in the management account, not by each unit</h4>
+				<p>Central purchases pool the organization's baseline, so one unit's dip is another's coverage and utilization stays high. The cost: units don't feel the commitment, so chargeback must pass the amortized discount to them.</p>
+			</div>
+			<div class="entry">
+				<h4>Compute Savings Plans as the default, EC2 Instance Savings Plans only for the fixed core</h4>
+				<p>The company is still migrating, moving to Graviton and running DR in us-west-2, so flexibility is worth the smaller discount. EC2 Instance Savings Plans go only on a baseline that has stayed in one family and Region for months.</p>
+			</div>
+			<div class="entry">
+				<h4>Rightsize before committing, and coverage below 100%</h4>
+				<p>A commitment fixed before rightsizing pays for waste for one or three years. Committing only to the lowest steady hourly spend leaves peaks on On-Demand, interruptible work on Spot, and room for workloads still to be retired.</p>
+			</div>
+			<div class="entry">
+				<h4>Prevent with SCPs and tag policies, detect with Config, react with budgets</h4>
+				<p>Prevention keeps unallocated spend out, but only for actions with tag-on-create; detection finds the rest; budget actions limit damage in dev. Document the rules: member accounts can't read their effective SCPs.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Billing Conductor pro forma billing</h4>
+				<p>Billing groups with markups, discounts and credits give each unit a bill at internal rates, including a proportional share of commitments (the September 2026 blog pattern). Simpler showback uses billing views and CUR.</p>
+			</div>
+			<div class="entry">
+				<h4>Restricted group sharing per business unit</h4>
+				<p>Each unit's commitments serve only that unit, which makes ownership clear but can strand unused commitment. Use it when units are separate legal or budget entities; otherwise Prioritized keeps the organization's discount rate.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove the guardrails</span><span class="desc">In <code>121212121212</code>, launch an instance without <code>CostCenter</code> (denied by the SCP) and with <code>CostCenter=bu-retail</code> (rejected by the enforced tag policy); a stack without tags must fail its Guard hook.</span></li>
+				<li><span class="name">Reconcile the export</span><span class="desc">The monthly CUR 2.0 total must match the invoice, and the <code>Unallocated</code> cost category value must stay under the agreed share; every new item there becomes a tagging fix.</span></li>
+				<li><span class="name">Fire the budget action</span><span class="desc">On a staging budget with a tiny limit, confirm the manual approval request arrives, the SCP attaches to the target OU, new launches fail, and reversing the action detaches it.</span></li>
+				<li><span class="name">Trigger an anomaly</span><span class="desc">Run an unusual but harmless workload in a sandbox account; the managed monitor must alert, and the EventBridge rule must route it to that unit's topic.</span></li>
+				<li><span class="name">Review commitments monthly</span><span class="desc">Check Savings Plans utilization and coverage per account against the targets, and the group sharing preference before month end, since the final bill uses the last setting.</span></li>
+				<li><span class="name">Measure each optimization</span><span class="desc">Before and after: NAT bytes and <code>DataTransfer-Regional-Bytes</code> after adding endpoints, Spot interruptions and job completion, Aurora cost over a full month on each configuration.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Design Multi-Account Governance and Compliance Solutions</td><td data-label="What this architecture demonstrates">Tag policies and SCPs from the management account, budget actions that attach SCPs to an OU, Config required-tags in conformance packs, organization-wide Compute Optimizer enrollment</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Design Architectures Based on AWS Pricing Models</td><td data-label="What this architecture demonstrates">Compute versus EC2 Instance versus Database Savings Plans, RIs for RDS, ElastiCache, OpenSearch and Redshift, central purchase and group sharing, Spot and Fargate Spot, Graviton, rightsizing before committing, dev schedules</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Optimize Data Transfer and Network Costs</td><td data-label="What this architecture demonstrates">Gateway and interface endpoints instead of NAT, AZ-local paths, Transit Gateway metering policies, CloudFront and filtered replication</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Design Cost Allocation and Visibility Solutions</td><td data-label="What this architecture demonstrates">Accounts and account tags, activated cost allocation tags, cost categories with split charges, CUR 2.0 with split cost allocation data, billing views, Budgets and Cost Anomaly Detection, amortized chargeback</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-4.html">3.4</a> Optimize Storage and Database Costs</td><td data-label="What this architecture demonstrates">Intelligent-Tiering and Lifecycle, gp3 migration, Aurora I/O-Optimized versus Standard, Serverless v2 auto-pause limits, DynamoDB capacity and table classes, log retention</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"A company with many accounts wants the largest discount on steady compute that keeps changing instance families and Regions, with the least management" is a <strong>Compute Savings Plan bought in the management account</strong> with discount sharing on. "Each business unit must benefit first from the commitments it paid for, without wasting unused capacity" is <strong>Prioritized RI and Savings Plans group sharing</strong>. "Per-resource cost data, including per-pod cost on a shared EKS cluster, for Athena" is <strong>CUR 2.0 in Data Exports with split cost allocation data</strong>, not Cost Explorer. "Prevent further spend in development accounts when the budget is exceeded" is a <strong>budget action that applies an SCP</strong> to the OU. "Aurora bill dominated by I/O on a steady workload" is <strong>Aurora I/O-Optimized</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/aws-cloud-financial-management/understanding-aws-savings-plans-recommendations-management-vs-member-account-views/">Understanding AWS Savings Plans Recommendations: Management vs. Member Account Views</a> (October 2026): why organization-level and member-account recommendations differ, and which to buy from.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws-cloud-financial-management/control-your-aws-commitments-with-risp-group-sharing/">Control Your AWS Commitments with Reserved Instances and Savings Plans Group Sharing</a> (November 2025): restricting or prioritizing discount sharing for groups of accounts.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws-cloud-financial-management/implementing-proportional-reserved-instance-and-savings-plans-chargeback-with-aws-billing-conductor/">Implementing Proportional Reserved Instance and Savings Plans Chargeback with AWS Billing Conductor</a> (September 2026): passing commitment discounts fairly to business units.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws-cloud-financial-management/automating-filtered-cost-and-usage-report-exports-with-aws-data-exports/">Automating filtered Cost and Usage Report exports with AWS Data Exports</a> (August 2026): per-business-unit CUR 2.0 exports for showback.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws-cloud-financial-management/how-to-scale-cost-optimization-across-1000s-of-accounts-with-a-finops-eba/">How To Scale Cost Optimization Across 1,000s of Accounts with a FinOps EBA</a> (September 2026): running cost optimization as a programme across many accounts.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/introducing-database-savings-plans-for-aws-databases/">Introducing Database Savings Plans for AWS Databases</a> (December 2025): the spend commitment across database services.</li>
+				<li><a href="https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/ri-turn-off.html">Reserved Instances and Savings Plans discount sharing</a> and <a href="https://docs.aws.amazon.com/cur/latest/userguide/table-dictionary-cur2.html">Cost and Usage Report (CUR) 2.0</a> (AWS documentation): sharing modes and group rules, CUR 2.0 table configurations. The <a href="https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html">Cost Optimization Pillar</a> (AWS Well-Architected, predates Database Savings Plans and group sharing) frames the programme.</li>
+				<li><a href="https://github.com/aws-solutions-library-samples/cloud-intelligence-dashboards-data-collection">Cloud Intelligence Dashboards data collection</a> (AWS sample code): CloudFormation that aggregates CUR 2.0 and optimization data from the organization into dashboards.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026.</div>
+</footer>
+
+</body>
+</html>

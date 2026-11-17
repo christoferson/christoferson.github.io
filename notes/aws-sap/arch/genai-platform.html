@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Multi-account generative AI platform | AWS SAP-C03 Notes</title>
+	<meta name="description" content="End-to-end SAP-C03 architecture: a central generative AI account and an agent platform account serving every business unit. Cross-account roles or a gateway because Bedrock has no invocation resource policy, pooled quotas, tagged application inference profiles, geographic versus global cross-Region inference with a data-residency SCP, managed knowledge bases shared with a resource policy, agents on AgentCore Runtime, Gateway, Identity and Policy with Cedar, guardrails enforced by IAM and an Organizations Bedrock policy, Step Functions approvals with a task token, invocation logging, GuardDuty and cost and quota controls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../sap.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAP-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">GenAI platform</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Multi-account generative AI platform</h1>
+		<p>Every business unit wants generative AI, and nobody wants a dozen unmanaged copies of it. One platform team runs approved models, shared knowledge, agents, guardrails and the audit trail in two central accounts, and each unit gets access, a cost line and a quota share instead of its own stack.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 5</span><span class="tag">Bedrock</span><span class="tag">Knowledge Bases</span><span class="tag">AgentCore</span><span class="tag">Guardrails</span><span class="tag">Step Functions</span><span class="tag">Organizations</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. The access path into the hub</a></li>
+				<li class="sub"><a href="#b2">2. Keep EU processing in the EU</a></li>
+				<li class="sub"><a href="#b3">3. Shared knowledge for RAG</a></li>
+				<li class="sub"><a href="#b4">4. Agents on AgentCore</a></li>
+				<li class="sub"><a href="#b5">5. Guardrails nobody can skip</a></li>
+				<li class="sub"><a href="#b6">6. Human approval for risky actions</a></li>
+				<li class="sub"><a href="#b7">7. Evidence, quotas and cost</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The support assistant worked, and now every business unit wants generative AI: marketing for drafts, finance for report summaries, the EU business unit for its own customers. Left alone, each would build its own stack, and nobody could tell the auditors what the model was asked, by whom, and what it said. <a href="../d1-task-1-2.html">Task 1.2</a> already set up two central accounts: the <strong>central GenAI account</strong> <code>222222222222</code> (approved models, guardrails, knowledge bases, invocation logs) and the <strong>agent platform account</strong> <code>333333333333</code> (AgentCore runtimes and gateways). This page turns them into a platform for the whole organization <code>o-a1b2c3d4e5</code>.</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>Controlled access</strong>: units call only approved models, only through the platform, with no long-lived keys.</li>
+				<li><strong>Chargeback</strong>: each unit's spend is visible and billed back to it, and one unit can't use up everyone's quota.</li>
+				<li><strong>Safety by default</strong>: every model call passes a guardrail the calling team can't remove, and risky agent actions need a person.</li>
+				<li><strong>Residency</strong>: EU customer prompts are processed only in the EU (<a href="../d2-task-2-4.html">Task 2.4</a>).</li>
+				<li><strong>Evidence</strong>: every prompt and response is kept as tamper-evident evidence for a year (<a href="../d2-task-2-3.html">Task 2.3</a>).</li>
+			</ul>
+			<p>Reused from the SAP task pages: role <code>GenAIInvoker-Support</code> and application inference profile <code>a1b2c3d4e5f6</code> in <code>222222222222</code> (<a href="../d1-task-1-2.html">Task 1.2</a>); guardrail <code>support-gr</code> version 3, gateway <code>support-gw-a1b2c3d4e5</code>, topic <code>refund-approvals</code> and the $500 refund rule (<a href="../d2-task-2-5.html">Task 2.5</a>); the <code>/genai/bedrock-invocations</code> log group and the <code>PlatformSecurityAdmin</code> role (<a href="../d2-task-2-3.html">Task 2.3</a>); the EU business unit account <code>555555555555</code> (<a href="../d2-task-2-4.html">Task 2.4</a>); the refund tool <code>open-refund-request</code> in the production account <code>111111111111</code>. New on this page:</p>
+			<ul>
+				<li><strong>Inference profile</strong>: <code>support-assistant-prod</code>, the name of profile <code>a1b2c3d4e5f6</code>, copied from a <code>us.</code> system profile and tagged <code>BusinessUnit</code> and <code>CostCenter</code>.</li>
+				<li><strong>Knowledge</strong>: managed knowledge base <code>support-articles</code> in <code>222222222222</code> (written <code>KB_ID</code> in code), fed from bucket <code>example-support-articles-222222222222</code>.</li>
+				<li><strong>Agents</strong>: runtime execution role <code>support-agent-runtime</code> in <code>333333333333</code>, the gateway tool <code>request_refund</code> and state machine <code>refund-approval</code>.</li>
+				<li><strong>EU</strong>: the EU unit runs Bedrock in its own account in eu-central-1 with <code>eu.</code> profiles (Step 2 explains why).</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> <strong>Bedrock Agents</strong> is now <strong>Agents Classic</strong>, closed to new customers since 30 July 2026: new agents run on <strong>AgentCore</strong>. <strong>AWS Agent Registry</strong> became generally available on 31 August 2026 in its own <code>agent-registry</code> namespace; the preview namespace was shut down on 30 October 2026. Organization-enforced guardrails arrived in April 2026, AgentCore Policy in March 2026, global cross-Region inference profiles in October 2025, and the GuardDuty AI Protection plan in July 2026. The <code>bedrock-mantle</code> endpoint (OpenAI-compatible APIs) isn't captured by invocation logging and has no guardrails, so this platform uses <code>bedrock-runtime</code>.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgG-wide-t">
+<title id="dgG-wide-t">Multi-account generative AI platform: customers reach the support agent on AgentCore Runtime in the agent platform account; the agent retrieves articles from the support-articles knowledge base and calls Bedrock Converse with an application inference profile and guardrail in the central GenAI account, where invocation logging records every call; tool calls go through AgentCore Gateway, whose Cedar policies allow small refunds against the order system and send large ones to the refund-approval workflow for a support manager.</title>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M290.0 152.0 L290.0 83.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M290.0 198.0 L290.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M500.0 198.0 L500.0 267.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M620.0 290.0 L580.0 290.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Customers</text>
+<text x="90" y="189" class="dg-s dg-sm2">Cognito sign-in</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">AgentCore Runtime</text>
+<text x="290" y="189" class="dg-s dg-sm2">333333333333</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">Bedrock Converse</text>
+<text x="290" y="74" class="dg-s dg-sm2">profile + guardrail</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Invocation logs</text>
+<text x="500" y="74" class="dg-s dg-sm2">prompts, tokens</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">support-articles</text>
+<text x="290" y="304" class="dg-s dg-sm2">KB in 222222222222</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="172" class="dg-t dg-sm">AgentCore Gateway</text>
+<text x="500" y="189" class="dg-s dg-sm2">Cedar policy</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">Order system</text>
+<text x="700" y="189" class="dg-s dg-sm2">111111111111</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">refund-approval</text>
+<text x="500" y="304" class="dg-s dg-sm2">Step Functions</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Support manager</text>
+<text x="700" y="304" class="dg-s dg-sm2">task token</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgG-tall-t">
+<title id="dgG-tall-t">Multi-account generative AI platform: customers reach the support agent on AgentCore Runtime in the agent platform account; the agent retrieves articles from the support-articles knowledge base and calls Bedrock Converse with an application inference profile and guardrail in the central GenAI account, where invocation logging records every call; tool calls go through AgentCore Gateway, whose Cedar policies allow small refunds against the order system and send large ones to the refund-approval workflow for a support manager.</title>
+<path d="M100.0 63.0 L100.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M180.0 138.0 L193.0 138.0 Q200.0 138.0 200.0 131.0 L200.0 47.0 Q200.0 40.0 207.0 40.0 L220.0 40.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M180.0 152.0 L220.0 152.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 342.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M180.0 255.0 L193.0 255.0 Q200.0 255.0 200.0 262.0 L200.0 358.0 Q200.0 365.0 207.0 365.0 L220.0 365.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<path d="M300.0 452.0 L300.0 388.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Customers</text>
+<text x="100" y="54" class="dg-s dg-sm2">Cognito sign-in</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="142" class="dg-t dg-sm">AgentCore Runtime</text>
+<text x="100" y="159" class="dg-s dg-sm2">333333333333</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Bedrock Converse</text>
+<text x="300" y="159" class="dg-s dg-sm2">profile + guardrail</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Invocation logs</text>
+<text x="300" y="269" class="dg-s dg-sm2">prompts, tokens</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">support-articles</text>
+<text x="300" y="54" class="dg-s dg-sm2">KB in 222222222222</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="252" class="dg-t dg-sm">AgentCore Gateway</text>
+<text x="100" y="269" class="dg-s dg-sm2">Cedar policy</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">Order system</text>
+<text x="100" y="379" class="dg-s dg-sm2">111111111111</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">refund-approval</text>
+<text x="300" y="379" class="dg-s dg-sm2">Step Functions</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">Support manager</text>
+<text x="300" y="489" class="dg-s dg-sm2">task token</text>
+</svg>
+				<figcaption>Figure: one shared platform, three accounts. The agent runs in the agent platform account <code>333333333333</code> (green); model calls and retrieval go to the central GenAI account <code>222222222222</code> through an application inference profile, the knowledge base resource policy and guardrails nobody can skip, and invocation logging keeps the evidence (blue and yellow). AgentCore Gateway checks every tool call against Cedar policies: small refunds reach the order system in <code>111111111111</code>, large ones only start <code>refund-approval</code>, which waits for a support manager's task token (dashed).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>A customer asks the support assistant about a refund. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">The request reaches the agent</li>
+				<li><span class="name">Sign in and ask<span class="who">Customer</span></span><span class="desc">The web app sends the question with the customer's Cognito token to the AgentCore Runtime endpoint in <code>333333333333</code>; the runtime's JWT authorizer checks issuer, audience and scopes.</span></li>
+				<li class="auto"><span class="name">Start a session<span class="who auto">AWS</span></span><span class="desc">The runtime starts an isolated session and issues a workload access token bound to both the agent and this customer.</span></li>
+				<li class="group">Retrieve and reason</li>
+				<li><span class="name">Retrieve help articles<span class="who">Agent</span></span><span class="desc">The agent calls <code>Retrieve</code> on <code>support-articles</code> in <code>222222222222</code> with the full knowledge base ARN, allowed by the knowledge base's resource policy.</span></li>
+				<li><span class="name">Call the model<span class="who">Agent</span></span><span class="desc">The agent assumes its invoker role in <code>222222222222</code> and calls Converse with the application inference profile and guardrail <code>support-gr</code> version 3.</span></li>
+				<li class="auto"><span class="name">Check, route and log<span class="who auto">AWS</span></span><span class="desc">The request guardrail and the organization guardrail both run (the strictest result wins); the <code>us.</code> profile picks a US Region with capacity; invocation logging writes prompt, response, token counts and caller identity to <code>/genai/bedrock-invocations</code>.</span></li>
+				<li class="group">Act on the order system</li>
+				<li><span class="name">Call a tool<span class="who">Agent</span></span><span class="desc">The agent asks the gateway to run <code>issue_refund</code> for $120. AgentCore Policy evaluates the Cedar policies against the user's claims and the amount, permits it, and the gateway invokes <code>open-refund-request</code> in <code>111111111111</code>.</span></li>
+				<li class="auto"><span class="name">Escalate a large refund<span class="who auto">AWS</span></span><span class="desc">For $900 the policy denies <code>issue_refund</code>; the agent can only call <code>request_refund</code>, which starts <code>refund-approval</code>. Step Functions publishes a task token to <code>refund-approvals</code> and waits up to 24 hours.</span></li>
+				<li><span class="name">Approve or reject<span class="who">Support manager</span></span><span class="desc">The approval app calls <code>SendTaskSuccess</code>, and the workflow, not the agent, issues the refund. No answer in 24 hours means rejected.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>The access path into the hub</h3>
+				<p><strong>No resource policy for invocation.</strong> Bedrock has no resource-based policy for invoking models, so a business unit can't call a model in another account directly. Two ways in (<a href="../d1-task-1-2.html">Task 1.2</a>):</p>
+				<ul>
+					<li><strong>Assume a role in the hub.</strong> Each consuming unit gets its own invoker role in <code>222222222222</code> (<code>GenAIInvoker-Support</code>, <code>GenAIInvoker-Marketing</code> and so on), trusted only by that unit's workload role. One role per unit matters later: IAM principal cost attribution then shows each unit by name.</li>
+					<li><strong>Call a gateway.</strong> An AgentCore Gateway with inference targets, or a LiteLLM-based gateway such as AWS's multi-provider generative AI gateway guidance, exposes one endpoint. Callers need permission on the gateway, not on Bedrock; the gateway's role holds the Bedrock permissions and can enforce rate limits per caller.</li>
+				</ul>
+				<p><strong>A profile per unit and use case.</strong> In the hub, the platform team creates an <strong>application inference profile</strong> for each consumer, copied from a system cross-Region profile, and tags it. Callers use its ARN as <code>modelId</code>; metrics and cost carry its tags.</p>
+				<span class="file">Central GenAI account 222222222222: a tagged profile for the support assistant, routing across US Regions (AWS CLI)</span>
+<pre><code>aws bedrock create-inference-profile \
+  --region us-east-1 \
+  --inference-profile-name support-assistant-prod \
+  --description "Support assistant production traffic" \
+  --model-source copyFrom=arn:aws:bedrock:us-east-1:222222222222:inference-profile/us.anthropic.claude-sonnet-5-5 \
+  --tags key=BusinessUnit,value=support key=CostCenter,value=CC-1001</code></pre>
+				<span class="file">A business unit's workload calls the approved model through the hub (Python, boto3)</span>
+<pre><code>import boto3
+
+<span class="c"># Role in the central GenAI account, trusted only by this unit's workload role</span>
+creds = boto3.client("sts").assume_role(
+    RoleArn="arn:aws:iam::222222222222:role/GenAIInvoker-Support",
+    RoleSessionName="support-assistant",
+)["Credentials"]
+
+runtime = boto3.client(
+    "bedrock-runtime", region_name="us-east-1",
+    aws_access_key_id=creds["AccessKeyId"],
+    aws_secret_access_key=creds["SecretAccessKey"],
+    aws_session_token=creds["SessionToken"],
+)
+
+<span class="c"># The application inference profile attributes cost and metrics to this unit</span>
+resp = runtime.converse(
+    modelId="arn:aws:bedrock:us-east-1:222222222222:application-inference-profile/a1b2c3d4e5f6",
+    messages=[{"role": "user", "content": [{"text": "Where is order o-1001?"}]}],
+    guardrailConfig={"guardrailIdentifier": "support-gr", "guardrailVersion": "3"},
+)</code></pre>
+				<p>Application inference profiles exist only in the API (not the console), work with Converse and InvokeModel but not the Responses or Chat Completions APIs, and their tags reach billing only after the payer account activates them (up to 24 hours, not retroactive). Interface VPC endpoints for <code>bedrock-runtime</code> keep calls private (<a href="../d1-task-1-4.html">Task 1.4</a>; <a href="../../aws-services/bedrock/inference.html">Bedrock inference notes</a>).</p>
+				<div class="callout trap"><p>"Grant the other accounts access with a resource policy on the model" is wrong; there isn't one. A hub also pools every unit's tokens-per-minute demand on the hub's per-account, per-Region quotas, so one noisy unit can throttle all the others unless a gateway rate-limits by caller.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Keep EU processing in the EU</h3>
+				<p><strong>Cross-Region inference is the default, not an exception.</strong> The <code>us.</code> profile above sends requests to any US Region in its list for capacity. <strong>Geographic</strong> profiles (<code>eu.</code>, <code>us.</code>, <code>apac.</code>) keep processing inside the geography; <strong>global</strong> profiles (<code>global.</code>) can route to any commercial Region, including Regions the account hasn't enabled. Global is about 10% cheaper and has its own quota, but it isn't residency-safe (<a href="../d2-task-2-4.html">Task 2.4</a>).</p>
+				<p><strong>Where the SCP must sit.</strong> An SCP restricts principals in the accounts it's attached to. If the EU unit assumed a role in the hub, a hub principal would make the call and the EU OU's SCP wouldn't apply. So the EU unit runs Bedrock in its own account <code>555555555555</code> (the spoke pattern), in eu-central-1 with <code>eu.</code> profiles, under the EU OU's SCP, with the organization guardrail (Step 5), its own invocation logging (Step 7), tagged profiles and its own quota.</p>
+				<span class="file">SCP for the EU OU: no global cross-Region inference (geographic eu. profiles still work)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyGlobalCrossRegionInference",
+      "Effect": "Deny",
+      "Action": "bedrock:*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "unspecified" },
+        "ArnLike": {
+          "bedrock:InferenceProfileArn": "arn:aws:bedrock:*:*:inference-profile/global.*"
+        }
+      }
+    }
+  ]
+}</code></pre>
+				<p>How it reads: global profiles appear to IAM with the Region "unspecified", so a deny listing Regions by name never catches them. Conversely, an <code>eu.</code> profile needs <strong>every</strong> destination Region allowed by the OU's Region deny (or an exemption by <code>bedrock:InferenceProfileArn</code>), or requests fail. Check destinations with <code>get-inference-profile</code> from each source Region rather than trusting the prefix.</p>
+				<div class="callout trap"><p>Data at rest stays in the source Region, but prompts and outputs may be stored in the destination Region for abuse detection, so the geography, not the Region, is the residency boundary. Guardrails on the Standard tier also need a cross-Region guardrail profile, so prompts can be checked elsewhere in the geography.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Shared knowledge for RAG</h3>
+				<p><strong>Managed by default.</strong> The help articles live in <code>example-support-articles-222222222222</code>, and a <strong>managed knowledge base</strong> <code>support-articles</code> in the hub handles parsing, embedding, storage, hybrid search and reranking, with scheduled syncs. A <strong>customer-managed</strong> knowledge base is the choice when a unit needs its own vector store or chunking: S3 Vectors for large, rarely queried indexes at low cost; OpenSearch for low-millisecond, high-QPS hybrid search; Aurora pgvector when the data is already in PostgreSQL; Neptune Analytics for relationships across documents (<a href="../d1-task-1-2.html">Task 1.2</a>; the <a href="../../aws-services/bedrock/knowledge-bases-managed.html">managed</a> and <a href="../../aws-services/bedrock/knowledge-bases-custom.html">customer-managed</a> knowledge base notes).</p>
+				<p><strong>Cross-account retrieval.</strong> A managed knowledge base accepts a resource policy that allows other accounts <code>bedrock:Retrieve</code> and <code>bedrock:GetDocumentContent</code>, nothing else, with no wildcards in Resource or Action. The agent's role also needs an identity policy for the same actions and passes the full ARN as <code>knowledgeBaseId</code>.</p>
+				<span class="file">kb-policy.json: the agent platform's runtime role may retrieve from the support articles</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAgentPlatformRetrieve",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::333333333333:role/support-agent-runtime" },
+      "Action": ["bedrock:Retrieve", "bedrock:GetDocumentContent"],
+      "Resource": "arn:aws:bedrock:us-east-1:222222222222:knowledge-base/KB_ID"
+    }
+  ]
+}</code></pre>
+				<span class="file">Attach it in the central GenAI account 222222222222 (AWS CLI)</span>
+<pre><code>aws bedrock-agent put-resource-policy \
+  --region us-east-1 \
+  --resource-arn arn:aws:bedrock:us-east-1:222222222222:knowledge-base/KB_ID \
+  --policy file://kb-policy.json</code></pre>
+				<p>Pass <code>--expected-revision-id</code> when several people or pipelines edit the policy. <code>RetrieveAndGenerate</code>, or a customer-managed knowledge base, needs a narrowly scoped role in the hub instead.</p>
+				<div class="callout trap"><p>The embedding model and vector store can't be changed after creation: a new embedding model means a new knowledge base, rebuilt blue/green. For several units sharing one corpus, use one knowledge base with a mandatory server-side metadata filter or document-level ACLs, not a knowledge base per unit (each allows only five data sources).</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Agents on AgentCore</h3>
+				<p><strong>The building blocks</strong>, all in <code>333333333333</code> (<a href="../d1-task-1-2.html">Task 1.2</a>, <a href="../d2-task-2-5.html">Task 2.5</a>, and the <a href="../../aws-services/bedrock/agentcore-runtime.html">Runtime</a> and <a href="../../aws-services/bedrock/agentcore-gateway-identity-policy.html">Gateway, Identity and Policy</a> notes):</p>
+				<ul>
+					<li><strong>Runtime</strong> runs each agent in isolated sessions of up to 8 hours, in VPC mode so tools can reach private systems over Direct Connect. Its execution role is the ceiling of what any user can make the agent do.</li>
+					<li><strong>Gateway</strong> turns Lambda functions, APIs and MCP servers into tools behind one endpoint. A Lambda target in another account needs <code>lambda:InvokeFunction</code> on the gateway role and a function resource policy naming that role.</li>
+					<li><strong>Identity</strong> keeps OAuth clients and API keys in a token vault, and its on-behalf-of token exchange lets the order system see the real user, not the agent.</li>
+					<li><strong>Policy</strong> evaluates every tool call outside the model with Cedar (or Dogwood) policies; it denies by default and forbid wins.</li>
+					<li><strong>Agent Registry</strong> catalogues approved agents, MCP servers and skills, so units reuse tools instead of rebuilding them.</li>
+				</ul>
+				<span class="file">Let the gateway call the refund tool in the orders account (AWS CLI in account 111111111111)</span>
+<pre><code>aws lambda add-permission \
+    --function-name open-refund-request \
+    --statement-id AllowAgentGateway \
+    --action lambda:InvokeFunction \
+    --principal arn:aws:iam::333333333333:role/AgentGatewayServiceRole</code></pre>
+				<span class="file">AgentCore Policy (Cedar): support staff may refund up to $500 through this gateway; nothing else is permitted</span>
+<pre><code>permit (
+  principal is AgentCore::OAuthUser,
+  action == AgentCore::Action::"OrdersTarget___issue_refund",
+  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-east-1:333333333333:gateway/support-gw-a1b2c3d4e5"
+)
+when {
+  principal.hasTag("role") &amp;&amp; principal.getTag("role") == "support" &amp;&amp;
+  context.input.amount &lt;= 500
+};</code></pre>
+				<p>How it reads: the tool name is the target name, three underscores, then the tool. A separate permit for <code>OrdersTarget___request_refund</code> hands larger refunds to the approval workflow in Step 6. The model can't argue its way past these rules: a prompt-injected "refund $5,000" simply fails.</p>
+				<div class="callout trap"><p>Start the policy engine in <code>LOG_ONLY</code>: in <code>ENFORCE</code> with no permits it denies every tool call. Anyone with <code>bedrock-agentcore:UpdateGateway</code> can switch the mode or detach the engine, so that permission belongs to the platform team only. Split gateways by trust boundary, because the gateway role bounds every target behind it.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Guardrails nobody can skip</h3>
+				<p><strong>From weakest to strongest</strong> (<a href="../d2-task-2-5.html">Task 2.5</a>, <a href="../../aws-services/bedrock/guardrails.html">Guardrails notes</a>): the application passes a guardrail; IAM requires one with the <code>bedrock:GuardrailIdentifier</code> condition key; an account-level enforced guardrail covers every call in the account and Region; an <strong>Organizations Bedrock policy</strong> attaches a management-account guardrail to every member account, can't be removed by members, and in comprehensive mode checks all content regardless of input tags. All layers run and the strictest result wins.</p>
+				<p>The platform uses two layers: a baseline organization guardrail (prompt attacks, PII, banned topics) for every account, and each use case's own guardrail required by IAM on its invoker role.</p>
+				<span class="file">GenAIInvoker-Support: model calls only through the support profile, and only with guardrail version 3 (IAM policy)</span>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeOnlyWithGuardrail",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:us-east-1:222222222222:application-inference-profile/a1b2c3d4e5f6",
+        "arn:aws:bedrock:*::foundation-model/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "bedrock:GuardrailIdentifier": "arn:aws:bedrock:us-east-1:222222222222:guardrail/support-gr:3"
+        }
+      }
+    },
+    {
+      "Sid": "ApplyThatGuardrail",
+      "Effect": "Allow",
+      "Action": "bedrock:ApplyGuardrail",
+      "Resource": "arn:aws:bedrock:us-east-1:222222222222:guardrail/support-gr"
+    }
+  ]
+}</code></pre>
+				<p>Converse is authorized as <code>bedrock:InvokeModel</code>. The foundation-model ARN uses a Region wildcard because a cross-Region profile runs the model in its destination Regions.</p>
+				<span class="file">Management account: create the organization guardrail policy (AWS CLI; the policy JSON is the one on Task 2.5)</span>
+<pre><code>aws organizations create-policy \
+  --type BEDROCK_POLICY \
+  --name org-guardrail-baseline \
+  --description "Baseline guardrail for every model call in member accounts" \
+  --content file://org-guardrail-policy.json</code></pre>
+				<p>First enable the policy type (<code>EnablePolicyType</code>) and give the management account's guardrail in each Region a resource policy granting <code>bedrock:ApplyGuardrail</code> to the organization (<code>aws:PrincipalOrgID</code>); then attach the policy and check it from a member with <code>DescribeEffectivePolicy</code>. Guardrail charges go to the calling account.</p>
+				<div class="callout trap"><p>Every caller needs <code>bedrock:ApplyGuardrail</code> on an enforced guardrail, or all its model calls fail. The IAM condition breaks roles used for <code>RetrieveAndGenerate</code> or agent internals, which call models without a guardrail, so give those their own roles. Guardrails don't check tool results or retrieved chunks: the agent calls <code>ApplyGuardrail</code> or <code>InvokeGuardrailChecks</code> on untrusted tool output to catch indirect prompt injection.</p></div>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Human approval for risky actions</h3>
+				<p><strong>Tier by rule, not by model.</strong> The Agentic AI Lens asks for approval levels set by deterministic rules (AGENTSEC04-BP02): read-only tools run alone, small writes run within limits, and payments, deletions and external messages need a person. Approvals can take hours or days, longer than an agent session, so they live in a <strong>Step Functions Standard</strong> workflow with the <code>.waitForTaskToken</code> callback (<a href="../d2-task-2-5.html">Task 2.5</a>).</p>
+				<span class="file">refund-approval (excerpt): refunds over $500 wait up to 24 hours for a human, then are rejected by default (Amazon States Language)</span>
+<pre><code>{
+  "StartAt": "NeedsApproval",
+  "States": {
+    "NeedsApproval": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.amount", "NumericGreaterThan": 500, "Next": "RequestApproval" }
+      ],
+      "Default": "IssueRefund"
+    },
+    "RequestApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:333333333333:refund-approvals",
+        "Message": {
+          "TaskToken.$": "$$.Task.Token",
+          "OrderId.$": "$.orderId",
+          "Amount.$": "$.amount"
+        }
+      },
+      "TimeoutSeconds": 86400,
+      "Catch": [
+        { "ErrorEquals": ["States.Timeout", "States.TaskFailed"], "Next": "RejectRefund" }
+      ],
+      "Next": "IssueRefund"
+    },
+    "IssueRefund": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "issue-refund", "Payload.$": "$" },
+      "End": true
+    },
+    "RejectRefund": { "Type": "Fail", "Error": "RefundNotApproved" }
+  }
+}</code></pre>
+				<p>How it reads: the workflow pauses at no compute cost until the approval app calls <code>SendTaskSuccess</code> or <code>SendTaskFailure</code> with the token; on timeout the answer is no. Store the decision context in S3 before asking, and log who approved. Express workflows don't support task tokens.</p>
+				<div class="callout tip"><p>"The agent must not issue large refunds without a manager" is a deterministic threshold in AgentCore Policy plus a Step Functions approval, not an instruction in the system prompt. "Approvals may take several days" rules out waiting inside an agent session.</p></div>
+			</div>
+
+			<div class="item" id="b7">
+				<span class="kicker">Step 7</span>
+				<h3>Evidence, quotas and cost</h3>
+				<p><strong>Two kinds of record</strong> (<a href="../d2-task-2-3.html">Task 2.3</a>). The organization trail already has <code>InvokeModel</code> and <code>Converse</code> as <strong>management events</strong>: who called which model, without the content. Knowledge base retrieval, <code>ApplyGuardrail</code> and agent calls are data events, added with advanced event selectors where needed. The prompts and responses come only from <strong>model invocation logging</strong>, which is off by default, set per account and per Region, and writes only to a log group or bucket in the same account and Region. It's turned on in the hub, in the EU spoke and in every Region they use.</p>
+				<span class="file">Central GenAI account 222222222222: log every prompt and response, large payloads to S3 (AWS CLI; repeat per Region and in 555555555555)</span>
+<pre><code>aws bedrock put-model-invocation-logging-configuration \
+  --region us-east-1 \
+  --logging-config '{
+    "cloudWatchConfig": {
+      "logGroupName": "/genai/bedrock-invocations",
+      "roleArn": "arn:aws:iam::222222222222:role/BedrockInvocationLogging",
+      "largeDataDeliveryS3Config": {
+        "bucketName": "example-genai-invocation-logs-222222222222",
+        "keyPrefix": "large"
+      }
+    },
+    "textDataDeliveryEnabled": true,
+    "imageDataDeliveryEnabled": true,
+    "embeddingDataDeliveryEnabled": false
+  }'</code></pre>
+				<p>A CloudWatch Logs centralization rule or S3 replication copies the logs to the log archive account, under Object Lock with one-year retention (<a href="../d2-task-2-4.html">Task 2.4</a>). The Task 2.3 SCP lets only <code>PlatformSecurityAdmin</code> change logging, and GuardDuty raises <code>DefenseEvasion:IAMUser/BedrockLoggingDisabled</code> if it's turned off anyway. The GuardDuty <strong>AI Protection</strong> plan adds findings for Bedrock and SageMaker AI such as anomalous invocations and cost harvesting (its direct prompt-injection finding needs the guardrail's prompt-attack filter). AgentCore traces go to CloudWatch GenAI observability, viewed from the monitoring account through cross-account observability (<a href="../d5-task-5-3.html">Task 5.3</a>).</p>
+				<p><strong>Quotas</strong> are per account and Region (tokens per minute per model, a daily cross-model token cap, separate cross-Region quotas). The hub watches <code>InvocationThrottles</code> and <code>EstimatedTPMQuotaUsage</code>, raises quotas before launches, and caps units at the gateway.</p>
+				<p><strong>Cost levers</strong> (<a href="../d3-task-3-1.html">Task 3.1</a>):</p>
+				<ul>
+					<li><strong>On-demand Standard tier</strong> by default. <strong>Priority</strong> (75% premium) for latency-critical chat; <strong>Flex</strong> (50% off) for work that can wait; <code>bedrock:ServiceTier</code> stops teams choosing Priority on their own.</li>
+					<li><strong>Reserved tier</strong> (reserved tokens per minute for serverless models, through the account team) for steady critical traffic. <strong>Provisioned Throughput</strong> is billed per model unit per hour whether used or not, starts with a quota of zero, can't be used through inference profiles, and is needed mainly for custom models.</li>
+					<li><strong>Prompt caching</strong> for the assistant's long system prompt and tool definitions (cache reads don't count toward the TPM quota); <strong>batch inference</strong> at 50% off for overnight summaries, best effort and without prompt caching.</li>
+				</ul>
+				<span class="file">Catch a runaway agent loop hours before the bill does (AWS CLI, 222222222222)</span>
+<pre><code>aws cloudwatch put-metric-alarm \
+  --alarm-name bedrock-output-tokens-high \
+  --namespace AWS/Bedrock \
+  --metric-name OutputTokenCount \
+  --dimensions Name=ModelId,Value=example-model-id \
+  --statistic Sum --period 3600 --evaluation-periods 1 \
+  --threshold 5000000 --comparison-operator GreaterThanThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:222222222222:genai-cost-alerts</code></pre>
+				<p><strong>Chargeback</strong> (<a href="../d3-task-3-3.html">Task 3.3</a>): everything lands on the hub's bill, so profile tags (cost per unit and use case) and IAM principal attribution in CUR 2.0 (which invoker role spent it) pass the cost back, with a budget per unit.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Hub for most units, spoke where policy demands it</h4>
+				<p>The hub gives one place for models, guardrails, knowledge and logs; new units onboard with a role and a profile. Its costs: shared quotas, a larger blast radius, a cross-account hop. The EU unit is a spoke because its SCP must apply to the calling principal. The AWS SRA AI Security guide says to merge accounts when risk profiles are uniform and only pre-trained models are used.</p>
+			</div>
+			<div class="entry">
+				<h4>Role assumption or gateway</h4>
+				<p>Role assumption needs no extra infrastructure, but nothing caps one unit's share. A gateway adds per-caller rate limits, model fallback and one endpoint for several providers, at the cost of another component (AgentCore Gateway is managed and charged per invocation; a LiteLLM proxy runs on your containers).</p>
+			</div>
+			<div class="entry">
+				<h4>Separate agent platform account</h4>
+				<p>Agents hold credentials to business systems and run code, a different risk from calling a model. A separate account limits who can change gateways, policy engines and execution roles, and keeps every cross-account permission explicit and reviewable.</p>
+			</div>
+			<div class="entry">
+				<h4>Geographic before global</h4>
+				<p>Global profiles are cheaper with more capacity, so US units may use them where residency allows; EU traffic uses <code>eu.</code> profiles, enforced by SCP. Neither guarantees availability: keep bounded retries and a fallback model.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Bedrock in every workload account</h4>
+				<p>Each account gets its own quotas and blast radius; governance comes from SCPs, the Bedrock policy, invocation logging deployed by StackSets, tagged profiles and Service Quotas request templates (up to 10 quotas, new accounts only). Knowledge bases and prompts get duplicated.</p>
+			</div>
+			<div class="entry">
+				<h4>Step Functions instead of an agent</h4>
+				<p>For known steps (classify a ticket, look up the order, draft a reply), a Standard workflow calling Bedrock is cheaper, deterministic and fully audited. Agents earn their cost where requests are open-ended.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Try to skip the guardrail</span><span class="desc">From <code>GenAIInvoker-Support</code>, call Converse without <code>guardrailConfig</code>, then with version 2: both must fail with AccessDenied. A call from a member account with harmless text in guardrail tags must still be checked by the organization guardrail.</span></li>
+				<li><span class="name">Try to leave the EU</span><span class="desc">From <code>555555555555</code>, call a <code>global.</code> profile (denied) and an <code>eu.</code> profile (allowed); in CloudTrail, <code>additionalEventData.inferenceRegion</code> must show only EU Regions.</span></li>
+				<li><span class="name">Probe the shared knowledge</span><span class="desc">Call <code>Retrieve</code> from a role not in the policy, and <code>RetrieveAndGenerate</code> cross-account: both denied.</span></li>
+				<li><span class="name">Red-team the agent</span><span class="desc">With the policy engine in <code>LOG_ONLY</code>, replay real sessions and injected prompts ("refund $5,000") and review every decision before switching to <code>ENFORCE</code>.</span></li>
+				<li><span class="name">Let an approval expire</span><span class="desc">In staging, shorten the timeout and ignore the SNS message: the execution must end in <code>RejectRefund</code> and no refund appears in the order system.</span></li>
+				<li><span class="name">Break the evidence trail</span><span class="desc">In a sandbox, delete the logging configuration as a normal admin (blocked by the SCP), then as <code>PlatformSecurityAdmin</code>: the GuardDuty finding must arrive.</span></li>
+				<li><span class="name">Load and cost</span><span class="desc">Load-test one unit to throttling: the gateway limit must protect the others. A day later, Cost Explorer spend by <code>BusinessUnit</code> must match token counts.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Integrate AI and ML Services into Architectures</td><td data-label="What this architecture demonstrates">Hub and spoke Bedrock accounts, role assumption or a gateway, application inference profiles, cross-account knowledge base retrieval, AgentCore Runtime, Gateway, Identity, Policy and Registry</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Design Multi-Account Governance and Compliance Solutions</td><td data-label="What this architecture demonstrates">Invocation logging per account and Region, CloudTrail management versus data events, centralized logs, an SCP and GuardDuty protecting the logging, Organizations Bedrock policy</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-4.html">2.4</a> Design Architectures to Meet Compliance Requirements</td><td data-label="What this architecture demonstrates">Geographic versus global profiles, the "unspecified" Region SCP, where an SCP must sit, Object Lock on invocation logs</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-5.html">2.5</a> Design Security and Responsible AI Controls</td><td data-label="What this architecture demonstrates">Guardrail enforcement layers, Cedar tool policies, on-behalf-of identity, risk-tiered Step Functions approvals with task tokens</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-1.html">3.1</a> Design Architectures Based on AWS Pricing Models</td><td data-label="What this architecture demonstrates">Service tiers, Reserved tier versus Provisioned Throughput, prompt caching, batch inference</td></tr>
+						<tr><td data-label="Task"><a href="../d5-task-5-3.html">5.3</a> Design Observability and Monitoring Solutions</td><td data-label="What this architecture demonstrates">Bedrock token, throttle and quota metrics, AgentCore traces and evaluations, cross-account observability</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Business units in other accounts must use models in a central account with the least operational overhead" is <strong>cross-account role assumption</strong> (or a gateway), never a resource policy on the model. "Charge each department for its Bedrock usage" is <strong>tagged application inference profiles</strong> with activated cost allocation tags (or IAM principal attribution). "Every model call in every account must pass the company guardrail, and teams must not be able to turn it off" is an <strong>Organizations Bedrock policy</strong>. "EU prompts must be processed only in the EU" is an <code>eu.</code> profile plus an <strong>SCP denying the "unspecified" Region</strong>. "Another account's agent must search our knowledge base" is the <strong>knowledge base resource policy</strong> (Retrieve only). "Keep every prompt and response for audit" is <strong>model invocation logging</strong>, not CloudTrail. "A human must approve high-value actions, possibly days later" is <strong>Step Functions with waitForTaskToken</strong>.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/building-an-agentic-ai-platform-on-amazon-bedrock-agentcore/">Building an Agentic AI Platform on Amazon Bedrock AgentCore</a> (October 2026): standing up a governed, multi-account agentic AI platform on AgentCore.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/build-a-multi-tenant-generative-ai-environment-for-your-enterprise-on-aws/">Build a multi-tenant generative AI environment for your enterprise on AWS</a> (November 2024): a central generative AI hub serving many business units with isolation and metering (predates AgentCore and IAM principal cost allocation).</li>
+				<li><a href="https://aws.amazon.com/blogs/architecture/track-generative-ai-costs-with-amazon-bedrock-inference-profiles/">Track generative AI costs with Amazon Bedrock inference profiles</a> (August 2026): application inference profiles with cost allocation tags for chargeback by department.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/managing-amazon-bedrock-costs-end-to-end-a-playbook-for-finops-and-platform-teams/">Managing Amazon Bedrock costs end to end: A playbook for FinOps and platform teams</a> (October 2026): visibility, allocation, spend controls and optimization levers at organization scale.</li>
+				<li><a href="https://aws.amazon.com/blogs/machine-learning/amazon-bedrock-guardrails-announces-iam-policy-based-enforcement-to-deliver-safe-ai-interactions/">Amazon Bedrock Guardrails announces IAM Policy-based enforcement to deliver safe AI interactions</a> (March 2025): the <code>bedrock:GuardrailIdentifier</code> condition key (predates organization-enforced guardrails).</li>
+				<li><a href="https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentic-ai-lens.html">Agentic AI Lens</a> and <a href="https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/generative-ai-lens.html">Generative AI Lens</a> (AWS Well-Architected): best practices for agents (tools, identity, human oversight) and for the generative AI lifecycle.</li>
+				<li><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-cross-account.html">Resource policies for managed knowledge bases</a> (Amazon Bedrock User Guide): the cross-account Retrieve model and its limits.</li>
+				<li><a href="https://github.com/aws-solutions-library-samples/guidance-for-multi-provider-generative-ai-gateway-on-aws">Guidance for a multi-provider generative AI gateway on AWS</a> (AWS sample code): a LiteLLM-based gateway with keys, budgets, rate limits and logging over Bedrock.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026.</div>
+</footer>
+
+</body>
+</html>

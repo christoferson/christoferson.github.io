@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Lakehouse data platform | AWS SAP-C03 Notes</title>
+	<meta name="description" content="End-to-end SAP-C03 architecture: an organization-wide lakehouse in the analytics account. Order events through Firehose into S3 Tables, Aurora PostgreSQL change data through a zero-ETL integration into Redshift Serverless, curated Apache Iceberg tables in table buckets and a general purpose bucket, the Glue Data Catalog and Lake Formation with LF-Tags, cross-account versions, RAM shares and data filters for regulated customer data, Athena and Redshift data sharing for business units, KMS keys per domain, Iceberg maintenance, Intelligent-Tiering and query cost controls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../sap.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAP-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">Lakehouse</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Lakehouse data platform</h1>
+		<p>One analytics account owns the company's data: order events and database changes land in Apache Iceberg tables within minutes, one catalog and one permission model govern every engine, and business units query the data in their own accounts, on their own bill, without copies.</p>
+		<div class="tags"><span class="tag code">SAP-C03</span><span class="tag">Domain 1</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">S3 Tables</span><span class="tag">Iceberg</span><span class="tag">Lake Formation</span><span class="tag">Glue</span><span class="tag">Redshift</span><span class="tag">Athena</span><span class="tag">Firehose</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Table buckets and keys per domain</a></li>
+				<li class="sub"><a href="#b2">2. Stream order events into Iceberg</a></li>
+				<li class="sub"><a href="#b3">3. Database changes through zero-ETL</a></li>
+				<li class="sub"><a href="#b4">4. One permission model in Lake Formation</a></li>
+				<li class="sub"><a href="#b5">5. Consumers in their own accounts</a></li>
+				<li class="sub"><a href="#b6">6. Maintenance, retention and cost</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>Analytics grew up account by account, with a different copy of the orders data, and a different answer, in every business unit. <a href="../d1-task-1-5.html">Task 1.5</a> already placed the lakehouse in the <strong>analytics account</strong> <code>444444444444</code>, with business-unit accounts querying it. This page builds that lakehouse for the whole organization <code>o-a1b2c3d4e5</code>. The basics of Glue, Athena, Iceberg and Redshift are in the <a href="../../aws-dea/index.html">DEA-C01 notes</a>; this page is about the multi-account design and its trade-offs.</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>Fresh data</strong>: order events are queryable within minutes, and order and customer data from Aurora PostgreSQL arrives without a hand-built pipeline.</li>
+				<li><strong>One copy, many engines</strong>: Athena, Redshift and Spark jobs read the same tables, under one set of permissions.</li>
+				<li><strong>Least privilege across accounts</strong>: each business unit sees only its domains, and the EU business unit sees only EU customers, without contact details (<a href="../d2-task-2-4.html">Task 2.4</a>).</li>
+				<li><strong>Encryption and evidence</strong>: customer managed keys per data domain, and an audit trail of who read what (<a href="../d2-task-2-2.html">Task 2.2</a>, <a href="../d2-task-2-3.html">Task 2.3</a>).</li>
+				<li><strong>Cost on the right bill</strong>: consumers pay for their own queries, with caps, and storage costs fall as data ages (<a href="../d3-task-3-4.html">Task 3.4</a>).</li>
+			</ul>
+			<p>Reused from the SAP task pages: table bucket <code>analytics-tables</code> with its <code>sales</code> namespace, role <code>SalesAnalyst</code> and the LF-Tag <code>domain=sales</code> (<a href="../d1-task-1-5.html">Task 1.5</a>); bucket <code>example-curated</code> and its customer managed key in <code>444444444444</code> (<a href="../d2-task-2-2.html">Task 2.2</a>); the cart service's <code>cart-lake-reader</code> role (<a href="../d2-task-2-1.html">Task 2.1</a>); the <code>central-orders</code> bus and the <code>order-analytics</code> queue in <code>444444444444</code> (<a href="event-driven-modernization.html">event-driven modernization</a>); the EU business unit account <code>555555555555</code>. New on this page:</p>
+			<ul>
+				<li><strong>Ingestion</strong>: Lambda function <code>order-analytics-forwarder</code> and Firehose stream <code>order-events-to-lake</code>, writing table <code>order_events</code> in a new <code>orders</code> namespace of <code>analytics-tables</code>.</li>
+				<li><strong>Warehouse</strong>: Redshift Serverless namespace and workgroup <code>analytics</code> in <code>444444444444</code>, fed by a zero-ETL integration from the orders database <code>orders</code> on the Aurora PostgreSQL cluster in <code>111111111111</code>; datashare <code>orders_share</code>.</li>
+				<li><strong>Curated tables</strong>: Glue database <code>curated</code> with Iceberg table <code>customers</code> on <code>example-curated</code>; data filter <code>eu_customers_no_contact</code>; LF-Tag <code>domain=orders</code>.</li>
+				<li><strong>Keys and query controls</strong>: KMS alias <code>alias/lake-orders</code> for the orders domain; Athena workgroup <code>eu-analysts</code> in <code>555555555555</code>.</li>
+			</ul>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> The S3 Tables integration with AWS analytics services now uses <strong>IAM access control by default</strong>, with Lake Formation optional; moving an old Lake Formation-mode integration to IAM mode removes all its Lake Formation grants. "SageMaker Lakehouse" was the launch name; the documentation now says "the lakehouse architecture of Amazon SageMaker". The Firehose database change data capture preview was removed in September 2025, so database changes arrive through zero-ETL here.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgL-wide-t">
+<title id="dgL-wide-t">Lakehouse data platform: order events flow from the central-orders bus through a queue and forwarder Lambda into Firehose, which commits them to Iceberg tables in the analytics-tables table bucket; a zero-ETL integration replicates the Aurora orders database into Redshift Serverless, which curates Iceberg tables and shares orders_share with the EU unit's Redshift; Lake Formation grants and data filters control what the EU unit's Athena workgroup can read.</title>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M580.0 60.0 L620.0 60.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M700.0 83.0 L700.0 152.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M170.0 175.0 L210.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M370.0 175.0 L420.0 175.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M290.0 198.0 L290.0 267.0" fill="none" stroke="var(--muted)" stroke-width="2.5"/>
+<path d="M500.0 198.0 L500.0 267.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M580.0 290.0 L620.0 290.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M700.0 198.0 L700.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">orders service</text>
+<text x="90" y="74" class="dg-s dg-sm2">111111111111</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">central-orders</text>
+<text x="290" y="74" class="dg-s dg-sm2">EventBridge bus</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="57" class="dg-t dg-sm">Queue + forwarder</text>
+<text x="500" y="74" class="dg-s dg-sm2">order-analytics</text>
+<rect x="620" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="57" class="dg-t dg-sm">Firehose</text>
+<text x="700" y="74" class="dg-s dg-sm2">order-events-to-lake</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">analytics-tables</text>
+<text x="700" y="189" class="dg-s dg-sm2">S3 Tables, Iceberg</text>
+<rect x="10" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="172" class="dg-t dg-sm">Aurora orders</text>
+<text x="90" y="189" class="dg-s dg-sm2">PostgreSQL</text>
+<rect x="210" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="290" y="172" class="dg-t dg-sm">Redshift Serverless</text>
+<text x="290" y="189" class="dg-s dg-sm2">zero-ETL, curation</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="172" class="dg-t dg-sm">example-curated</text>
+<text x="500" y="189" class="dg-s dg-sm2">Iceberg, Glue</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="287" class="dg-t dg-sm">Lake Formation</text>
+<text x="500" y="304" class="dg-s dg-sm2">grants, filters</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Athena eu-analysts</text>
+<text x="700" y="304" class="dg-s dg-sm2">555555555555</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">EU Redshift</text>
+<text x="290" y="304" class="dg-s dg-sm2">orders_share</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgL-tall-t">
+<title id="dgL-tall-t">Lakehouse data platform: order events flow from the central-orders bus through a queue and forwarder Lambda into Firehose, which commits them to Iceberg tables in the analytics-tables table bucket; a zero-ETL integration replicates the Aurora orders database into Redshift Serverless, which curates Iceberg tables and shares orders_share with the EU unit's Redshift; Lake Formation grants and data filters control what the EU unit's Athena workgroup can read.</title>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M220.0 145.0 L180.0 145.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 168.0 L100.0 232.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M100.0 278.0 L100.0 342.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M300.0 388.0 L300.0 452.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 475.0 L180.0 475.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M100.0 452.0 L100.0 388.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">orders service</text>
+<text x="100" y="54" class="dg-s dg-sm2">111111111111</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">central-orders</text>
+<text x="300" y="54" class="dg-s dg-sm2">EventBridge bus</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="142" class="dg-t dg-sm">Queue + forwarder</text>
+<text x="300" y="159" class="dg-s dg-sm2">order-analytics</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">Firehose</text>
+<text x="100" y="159" class="dg-s dg-sm2">order-events-to-lake</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">analytics-tables</text>
+<text x="100" y="269" class="dg-s dg-sm2">S3 Tables, Iceberg</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="252" class="dg-t dg-sm">Aurora orders</text>
+<text x="300" y="269" class="dg-s dg-sm2">PostgreSQL</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="362" class="dg-t dg-sm">Redshift Serverless</text>
+<text x="300" y="379" class="dg-s dg-sm2">zero-ETL, curation</text>
+<rect x="220" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="472" class="dg-t dg-sm">example-curated</text>
+<text x="300" y="489" class="dg-s dg-sm2">Iceberg, Glue</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="100" y="472" class="dg-t dg-sm">Lake Formation</text>
+<text x="100" y="489" class="dg-s dg-sm2">grants, filters</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">Athena eu-analysts</text>
+<text x="100" y="379" class="dg-s dg-sm2">555555555555</text>
+</svg>
+				<figcaption>Figure: two ways in, one governed catalog. Order events reach the analytics account <code>444444444444</code> on the event bus and land in S3 Tables through Firehose (grey and blue); the Aurora orders database replicates into Redshift Serverless by zero-ETL, and Redshift writes curated Iceberg tables (green). Lake Formation cross-account grants and the <code>eu_customers_no_contact</code> filter decide what Athena in the EU unit <code>555555555555</code> sees (yellow), and a Redshift datashare gives the EU unit's own warehouse live access (desktop view).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>A customer places an order, and an analyst in the EU business unit sees it in a report a few minutes later. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Data arrives</li>
+				<li><span class="name">Publish the event<span class="who">Orders service</span></span><span class="desc">The orders service in <code>111111111111</code> puts <code>OrderConfirmed</code> on <code>central-orders</code>; a rule delivers it to the <code>order-analytics</code> queue in <code>444444444444</code>.</span></li>
+				<li><span class="name">Forward to Firehose<span class="who">Lambda</span></span><span class="desc"><code>order-analytics-forwarder</code> reads batches from the queue and sends one JSON object per record to <code>order-events-to-lake</code>.</span></li>
+				<li class="auto"><span class="name">Commit to Iceberg<span class="who auto">AWS</span></span><span class="desc">Firehose buffers the records and commits them to <code>order_events</code> in the table bucket, encrypted with the table bucket's KMS key. Records that don't match the table schema go to the S3 error prefix.</span></li>
+				<li class="auto"><span class="name">Replicate database changes<span class="who auto">AWS</span></span><span class="desc">The zero-ETL integration copies inserts, updates and deletes from the <code>orders</code> database into the <code>analytics</code> Redshift Serverless namespace in near real time.</span></li>
+				<li class="group">Data is curated and governed</li>
+				<li><span class="name">Build curated tables<span class="who">Scheduled SQL</span></span><span class="desc">Redshift runs <code>MERGE</code> and CTAS jobs that write Iceberg tables: sales aggregates into the <code>sales</code> namespace of <code>analytics-tables</code>, the regulated <code>customers</code> table into <code>example-curated</code>.</span></li>
+								<li class="group">Data is consumed</li>
+				<li><span class="name">Query in Athena<span class="who">EU analyst</span></span><span class="desc">Signed in through IAM Identity Center, the analyst queries a resource link in <code>555555555555</code> from the <code>eu-analysts</code> workgroup.</span></li>
+				<li class="auto"><span class="name">Authorize and filter<span class="who auto">AWS</span></span><span class="desc">Lake Formation checks the cross-account grant and applies <code>eu_customers_no_contact</code>: only EU rows, no e-mail or phone columns. Athena reads the files with credentials Lake Formation vends for this query, and CloudTrail records the access in both accounts.</span></li>
+				<li><span class="name">Query the warehouse<span class="who">Finance team</span></span><span class="desc">The EU unit's own Redshift Serverless workgroup reads <code>orders_share</code> live, paying for its own compute while the analytics account pays for storage.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Table buckets and keys per domain</h3>
+				<p><strong>Where Iceberg tables live.</strong> There are two homes for an Iceberg table, and this platform uses both (<a href="../d1-task-1-5.html">Task 1.5</a>):</p>
+				<ul>
+					<li><strong>S3 Tables (table buckets)</strong>: tables are subresources of a bucket built for Iceberg. Compaction and snapshot management are on by default, access uses <code>s3tables</code> resource policies at bucket and table level, and the bucket can default to SSE-KMS and the Intelligent-Tiering storage class. The default quota is now 100 table buckets per Region per account (raised from 10 on 30 September 2026). The high-churn streaming tables and the shared sales tables go here.</li>
+					<li><strong>Iceberg on a general purpose bucket</strong>: you manage maintenance yourself, or let the Glue Data Catalog's table optimizers handle compaction, snapshot expiry and orphan files. You keep the familiar bucket features and policies. The regulated <code>customers</code> table goes on <code>example-curated</code>, whose key policy from <a href="../d2-task-2-2.html">Task 2.2</a> already limits decryption to S3 for that bucket.</li>
+				</ul>
+				<p><strong>A key per domain.</strong> Each data domain gets its own customer managed key in <code>444444444444</code>, so revoking or auditing one domain doesn't touch the others, and key policies name the consumers of that domain only. The orders table bucket defaults to <code>alias/lake-orders</code>; a table can override the bucket default.</p>
+				<span class="file">Analytics account 444444444444: a table bucket for the next domain, SSE-KMS by default, Intelligent-Tiering for new tables, tagged for cost allocation (AWS CLI)</span>
+<pre><code>aws s3tables create-table-bucket \
+  --region us-east-1 \
+  --name payments-tables \
+  --encryption-configuration sseAlgorithm=aws:kms,kmsKeyArn=arn:aws:kms:us-east-1:444444444444:key/KEY_ID \
+  --storage-class-configuration storageClass=INTELLIGENT_TIERING \
+  --tags domain=payments,CostCenter=CC-2001</code></pre>
+				<p>The existing <code>analytics-tables</code> holds two domains in separate namespaces, so its <code>orders</code> tables set <code>alias/lake-orders</code> at table level. The caller needs <code>s3tables:PutTableBucketEncryption</code>, <code>s3tables:PutTableBucketStorageClass</code> and <code>s3tables:TagResource</code> as well as <code>s3tables:CreateTableBucket</code>. Tags on table buckets and tables (from November 2025) work for both ABAC and cost allocation.</p>
+				<div class="callout trap"><p>With SSE-KMS, the key policy must let the <strong>S3 Tables maintenance principal</strong> use the key, or compaction and snapshot expiry can't read and rewrite the files; every integrated engine's role also needs KMS permissions. For Firehose, set the KMS key on the table bucket, not in the Firehose stream: Firehose ignores its own KMS settings when it delivers to S3 Tables.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Stream order events into Iceberg</h3>
+				<p><strong>The path.</strong> The <code>central-orders</code> rule can't target Firehose in another account directly (cross-account direct targets are SQS, SNS, Lambda, Kinesis Data Streams and API Gateway), so it already delivers to the <code>order-analytics</code> queue in the analytics account. A small forwarder function turns queue messages into Firehose records. Firehose then writes to Iceberg tables, either self-managed in S3 or in S3 Tables, can route records from one stream to several tables, and can apply inserts, updates and deletes (<a href="../d1-task-1-1.html">Task 1.1</a>).</p>
+				<span class="file">order-analytics-forwarder: send each order event to Firehose as one JSON object per record (Python, Lambda with an SQS event source)</span>
+<pre><code>import json
+import boto3
+
+firehose = boto3.client("firehose")
+
+def handler(event, context):
+    records = []
+    for msg in event["Records"]:
+        detail = json.loads(msg["body"])["detail"]
+        # Flat, first-level fields only: Firehose maps top-level JSON keys to columns
+        row = {
+            "order_id": detail["orderId"],
+            "customer_id": detail["customerId"],
+            "status": "CONFIRMED",
+            "amount": detail["amount"],
+            "event_time": detail["confirmedAt"],
+        }
+        # One JSON object per Firehose record; several objects in one record fail
+        records.append({"Data": (json.dumps(row) + "\n").encode()})
+
+    resp = firehose.put_record_batch(DeliveryStreamName="order-events-to-lake", Records=records)
+    # Fail the batch so SQS retries; consumers downstream must tolerate duplicates
+    if resp["FailedPutCount"]:
+        raise RuntimeError(f"{resp['FailedPutCount']} records rejected")</code></pre>
+				<p><strong>Limits that shape the design</strong> (Firehose Iceberg considerations):</p>
+				<ul>
+					<li><strong>Throughput</strong>: a Direct PUT stream to Iceberg starts at 5 MiB per second in us-east-1, us-west-2 and eu-west-1 and 1 MiB per second elsewhere; Firehose raises it under throttling, but plan a limit increase before a launch. Setting <code>AppendOnly</code> (insert only, API only) lets the stream scale automatically, which suits order events.</li>
+					<li><strong>Partitions</strong>: higher throughput means fewer active partitions (about 3,000 at up to 20 MB/s, 100 at 40&ndash;400 MB/s), so partition by day, not by customer.</li>
+					<li><strong>Schema</strong>: column names and types must match the table exactly; mismatches go to the S3 error prefix and extra fields are skipped. Databases and tables must be created through Iceberg's GlueCatalog API and can't contain hyphens, hence <code>order_events</code>.</li>
+					<li><strong>One writer per table</strong>: Iceberg uses optimistic concurrency, so two streams writing one table keep retrying each other's commits. MSK Serverless isn't supported as a source.</li>
+				</ul>
+				<div class="callout trap"><p>Every Firehose commit creates a snapshot and new files, so a table fed every minute fills with small files and metadata quickly. On a general purpose bucket that is your problem (Glue optimizers, Athena <code>OPTIMIZE</code> and <code>VACUUM</code>); in a table bucket compaction runs for you. This is the main reason the streaming tables sit in S3 Tables.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Database changes through zero-ETL</h3>
+				<p><strong>No pipeline to run.</strong> An Aurora zero-ETL integration replicates data and schema changes from the orders cluster into the <code>analytics</code> Redshift Serverless namespace in near real time; Aurora also supports a lakehouse of Amazon SageMaker as a target. Several clusters can feed one target, so the cart and payments databases can join later. The integration crosses accounts (cluster in <code>111111111111</code>, warehouse in <code>444444444444</code>); the Redshift side must authorize the source account before the integration can be created (the Redshift zero-ETL documentation covers the steps). AWS DMS with change data capture remains the option when data must be transformed on the way.</p>
+				<p><strong>Requirements to plan for</strong> (Aurora zero-ETL limitations):</p>
+				<ul>
+					<li>An Aurora PostgreSQL source needs at least one <strong>data filter pattern</strong>, at minimum one database such as <code>orders.*.*</code>; every table in the filter needs a <strong>primary key</strong> (otherwise it fails), and databases must be UTF-8.</li>
+					<li>Source and target must be in the <strong>same Region</strong>, and the source can't be an Aurora Limitless Database or a cross-account clone.</li>
+					<li>The first seeding, and any table resynchronization, can take 20&ndash;25 minutes or more; DDL such as <code>ALTER TABLE</code> on the source can trigger a resync that makes the table unavailable meanwhile.</li>
+					<li>Quotas: 100 integrations per account, 50 per target, 5 per source cluster.</li>
+				</ul>
+				<div class="callout trap"><p>The orders cluster is an Aurora Global Database with DR in us-west-2 (<a href="../d4-task-4-2.html">Task 4.2</a>). If the primary <strong>fails over</strong> to the secondary, the integration becomes inactive and must be deleted and recreated, in the new Region, with a full reseed. A blue/green switchover also needs the integration deleted first. Put "recreate the zero-ETL integration" in the DR runbook, and don't promise analytics an RPO the integration can't keep.</p></div>
+				<p><strong>Curating into Iceberg.</strong> Redshift now creates and writes Iceberg tables (CTAS, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>MERGE</code>) in S3 and in table buckets, registered in the Glue Data Catalog, so the warehouse can publish curated tables that every engine reads.</p>
+				<span class="file">Scheduled curation in the analytics workgroup: one regulated table on the general purpose bucket, one shared aggregate in the table bucket (Redshift SQL)</span>
+<pre><code>-- Default Glue catalog: LOCATION is required and must be an empty prefix in this Region
+CREATE TABLE awsdatacatalog.curated.customers
+USING ICEBERG
+LOCATION 's3://example-curated/iceberg/customers/'
+TABLE PROPERTIES ('format-version'='2')
+AS SELECT customer_id, full_name, email, phone, country, region, loyalty_tier
+FROM orders_zeroetl.public.customers;
+
+-- Table bucket: no LOCATION allowed; S3 Tables places and maintains the files
+CREATE TABLE "analytics-tables@s3tablescatalog".sales.daily_orders
+USING ICEBERG
+AS SELECT order_date, region, COUNT(*) AS orders, SUM(amount) AS revenue
+FROM orders_zeroetl.public.orders
+GROUP BY order_date, region;</code></pre>
+				<p>How it reads: <code>orders_zeroetl</code> is the Redshift database created from the integration (a new name). Format version 2 is deliberate: Athena creates only v2 tables and can't read v3. Later runs use <code>MERGE</code>, which needs S3 <code>DELETE</code> permission on a general purpose bucket because Redshift removes intermediate files (not needed for S3 Tables). <code>DROP TABLE</code> only removes the catalog entry, so the files on <code>example-curated</code> stay until orphan-file cleanup removes them.</p>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>One permission model in Lake Formation</h3>
+				<p><strong>IAM mode or Lake Formation.</strong> The S3 Tables integration works with IAM alone, which is enough when whole tables go to whole roles. This platform needs column, row and cell permissions, tag-based grants and cross-account sharing to hundreds of principals, so the analytics account turns Lake Formation on for both catalogs. With Lake Formation, IAM and Lake Formation grants together decide access (<a href="../d1-task-1-5.html">Task 1.5</a>; <a href="../../aws-dea/d4-task-4-2.html">DEA-C01 Task 4.2</a> for the basics).</p>
+				<p><strong>Settings that block sharing if you miss them</strong> (Lake Formation cross-account notes):</p>
+				<ul>
+					<li><strong>Cross-account version 4 or higher</strong>: needed to share objects in a federated catalog (the S3 Tables catalog is one) or resources in hybrid access mode. Version 5 shares unlimited tables through wildcard RAM shares, and can't be downgraded.</li>
+					<li><strong>No IAMAllowedPrincipals</strong> on Lake Formation-mode resources: revoke it before cross-account grants, or Lake Formation throws <code>AccessDeniedException</code>; new databases should default to no permissions.</li>
+					<li><strong>Catalog encryption with a customer managed key</strong>: a catalog encrypted with the Glue service-managed key can't be shared; recipients need decrypt permission on the catalog key.</li>
+				</ul>
+				<span class="file">settings.json for aws lakeformation put-data-lake-settings --data-lake-settings file://settings.json (it replaces the whole settings object, so read the current one first)</span>
+<pre><code>{
+  "DataLakeAdmins": [
+    { "DataLakePrincipalIdentifier": "arn:aws:iam::444444444444:role/LakeAdmin" }
+  ],
+  "CreateDatabaseDefaultPermissions": [],
+  "CreateTableDefaultPermissions": [],
+  "Parameters": { "CROSS_ACCOUNT_VERSION": "4" }
+}</code></pre>
+				<p><strong>Tags, not table lists.</strong> Each table carries LF-Tags (<code>domain=orders</code>, <code>domain=sales</code>); a grant to an LF-Tag expression covers every current and future table with those tags. Values inside one tag are OR, separate tags are AND. From version 3, LF-Tag grants to another account travel through AWS RAM (the recipient accepts an invitation; grants to an OU or the organization need none). The <a href="../d1-task-1-5.html">Task 1.5</a> grant of <code>domain=sales</code> to <code>555555555555</code> is the pattern; the EU unit gets <code>domain=orders</code> the same way.</p>
+				<p><strong>Regulated customer data: a data filter.</strong> A data cells filter combines a row filter (a PartiQL predicate) and a column list or exclusion list. The EU unit gets <code>SELECT</code> on the filter, never on the table, so it sees EU customers only and never the contact columns.</p>
+				<span class="file">Analytics account 444444444444: EU rows only, without e-mail and phone (aws lakeformation create-data-cells-filter --cli-input-json file://input.json)</span>
+<pre><code>{
+  "TableData": {
+    "TableCatalogId": "444444444444",
+    "DatabaseName": "curated",
+    "TableName": "customers",
+    "Name": "eu_customers_no_contact",
+    "RowFilter": { "FilterExpression": "region = 'EU'" },
+    "ColumnWildcard": { "ExcludedColumnNames": ["email", "phone"] }
+  }
+}</code></pre>
+				<p>Column-level control in Athena and Redshift Spectrum is inclusion-only, and Glue ETL doesn't support it; Spark jobs that need fine-grained control run on engines with Lake Formation integration.</p>
+				<div class="callout trap"><p>A recipient account can re-grant a shared resource only to its own principals, never to another account, organization or <code>IAMAllowedPrincipals</code>, and the grant needs the grant option for the consumer's data lake administrator to re-grant at all. Revoke cross-account grants before deleting a table, or orphaned RAM shares remain.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Consumers in their own accounts</h3>
+				<p><strong>Athena.</strong> The EU unit's data lake administrator accepts the RAM share and creates <strong>resource links</strong> to the shared databases; Athena and Redshift Spectrum need them. Analysts query from a workgroup that enforces its settings, encrypts results with the unit's key and cancels any query that would scan more than a set amount. With IAM Identity Center trusted identity propagation, Lake Formation authorizes the signed-in analyst, not just a role, and CloudTrail names the user (<a href="../d2-task-2-1.html">Task 2.1</a>).</p>
+				<span class="file">EU business unit 555555555555: a workgroup that overrides client settings and stops any query scanning over 1 TB (AWS CLI)</span>
+<pre><code>aws athena create-work-group \
+  --name eu-analysts \
+  --description "EU business unit analysts on the shared lakehouse" \
+  --configuration '{
+    "ResultConfiguration": {
+      "OutputLocation": "s3://example-athena-results-555555555555/eu-analysts/",
+      "EncryptionConfiguration": { "EncryptionOption": "SSE_KMS", "KmsKey": "arn:aws:kms:us-east-1:555555555555:key/KEY_ID" }
+    },
+    "EnforceWorkGroupConfiguration": true,
+    "PublishCloudWatchMetricsEnabled": true,
+    "BytesScannedCutoffPerQuery": 1000000000000
+  }' \
+  --tags Key=BusinessUnit,Value=eu Key=CostCenter,Value=CC-3001</code></pre>
+								<p><strong>Redshift data sharing.</strong> For dashboards and heavy SQL, the producer shares live tables from the <code>analytics</code> namespace with the EU unit's own workgroup. The consumer is charged for compute and any cross-Region transfer, the producer for storage; both sides must be encrypted, though not with the same key.</p>
+				<span class="file">Producer, analytics workgroup in 444444444444: create the share and add tables (Redshift SQL)</span>
+<pre><code>CREATE DATASHARE orders_share;
+-- ADD SCHEMA grants USAGE only; ADD TABLE grants SELECT only
+ALTER DATASHARE orders_share ADD SCHEMA reporting;
+ALTER DATASHARE orders_share ADD TABLE reporting.order_facts;
+GRANT USAGE ON DATASHARE orders_share TO ACCOUNT '555555555555';</code></pre>
+				<span class="file">Producer account 444444444444: authorize the consumer account, read-only (AWS CLI)</span>
+<pre><code>aws redshift authorize-data-share \
+  --data-share-arn arn:aws:redshift:us-east-1:444444444444:datashare:NAMESPACE_ID/orders_share \
+  --consumer-identifier 555555555555 \
+  --no-allow-writes</code></pre>
+				<p>Writes through a share are opt-in (grants to the share, <code>--allow-writes</code>, consumer association), and re-authorizing without the flag revokes them. Stored procedures and Python or Lambda UDFs can't be shared. To make the whole namespace readable by Iceberg engines instead, the producer can <strong>register the namespace in the Glue Data Catalog</strong>: every database and table is then shared under Lake Formation control, where a datashare goes object by object.</p>
+				<p><strong>Applications, ML and GenAI</strong> read curated tables under the same grants: the cart service through <code>cart-lake-reader</code> (<a href="../d2-task-2-1.html">Task 2.1</a>), ML training jobs (<a href="../../aws-mla/index.html">MLA-C02 notes</a>), and data assistants on the <a href="genai-platform.html">GenAI platform</a> querying Athena as the signed-in user.</p>
+			</div>
+
+			<div class="item" id="b6">
+				<span class="kicker">Step 6</span>
+				<h3>Maintenance, retention and cost</h3>
+				<p><strong>Iceberg maintenance in S3 Tables.</strong> Compaction (table level) merges small files and applies row-level deletes, with a default target of 512 MB (configurable from 64 to 512 MB). Strategies: <code>auto</code> (default: <code>sort</code> if the table has a sort order, otherwise <code>binpack</code>), <code>binpack</code>, <code>sort</code> and <code>z-order</code>. Compaction is charged, and sort and z-order can cost more than binpack. Choose sort when queries filter on one dominant column, z-order when they filter on several.</p>
+				<span class="file">order_events is filtered mostly by event_time: sort compaction (AWS CLI, 444444444444; needs a sort order in the table properties)</span>
+<pre><code>aws s3tables put-table-maintenance-configuration \
+  --table-bucket-arn arn:aws:s3tables:us-east-1:444444444444:bucket/analytics-tables \
+  --type icebergCompaction \
+  --namespace orders \
+  --name order_events \
+  --value='{"status":"enabled","settings":{"icebergCompaction":{"strategy":"sort"}}}'</code></pre>
+				<p><strong>Retention.</strong> Snapshot management keeps at least <code>MinimumSnapshots</code> (default 1) and expires snapshots older than <code>MaximumSnapshotAge</code> (default 120 hours). Files referenced only by expired snapshots become noncurrent and are deleted, permanently, after the <code>NoncurrentDays</code> of the unreferenced file removal policy. That chain matters for privacy: a row removed with <code>DELETE</code> is still readable through time travel until its snapshots expire and the files are removed (<a href="../d2-task-2-4.html">Task 2.4</a>).</p>
+				<span class="file">customers-facing tables keep two weeks of time travel, at least 10 snapshots (AWS CLI, 444444444444)</span>
+<pre><code>aws s3tables put-table-maintenance-configuration \
+  --table-bucket-arn arn:aws:s3tables:us-east-1:444444444444:bucket/analytics-tables \
+  --namespace sales \
+  --name daily_orders \
+  --type icebergSnapshotManagement \
+  --value '{"status":"enabled","settings":{"icebergSnapshotManagement":{"minSnapshotsToKeep":10,"maxSnapshotAgeHours":336}}}'</code></pre>
+				<div class="callout trap"><p>Snapshot management <strong>fails for the whole table</strong> if any user-defined Iceberg tag or branch exists, or if <code>history.expire.max-snapshot-age-ms</code> or <code>history.expire.min-snapshots-to-keep</code> is set as a table property; then nothing expires and storage grows silently. Engines' own retention properties don't apply in S3 Tables: use the maintenance configuration. Check <code>get-table-maintenance-job-status</code> for <code>FAILED</code>.</p></div>
+				<p><strong>Storage cost</strong> (<a href="../d3-task-3-4.html">Task 3.4</a>): table buckets default new tables to <code>INTELLIGENT_TIERING</code> (from December 2025), which moves table data between access tiers as it cools. S3 Tables replication (also December 2025) can copy tables to us-west-2 for DR.</p>
+				<p><strong>Compute cost controls:</strong></p>
+				<ul>
+					<li><strong>Athena</strong>: the per-query scan cutoff in each workgroup (Step 5), columnar files, partitions and compaction to cut bytes scanned.</li>
+					<li><strong>Redshift Serverless</strong>: base capacity defaults to 128 RPUs (range 4&ndash;512); usage limits cap RPU-hours and cross-Region data sharing per workgroup. Serverless and RG don't pay Spectrum's per-TB charge; RA3 does.</li>
+					<li><strong>Spark</strong>: EMR Serverless is cheaper than an EMR on EC2 cluster that would run below about 70% utilization On-Demand (50% with Savings Plans); with Spot, EMR on EC2 or EKS stays cheaper.</li>
+				</ul>
+				<span class="file">Analytics workgroup 444444444444: alarm at 2,000 RPU-hours a month, then switch user queries off at a hard cap (AWS CLI)</span>
+<pre><code>aws redshift-serverless create-usage-limit \
+  --resource-arn arn:aws:redshift-serverless:us-east-1:444444444444:workgroup/WORKGROUP_ID \
+  --usage-type serverless-compute \
+  --amount 2000 --period monthly --breach-action emit-metric
+
+aws redshift-serverless create-usage-limit \
+  --resource-arn arn:aws:redshift-serverless:us-east-1:444444444444:workgroup/WORKGROUP_ID \
+  --usage-type serverless-compute \
+  --amount 3000 --period monthly --breach-action deactivate</code></pre>
+				<p>The amount is RPU-hours (terabytes for <code>cross-region-datasharing</code>). <code>deactivate</code> stops queries, so the hard cap sits well above the alert.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Central producer account, consumers on their own bill</h4>
+				<p>One analytics account owns storage, catalog, keys and grants; units query from their own accounts. The cost: the analytics team becomes a bottleneck for new data products, which is when a data mesh (Alternatives) pays off.</p>
+			</div>
+			<div class="entry">
+				<h4>Table buckets for churn, a general purpose bucket for the regulated table</h4>
+				<p>Table buckets remove maintenance work, which matters most for tables written every minute. The regulated <code>customers</code> table stays on <code>example-curated</code>, where the existing key policy, bucket policies, lifecycle rules and replication already satisfy the auditors. The cost is two maintenance models: S3 Tables configuration for one, Glue optimizers for the other.</p>
+			</div>
+			<div class="entry">
+				<h4>Lake Formation rather than IAM-only access</h4>
+				<p>IAM and table bucket policies grant whole tables and namespaces. Lake Formation adds rows, columns, cells, tags and cross-account RAM shares in one place across Athena, Redshift and EMR. The price is a second permission system to learn and audit, and settings (cross-account version, IAMAllowedPrincipals, catalog key) that silently block sharing when wrong.</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>Data mesh with producer accounts</h4>
+				<p>Each domain account owns its tables and keys and shares data products through the central catalog, with SageMaker Catalog (built on DataZone) for discovery and access requests. It scales ownership but multiplies accounts, keys and RAM shares.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Prove the filter</span><span class="desc">As an EU analyst, <code>SELECT *</code> on the customers resource link must return only <code>region = 'EU'</code> rows and no <code>email</code> or <code>phone</code> columns; a query naming <code>email</code> must fail. A role in another business unit must get AccessDenied.</span></li>
+				<li><span class="name">Break the schema</span><span class="desc">Send an event with a renamed field through the forwarder: the record must land in the Firehose error prefix, an alarm must fire, and <code>order_events</code> must keep its schema.</span></li>
+				<li><span class="name">Watch maintenance</span><span class="desc">Run <code>aws s3tables get-table-maintenance-job-status</code> for each table weekly; any <code>FAILED</code> snapshot job (a forgotten branch or retention property) is a finding.</span></li>
+				<li><span class="name">Rehearse a DR failover</span><span class="desc">In staging, fail over the orders Global Database: confirm the integration goes inactive, recreate it in us-west-2 and measure reseeding time against the analytics recovery objective.</span></li>
+				<li><span class="name">Test a deletion request</span><span class="desc">Delete a test customer, then confirm time travel still shows the row until the snapshot ages out, and that it is gone after expiry and <code>NoncurrentDays</code>.</span></li>
+				<li><span class="name">Check the bill</span><span class="desc">Run a query over the scan cutoff (cancelled), push the staging workgroup past its usage limit (metric, then deactivation), and confirm Cost Explorer splits storage by the <code>domain</code> tag and query cost by consumer account.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-5.html">1.5</a> Design Data, Storage, and Database Architectures</td><td data-label="What this architecture demonstrates">S3 Tables versus Iceberg on general purpose buckets, Firehose to Iceberg, Aurora zero-ETL, Redshift writing Iceberg, Lake Formation cross-account sharing, resource links, Redshift data sharing</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design Identity Security Architectures</td><td data-label="What this architecture demonstrates">Trusted identity propagation so Lake Formation authorizes the signed-in analyst</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Design Encryption and Key Management Strategies</td><td data-label="What this architecture demonstrates">A customer managed key per domain, SSE-KMS table buckets and the maintenance principal, shareable catalog encryption, encrypted datashares and Athena results</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-3.html">2.3</a> Design Multi-Account Governance and Compliance Solutions</td><td data-label="What this architecture demonstrates">Producer and consumer accounts, LF-Tag grants through AWS RAM, cross-account versions, no re-sharing, CloudTrail in both accounts</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-4.html">2.4</a> Design Architectures to Meet Compliance Requirements</td><td data-label="What this architecture demonstrates">Data filters for regulated rows and columns, snapshot expiry and file removal for deletion requests</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-4.html">3.4</a> Optimize Storage and Database Costs</td><td data-label="What this architecture demonstrates">Compaction strategies, Intelligent-Tiering for tables, Athena scan cutoffs, Redshift Serverless usage limits, consumer-pays sharing, EMR Serverless versus EMR on EC2</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"Business units in other accounts must query the central data lake with column- and row-level restrictions and the least operational overhead" is <strong>Lake Formation with LF-Tag grants through AWS RAM and data filters</strong>, with resource links in the consumer account, not bucket policies or copies. "Each consuming team must pay for its own warehouse queries on live data" is <strong>Redshift data sharing</strong> (consumer pays compute). "Load Aurora changes into the warehouse continuously without building a pipeline" is a <strong>zero-ETL integration</strong>. "Streaming Iceberg tables suffer from many small files" is <strong>S3 Tables automatic compaction</strong> (or Glue table optimizers). "The cross-account grant fails with AccessDeniedException" points to <strong>IAMAllowedPrincipals</strong>, the cross-account version or a catalog encrypted with the Glue service-managed key.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/big-data/enable-cross-region-fine-grained-data-access-with-aws-lake-formation-and-trusted-identity-propagation/">Enable cross-Region fine-grained data access with AWS Lake Formation and Trusted Identity Propagation</a> (October 2026): a producer account shares Lake Formation tables and a Redshift datashare with a consumer account through resource links, authorized per user.</li>
+				<li><a href="https://aws.amazon.com/blogs/big-data/scaling-fine-grained-access-control-for-enterprise-lakehouse-using-sagemaker-unified-studio-and-aws-lake-formation/">Scaling fine-grained access control for enterprise lakehouse using SageMaker Unified Studio and AWS Lake Formation</a> (August 2026): Identity Center groups mapped to LF-Tag policies on Iceberg tables, deployed with the CDK.</li>
+				<li><a href="https://aws.amazon.com/blogs/big-data/dbt-and-amazon-redshift-data-sharing-multi-cluster-pipelines-without-moving-a-byte/">dbt and Amazon Redshift Data Sharing: Multi-cluster pipelines without moving a byte</a> (October 2026): producer and consumer workgroups sharing live data for separate workloads.</li>
+				<li><a href="https://aws.amazon.com/blogs/aws/new-amazon-s3-tables-storage-optimized-for-analytics-workloads/">New Amazon S3 Tables: Storage optimized for analytics workloads</a> (December 2024): the launch of table buckets and managed Iceberg maintenance (predates SSE-KMS, Intelligent-Tiering and replication for tables).</li>
+				<li><a href="https://aws.amazon.com/blogs/big-data/design-a-data-mesh-architecture-using-aws-lake-formation-and-aws-glue/">Design a data mesh architecture using AWS Lake Formation and AWS Glue</a> (July 2021): producer and consumer accounts around a central governance catalog, the alternative above (predates S3 Tables and SageMaker Lakehouse).</li>
+				<li><a href="https://docs.aws.amazon.com/firehose/latest/dev/apache-iceberg-destination.html">Deliver data to Apache Iceberg Tables with Amazon Data Firehose</a> and <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-maintenance.html">Maintenance for tables</a> (AWS documentation): Firehose limits and S3 Tables compaction and snapshot settings.</li>
+				<li><a href="https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/zero-etl.html">Aurora zero-ETL integrations</a> and <a href="https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-notes.html">Cross-account data sharing notes</a> (AWS documentation): integration limits, and the rules for shared resources and resource links.</li>
+				<li><a href="https://github.com/aws/modern-data-architecture-accelerator">Modern Data Architecture Accelerator (MDAA)</a> (AWS sample code): configuration-driven CDK deployment of a governed data lake with Lake Formation, Glue and Athena.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Professional (SAP-C03) exam guide, effective 17 November 2026.</div>
+</footer>
+
+</body>
+</html>
