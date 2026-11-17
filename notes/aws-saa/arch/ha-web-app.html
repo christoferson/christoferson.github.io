@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Architecture: Highly available web application | AWS SAA-C03 Notes</title>
+	<meta name="description" content="SAA-C03 reference architecture: the company's customer-facing web application in us-east-1, built to survive an Availability Zone failure and scale with demand. Route 53 alias to CloudFront with AWS WAF and ACM, an Application Load Balancer across three AZs, EC2 Auto Scaling with a launch template, ELB health checks, target tracking and instance refresh, Aurora PostgreSQL with replicas and RDS Proxy, ElastiCache for Valkey for sessions, ARC zonal shift, NAT per AZ or Regional NAT, and Savings Plans.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="../saa.css">
+	<!-- diagram:style -->
+	<style>
+	.arch-fig { margin: 18px 0 26px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+	.arch-fig figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); }
+	.dg { display: block; width: 100%; height: auto; margin: 0 auto; }
+	.dg-tall { display: none; max-width: 460px; }
+	@media (max-width: 640px) { .dg-wide { display: none; } .dg-tall { display: block; } }
+	.dg-box { fill: var(--bg-alt); stroke: var(--line-strong); stroke-width: 1.5; }
+	.dg-hub { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dg-grp { fill: none; stroke: var(--line-strong); stroke-width: 1.5; stroke-dasharray: 6 4; }
+	.dg-t { fill: var(--ink); font: 600 13px "Segoe UI", Arial, sans-serif; text-anchor: middle; }
+	.dg-s { fill: var(--muted); font: 12px Consolas, monospace; text-anchor: middle; }
+	.dg-lbl { fill: var(--muted); font: 12px "Segoe UI", Arial, sans-serif; }
+	.dg-halo { paint-order: stroke; stroke: var(--card); stroke-width: 5px; stroke-linejoin: round; }
+	</style>
+	<!-- /diagram:style -->
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../../index.html">All notes</a><span class="sep">/</span><a href="../index.html">SAA-C03</a><span class="sep">/</span><a href="index.html">Architectures</a><span class="sep">/</span><span class="here">HA web application</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Reference architecture</span>
+		<h1>Highly available web application</h1>
+		<p>The company's customer-facing web application in us-east-1, built so that losing a whole Availability Zone costs users at most a few seconds of errors, and so that a sales peak adds capacity by itself: CloudFront and WAF at the edge, an Application Load Balancer and an Auto Scaling group across three AZs, Aurora PostgreSQL with replicas, and sessions in ElastiCache.</p>
+		<div class="tags"><span class="tag code">SAA-C03</span><span class="tag">Domain 2</span><span class="tag">Domain 3</span><span class="tag">Domain 4</span><span class="tag">CloudFront</span><span class="tag">ALB</span><span class="tag">EC2 Auto Scaling</span><span class="tag">Aurora PostgreSQL</span><span class="tag">ElastiCache</span><span class="tag">Route 53</span><span class="tag">ARC</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#scenario">Scenario and requirements</a></li>
+				<li><a href="#flow">How it works</a></li>
+				<li><a href="#build">Build it</a></li>
+				<li class="sub"><a href="#b1">1. Network across three AZs</a></li>
+				<li class="sub"><a href="#b2">2. Edge: Route 53, CloudFront, WAF and ACM</a></li>
+				<li class="sub"><a href="#b3">3. Web tier: ALB and Auto Scaling</a></li>
+				<li class="sub"><a href="#b4">4. Data tier: Aurora, RDS Proxy and ElastiCache</a></li>
+				<li class="sub"><a href="#b5">5. Deployments and AZ impairment</a></li>
+				<li><a href="#decisions">Design decisions</a></li>
+				<li><a href="#alternatives">Alternatives</a></li>
+				<li><a href="#testing">Testing it</a></li>
+				<li><a href="#exam">Exam angles</a></li>
+				<li><a href="#references">Official blogs and references</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="scenario">Scenario and requirements</h2>
+			<p>The company's website and mobile app take orders from customers around the clock. The web tier runs on EC2 in the production account <code>111111111111</code> in us-east-1, and the order data lives in Aurora PostgreSQL. <a href="../d2-task-2-2.html">Task 2.2</a> states the target: survive the loss of an AZ with no manual action, and scale with demand without anyone resizing servers (<a href="../d2-task-2-1.html">Task 2.1</a>, <a href="../d3-task-3-2.html">Task 3.2</a>). Losing the whole Region is the DR on a budget page (not written yet) and, at Professional depth, the SAP <a href="../../aws-sap/arch/multi-region-dr.html">multi-Region DR</a> architecture.</p>
+			<p>The requirements:</p>
+			<ul>
+				<li><strong>AZ failure is a non-event</strong>: every tier spans three AZs, and the remaining two can carry the load.</li>
+				<li><strong>Elastic web tier</strong>: capacity follows traffic, and failed instances are replaced automatically.</li>
+				<li><strong>Stateless servers</strong>: any instance can serve any request, so instances can be added, removed or replaced at any time.</li>
+				<li><strong>Database failover in about a minute or less</strong>, without code changes, and reads offloaded from the writer.</li>
+				<li><strong>Protected at the edge</strong>: HTTPS everywhere, and SQL injection, cross-site scripting and floods filtered before they reach the servers (<a href="../d1-task-1-2.html">Task 1.2</a>).</li>
+				<li><strong>Cost-aware</strong>: pay for redundancy where the requirement needs it, and commit only to the steady baseline (<a href="../d4-task-4-2.html">Task 4.2</a>).</li>
+			</ul>
+			<p>Reused from the task pages: <code>vpc-0prod11111111111</code> and its security groups (<a href="../d1-task-1-2.html">Task 1.2</a>), <code>web-alb</code> and <code>web-tg</code> (<a href="../d2-task-2-1.html">Task 2.1</a>), <code>orders-proxy</code> and the <code>web-5xx-high</code> alarm (<a href="../d2-task-2-2.html">Task 2.2</a>), and the Valkey cache <code>web-cache</code> (<a href="../d3-task-3-3.html">Task 3.3</a>). New on this page: the Auto Scaling group <code>web-asg</code>, the launch template <code>web-lt</code>, the third app subnet <code>subnet-0appc111111111111</code>, and the Aurora cluster <code>orders-east</code> with instances <code>orders-east-1</code> (writer), <code>orders-east-2</code> and <code>orders-east-3</code>.</p>
+			<div class="callout retired"><p><strong>Status changes to know.</strong> Launch configurations are deprecated, and accounts created on or after 1 October 2024 can't create them: use launch templates. Route 53 Application Recovery Controller is now Amazon Application Recovery Controller (ARC); its readiness check is closed to new customers, while zonal shift and zonal autoshift continue. A Regional NAT gateway (November 2025) is now an option next to one zonal NAT gateway per AZ. AWS WAF Classic has reached end of support, so new web ACLs are AWS WAF.</p></div>
+
+			<h2 id="flow">How it works</h2>
+			<!-- diagram:fig -->
+			<figure class="arch-fig">
+<svg class="dg dg-wide" viewBox="0 0 790 350" role="img" aria-labelledby="dgH-wide-t">
+<title id="dgH-wide-t">Highly available web application: Route 53 points at CloudFront with AWS WAF, which sends dynamic requests to an Application Load Balancer across three AZs; the web-asg Auto Scaling group keeps sessions in ElastiCache, writes through RDS Proxy to the Aurora writer and reads from Aurora replicas; ARC zonal shift moves traffic away from an impaired AZ.</title>
+<path d="M170.0 60.0 L210.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M370.0 60.0 L420.0 60.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M620.0 60.0 L580.0 60.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M500.0 83.0 L500.0 152.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M580.0 175.0 L620.0 175.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M493.0 198.0 L493.0 267.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M420.0 290.0 L370.0 290.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M507.0 198.0 L507.0 225.5 Q507.0 232.5 514.0 232.5 L693.0 232.5 Q700.0 232.5 700.0 239.5 L700.0 267.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<rect x="10" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="90" y="57" class="dg-t dg-sm">Route 53</text>
+<text x="90" y="74" class="dg-s dg-sm2">alias record</text>
+<rect x="210" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="57" class="dg-t dg-sm">CloudFront + WAF</text>
+<text x="290" y="74" class="dg-s dg-sm2">ACM, cached /static</text>
+<rect x="420" y="37" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="57" class="dg-t dg-sm">ALB</text>
+<text x="500" y="74" class="dg-s dg-sm2">3 AZs, health checks</text>
+<rect x="620" y="37" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="57" class="dg-t dg-sm">ARC zonal shift</text>
+<text x="700" y="74" class="dg-s dg-sm2">autoshift</text>
+<rect x="420" y="152" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="500" y="172" class="dg-t dg-sm">web-asg</text>
+<text x="500" y="189" class="dg-s dg-sm2">EC2 Auto Scaling</text>
+<rect x="620" y="152" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="172" class="dg-t dg-sm">web-cache</text>
+<text x="700" y="189" class="dg-s dg-sm2">ElastiCache sessions</text>
+<rect x="420" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="500" y="287" class="dg-t dg-sm">orders-proxy</text>
+<text x="500" y="304" class="dg-s dg-sm2">RDS Proxy</text>
+<rect x="210" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="290" y="287" class="dg-t dg-sm">orders-east-1</text>
+<text x="290" y="304" class="dg-s dg-sm2">Aurora writer</text>
+<rect x="620" y="267" width="160" height="46" rx="10" class="dg-box"/>
+<text x="700" y="287" class="dg-t dg-sm">Aurora replicas</text>
+<text x="700" y="304" class="dg-s dg-sm2">reader endpoint</text>
+</svg>
+<svg class="dg dg-tall" viewBox="0 0 400 520" role="img" aria-labelledby="dgH-tall-t">
+<title id="dgH-tall-t">Highly available web application: Route 53 points at CloudFront with AWS WAF, which sends dynamic requests to an Application Load Balancer across three AZs; the web-asg Auto Scaling group keeps sessions in ElastiCache, writes through RDS Proxy to the Aurora writer and reads from Aurora replicas; ARC zonal shift moves traffic away from an impaired AZ.</title>
+<path d="M180.0 40.0 L220.0 40.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M300.0 63.0 L300.0 122.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M180.0 145.0 L220.0 145.0" fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+<path d="M300.0 168.0 L300.0 232.0" fill="none" stroke="var(--text)" stroke-width="2.5"/>
+<path d="M220.0 255.0 L180.0 255.0" fill="none" stroke="var(--info)" stroke-width="2.5"/>
+<path d="M300.0 278.0 L300.0 342.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M220.0 365.0 L180.0 365.0" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+<path d="M100.0 388.0 L100.0 452.0" fill="none" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="6 5"/>
+<rect x="20" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="37" class="dg-t dg-sm">Route 53</text>
+<text x="100" y="54" class="dg-s dg-sm2">alias record</text>
+<rect x="220" y="17" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="37" class="dg-t dg-sm">CloudFront + WAF</text>
+<text x="300" y="54" class="dg-s dg-sm2">ACM, cached /static</text>
+<rect x="220" y="122" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="142" class="dg-t dg-sm">ALB</text>
+<text x="300" y="159" class="dg-s dg-sm2">3 AZs, health checks</text>
+<rect x="20" y="122" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="142" class="dg-t dg-sm">ARC zonal shift</text>
+<text x="100" y="159" class="dg-s dg-sm2">autoshift</text>
+<rect x="220" y="232" width="160" height="46" rx="10" class="dg-hub"/>
+<text x="300" y="252" class="dg-t dg-sm">web-asg</text>
+<text x="300" y="269" class="dg-s dg-sm2">EC2 Auto Scaling</text>
+<rect x="20" y="232" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="252" class="dg-t dg-sm">web-cache</text>
+<text x="100" y="269" class="dg-s dg-sm2">ElastiCache sessions</text>
+<rect x="220" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="300" y="362" class="dg-t dg-sm">orders-proxy</text>
+<text x="300" y="379" class="dg-s dg-sm2">RDS Proxy</text>
+<rect x="20" y="342" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="362" class="dg-t dg-sm">orders-east-1</text>
+<text x="100" y="379" class="dg-s dg-sm2">Aurora writer</text>
+<rect x="20" y="452" width="160" height="46" rx="10" class="dg-box"/>
+<text x="100" y="472" class="dg-t dg-sm">Aurora replicas</text>
+<text x="100" y="489" class="dg-s dg-sm2">reader endpoint</text>
+</svg>
+				<figcaption>Figure: every tier spans three AZs in us-east-1. Requests pass Route 53, CloudFront with AWS WAF and the ALB (grey) to stateless instances in <code>web-asg</code>, which keep sessions in <code>web-cache</code> and read from the Aurora reader endpoint (blue) and write through <code>orders-proxy</code> to the writer (green). When an AZ fails, health checks or an ARC zonal shift (yellow) take it out of service, Auto Scaling replaces capacity in the other AZs and Aurora promotes a replica (dashed: replication, phone view).</figcaption>
+			</figure>
+			<!-- /diagram:fig -->
+			<p>A customer's request, and what happens when an AZ fails. Steps marked <span class="who auto">AWS</span> happen automatically.</p>
+			<ol class="flow">
+				<li class="group">Normal request</li>
+				<li class="auto"><span class="name">Resolve the name<span class="who auto">AWS</span></span><span class="desc">Route 53 answers <code>www.example.com</code> with an alias record pointing at the CloudFront distribution; alias queries to AWS resources are free.</span></li>
+				<li class="auto"><span class="name">Edge<span class="who auto">AWS</span></span><span class="desc">CloudFront terminates TLS with an ACM certificate, AWS WAF checks the request, and static paths such as <code>/static/*</code> are served from cache.</span></li>
+				<li class="auto"><span class="name">Load balancer<span class="who auto">AWS</span></span><span class="desc">Dynamic requests go to the ALB, which sends each one to a healthy instance of <code>web-asg</code> in any of the three AZs (cross-zone is always on at an ALB).</span></li>
+				<li><span class="name">Application<span class="who">Web tier</span></span><span class="desc">The instance reads the customer's session from <code>web-cache</code>, reads catalog data from cache or the Aurora reader endpoint, and writes orders through <code>orders-proxy</code> to the writer.</span></li>
+				<li class="group">An AZ fails</li>
+				<li class="auto"><span class="name">Stop sending traffic<span class="who auto">AWS</span></span><span class="desc">ALB health checks fail for targets in the impaired AZ and the ALB routes only to healthy targets; with zonal autoshift, or a zonal shift you start, ARC moves traffic away even when health checks still pass.</span></li>
+				<li class="auto"><span class="name">Replace capacity<span class="who auto">AWS</span></span><span class="desc">Auto Scaling launches replacements and new capacity in the healthy AZs, and rebalances when the AZ returns.</span></li>
+				<li class="auto"><span class="name">Fail over the database<span class="who auto">AWS</span></span><span class="desc">If the writer was in that AZ, Aurora promotes the replica with the best promotion tier, typically in under 60 seconds; RDS Proxy keeps client connections open and reconnects them to the new writer.</span></li>
+			</ol>
+
+			<h2 id="build">Build it</h2>
+
+			<div class="item" id="b1">
+				<span class="kicker">Step 1</span>
+				<h3>Network across three AZs</h3>
+				<p><strong>Three tiers of subnets in three AZs.</strong> Each AZ gets a public subnet (the ALB's nodes and, with zonal NAT, the NAT gateway), a private app subnet (the instances and the cache) and a private database subnet with no route to the internet at all (<a href="../d1-task-1-2.html">Task 1.2</a>). Security groups chain the tiers by reference, not IP address, so the rules keep working as instances come and go.</p>
+				<span class="file">Allow the app tier to receive traffic only from the load balancer (AWS CLI, from Task 1.2)</span>
+<pre><code>aws ec2 authorize-security-group-ingress \
+    --group-id sg-0app1111111111111 \
+    --protocol tcp --port 8080 \
+    --source-group sg-0alb1111111111111</code></pre>
+				<p><strong>Outbound internet without a single point of failure.</strong> A zonal NAT gateway is redundant only inside its own AZ: one serving all three AZs means losing its AZ cuts outbound access for the other two. The fix is either one zonal NAT gateway per AZ with each private route table pointing at the one in its own AZ, or a Regional NAT gateway, one ID that expands across AZs automatically and needs no public subnet.</p>
+				<span class="file">Create a Regional NAT gateway for the prod VPC (AWS CLI, from Task 1.2)</span>
+<pre><code><span class="c"># Automatic mode manages the addresses and the AZ expansion for you</span>
+aws ec2 create-nat-gateway --vpc-id vpc-0prod11111111111 --availability-mode regional</code></pre>
+				<div class="callout trap"><p>"Instances in private subnets lost internet access when one AZ failed" means a single zonal NAT gateway. The highly available answer is <strong>one NAT gateway per AZ</strong> (with per-AZ route tables) or a Regional NAT gateway, not a second NAT gateway in the same AZ.</p></div>
+			</div>
+
+			<div class="item" id="b2">
+				<span class="kicker">Step 2</span>
+				<h3>Edge: Route 53, CloudFront, WAF and ACM</h3>
+				<p><strong>Route 53 alias to CloudFront.</strong> An alias record works at the zone apex too, needs no TTL management and costs nothing per query. Route 53 failover records belong to the Region-level design; inside one Region the ALB and ARC handle AZ failures.</p>
+				<p><strong>CloudFront in front of the ALB, even for dynamic pages.</strong> CloudFront ends TLS close to the customer, caches what it can, and absorbs spikes and DDoS attacks (<a href="../d2-task-2-1.html">Task 2.1</a>). One distribution has two cache behaviours:</p>
+				<ul>
+					<li><strong><code>/static/*</code></strong> (images, CSS, scripts): long TTLs, so most requests never reach the ALB.</li>
+					<li><strong>Default (<code>*</code>)</strong>: forwards to the ALB with caching off or very short, passing the cookies and headers the application needs for sessions.</li>
+				</ul>
+				<p><strong>AWS WAF on the distribution.</strong> A global web ACL (created in us-east-1) on CloudFront filters at the edge: the Core rule set for cross-site scripting, the SQL database rule group for SQL injection, and a rate-based rule for request floods from one address (<a href="../d1-task-1-2.html">Task 1.2</a>). Shield Standard protects CloudFront and Route 53 automatically at no cost.</p>
+				<p><strong>Certificates from ACM.</strong> Public ACM certificates are free and renew automatically. The certificate for CloudFront must be in us-east-1, and the ALB's certificate must be in the ALB's Region; here both are us-east-1.</p>
+				<p><strong>Protecting the origin.</strong> If the ALB is internet-facing, anyone who finds its DNS name can skip CloudFront and its WAF rules. Since November 2024, CloudFront VPC origins can reach an ALB in private subnets, so the load balancer doesn't need to be public at all. The company starts with an internet-facing ALB and plans that move (Design decisions).</p>
+				<div class="callout tip"><p>"Block SQL injection and cross-site scripting for a website behind CloudFront" is <strong>AWS WAF on the CloudFront distribution</strong> (or the ALB), never a security group or network ACL. "TLS certificate for CloudFront" means <strong>ACM in us-east-1</strong>, whatever Region the origin is in.</p></div>
+			</div>
+
+			<div class="item" id="b3">
+				<span class="kicker">Step 3</span>
+				<h3>Web tier: ALB and Auto Scaling</h3>
+				<p><strong>The ALB spans three AZs.</strong> It has nodes in every enabled AZ, so it isn't a single point of failure; <code>web-tg</code> health-checks each instance and sends traffic only to healthy targets, across zones. Deregistration delay (300 seconds by default) lets in-flight requests finish when an instance leaves during scale-in or a deployment.</p>
+				<p><strong>An Auto Scaling group with a launch template.</strong> The launch template <code>web-lt</code> holds the AMI, instance type, IMDSv2 requirement and security group; each new AMI is a new version.</p>
+				<span class="file">Create the web tier group across three AZs with ELB health checks (AWS CLI; new names web-asg, web-lt, subnet-0appc111111111111)</span>
+<pre><code>aws autoscaling create-auto-scaling-group \
+    --auto-scaling-group-name web-asg \
+    --launch-template LaunchTemplateName=web-lt,Version='$Default' \
+    --min-size 6 \
+    --max-size 30 \
+    --desired-capacity 6 \
+    --vpc-zone-identifier "subnet-0appa111111111111,subnet-0appb111111111111,subnet-0appc111111111111" \
+    --target-group-arns arn:aws:elasticloadbalancing:us-east-1:111111111111:targetgroup/web-tg/fedcba9876543210 \
+    --health-check-type ELB \
+    --health-check-grace-period 300 \
+    --default-instance-warmup 300 \
+    --availability-zone-impairment-policy ZonalShiftEnabled=true,ImpairedZoneHealthCheckBehavior=IgnoreUnhealthy</code></pre>
+				<p>How it reads:</p>
+				<ul>
+					<li><strong><code>--health-check-type ELB</code></strong>: EC2 status checks notice a broken instance, not a broken application; the ELB check also replaces an instance whose web server has hung.</li>
+					<li><strong><code>--health-check-grace-period 300</code></strong>: how long a new instance has to boot before its health checks count. It is 300 seconds by default in the console but 0 from the CLI and SDKs, so set it explicitly, or new instances are killed while they are still starting.</li>
+					<li><strong><code>--default-instance-warmup 300</code></strong>: a new instance's metrics aren't counted in scaling decisions until it is ready (AWS suggests 300 seconds if unsure).</li>
+					<li><strong>Minimum of six, two per AZ</strong>: static stability. If one AZ is lost, four instances keep serving while replacements launch; the minimum is sized so two AZs carry normal peak traffic.</li>
+					<li><strong><code>--availability-zone-impairment-policy</code></strong>: registers the group for ARC zonal shift (Step 5); <code>IgnoreUnhealthy</code> means instances in a shifted-away AZ aren't replaced during the impairment, which AWS recommends when the group is prescaled.</li>
+				</ul>
+				<p><strong>Target tracking on requests per target.</strong> The group keeps about 1,000 requests per instance, the policy from <a href="../d2-task-2-1.html">Task 2.1</a>. <code>ALBRequestCountPerTarget</code> suits a web tier because it rises with traffic and falls as instances are added; the load balancer's total <code>RequestCount</code> or its latency don't fall with added capacity and make poor targets (<a href="../d3-task-3-2.html">Task 3.2</a>).</p>
+				<span class="file">Attach the target tracking policy to web-asg (AWS CLI; config.json is the Task 2.1 configuration with TargetValue 1000.0 and ALBRequestCountPerTarget)</span>
+<pre><code>aws autoscaling put-scaling-policy \
+    --auto-scaling-group-name web-asg \
+    --policy-name web-1000-requests-per-target \
+    --policy-type TargetTrackingScaling \
+    --target-tracking-configuration file://config.json</code></pre>
+				<p><strong>Stateless instances.</strong> Nothing about a customer lives on an instance: sessions are in ElastiCache and uploads in <code>example-prod-uploads</code>, so scale-in, instance refresh and AZ loss are harmless. Sticky sessions would lose the session with its instance, so the target group doesn't use them.</p>
+				<div class="callout trap"><p>"Instances are terminated and replaced in a loop right after launch" is a health check grace period that is too short (often 0 because the group was created from the CLI), not a scaling policy problem. "The web server hangs but Auto Scaling never replaces the instance" is a group using only <strong>EC2</strong> health checks; switch it to <strong>ELB</strong>.</p></div>
+			</div>
+
+			<div class="item" id="b4">
+				<span class="kicker">Step 4</span>
+				<h3>Data tier: Aurora, RDS Proxy and ElastiCache</h3>
+				<p><strong>Aurora PostgreSQL with replicas in the other AZs.</strong> Aurora's storage keeps six copies across three AZs, so data survives an AZ loss even with one instance; but with no replica Aurora must recreate the writer (typically under 10 minutes). With replicas in other AZs it promotes one, typically in under 60 seconds. <code>orders-east</code> has its writer <code>orders-east-1</code> in one AZ and a replica in each of the others.</p>
+				<span class="file">Add an Aurora Replica to orders-east in a second AZ, first in line for promotion (AWS CLI; new names; the cluster manages storage, security groups and backups)</span>
+<pre><code><span class="c"># Run once more with orders-east-3, us-east-1c and the same tier for the third AZ</span>
+aws rds create-db-instance \
+    --db-instance-identifier orders-east-2 \
+    --db-cluster-identifier orders-east \
+    --engine aurora-postgresql \
+    --db-instance-class db.r6g.large \
+    --availability-zone us-east-1b \
+    --promotion-tier 0</code></pre>
+				<p>Promotion tiers run from 0 to 15, and Aurora promotes the replica with the lowest tier first. Keep replicas the same class as the writer.</p>
+				<p><strong>Writer and reader endpoints.</strong> The cluster endpoint always points to the writer and follows it through a failover; the reader endpoint spreads <em>connections</em> (not individual queries) over the replicas. The application sends order writes to the writer and catalog and order-history reads to the reader endpoint, so the failover replicas also offload reads (<a href="../d3-task-3-3.html">Task 3.3</a>). Keep client DNS caching short.</p>
+				<p><strong>RDS Proxy for faster, quieter failovers.</strong> <code>orders-proxy</code> pools connections, protecting Aurora from connection storms when the web tier scales out quickly, and during a failover keeps the application's connections open and reconnects to the new writer itself, bypassing DNS caching. It is never publicly accessible.</p>
+				<span class="file">The proxy in front of the orders database, from Task 2.2 (AWS CLI)</span>
+<pre><code>aws rds create-db-proxy \
+    --db-proxy-name orders-proxy \
+    --engine-family POSTGRESQL \
+    --auth AuthScheme=SECRETS,SecretArn=arn:aws:secretsmanager:us-east-1:111111111111:secret:orders-db,IAMAuth=REQUIRED \
+    --role-arn arn:aws:iam::111111111111:role/rds-proxy-secrets \
+    --vpc-subnet-ids subnet-0dba111111111111a subnet-0dbb111111111111b \
+    --vpc-security-group-ids sg-0proxy1111111111 \
+    --require-tls</code></pre>
+				<p><strong>ElastiCache for Valkey for sessions and read caching.</strong> <code>web-cache</code> is serverless Valkey: no node sizing, automatic scaling, replicated across AZs. Sessions carry a TTL matching the session timeout; catalog pages use lazy loading with a TTL, so a burst of product views doesn't reach the database (<a href="../d2-task-2-1.html">Task 2.1</a>). Valkey is priced 33% lower than other engines on serverless.</p>
+				<span class="file">The serverless Valkey cache in the app subnets, from Task 3.3 (AWS CLI)</span>
+<pre><code>aws elasticache create-serverless-cache --serverless-cache-name web-cache \
+    --engine valkey \
+    --subnet-ids subnet-0appa111111111111 subnet-0appb111111111111 \
+    --security-group-ids sg-0cache111111111111</code></pre>
+				<div class="callout tip"><p>"Survive an AZ failure with automatic database failover and also scale reads" is <strong>Aurora with replicas in other AZs</strong> (or an RDS Multi-AZ DB cluster). "Reduce failover time without changing the application" is <strong>RDS Proxy</strong>. "Session state must survive the loss of a web server" is <strong>ElastiCache</strong> (or DynamoDB), not sticky sessions.</p></div>
+			</div>
+
+			<div class="item" id="b5">
+				<span class="kicker">Step 5</span>
+				<h3>Deployments and AZ impairment</h3>
+				<p><strong>Instance refresh for new AMIs.</strong> Servers are never patched in place: EC2 Image Builder bakes a new AMI, it becomes a new <code>web-lt</code> version, and an instance refresh replaces the fleet in rolling batches (<a href="../d2-task-2-2.html">Task 2.2</a>). Keeping 90% healthy (the default) limits the capacity dip, and automatic rollback returns the group to the previous template version if the refresh fails or the <code>web-5xx-high</code> alarm fires.</p>
+				<span class="file">config.json for aws autoscaling start-instance-refresh --cli-input-json file://config.json: roll out the default web-lt version, roll back on failure or on the 5xx alarm</span>
+<pre><code>{
+  "AutoScalingGroupName": "web-asg",
+  "DesiredConfiguration": {
+    "LaunchTemplate": {
+      "LaunchTemplateName": "web-lt",
+      "Version": "$Default"
+    }
+  },
+  "Preferences": {
+    "MinHealthyPercentage": 90,
+    "InstanceWarmup": 300,
+    "AutoRollback": true,
+    "AlarmSpecification": { "Alarms": ["web-5xx-high"] }
+  }
+}</code></pre>
+				<p>Blue/green (weighted target groups or CodeDeploy) is the alternative when both versions must run before traffic moves.</p>
+				<p><strong>Zonal shift for gray failures.</strong> Health checks catch instances that fail outright. Some AZ problems don't fail them: higher latency or intermittent errors in one AZ while checks still pass. ARC zonal shift moves traffic away from one AZ for a supported resource (ALB, NLB, Auto Scaling group, EKS) for up to three days, extendable, and back again; with zonal autoshift AWS starts the shift itself and runs practice shifts. Enable zonal shift on each load balancer first. During a shift on <code>web-asg</code>, the group launches all new capacity in the healthy AZs and blocks scaling policies from lowering desired capacity.</p>
+				<span class="file">Move web-asg away from the impaired AZ for two hours (AWS CLI; replace &lt;uuid&gt; with the group's ID from its ARN; use the AZ ID, not the AZ name)</span>
+<pre><code>aws arc-zonal-shift start-zonal-shift \
+    --resource-identifier arn:aws:autoscaling:us-east-1:111111111111:autoScalingGroup:&lt;uuid&gt;:autoScalingGroupName/web-asg \
+    --away-from use1-az1 \
+    --expires-in 2h \
+    --comment "Elevated 5xx in use1-az1, shifting web tier"</code></pre>
+				<p>Shift the ALB too, so it stops sending requests into the AZ. AZ IDs such as <code>use1-az1</code> name the same physical AZ in every account.</p>
+			</div>
+
+			<h2 id="decisions">Design decisions</h2>
+			<div class="entry">
+				<h4>Three AZs, prescaled for the loss of one</h4>
+				<p>With three AZs, losing one leaves two thirds of the capacity; with two, it leaves half, so a two-AZ design must overprovision to 200% of peak to stay statically stable, against 150% for three. The six-instance minimum costs money every hour but removes any dependence on launching capacity during the failure.</p>
+			</div>
+			<div class="entry">
+				<h4>Aurora replicas instead of a larger single writer</h4>
+				<p>Two replicas roughly triple the database instance cost, but turn a possible 10-minute writer recreation into a sub-minute failover and absorb reads. Aurora Standard charges per I/O; I/O-Optimized suits clusters where I/O is at least 25% of the Aurora bill (<a href="../d3-task-3-3.html">Task 3.3</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>Regional NAT gateway instead of one per AZ</h4>
+				<p>Both meet the requirement. A zonal NAT gateway costs US$0.045 per hour plus US$0.045 per GB processed (<a href="../d4-task-4-4.html">Task 4.4</a>), so three of them cost three hourly charges; the Regional NAT gateway is billed per AZ it runs in, so its gain is simpler routing. A single zonal NAT gateway is what fails the requirement.</p>
+			</div>
+			<div class="entry">
+				<h4>Origin protection: move to a CloudFront VPC origin</h4>
+				<p>An internet-facing ALB can be reached around CloudFront, skipping its WAF rules and caching. A VPC origin makes the ALB internal, so CloudFront is the only way in. The ANS <a href="../../aws-ans/arch/inbound-perimeter.html">inbound perimeter</a> architecture cover the edge in more depth.</p>
+			</div>
+			<div class="entry">
+				<h4>Multi-AZ cost, cross-AZ traffic and commitments</h4>
+				<p>Redundancy has running costs beyond extra instances: traffic between AZs costs US$0.01 per GB in each direction, so a web tier calling a cache or database in another AZ pays for every byte (<a href="../d3-task-3-4.html">Task 3.4</a>). The steady baseline (the six-instance minimum around the clock) is covered by a Compute Savings Plan, up to 66% off and still valid if the team moves to Graviton or Fargate (<a href="../d4-task-4-2.html">Task 4.2</a>); peaks above it stay On-Demand, and the Aurora instances can be covered by Reserved Instances or a Database Savings Plan (<a href="../d4-task-4-3.html">Task 4.3</a>).</p>
+			</div>
+
+			<h2 id="alternatives">Alternatives</h2>
+			<div class="entry">
+				<h4>ECS on Fargate instead of EC2</h4>
+				<p>The company's APIs already run as ECS services on Fargate (<a href="../d2-task-2-1.html">Task 2.1</a>). The same design works with an ECS service across three AZs behind the ALB: no AMIs or patching, Application Auto Scaling for tasks, and built-in blue/green with rollback. Fargate is billed per second for the vCPU and memory each task requests, with no instances to keep busy, and it removes the server management, which is the usual answer to "least operational overhead". Compute Savings Plans cover Fargate too.</p>
+			</div>
+			<div class="entry">
+				<h4>Elastic Beanstalk</h4>
+				<p>Beanstalk creates the ALB, Auto Scaling group and health monitoring from an uploaded application, for a team that wants a multi-AZ web tier without designing it, at the cost of control. Its Amazon Linux 2 platforms are retired; use the AL2023 platforms (<a href="../d3-task-3-2.html">Task 3.2</a>).</p>
+			</div>
+			<div class="entry">
+				<h4>A single-AZ design</h4>
+				<p>One AZ is cheaper (no cross-AZ traffic, one NAT gateway, no replicas) but fails the requirement: an AZ event takes down every tier at once. It suits only dev and test. An Auto Scaling group of one across several AZ subnets is the minimum self-healing pattern for an application that can't run more than one copy (<a href="../d2-task-2-2.html">Task 2.2</a>), with downtime while the replacement starts.</p>
+			</div>
+
+			<h2 id="testing">Testing it</h2>
+			<ol class="flow">
+				<li><span class="name">Load test to the peak</span><span class="desc">Ramp synthetic traffic through CloudFront to the expected sales peak and beyond; <code>web-asg</code> must scale out on <code>ALBRequestCountPerTarget</code> without 5xx errors, and scale back in gradually afterwards.</span></li>
+				<li><span class="name">Kill instances</span><span class="desc">Stop the web server on one instance: the ELB health check must mark it unhealthy and Auto Scaling must replace it, with no customer losing their session.</span></li>
+				<li><span class="name">Fail over Aurora</span><span class="desc">Run <code>aws rds failover-db-cluster --db-cluster-identifier orders-east --target-db-instance-identifier orders-east-2</code> in a quiet period; measure how long order writes fail through <code>orders-proxy</code> and confirm the cluster endpoint now points at <code>orders-east-2</code>.</span></li>
+				<li><span class="name">Rehearse an AZ loss</span><span class="desc">Start a zonal shift on the ALB and <code>web-asg</code> for one AZ ID (or use an AWS FIS AZ scenario); two AZs must carry peak load, latency must stay within target, and new instances must launch only in the healthy AZs.</span></li>
+				<li><span class="name">Check the edge</span><span class="desc">Send a request with a SQL injection pattern: WAF must block it at CloudFront. After the VPC origin move, the ALB must not answer from the internet at all.</span></li>
+				<li><span class="name">Roll back a deployment</span><span class="desc">Start an instance refresh with a deliberately broken AMI on staging; the failing health checks or the 5xx alarm must stop the refresh and restore the previous template version.</span></li>
+			</ol>
+
+			<h2 id="exam">Exam angles</h2>
+			<div class="table-wrap">
+				<table class="stack labeled">
+					<thead><tr><th>Task</th><th>What this architecture demonstrates</th></tr></thead>
+					<tbody>
+						<tr><td data-label="Task"><a href="../d1-task-1-2.html">1.2</a> Design secure workloads and applications</td><td data-label="What this architecture demonstrates">Tiered subnets, security groups referencing each other, NAT per AZ or Regional NAT, AWS WAF on CloudFront, Shield, ACM certificates in us-east-1 for CloudFront</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-1.html">2.1</a> Design scalable and loosely coupled architectures</td><td data-label="What this architecture demonstrates">Stateless web tier with sessions in ElastiCache, ALB with Auto Scaling and launch templates, CloudFront in front, lazy-loading cache</td></tr>
+						<tr><td data-label="Task"><a href="../d2-task-2-2.html">2.2</a> Design highly available and/or fault-tolerant architectures</td><td data-label="What this architecture demonstrates">Every tier across three AZs, static stability, Aurora replicas and failover, RDS Proxy, instance refresh, ARC zonal shift and autoshift</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-2.html">3.2</a> Design high-performing and elastic compute solutions</td><td data-label="What this architecture demonstrates">Target tracking on ALBRequestCountPerTarget, ELB health checks, grace period and instance warmup</td></tr>
+						<tr><td data-label="Task"><a href="../d3-task-3-3.html">3.3</a> Determine high-performing database solutions</td><td data-label="What this architecture demonstrates">Writer and reader endpoints, read offload to replicas, ElastiCache for Valkey for sessions and hot reads</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-2.html">4.2</a> Design cost-optimized compute solutions</td><td data-label="What this architecture demonstrates">Compute Savings Plan for the baseline, On-Demand for peaks, Fargate as the lower-overhead alternative</td></tr>
+						<tr><td data-label="Task"><a href="../d4-task-4-4.html">4.4</a> Design cost-optimized network architectures</td><td data-label="What this architecture demonstrates">NAT gateway pricing, cross-AZ charges, CloudFront caching to cut origin traffic</td></tr>
+					</tbody>
+				</table>
+			</div>
+			<div class="callout tip"><p>"A web application must remain available if an Availability Zone fails. Which solution meets these requirements with the LEAST operational overhead?" is an <strong>ALB with an Auto Scaling group across multiple AZs and a Multi-AZ database</strong> (Aurora with replicas here), not scripts that relaunch instances or a larger single instance. "Users are logged out when Auto Scaling terminates instances" is <strong>sessions in ElastiCache</strong> (or DynamoDB). "Most cost-effective way to keep private instances' internet access through an AZ failure" is <strong>NAT per AZ or a Regional NAT gateway</strong>. "Unhealthy instances keep receiving traffic and aren't replaced" is <strong>ELB health checks</strong> on the group.</p></div>
+
+			<h2 id="references">Official blogs and references</h2>
+			<ul>
+				<li><a href="https://aws.amazon.com/blogs/compute/using-zonal-shift-with-amazon-ec2-auto-scaling/">Using zonal shift with Amazon EC2 Auto Scaling</a> (November 2024): stopping launches into and routing away from an impaired AZ. Zonal shift is part of ARC, formerly Route 53 ARC.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/optimizing-application-performance-the-strategic-benefits-of-combining-amazon-cloudfront-with-application-load-balancers/">Optimizing application performance: The strategic benefits of combining Amazon CloudFront with Application Load Balancers</a> (February 2026): why CloudFront in front of an ALB helps even dynamic content.</li>
+				<li><a href="https://aws.amazon.com/blogs/networking-and-content-delivery/migrate-amazon-cloudfront-public-origins-to-private-vpc-origins/">Migrate Amazon CloudFront public origins to private VPC origins</a> (March 2026): moving the ALB into private subnets, reachable only through CloudFront.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/faster-scaling-with-amazon-ec2-auto-scaling-target-tracking/">Faster scaling with Amazon EC2 Auto Scaling Target Tracking</a> (November 2024): high-resolution metrics so the group reacts faster to spikes.</li>
+				<li><a href="https://aws.amazon.com/blogs/compute/introducing-instance-refresh-for-ec2-auto-scaling/">Introducing Instance Refresh for EC2 Auto Scaling</a> (June 2020): rolling replacement after a launch template change (predates the launch configuration deprecation; use launch templates).</li>
+				<li><a href="https://aws.amazon.com/blogs/database/how-intuit-and-aws-systematically-improved-resiliency-on-elasticache-using-aws-fault-injection-service/">How Intuit and AWS systematically improved resiliency on ElastiCache using AWS Fault Injection Service</a> (September 2026): testing cache failover and client behaviour under node and AZ failures.</li>
+				<li><a href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-zonal-shift.html">Auto Scaling group zonal shift</a> and <a href="https://docs.aws.amazon.com/cli/latest/reference/rds/failover-db-cluster.html">failover-db-cluster</a> (AWS documentation): group behaviour during a shift, and forcing an Aurora failover for testing.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Architecture navigation">
+				<a href="index.html"><small>Back</small>All architectures</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes based on the official AWS Certified Solutions Architect &ndash; Associate (SAA-C03) exam guide, version 1.1.</div>
+</footer>
+
+</body>
+</html>
