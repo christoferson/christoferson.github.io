@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.1: Architecture and Runtime Selection | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 1.1 (7 December 2026 guide): choosing a workflow or an agent from business requirements, error tolerance and audit constraints, deciding on orchestrator and subagent decomposition, and picking the runtime: your own loop on the Messages API, a self-hosted Agent SDK harness, or Claude Managed Agents with a cloud or self-hosted sandbox.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agents and Workflows &middot; 17%</span>
+		<h1>1.1: Architecture and Runtime Selection</h1>
+		<p>Two decisions before any code: whether the job is a workflow or an agent (and whether it splits into subagents), and where the agent loop and its tools will run, from your own process to a sandbox Anthropic manages.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Workflows</span><span class="tag">Agents</span><span class="tag">Subagents</span><span class="tag">Agent SDK</span><span class="tag">Managed Agents</span><span class="tag">Sandboxes</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Workflow or agent</a></li>
+				<li><a href="#s2">Splitting into subagents</a></li>
+				<li><a href="#s3">Three runtimes</a></li>
+				<li><a href="#s4">The decision in code</a></li>
+				<li><a href="#s5">Managed Agents</a></li>
+				<li><a href="#s6">Cloud or self-hosted sandbox</a></li>
+				<li><a href="#s7">Self-hosting the Agent SDK</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.1</span>
+				<p><strong>Architecture and Runtime Selection</strong>: "Evaluating whether a workflow or an agentic architecture fits a set of business requirements, error tolerance, and audit constraints. This includes choosing the orchestrator and subagent decomposition and selecting the execution environment: a self-hosted harness or a managed, sandboxed agent runtime."</p>
+			</div>
+			<p>Exam items describe a business need and its constraints (how costly a mistake is, what must be auditable, where data may go), then ask for the design and the place it runs. The design half overlaps the architect exam, so this page summarises it and links the detail in the CCAR-F notes. The runtime half, and especially Claude Managed Agents, is the developer-specific part. Building the agent itself with the SDK is <a href="d1-skill-1-2.html">skill 1.2</a>, and diagnosing a misbehaving one is <a href="d1-skill-1-3.html">skill 1.3</a>.</p>
+			<p>Sources: Anthropic's documentation on Claude Managed Agents (overview, choosing an environment, quickstart) and on hosting the Agent SDK, plus "Building effective agents", checked on 20 November 2026 and paraphrased. Both examples were run against the anthropic Python SDK 2.10.0 with a mocked API, not the live service.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop wants three things automated: refunds under a fixed policy, a weekly audit of supplier contracts that are confidential and must stay on the shop's servers, and open-ended research into what competitors stock.</p></div>
+
+			<!-- ===== Workflow or agent ===== -->
+			<h2 id="s1">Workflow or agent</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">Fitting the architecture to requirements, error tolerance and audit.</span></p>
+				<p>In a <strong>workflow</strong>, your code fixes the path: Claude is called at defined steps, and the sequence doesn't change. In an <strong>agent</strong>, Claude decides the next step from each tool result. The choice follows from three things the guide names:</p>
+				<ul>
+					<li><strong>Business requirements:</strong> if the steps can be written down in advance (check eligibility, calculate, refund, notify), it's a workflow. If they depend on what's found (investigate a contract, then decide what to read next), it's an agent.</li>
+					<li><strong>Error tolerance:</strong> where a mistake costs money or breaks a rule, prefer the predictability of a workflow. If an agent is still needed, put the must-hold rules in code around it (approval gates, hooks), not only in the prompt.</li>
+					<li><strong>Audit constraints:</strong> a workflow gives the same, reviewable path every time. An agent's path varies, so auditing it means logging every tool call and decision, as the managed example below does.</li>
+				</ul>
+				<p>Anthropic's advice is to start with the simplest design that works and add autonomy only when it pays for itself. The architect notes cover this in more depth (<a href="../anthropic-ccar-f/d1-task-1-1.html#s6">model-driven or predefined</a>).</p>
+			</div>
+
+			<!-- ===== Subagents ===== -->
+			<h2 id="s2">Splitting into subagents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">Choosing the orchestrator and subagent decomposition.</span></p>
+				<p>An orchestrator breaks a task into parts, hands each to a subagent with its own context, and merges what they return. That's worth it when the parts are genuinely independent and broad (research across several competitors, an audit across many contracts): they run in parallel and none fills its context with another's reading. It isn't worth it for a single, sequential task, where one agent is cheaper and simpler. Multi-agent systems use many times the tokens of a single chat.</p>
+				<p>Decompose by independent subtopic or source so subagents don't duplicate work, and check that the parts together cover the whole question. The details are in the architect notes (<a href="../anthropic-ccar-f/d1-task-1-2.html#s5">partitioning the scope</a>, <a href="../anthropic-ccar-f/d1-task-1-2.html#s9">when one agent is better</a>).</p>
+			</div>
+
+			<!-- ===== Runtimes ===== -->
+			<h2 id="s3">Three runtimes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">Where the agent loop and its tools run.</span></p>
+				<ul>
+					<li><strong>Your own loop on the Messages API.</strong> Your code sends requests, runs each tool call and returns the results. It gives full control and nothing is hosted for you. It suits short calls, workflows, and agents whose control flow or tool execution is unusual.</li>
+					<li><strong>The Agent SDK as a self-hosted harness.</strong> The SDK provides Claude Code's loop and built-in tools (files, Bash, search), and runs them in your process and your containers. You own isolation, scaling, session storage and network controls.</li>
+					<li><strong>Claude Managed Agents</strong> (beta). Anthropic hosts the agent loop. You define an agent once, start sessions, and exchange events with it while it works. Tools run in a sandbox that Anthropic manages, or in one you run yourself. Anthropic positions it for long-running and asynchronous work.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Decision code ===== -->
+			<h2 id="s4">The decision in code</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">Requirements in, architecture and runtime out.</span></p>
+				<div class="code"><span class="file">choose_architecture.py (Python)</span>
+<pre><code>"""Turn a set of requirements into an architecture and a runtime, with the reason for each choice."""
+from dataclasses import dataclass
+
+
+@dataclass
+class Requirements:
+    steps_known: bool            <span class="c"># can the sequence of steps be written down in advance?</span>
+    error_tolerance: str         <span class="c"># "low" (money, compliance) or "high" (drafts, research)</span>
+    audit_every_step: bool       <span class="c"># must each decision be reproducible and reviewable?</span>
+    independent_subtasks: int    <span class="c"># how many parts can be worked on separately</span>
+    runs_for_minutes: bool       <span class="c"># long, multi-tool tasks or quick request/response</span>
+    data_must_stay_on_prem: bool <span class="c"># files and processes must stay on our infrastructure</span>
+    needs_custom_loop: bool      <span class="c"># unusual control flow, own tool executor, own UI events</span>
+    team_runs_infra: bool        <span class="c"># willing to operate containers, isolation and session storage</span>
+
+
+def choose(r: Requirements) -&gt; dict:
+    why = []
+    if r.steps_known or (r.error_tolerance == "low" and r.audit_every_step):
+        pattern = "workflow"
+        why.append("fixed code path: predictable, testable and auditable step by step")
+    else:
+        pattern = "agent"
+        why.append("the next step depends on what is found, so the model chooses it")
+    if pattern == "agent" and r.error_tolerance == "low":
+        why.append("keep must-hold rules (approvals, limits) in code or hooks around the agent")
+    if r.independent_subtasks &gt;= 3:
+        pattern += " with orchestrator and subagents"
+        why.append("independent parts run in parallel in isolated contexts; the orchestrator merges them")
+
+    if not r.runs_for_minutes or r.needs_custom_loop:
+        runtime = "Messages API, your own loop"
+        why.append("short calls or custom control flow: full control, nothing hosted")
+    elif r.team_runs_infra:
+        runtime = "Agent SDK, self-hosted harness"
+        why.append("the agent loop and tools run in your containers; you own isolation and session storage")
+    elif r.data_must_stay_on_prem:
+        runtime = "Managed Agents, self-hosted sandbox"
+        why.append("Anthropic runs the loop; bash and file tools run on your worker, files stay with you")
+    else:
+        runtime = "Managed Agents, cloud environment"
+        why.append("Anthropic runs the loop and an isolated sandbox per session; nothing to operate")
+    return {"pattern": pattern, "runtime": runtime, "why": why}</code></pre></div>
+				<ul>
+					<li><strong>Refunds</strong> (known steps, low tolerance, every step audited, short calls): a workflow on the Messages API.</li>
+					<li><strong>Contract audit</strong> (steps not known in advance, four independent contract groups, runs for minutes, files must stay on site, no appetite to run agent infrastructure): an agent with an orchestrator and subagents, on Managed Agents with a self-hosted sandbox. Approval rules stay in code or hooks.</li>
+					<li><strong>Competitor research</strong> (open-ended, mistakes tolerable, no data constraints): an agent on Managed Agents with a cloud environment. A team that wants to run its own containers would choose the self-hosted Agent SDK instead.</li>
+				</ul>
+				<p>The rules are a teaching aid, not a formula: exam items turn on which requirement dominates.</p>
+			</div>
+
+			<!-- ===== Managed Agents ===== -->
+			<h2 id="s5">Managed Agents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">A managed, sandboxed agent runtime.</span></p>
+				<div class="code"><span class="file">managed_audit_agent.py (Python, anthropic SDK)</span>
+<pre><code>"""A long-running contract-audit agent on Claude Managed Agents (beta), with every tool call logged for audit."""
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()          <span class="c"># the SDK adds the managed-agents-2026-04-01 beta header itself</span>
+
+
+def create(on_prem: bool) -&gt; tuple[str, str]:
+    agent = client.beta.agents.create(
+        name="Contract auditor",
+        model="claude-opus-5-5",
+        system="Audit the supplier contracts in /data/contracts. Write findings to /data/out/findings.json.",
+        tools=[{"type": "agent_toolset_20260401",          <span class="c"># bash, file tools, web search and fetch</span>
+                "configs": [{"name": "web_search", "enabled": False},
+                            {"name": "web_fetch", "enabled": False}]}],   <span class="c"># only the tools it needs</span>
+    )
+    if on_prem:
+        <span class="c"># Bash and file tools run on our own worker; contract files never leave our network.</span>
+        config = {"type": "self_hosted"}
+    else:
+        <span class="c"># A fresh Anthropic-managed container per session; no outbound network except the listed host.</span>
+        config = {"type": "cloud", "networking": {"type": "limited", "allowed_hosts": ["contracts.internal.example"]}}
+    environment = client.beta.environments.create(name="contract-audit", config=config)
+    return agent.id, environment.id
+
+
+def run(agent_id: str, environment_id: str, task: str, audit_log: list) -&gt; str:
+    session = client.beta.sessions.create(agent=agent_id, environment_id=environment_id, title="Weekly audit")
+    reply = []
+    with client.beta.sessions.events.stream(session.id) as stream:
+        client.beta.sessions.events.send(session.id, events=[
+            {"type": "user.message", "content": [{"type": "text", "text": task}]}])
+        for event in stream:
+            if event.type == "agent.tool_use":
+                audit_log.append({"session": session.id, "tool": event.name, "input": event.input})
+            elif event.type == "agent.message":
+                reply += [b.text for b in event.content if b.type == "text"]
+            elif event.type == "session.status_idle":   <span class="c"># nothing more to do: the task is finished</span>
+                break
+    <span class="c"># The service keeps the full event history too, so the audit trail can be re-read later.</span>
+    return "".join(reply)
+
+
+if __name__ == "__main__":
+    log: list = []
+    print(run(*create(on_prem=True), "Audit this week's contracts.", log))
+    print(json.dumps(log, indent=1))</code></pre></div>
+				<ul>
+					<li><strong>Four concepts:</strong>
+						<ul>
+							<li>An <strong>agent</strong> is the model, system prompt, tools, MCP servers and skills; you create it once and reference it by ID, and it carries a version.</li>
+							<li>An <strong>environment</strong> says where sessions run.</li>
+							<li>A <strong>session</strong> is one running task.</li>
+							<li><strong>Events</strong> are the messages between your application and the agent.</li>
+						</ul>
+					</li>
+					<li><strong>Tools:</strong> <code>agent_toolset_20260401</code> turns on the built-in tools: Bash, file operations, web search and fetch. Disable what the job doesn't need; the docs advise the smallest tool set.</li>
+					<li><strong>Events, not request/response:</strong> open the stream, send a <code>user.message</code>, then handle <code>agent.message</code> and <code>agent.tool_use</code> events until <code>session.status_idle</code> says the agent has nothing more to do. You can send more events to steer it, or interrupt it. Logging each <code>agent.tool_use</code> gives the audit trail, and the service keeps the full event history as well.</li>
+					<li><strong>Beta and data handling:</strong> every endpoint needs the <code>managed-agents-2026-04-01</code> beta header, which the SDK adds. Sessions are stateful, and transcripts persist until you delete them. That's why Managed Agents isn't eligible for zero data retention or HIPAA, except when the whole service is self-hosted.</li>
+					<li><strong>Also in the box:</strong> prompt caching and compaction built into the harness, persistent session filesystems, and scheduled deployments that run an agent on a cron schedule.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Environments ===== -->
+			<h2 id="s6">Cloud or self-hosted sandbox</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">Where tools and code run, and what you operate.</span></p>
+				<ul>
+					<li><strong>Cloud environment</strong> (the default): each session gets a fresh, isolated Linux container on Anthropic's infrastructure, with common languages and tools installed. You set its network rules: <code>limited</code> networking allows only the hosts you list, and that list also restricts web search and fetch. You operate nothing.</li>
+					<li><strong>Self-hosted sandbox</strong> (<code>{"type": "self_hosted"}</code>): Claude still runs on Anthropic's side and decides what to call. A worker you run executes the Bash and file tools on your machines and sends the results back. Choose it when files can't leave your network, when tools must reach internal services, or when your own compliance and audit controls must apply. You take on hardening the hosts, controlling egress, rotating the environment key and isolating sessions. Some cloud features, such as preinstalled packages and repository mounting, are lost.</li>
+					<li><strong>What doesn't change:</strong> with either option, the conversation history and tool results go to Anthropic, because that's how the model sees what a tool returned. Web search and fetch always run on Anthropic's side.</li>
+					<li><strong>Fully self-hosted Managed Agents:</strong> running the whole service yourself, including storing sessions, is available through your Anthropic account team. Model requests still go to Anthropic.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Self-hosted sandbox, so nothing leaves our network"</strong> is wrong. The sandbox's files and processes stay with you, but whatever a tool returns to the model reaches the service. If a tool's output itself must not leave, change what the tool returns.</p></div>
+			</div>
+
+			<!-- ===== Agent SDK hosting ===== -->
+			<h2 id="s7">Self-hosting the Agent SDK</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.1</span><span class="skill-text">What running your own harness involves.</span></p>
+				<p>Each Agent SDK session is a <code>claude</code> CLI subprocess that owns a shell, a working directory and its transcript files on local disk. Hosting it is not like hosting a stateless API wrapper. The hosting guide's session patterns:</p>
+				<ul>
+					<li><strong>Ephemeral:</strong> one container per task, destroyed when it ends.</li>
+					<li><strong>Long-running:</strong> persistent containers serving many sessions.</li>
+					<li><strong>Hybrid:</strong> containers that sleep when idle and restore sessions from a <code>SessionStore</code>, which is then required.</li>
+					<li><strong>Multi-agent container:</strong> several agents sharing one environment.</li>
+				</ul>
+				<p>You also own everything around the sessions:</p>
+				<ul>
+					<li><strong>Isolation:</strong> containers such as Docker, gVisor or Firecracker, and an egress proxy with domain allowlists.</li>
+					<li><strong>Per-tenant settings:</strong> in a shared container, give each tenant its own working directory and config, so one tenant's CLAUDE.md and memory can't leak into another's session.</li>
+					<li><strong>Limits:</strong> sessions have no timeout of their own, so set <code>max_turns</code>.</li>
+					<li><strong>Sizing:</strong> about 1 GiB of RAM, 5 GiB of disk and one CPU per agent to start.</li>
+				</ul>
+				<p>The hosting guide itself suggests Managed Agents when you don&rsquo;t need to run the loop on your own infrastructure.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Workflow when the steps are known, mistakes are costly or every step must be auditable; agent when the next step depends on what's found. Keep must-hold rules in code around an agent.</li>
+				<li>Use an orchestrator with subagents only for independent, broad parts that benefit from parallel, isolated contexts; one agent is cheaper for sequential work.</li>
+				<li>Runtimes: your own loop on the Messages API (full control), a self-hosted Agent SDK harness (your containers, your isolation and session storage), or Claude Managed Agents (beta; Anthropic hosts the loop, best for long-running, asynchronous work).</li>
+				<li>Managed Agents: agent, environment, session and events; <code>agent_toolset_20260401</code>; stream until <code>session.status_idle</code>; beta header <code>managed-agents-2026-04-01</code>; not ZDR or HIPAA eligible unless fully self-hosted.</li>
+				<li>Cloud environment by default; a self-hosted sandbox when files or tools must stay on your infrastructure. Either way, conversation history and tool results reach Anthropic.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="index.html"><small>Previous</small>CCDV-F overview</a>
+				<a class="next" href="d1-skill-1-2.html"><small>Next</small>1.2: Agent SDK Construction and Hooks</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

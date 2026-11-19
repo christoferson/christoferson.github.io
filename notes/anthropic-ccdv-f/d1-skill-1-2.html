@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.2: Agent SDK Construction and Hooks | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 1.2 (7 December 2026 guide): building and fixing Agent SDK agent definitions, hook configurations and custom agent harnesses so required actions always happen: PreToolUse denials, PostToolUse auditing, Stop hooks that block finishing until tests pass, and putting must-run steps in the tool executor.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agents and Workflows &middot; 17%</span>
+		<h1>1.2: Agent SDK Construction and Hooks</h1>
+		<p>Making the steps that must happen happen every time: agent definitions that give each agent the right tools, hooks that refuse, record and check outside the model, and harness code that does the must-run work itself.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Agent SDK</span><span class="tag">AgentDefinition</span><span class="tag">Hooks</span><span class="tag">Stop hook</span><span class="tag">Harness</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Discretion or determinism</a></li>
+				<li><a href="#s2">An agent with enforced steps</a></li>
+				<li><a href="#s3">Agent definitions that go wrong</a></li>
+				<li><a href="#s4">Hook configurations that go wrong</a></li>
+				<li><a href="#s5">Stop hooks</a></li>
+				<li><a href="#s6">Required steps in a custom harness</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.2</span>
+				<p><strong>Agent SDK Construction and Hooks</strong>: "Building and correcting Claude Agent SDK agent definitions, custom agent loops and harnesses, and hook configurations so that required actions execute deterministically rather than at the model's discretion."</p>
+			</div>
+			<p>The verbs are <em>building</em> and <em>correcting</em>, so exam items show an agent setup, often with a defect, and ask what it does or how to fix it. The thread through all of them is the last clause: anything that must always happen belongs in code that runs regardless of what the model decides. The architect notes cover the same hooks from the design side (<a href="../anthropic-ccar-f/d1-task-1-4.html">prerequisite gates</a>, <a href="../anthropic-ccar-f/d1-task-1-5.html">interception and normalisation</a>); this page focuses on the code and its failure modes.</p>
+			<p>Sources: the Claude Agent SDK documentation on hooks, subagents, permissions and the agent loop, and the Claude Code hooks reference, checked on 19 and 20 November 2026 and paraphrased. The hooks were tested by calling them with hook inputs using claude-agent-sdk 0.2.185, and the harness against the anthropic Python SDK 2.10.0 with a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop lets an agent make small fixes to its refund service. Every edit must be logged, nothing outside the source and test folders may change, and the agent may not report success while the tests fail. A second, hand-written harness issues refunds, and each one must reach the finance ledger.</p></div>
+
+			<!-- ===== Determinism ===== -->
+			<h2 id="s1">Discretion or determinism</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Which steps can be left to the model, and which can't.</span></p>
+				<p>An instruction such as "always run the tests before finishing" is followed most of the time. A hook or a line in the harness runs every time. That's the distinction the guide asks for:</p>
+				<ul>
+					<li><strong>At the model's discretion:</strong> anything in the system prompt or a tool description, such as the order of steps, what to check or when to ask.</li>
+					<li><strong>Deterministic:</strong> a <code>PreToolUse</code> hook that refuses a call, a <code>PostToolUse</code> hook that records one, a <code>Stop</code> hook that won't let the agent finish, permission rules, and code in your own loop or tool executor.</li>
+				</ul>
+				<p>Use both: the prompt makes the right behaviour likely, and the code makes the required part certain.</p>
+			</div>
+
+			<!-- ===== Agent ===== -->
+			<h2 id="s2">An agent with enforced steps</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Agent definition plus three hooks.</span></p>
+				<div class="code"><span class="file">release_agent.py (Python, Agent SDK)</span>
+<pre><code>"""A code-change agent whose required steps are enforced by hooks, not left to the model:
+every edit is audited, edits outside src/ and tests/ are refused, and it can't finish while the tests fail."""
+import json
+import subprocess
+import time
+
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
+
+AUDIT = "audit.jsonl"
+
+
+async def restrict_paths(input_data, tool_use_id, context):            <span class="c"># PreToolUse on Edit|Write</span>
+    path = input_data["tool_input"].get("file_path", "")
+    if not path.startswith(("src/", "tests/")):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": f"{path} is outside src/ and tests/; change only those."}}
+    return {}
+
+
+async def audit(input_data, tool_use_id, context):                     <span class="c"># PostToolUse on Edit|Write|Bash</span>
+    with open(AUDIT, "a") as f:                                         <span class="c"># runs on every call, whatever the prompt says</span>
+        f.write(json.dumps({"t": time.time(), "tool": input_data["tool_name"], "input": input_data["tool_input"]}) + "\n")
+    return {}
+
+
+async def require_passing_tests(input_data, tool_use_id, context):     <span class="c"># Stop</span>
+    run = subprocess.run(["npm", "test", "--silent"], capture_output=True, text=True)   <span class="c"># the hook checks, not the model</span>
+    if run.returncode == 0:
+        return {}
+    if input_data.get("stop_hook_active"):
+        <span class="c"># Already sent back once and still failing: let it stop, and make the failure visible to the user.</span>
+        return {"systemMessage": "Tests still fail; the change was not completed."}
+    return {"decision": "block", "reason": "Tests fail. Fix them before finishing:\n" + run.stdout[-2000:]}
+
+
+options = ClaudeAgentOptions(
+    allowed_tools=["Read", "Grep", "Glob", "Edit", "Write", "Bash(npm test *)", "Agent"],   <span class="c"># pre-approved, no prompts</span>
+    disallowed_tools=["WebFetch", "WebSearch"],                                            <span class="c"># actually removed</span>
+    agents={
+        "test-runner": AgentDefinition(
+            description="Runs the test suite and summarises failures. Use after every change.",
+            prompt="Run npm test. Report each failing test with its file and the assertion that failed.",
+            tools=["Bash", "Read"],                 <span class="c"># without this list the subagent inherits every tool</span>
+            model="haiku",
+        ),
+    },
+    hooks={
+        "PreToolUse": [HookMatcher(matcher="Edit|Write", hooks=[restrict_paths], on_failure="block")],
+        "PostToolUse": [HookMatcher(matcher="Edit|Write|Bash", hooks=[audit])],
+        "Stop": [HookMatcher(hooks=[require_passing_tests])],   <span class="c"># Stop takes no matcher</span>
+    },
+    max_turns=40,
+)</code></pre></div>
+				<ul>
+					<li><strong><code>restrict_paths</code></strong> (<code>PreToolUse</code> on <code>Edit|Write</code>) denies changes outside <code>src/</code> and <code>tests/</code>, and its reason tells Claude what it may change. <code>on_failure="block"</code> means a crashing hook refuses the call rather than letting it through.</li>
+					<li><strong><code>audit</code></strong> (<code>PostToolUse</code>) appends every edit and command to <code>audit.jsonl</code>. It doesn't depend on the model remembering to log anything.</li>
+					<li><strong><code>require_passing_tests</code></strong> (<code>Stop</code>) runs the test suite itself and reads the exit code, rather than trusting the model's claim that tests pass or parsing its output.</li>
+					<li><strong>Tool access:</strong> <code>allowed_tools</code> pre-approves the tools the agent uses so it isn't stopped by permission prompts, and <code>disallowed_tools</code> removes the web tools altogether. The <code>test-runner</code> subagent gets its own short <code>tools</code> list and a small model.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Definition defects ===== -->
+			<h2 id="s3">Agent definitions that go wrong</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Correcting AgentDefinition and option mistakes.</span></p>
+				<ul>
+					<li><strong>Subagent can do too much:</strong> its <code>AgentDefinition</code> has no <code>tools</code> list, so it inherits every tool. Give it the few it needs, or use its <code>disallowedTools</code>.</li>
+					<li><strong>"I listed only Read in <code>allowed_tools</code>, but it still ran Bash":</strong> <code>allowed_tools</code> pre-approves, it doesn't restrict. Use <code>disallowed_tools</code> or a tools list to remove tools.</li>
+					<li><strong>Subagent never chosen, or chosen for the wrong job:</strong> its <code>description</code> is vague. Claude picks subagents by description, so say what it does and when to use it.</li>
+					<li><strong>Subagent lacks information the coordinator had:</strong> subagents start without the parent's history. Put what they need in the prompt the coordinator writes, not in the conversation (<a href="../anthropic-ccar-f/d1-task-1-3.html#s3">context is passed, not inherited</a>).</li>
+					<li><strong>Coordinator can't spawn subagents:</strong> the Agent tool (formerly Task) has been removed with <code>disallowed_tools</code> or a restrictive tools setting.</li>
+					<li><strong>Run never ends:</strong> there's no <code>max_turns</code> or <code>max_budget_usd</code>. Sessions have no timeout of their own.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Hook defects ===== -->
+			<h2 id="s4">Hook configurations that go wrong</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Why a hook didn't do what was intended.</span></p>
+				<ul>
+					<li><strong>Hook never fires:</strong> the matcher doesn't match the tool name. Matchers are case-sensitive regexes on names such as <code>Bash</code>, <code>Edit|Write</code> or <code>^mcp__orders__</code>. MCP tools are named <code>mcp__server__tool</code>, so a matcher of <code>process_refund</code> alone may miss.</li>
+					<li><strong>Denial ignored:</strong> the output lacks the <code>hookSpecificOutput</code> wrapper with <code>hookEventName</code>, or puts <code>permissionDecision</code> at the top level.</li>
+					<li><strong>Claude retries the blocked action:</strong> the deny reason is empty or vague. The reason goes to the model, so name the alternative ("escalate instead").</li>
+					<li><strong>Policy check in <code>PostToolUse</code>:</strong> too late, because the tool has already run. Blocking belongs in <code>PreToolUse</code>; <code>PostToolUse</code> is for recording and reshaping results.</li>
+					<li><strong>A crashing hook lets calls through:</strong> set <code>on_failure="block"</code> on guards.</li>
+					<li><strong>Several hooks disagree:</strong> the most restrictive decision wins (deny over defer over ask over allow), so an allow in one hook can't override another's deny.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Stop hooks ===== -->
+			<h2 id="s5">Stop hooks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Not letting the agent finish until a condition holds.</span></p>
+				<ul>
+					<li><strong>When it runs:</strong> each time the main agent finishes responding. It doesn't run after a user interrupt, and API errors fire <code>StopFailure</code> instead. In a subagent, the equivalent event is <code>SubagentStop</code>. Stop hooks take no matcher.</li>
+					<li><strong>How to block:</strong> return <code>decision: "block"</code> with a <code>reason</code>, which is required and tells Claude what to do. Claude carries on working. <code>additionalContext</code> keeps it going too, but as guidance rather than an error.</li>
+					<li><strong>Avoiding a loop:</strong> the input's <code>stop_hook_active</code> is true when Claude is already continuing because of a stop hook. Check it, as the example does, so a condition that can't be met doesn't hold the agent forever. Claude Code also caps continuations at eight in a row, resetting whenever Claude calls a tool.</li>
+					<li><strong>Shortcut:</strong> in Claude Code, <code>/goal</code> is a built-in, session-scoped Stop hook driven by a prompt.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Harness ===== -->
+			<h2 id="s6">Required steps in a custom harness</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">When you own the loop, you own the guarantees.</span></p>
+				<div class="code"><span class="file">refund_harness.py (Python, anthropic SDK)</span>
+<pre><code>"""A custom harness on the Messages API: the model decides whether to refund; the harness, not the model,
+records every refund in the ledger and stops runaway loops."""
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()
+TOOLS = [{"name": "issue_refund", "description": "Refund an order. Use only after checking the return is eligible.",
+          "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}, "amount": {"type": "number"}},
+                           "required": ["order_id", "amount"]}, "strict": True}]
+ledger: list[dict] = []
+
+
+def issue_refund(order_id: str, amount: float) -&gt; dict:
+    result = {"status": "refunded", "order_id": order_id, "amount": amount}
+    ledger.append(result)                    <span class="c"># part of executing the tool: can't be skipped or forgotten by the model</span>
+    return result
+
+
+def run(task: str, max_turns: int = 10) -&gt; str:
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_turns):
+        response = client.messages.create(model="claude-sonnet-5-5", max_tokens=2000, tools=TOOLS, messages=messages)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return "".join(b.text for b in response.content if b.type == "text")
+        results = []
+        for block in (b for b in response.content if b.type == "tool_use"):
+            try:
+                out, err = issue_refund(**block.input), False
+            except Exception as e:                     <span class="c"># report failures to the model instead of crashing the loop</span>
+                out, err = {"error": str(e)}, True
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(out), "is_error": err})
+        messages.append({"role": "user", "content": results})
+    raise RuntimeError(f"no answer after {max_turns} turns")   <span class="c"># a safety net that reports, not a normal exit</span></code></pre></div>
+				<ul>
+					<li><strong>The must-run step is part of executing the tool:</strong> the ledger entry is written inside <code>issue_refund</code>. There's no separate "record in ledger" tool the model might forget to call.</li>
+					<li><strong>Loop on the stop reason:</strong> continue only while <code>stop_reason</code> is <code>tool_use</code>, and run every tool call in the response.</li>
+					<li><strong>Failures go back as results:</strong> a bad call becomes a <code>tool_result</code> with <code>is_error: true</code>, so the model can correct itself and the loop survives.</li>
+					<li><strong>A turn cap that raises:</strong> hitting <code>max_turns</code> is an error to report, not a normal exit. The Agent SDK does the same with <code>error_max_turns</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong>A classic wrong fix:</strong> "add 'always record refunds in the ledger' to the system prompt". It makes the step more likely, not certain. The deterministic fix is in the code that executes the refund, or a hook on it.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Prompts make behaviour likely; hooks, permission rules and harness code make it certain. Put every must-happen step in the second group.</li>
+				<li><code>PreToolUse</code> denies with a reason Claude can act on (wrapped in <code>hookSpecificOutput</code>, with <code>on_failure="block"</code> for guards); <code>PostToolUse</code> records or reshapes after the tool has run.</li>
+				<li>A <code>Stop</code> hook with <code>decision: "block"</code> and a reason keeps the agent working until a condition holds. Check <code>stop_hook_active</code> to avoid endless loops, and verify the condition in the hook, such as running the tests yourself.</li>
+				<li>Common definition defects: no <code>tools</code> list (inherits all), relying on <code>allowed_tools</code> to restrict, vague descriptions, missing context in the subagent prompt, no turn or budget limit.</li>
+				<li>In a custom harness, do required steps inside tool execution, return failures as <code>is_error</code> results, loop on <code>stop_reason</code>, and make the turn cap raise.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-1.html"><small>Previous</small>1.1: Architecture and Runtime Selection</a>
+				<a class="next" href="index.html#d1"><small>Next</small>Domain 1</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
