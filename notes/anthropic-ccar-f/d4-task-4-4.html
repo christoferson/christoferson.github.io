@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.4: Validation, Retry and Feedback Loops | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 4.4: validating extractions for semantic errors, retrying with the original document, the failed output and specific errors, recognising when a retry can't help because the information isn't in the source, self-checking fields such as calculated_total and conflict_detected, and detected_pattern fields for analysing dismissed review findings.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Prompt Engineering &amp; Structured Output &middot; 20%</span>
+		<h1>4.4: Validation, Retry and Feedback Loops</h1>
+		<p>Catching the extraction that's well-formed but wrong, sending it back with exactly what failed, knowing when no retry will ever succeed, and recording enough about each review finding to learn from the ones developers throw away.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Validation</span><span class="tag">Retry</span><span class="tag">Self-correction</span><span class="tag">Extraction</span><span class="tag">Feedback</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Syntax errors and semantic errors</a></li>
+				<li><a href="#s2">Retry with error feedback</a></li>
+				<li><a href="#s3">When a retry can't help</a></li>
+				<li><a href="#s4">Fields that check themselves</a></li>
+				<li><a href="#s5">Feedback loops for findings</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.4</span>
+				<p><strong>Implement validation, retry, and feedback loops for extraction quality.</strong></p>
+			</div>
+			<p>The exam guide asks you to know how a retry that includes the specific validation errors guides the model to a correction, that retries are useless when the information simply isn't in the source (as opposed to format or structural errors), how tracking which code constructs trigger findings (a <code>detected_pattern</code> field) makes dismissals analysable, and the difference between semantic errors and the syntax errors that tool use already removes. In practice it asks you to send follow-ups containing the original document, the failed extraction and the specific errors, to recognise in advance which retries will and won't work, and to design self-checking output such as <code>calculated_total</code> beside <code>stated_total</code> and a <code>conflict_detected</code> flag. Schemas themselves are <a href="d4-task-4-3.html">task 4.3</a>.</p>
+			<p>Sources: the patterns come from the exam guide; the supporting API behaviour (what schemas guarantee, stop reasons) is from the Claude API documentation, checked on 19 November 2026. The code is my own and was tested with anthropic 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's invoice pipeline from tasks 4.2 and 4.3, and its pull-request reviewer from task 4.1.</p></div>
+
+			<!-- ===== Syntax vs semantic ===== -->
+			<h2 id="s1">Syntax errors and semantic errors</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.4</span><span class="skill-text">What's left to validate once the schema is enforced.</span></p>
+				<ul>
+					<li><strong>Syntax errors</strong> (malformed JSON, missing required keys, wrong types) are eliminated by tool use with strict schemas or by JSON outputs. If you still ask for JSON in plain text, your validator has to catch them too.</li>
+					<li><strong>Semantic errors</strong> survive any schema: line amounts that don't add up to the total, a delivery date in the invoice-date field, a dropped line, a value copied from the wrong part of the document. Only checks that know the business rules find them.</li>
+				</ul>
+				<p>Validation is the code that runs these checks on every extraction, and its output (the list of what failed) is the input to the retry.</p>
+			</div>
+
+			<!-- ===== Retry ===== -->
+			<h2 id="s2">Retry with error feedback</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.4</span><span class="skill-text">The document, the failed answer and the exact errors.</span></p>
+				<div class="code"><span class="file">retry_loop.py (Python, anthropic SDK)</span>
+<pre><code>"""Validate an invoice extraction, retry with the specific errors, and stop when retrying can't help."""
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+SYSTEM = ("Extract the invoice as JSON: supplier, invoice_number, po_number (or null), lines (description, amount), "
+          "stated_total (the total printed on the invoice), calculated_total (the sum of the line amounts you extracted), "
+          "conflict_detected (true if the document itself disagrees with itself, e.g. two different totals) and conflict_note.")
+
+
+def ask(messages: list) -&gt; str:
+    response = client.messages.create(model="claude-sonnet-5-5", max_tokens=2000, system=SYSTEM, messages=messages)
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def validate(data: dict) -&gt; tuple[list[str], list[str]]:
+    """Return (fixable errors, unfixable gaps). Retrying only helps with the first kind."""
+    fixable, gaps = [], []
+    calc = round(sum(line["amount"] for line in data["lines"]), 2)
+    if abs(calc - data["calculated_total"]) &gt; 0.01:
+        fixable.append(f"calculated_total is {data['calculated_total']} but your lines sum to {calc}")
+    if data["stated_total"] is not None and abs(calc - data["stated_total"]) &gt; 0.01 and not data["conflict_detected"]:
+        fixable.append(f"lines sum to {calc} but stated_total is {data['stated_total']}: re-check the lines, "
+                       "or set conflict_detected if the document is inconsistent")
+    if data["po_number"] is None:
+        gaps.append("po_number not in this document (it may be on the purchase order, which we didn't send)")
+    return fixable, gaps
+
+
+def extract(document: str, max_retries: int = 2) -&gt; dict:
+    messages = [{"role": "user", "content": f"&lt;document&gt;\n{document}\n&lt;/document&gt;"}]
+    for attempt in range(max_retries + 1):
+        raw = ask(messages)
+        try:
+            data = json.loads(raw)
+        except ValueError as e:
+            fixable, gaps = [f"output was not valid JSON ({e})"], []
+            data = None
+        else:
+            fixable, gaps = validate(data)
+        if not fixable:
+            return {"data": data, "gaps": gaps, "attempts": attempt + 1}
+        <span class="c"># Retry with the original document, the failed output and the exact errors, not just "try again".</span>
+        messages += [{"role": "assistant", "content": raw},
+                     {"role": "user", "content": "Your extraction failed these checks:\n- " + "\n- ".join(fixable)
+                      + "\nCorrect them using the document above. Change only what the errors concern."}]
+    return {"data": data, "gaps": gaps, "errors": fixable, "attempts": max_retries + 1, "needs_review": True}</code></pre></div>
+				<ul>
+					<li><strong>What the follow-up contains:</strong> the original document (still the first message), the failed extraction (as Claude's previous turn) and the specific errors in a new message: "lines sum to 300.0 but stated_total is 492.0". A bare "that's wrong, try again" gives the model nothing to fix and often produces the same answer.</li>
+					<li><strong>Change only what failed:</strong> asking for a targeted correction keeps the fields that were right from drifting.</li>
+					<li><strong>Bounded:</strong> a fixed number of retries, then the result is marked for human review with its errors attached, rather than looping forever or silently accepting a bad record.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s3">When a retry can't help</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.4</span><span class="skill-text">Separating errors the model can fix from gaps in the source.</span></p>
+				<p>A retry gives the model another look at the same document. That fixes mistakes in reading it, and nothing else:</p>
+				<ul>
+					<li><strong>Retries succeed</strong> for format mismatches (a date in the wrong format, "1.234,50" not converted), structural errors (a line dropped or split, a value in the wrong field) and invalid JSON when no schema is enforced.</li>
+					<li><strong>Retries fail</strong> when the information isn't there: the PO number exists only on the purchase order, which wasn't sent; the delivery address is in a separate shipping note. Asking again invites the model to invent a value to satisfy you.</li>
+				</ul>
+				<p>So the validator returns two lists: <em>fixable errors</em>, which trigger a retry, and <em>gaps</em>, which are recorded (null plus a reason) and routed elsewhere, for example by fetching the purchase order. The example treats a missing PO number as a gap and never retries for it.</p>
+				<div class="callout trap"><p><strong>"Retry until every required field is filled"</strong> is the tempting wrong answer for missing information. It turns honest nulls into fabrications. The fix for an absent field is a nullable schema (task 4.3) and a route to the document that does contain it.</p></div>
+			</div>
+
+			<!-- ===== Self-checks ===== -->
+			<h2 id="s4">Fields that check themselves</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.4</span><span class="skill-text">Making discrepancies visible in the output itself.</span></p>
+				<ul>
+					<li><strong><code>stated_total</code> and <code>calculated_total</code>:</strong> extract the total printed on the invoice <em>and</em> the sum of the extracted lines. If they differ, either a line was misread (a fixable error, so retry) or the invoice itself is wrong.</li>
+					<li><strong><code>conflict_detected</code> and <code>conflict_note</code>:</strong> let the model say the source disagrees with itself ("page 1 says 500, the summary says 492"). A flagged conflict isn't an extraction error, so it isn't retried; it goes to a person, with the note.</li>
+				</ul>
+				<p>These fields turn a silent inconsistency into data your code can act on: retry when the extraction is the problem, escalate when the document is.</p>
+			</div>
+
+			<!-- ===== Feedback ===== -->
+			<h2 id="s5">Feedback loops for findings</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.4</span><span class="skill-text">Learning from the findings developers dismiss.</span></p>
+				<p>Knowing that 40% of the reviewer's "bugs" findings are dismissed (task 4.1) says there's a problem, not where. Adding a <code>detected_pattern</code> field to every structured finding, naming the code construct that triggered it ("empty catch block", "float money arithmetic"), lets you group dismissals by cause:</p>
+				<div class="code"><span class="file">dismissal_patterns.py (Python)</span>
+<pre><code>"""Which code constructs make developers dismiss review findings? Group by the finding's detected_pattern."""
+from collections import defaultdict
+
+
+def dismissal_report(findings: list[dict], min_count: int = 10) -&gt; list[str]:
+    """findings: {"category", "detected_pattern", "outcome": "fixed" | "dismissed"}"""
+    by_pattern = defaultdict(lambda: [0, 0])  <span class="c"># [dismissed, total]</span>
+    for f in findings:
+        key = (f["category"], f["detected_pattern"])
+        by_pattern[key][1] += 1
+        by_pattern[key][0] += f["outcome"] == "dismissed"
+    rows = []
+    for (category, pattern), (dismissed, total) in sorted(by_pattern.items(), key=lambda kv: -kv[1][0] / kv[1][1]):
+        if total &gt;= min_count:
+            rows.append(f"{category:&lt;10} {pattern:&lt;32} {dismissed}/{total} dismissed ({dismissed / total:.0%})")
+    return rows
+
+
+if __name__ == "__main__":
+    sample = ([{"category": "bugs", "detected_pattern": "empty catch block", "outcome": "dismissed"}] * 18
+              + [{"category": "bugs", "detected_pattern": "empty catch block", "outcome": "fixed"}] * 2
+              + [{"category": "bugs", "detected_pattern": "float money arithmetic", "outcome": "fixed"}] * 14
+              + [{"category": "bugs", "detected_pattern": "float money arithmetic", "outcome": "dismissed"}] * 1)
+    print("\n".join(dismissal_report(sample)))</code></pre></div>
+				<p>Here the "empty catch block" pattern accounts for nearly all the dismissals, while "float money arithmetic" findings are almost always fixed. The fix is then specific: an exclusion or an acceptable-pattern example (task 4.2) for logged-and-retried errors, leaving the useful pattern alone, rather than switching off the whole bugs category.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Schemas remove syntax errors; semantic errors (sums, field placement, dropped lines) need validation in code.</li>
+				<li>Retry with the original document, the failed extraction and the specific errors; ask for a targeted correction; cap retries and send what's still failing to review.</li>
+				<li>Retries fix misreadings (format, structure); they can't supply information that isn't in the source. Record gaps as nulls with a reason and route them, never retry them.</li>
+				<li>Self-checking fields such as <code>stated_total</code> versus <code>calculated_total</code> and <code>conflict_detected</code> separate extraction errors from inconsistent documents.</li>
+				<li>A <code>detected_pattern</code> on each finding makes dismissals analysable by cause, so fixes target the noisy pattern instead of a whole category.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-3.html"><small>Previous</small>4.3: Structured Output with Tools and Schemas</a>
+				<a class="next" href="d4-task-4-5.html"><small>Next</small>4.5: Batch Processing Strategies</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Supporting facts from the Claude API documentation, with everything in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

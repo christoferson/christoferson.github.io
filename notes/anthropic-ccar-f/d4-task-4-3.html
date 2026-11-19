@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.3: Structured Output with Tools and Schemas | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 4.3: extraction through tool use with strict JSON schemas, tool_choice auto, any and forced, which current models reject forced tool choice and what to use instead, why schemas stop syntax errors but not semantic ones, and schema design with nullable fields, unclear and other-plus-detail enums, and normalisation rules.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Prompt Engineering &amp; Structured Output &middot; 20%</span>
+		<h1>4.3: Structured Output with Tools and Schemas</h1>
+		<p>Getting machine-readable data out of Claude every time: extraction tools whose input schema is the output format, the tool_choice settings that make a call happen (and the newest models that refuse them), what a schema can and can't guarantee, and schemas designed so Claude never has to invent a value.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">tool_use</span><span class="tag">tool_choice</span><span class="tag">JSON schema</span><span class="tag">strict</span><span class="tag">Extraction</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Tools as an output format</a></li>
+				<li><a href="#s2">tool_choice: auto, any, forced</a></li>
+				<li><a href="#s3">An extraction pipeline</a></li>
+				<li><a href="#s4">Syntax versus semantics</a></li>
+				<li><a href="#s5">Designing the schema</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.3</span>
+				<p><strong>Enforce structured output using tool use and JSON schemas.</strong></p>
+			</div>
+			<p>The exam guide asks you to know that tool use with a JSON schema is the most reliable way to get schema-compliant output without JSON syntax errors, how the three <code>tool_choice</code> settings differ, that a strict schema prevents syntax errors but not semantic ones (line items that don't add up, values in the wrong field), and how to design schemas (required versus optional fields, enums with "other" plus a detail field). In practice it asks you to define extraction tools and read their <code>tool_use</code> input, use <code>"any"</code> when several extraction tools exist and the document type is unknown, force one named tool so an extraction runs before enrichment, make fields nullable when documents may lack them, add "unclear" and "other" values, and pair strict schemas with normalisation rules in the prompt. Validation and retries are <a href="d4-task-4-4.html">task 4.4</a>; the API mechanics are covered in the developer notes (<a href="../anthropic-ccdv-f/d2-skill-2-1.html#s4">structured outputs</a>).</p>
+			<p>Sources: the Claude API documentation on defining tools, strict tool use, structured outputs and errors, checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The code is my own and was tested with anthropic 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's supplier-document pipeline receives invoices and delivery notes in one mailbox, with nothing to say which is which, and must turn each into a record for the accounting system.</p></div>
+
+			<!-- ===== Tools as format ===== -->
+			<h2 id="s1">Tools as an output format</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.3</span><span class="skill-text">The tool's input schema is the shape of the answer.</span></p>
+				<p>An extraction "tool" doesn't have to do anything. You define <code>extract_invoice</code> with an input schema describing the fields you want, Claude "calls" it with the extracted values as arguments, and your code reads the <code>tool_use</code> block's <code>input</code>: already-parsed JSON in your shape. Asking for JSON in plain text, by contrast, invites a stray sentence, a missing bracket or a trailing comma.</p>
+				<p>With <code>"strict": true</code> on the tool, Claude's tool names and inputs are guaranteed to match the schema: required fields present, types right, no extra keys, no syntax errors. The same guarantee for a plain reply is available as JSON outputs (<code>output_config.format</code>), which the API now offers as the other route to structured output.</p>
+			</div>
+
+			<!-- ===== tool_choice ===== -->
+			<h2 id="s2">tool_choice: auto, any, forced</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.3</span><span class="skill-text">Whether Claude must call a tool, and which.</span></p>
+				<ul>
+					<li><strong><code>{"type": "auto"}</code></strong> (the default when tools are given): Claude decides, so it may answer in text instead of calling a tool.</li>
+					<li><strong><code>{"type": "any"}</code></strong>: Claude must call a tool but chooses which. Right when several extraction schemas exist and the document type isn't known in advance: Claude picks <code>extract_invoice</code> or <code>extract_delivery_note</code>, but it can't reply in prose.</li>
+					<li><strong><code>{"type": "tool", "name": "extract_metadata"}</code></strong>: Claude must call that specific tool. Right when a step has to happen first, such as extracting metadata before enrichment calls that depend on it.</li>
+					<li><strong><code>{"type": "none"}</code></strong>: no tool calls.</li>
+				</ul>
+				<p>With <code>any</code> or a named tool, the response starts directly with the tool call (no text before it), and on the models that allow forcing, the forced call skips thinking.</p>
+				<div class="callout trap"><p><strong>The newest models reject forced tool choice.</strong> The guide's <code>"any"</code> and named-tool techniques work on models such as Claude Haiku 5.5 and Opus 5, and they're the expected exam answers. But Claude Fable 5.2, Mythos 5.2, Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1 return a 400 error for both ("tool_choice: type "tool" and "any" are not supported for this model"). On those, the docs say to use <code>auto</code> with strict tools and a clear instruction to call one, or JSON outputs when you need the reply itself in a fixed shape, and to check in code that a tool was actually called.</p></div>
+			</div>
+
+			<!-- ===== Pipeline ===== -->
+			<h2 id="s3">An extraction pipeline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.3</span><span class="skill-text">Two schemas, an unknown document, and a forced first step.</span></p>
+				<div class="code"><span class="file">extract_tools.py (Python, anthropic SDK)</span>
+<pre><code>"""Structured extraction through tool use: schema-valid input every time, then semantic checks in code."""
+import anthropic
+
+client = anthropic.Anthropic()
+
+<span class="c"># Models that reject forced tool_choice ("any" or a named tool) with a 400 error.</span>
+NO_FORCED_CHOICE = {"claude-fable-5-2", "claude-mythos-5-2", "claude-opus-5-5", "claude-sonnet-5-5",
+                    "claude-fable-5-1", "claude-mythos-5-1"}
+
+NULLABLE_STR = {"type": ["string", "null"]}
+LINE = {"type": "object", "additionalProperties": False,
+        "properties": {"description": {"type": "string"}, "quantity": {"type": "number"},
+                       "unit_price": {"type": "number"}, "amount": {"type": "number"}},
+        "required": ["description", "quantity", "unit_price", "amount"]}
+
+EXTRACT_INVOICE = {
+    "name": "extract_invoice", "strict": True,
+    "description": "Record a supplier invoice: a document that asks for payment.",
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "supplier": {"type": "string"},
+        "invoice_number": {"type": "string"},
+        "po_number": NULLABLE_STR,                     <span class="c"># often absent: nullable, so nothing gets invented</span>
+        "invoice_date": NULLABLE_STR,                  <span class="c"># ISO 8601, per the normalisation rules</span>
+        "category": {"type": "string", "enum": ["fabric", "hardware", "packaging", "other", "unclear"]},
+        "category_detail": NULLABLE_STR,               <span class="c"># filled when category is "other" or "unclear"</span>
+        "lines": {"type": "array", "items": LINE},
+        "total": {"type": "number"},
+    }, "required": ["supplier", "invoice_number", "po_number", "invoice_date", "category", "category_detail", "lines", "total"]},
+}
+
+EXTRACT_DELIVERY_NOTE = {
+    "name": "extract_delivery_note", "strict": True,
+    "description": "Record a delivery note: a document listing goods delivered, with no amount to pay.",
+    "input_schema": {"type": "object", "additionalProperties": False, "properties": {
+        "supplier": {"type": "string"}, "delivery_date": NULLABLE_STR, "po_number": NULLABLE_STR,
+        "items": {"type": "array", "items": {"type": "string"}},
+    }, "required": ["supplier", "delivery_date", "po_number", "items"]},
+}
+
+RULES = ("Normalise as you extract: dates to YYYY-MM-DD, amounts to plain numbers without currency symbols "
+         "or thousands separators, supplier names as printed on the letterhead. Use null when a field is absent.")
+
+
+def extract(document: str, model: str = "claude-haiku-5-5") -&gt; tuple[str, dict]:
+    tools = [EXTRACT_INVOICE, EXTRACT_DELIVERY_NOTE]
+    params = dict(model=model, max_tokens=2000, tools=tools, system=RULES,
+                  messages=[{"role": "user", "content": f"Record this document with one tool.\n&lt;document&gt;{document}&lt;/document&gt;"}])
+    if model not in NO_FORCED_CHOICE:
+        params["tool_choice"] = {"type": "any"}  <span class="c"># must call a tool; Claude picks which, as the document type is unknown</span>
+    response = client.messages.create(**params)  <span class="c"># elsewhere: "auto" plus strict tools and a clear instruction</span>
+    calls = [b for b in response.content if b.type == "tool_use"]
+    if not calls:
+        raise RuntimeError("no extraction tool was called")
+    return calls[0].name, calls[0].input
+
+
+def semantic_problems(invoice: dict) -&gt; list[str]:
+    """The schema guarantees shape, not truth: check the arithmetic and the cross-field rules."""
+    problems = []
+    for line in invoice["lines"]:
+        if abs(line["quantity"] * line["unit_price"] - line["amount"]) &gt; 0.01:
+            problems.append(f"line '{line['description']}': quantity x unit price != amount")
+    if abs(sum(l["amount"] for l in invoice["lines"]) - invoice["total"]) &gt; 0.01:
+        problems.append("lines don't add up to the total")
+    if invoice["category"] in ("other", "unclear") and not invoice["category_detail"]:
+        problems.append("category needs a detail")
+    return problems
+
+
+def extract_metadata_first(document: str) -&gt; dict:
+    """Force one specific tool so this step always runs before enrichment (on a model that allows forcing)."""
+    meta_tool = {"name": "extract_metadata", "strict": True, "description": "Record the document's metadata.",
+                 "input_schema": {"type": "object", "additionalProperties": False,
+                                  "properties": {"supplier": {"type": "string"}, "document_type": {"type": "string"},
+                                                 "language": {"type": "string"}},
+                                  "required": ["supplier", "document_type", "language"]}}
+    response = client.messages.create(
+        model="claude-haiku-5-5", max_tokens=500, tools=[meta_tool],
+        tool_choice={"type": "tool", "name": "extract_metadata"},
+        messages=[{"role": "user", "content": f"&lt;document&gt;{document}&lt;/document&gt;"}],
+    )
+    return next(b.input for b in response.content if b.type == "tool_use")</code></pre></div>
+				<ul>
+					<li><strong>Choosing the setting by model:</strong> <code>"any"</code> where it's accepted; on models that reject it, <code>auto</code> plus strict tools, and code that raises if no tool was called.</li>
+					<li><strong>Normalisation rules in the prompt:</strong> the schema says a date is a string; only the prompt can say it must be <code>YYYY-MM-DD</code>, and that "1.234,50 EUR" becomes <code>1234.50</code>. Strict schemas and format rules work together.</li>
+					<li><strong>The forced first step:</strong> <code>extract_metadata_first</code> names its tool so metadata is always extracted before anything else uses it, on a model that allows forcing.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Semantics ===== -->
+			<h2 id="s4">Syntax versus semantics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.3</span><span class="skill-text">What a schema guarantees, and what it doesn't.</span></p>
+				<p>A strict schema guarantees the <em>shape</em>: <code>total</code> is a number, <code>lines</code> is a list of objects with the right keys. It can't guarantee the content is <em>true</em>: line amounts that don't sum to the total, a delivery date placed in the invoice-date field, a PO number copied into the invoice number. Those are semantic errors, and the <code>semantic_problems</code> function above is where they get caught: arithmetic checks, cross-field rules ("other" needs a detail), and anything else your business knows must hold. Schemas also can't express numeric ranges or string lengths, so those checks live in code too.</p>
+				<p>Two cases can break even the shape: a refusal and a reply cut off by <code>max_tokens</code>, so check the stop reason before trusting the result.</p>
+			</div>
+
+			<!-- ===== Schema design ===== -->
+			<h2 id="s5">Designing the schema</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.3</span><span class="skill-text">Fields Claude can fill honestly.</span></p>
+				<ul>
+					<li><strong>Nullable when the source may not have it.</strong> A required, non-nullable <code>po_number</code> forces Claude to produce one, so on an invoice without a PO it will find something plausible. A type list such as <code>["string", "null"]</code> lets it answer "not present". The example lists every field as required and uses nullability for "may be absent", so the output always has the same keys; leaving a field out of <code>required</code> also works, within the limit of 24 optional parameters per request.</li>
+					<li><strong>Enums for closed sets, with escape hatches.</strong> <code>fabric</code>, <code>hardware</code>, <code>packaging</code> cover most invoices; <code>other</code> plus a <code>category_detail</code> string handles new kinds without a schema change; <code>unclear</code> lets Claude say the document doesn't make it obvious, instead of forcing a guess into a real category.</li>
+					<li><strong>Clear descriptions</strong> on tools and fields tell Claude which tool fits ("a document that asks for payment") and what a field means.</li>
+					<li><strong>Within strict limits:</strong> every object needs <code>additionalProperties: false</code>, and there are caps per request (for example 16 union-type parameters and 20 strict tools), so keep schemas flat and focused.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>An extraction tool's input schema is the output format; read the <code>tool_use</code> input. <code>strict: true</code> guarantees schema-valid names and inputs, with no syntax errors; JSON outputs do the same for plain replies.</li>
+				<li><code>auto</code>: Claude may reply in text. <code>any</code>: must call some tool (use when the document type is unknown). Named tool: must call that one (use to run a step first).</li>
+				<li>Fable 5.2, Opus 5.5, Sonnet 5.5, Fable 5.1 and the Mythos 5.x models reject <code>any</code> and named-tool choice with a 400; use <code>auto</code> with strict tools (and check a tool was called), or JSON outputs.</li>
+				<li>Schemas prevent syntax errors, not semantic ones: check sums, field placement and ranges in code, and check the stop reason.</li>
+				<li>Make absent-able fields nullable to prevent fabrication; use enums with <code>other</code> plus a detail field and an <code>unclear</code> value; put format normalisation rules in the prompt.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-2.html"><small>Previous</small>4.2: Few-Shot Examples</a>
+				<a class="next" href="d4-task-4-4.html"><small>Next</small>4.4: Validation, Retry and Feedback Loops</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude API documentation, with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

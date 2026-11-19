@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.5: Batch Processing Strategies | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 4.5: what the Message Batches API offers and costs, matching batch or synchronous calls to a workflow's latency needs, what batches can't do (tool calls mid-request), working out submission frequency from an SLA, correlating results by custom_id, resubmitting only failed items with fixes such as chunking, and piloting a prompt before a large run.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Prompt Engineering &amp; Structured Output &middot; 20%</span>
+		<h1>4.5: Batch Processing Strategies</h1>
+		<p>Half-price processing for work nobody is waiting on: deciding which workflows can tolerate a day's delay, scheduling submissions so a deadline still holds, matching thousands of results to their inputs, and resubmitting only what failed.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Message Batches API</span><span class="tag">custom_id</span><span class="tag">SLA</span><span class="tag">Cost</span><span class="tag">Retries</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What batches offer</a></li>
+				<li><a href="#s2">Batch or synchronous</a></li>
+				<li><a href="#s3">What a batch request can't do</a></li>
+				<li><a href="#s4">Scheduling for an SLA</a></li>
+				<li><a href="#s5">A batch pipeline</a></li>
+				<li><a href="#s6">Getting the first pass right</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.5</span>
+				<p><strong>Design efficient batch processing strategies.</strong></p>
+			</div>
+			<p>The exam guide asks you to know what the Message Batches API offers (half the cost, up to 24 hours to process, no latency guarantee), which workloads it suits (overnight reports, weekly audits, nightly test generation) and which it doesn't (blocking checks such as pre-merge reviews), that a batch request can't run tools mid-request and continue, and how <code>custom_id</code> ties results back to requests. In practice it asks you to match the API to the workflow's latency needs, work out how often to submit to meet an SLA, resubmit only the failed documents (with fixes such as chunking an oversized one), and refine the prompt on a sample before processing thousands. The request mechanics are in the developer notes (<a href="../anthropic-ccdv-f/d2-skill-2-1.html#s9">batch or real time</a>); batch economics in more depth are in their cost page (<a href="../anthropic-ccdv-f/d5-skill-5-3.html#s6">batches and budgets</a>).</p>
+			<p>Sources: the Claude API documentation on batch processing, context windows, refusals and the Python SDK, checked on 19 November 2026 and paraphrased. The pipeline is my own and was tested with anthropic 2.10.0 against a mocked Batches API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> Every week the outdoor-gear shop audits a few thousand supplier contracts for long payment terms and missing liability caps. The finance team needs results within 30 hours of a contract arriving. Separately, every pull request needs a review before it can merge.</p></div>
+
+			<!-- ===== Offer ===== -->
+			<h2 id="s1">What batches offer</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">The Message Batches API in brief.</span></p>
+				<ul>
+					<li><strong>Cost:</strong> half the normal price on every token, cached ones included.</li>
+					<li><strong>Time:</strong> most batches finish within an hour, but there's no latency guarantee; requests not processed within 24 hours expire.</li>
+					<li><strong>Size:</strong> up to 100,000 requests or 256 MB per batch.</li>
+					<li><strong>Results:</strong> downloadable for 29 days, returned in <em>any order</em>, each tagged with the <code>custom_id</code> you gave its request (1 to 64 letters, digits, hyphens or underscores). Match by <code>custom_id</code>, never by position.</li>
+					<li><strong>Billing of failures:</strong> errored, cancelled and expired requests aren't billed.</li>
+					<li><strong>Not in batches:</strong> streaming and fast mode, and the server-side refusal fallback; a refusal comes back as a succeeded result with stop reason <code>refusal</code>. Batches also aren't available on every cloud platform and aren't covered by zero data retention.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Batch or sync ===== -->
+			<h2 id="s2">Batch or synchronous</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">Matching the API to the workflow's latency requirement.</span></p>
+				<ul>
+					<li><strong>Synchronous</strong> when someone or something is blocked waiting: a pre-merge review gates the merge, a support agent is answering a customer, a deploy pipeline waits for a check. Half price is no use if the result arrives tomorrow.</li>
+					<li><strong>Batch</strong> when the work is non-blocking and latency-tolerant: the weekly contract audit, overnight reports, nightly test generation, re-classifying an archive, running evaluations.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Use batches to halve the cost of pre-merge reviews"</strong> is the classic wrong answer: the developer would wait up to a day to merge. Cost savings never override a blocking latency requirement.</p></div>
+			</div>
+
+			<!-- ===== Can't do ===== -->
+			<h2 id="s3">What a batch request can't do</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">One request, one response, no conversation.</span></p>
+				<p>Each item in a batch is a single Messages API call. If Claude's response ends with a <code>tool_use</code> block, nothing runs the tool and sends the result back within that request: the item simply finishes with the tool call. Agent loops that need several tool rounds (task 1.1) therefore don't fit in one batch request. The options are to give each request everything it needs up front (the full contract text, not a tool to fetch it), or to run tool rounds as successive batches or synchronous calls. Single-step jobs such as extraction, classification and auditing a provided document are the natural batch workload.</p>
+			</div>
+
+			<!-- ===== SLA ===== -->
+			<h2 id="s4">Scheduling for an SLA</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">How often to submit so the slowest document still meets its deadline.</span></p>
+				<p>A document that arrives just after a submission waits for the next one, then up to 24 hours more for the batch. So the worst case is the submission interval plus the processing window, and that has to fit inside the SLA with some margin:</p>
+				<ul>
+					<li><strong>30-hour SLA:</strong> 30 minus 24 hours of processing leaves 6 hours; keep 2 hours of margin and submit every <strong>4 hours</strong>. That's the guide's example.</li>
+					<li><strong>48-hour SLA</strong> with a 4-hour margin: submit every 20 hours, so once a day is fine.</li>
+					<li><strong>An SLA under 24 hours</strong> can't be guaranteed by batches alone, even though most batches finish within an hour: there's no latency guarantee.</li>
+				</ul>
+				<p>The <code>submit_interval_hours</code> function in the pipeline below does this sum.</p>
+			</div>
+
+			<!-- ===== Pipeline ===== -->
+			<h2 id="s5">A batch pipeline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">Submit, match by custom_id, resubmit only the failures.</span></p>
+				<div class="code"><span class="file">batch_pipeline.py (Python, anthropic SDK)</span>
+<pre><code>"""Weekly supplier-contract audit on the Message Batches API: pilot first, submit, match by custom_id,
+and resubmit only what failed."""
+import time
+
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+client = anthropic.Anthropic()
+SYSTEM = "Audit this supplier contract for payment terms over 60 days and missing liability caps. Reply as JSON."
+
+
+def submit_interval_hours(sla_hours: float, processing_hours: float = 24, margin_hours: float = 2) -&gt; float:
+    """How often to submit so the slowest document still meets the SLA: wait + processing + margin &lt;= SLA."""
+    return sla_hours - processing_hours - margin_hours   <span class="c"># a 30 h SLA gives a 4 h submission window</span>
+
+
+def params(text: str) -&gt; MessageCreateParamsNonStreaming:
+    return MessageCreateParamsNonStreaming(model="claude-sonnet-5-5", max_tokens=2000, system=SYSTEM,
+                                           messages=[{"role": "user", "content": f"&lt;contract&gt;{text}&lt;/contract&gt;"}])
+
+
+def pilot(sample: dict[str, str], looks_right) -&gt; float:
+    """Refine the prompt on a few documents synchronously before paying for thousands."""
+    passed = sum(looks_right(client.messages.create(**params(text))) for text in sample.values())
+    return passed / len(sample)
+
+
+def run_batch(docs: dict[str, str]) -&gt; dict:
+    <span class="c"># custom_id: 1-64 characters (letters, digits, - and _), so results can be matched whatever their order.</span>
+    batch = client.messages.batches.create(requests=[Request(custom_id=doc_id, params=params(text))
+                                                     for doc_id, text in docs.items()])
+    while client.messages.batches.retrieve(batch.id).processing_status != "ended":
+        time.sleep(60)
+    return {item.custom_id: item.result for item in client.messages.batches.results(batch.id)}
+
+
+def chunk(text: str, size: int = 150_000) -&gt; list[str]:
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+def audit(docs: dict[str, str]) -&gt; tuple[dict, list[str]]:
+    done, failed = {}, []
+    results = run_batch(docs)
+    retry = {}
+    for doc_id, result in results.items():
+        if result.type == "succeeded":
+            done[doc_id] = result.message
+        elif result.type == "errored" and "prompt is too long" in result.error.error.message:
+            <span class="c"># Too big for one request: resubmit just this document, split into parts.</span>
+            for n, part in enumerate(chunk(docs[doc_id]), start=1):
+                retry[f"{doc_id}-part{n}"] = part
+        elif result.type in ("expired", "canceled"):
+            retry[doc_id] = docs[doc_id]       <span class="c"># not billed; send again unchanged</span>
+        else:
+            failed.append(doc_id)              <span class="c"># any other error: a person looks at it</span>
+    if retry:
+        for doc_id, result in run_batch(retry).items():
+            if result.type == "succeeded":
+                done[doc_id] = result.message
+            else:
+                failed.append(doc_id)          <span class="c"># failed twice: stop resubmitting</span>
+    return done, failed</code></pre></div>
+				<ul>
+					<li><strong>custom_id is the contract's ID,</strong> so each result maps straight back to its document.</li>
+					<li><strong>Only failures are resubmitted,</strong> each with the fix its failure needs: a contract too long for the context window is split into parts with new IDs (<code>c-peak-part1</code> and so on), expired or cancelled items go again unchanged, and anything else goes to a person rather than round again.</li>
+					<li><strong>Resubmission is bounded:</strong> one retry batch; items that fail twice stop. Errors only show up once a batch has ended, which is another reason to try requests synchronously first.</li>
+				</ul>
+			</div>
+
+			<!-- ===== First pass ===== -->
+			<h2 id="s6">Getting the first pass right</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.5</span><span class="skill-text">Piloting on a sample before paying for thousands.</span></p>
+				<p>A prompt flaw in a batch of 5,000 contracts costs 5,000 requests, a day's wait, and another batch to redo them. Running the prompt synchronously on a representative sample of 20 to 50 first (the <code>pilot</code> function) shows the first-pass success rate in minutes; refine until it's high, then submit the full volume. The same logic suggests sending one request with a shared prompt prefix before the rest when relying on caching, since cache hits inside a batch are best-effort.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Batches: 50% off, up to 24 hours with no latency guarantee, up to 100,000 requests per batch, results in any order for 29 days, failures not billed.</li>
+				<li>Synchronous for blocking work (pre-merge checks, live conversations); batch for non-blocking, latency-tolerant work (overnight reports, weekly audits, nightly test generation).</li>
+				<li>A batch request is a single call: it can't run tools mid-request and continue, so give it everything it needs or run tool rounds separately.</li>
+				<li>Submission interval plus 24 hours plus a margin must fit the SLA: every 4 hours for a 30-hour SLA.</li>
+				<li>Correlate by <code>custom_id</code>; resubmit only failed items, fixed for their failure (chunk oversized documents, resend expired ones); pilot the prompt on a sample first.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-4.html"><small>Previous</small>4.4: Validation, Retry and Feedback Loops</a>
+				<a class="next" href="index.html#d4"><small>Next</small>Domain 4 overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude API documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
