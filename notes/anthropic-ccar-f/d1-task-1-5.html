@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.5: Hooks for Interception and Normalisation | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.5: Claude Agent SDK PreToolUse and PostToolUse hooks, normalising timestamps and status codes from different MCP tools before the model reads them, blocking policy-violating calls such as large refunds and redirecting them to human escalation, and choosing hooks over prompt instructions when compliance must be guaranteed.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.5: Hooks for Interception and Normalisation</h1>
+		<p>Code that runs around every tool call: before it, to stop or redirect actions the business forbids, and after it, to turn each system's dates and status codes into one format before Claude reads the result.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Agent SDK</span><span class="tag">PreToolUse</span><span class="tag">PostToolUse</span><span class="tag">MCP</span><span class="tag">Normalisation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Two interception points</a></li>
+				<li><a href="#s2">Normalising tool results</a></li>
+				<li><a href="#s3">Rules for rewriting results</a></li>
+				<li><a href="#s4">Intercepting outgoing calls</a></li>
+				<li><a href="#s5">Registering the hooks</a></li>
+				<li><a href="#s6">Hooks or prompt instructions</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.5</span>
+				<p><strong>Apply Agent SDK hooks for tool call interception and data normalization.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the hook that intercepts tool <em>results</em> to transform them before the model processes them (<code>PostToolUse</code>), the hook that intercepts outgoing tool <em>calls</em> to enforce rules such as a refund threshold, and why hooks give deterministic guarantees where prompt instructions give probabilistic compliance. In practice it asks you to normalise mixed formats (Unix timestamps, ISO 8601, numeric status codes) coming from different MCP tools, block policy-violating calls (refunds over $500) and redirect them to another workflow such as human escalation, and choose hooks when a business rule must hold every time. Gates that depend on an earlier step's result are covered in <a href="d1-task-1-4.html">task 1.4</a>.</p>
+			<p>Sources: the Claude Agent SDK hooks guide and the Claude Code hooks reference, checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The hooks are my own and were tested by calling them with hook inputs, using claude-agent-sdk 0.2.185.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's support agent reads three systems through MCP servers: <code>orders</code> (numeric status codes, Unix seconds), <code>warehouse</code> (two-letter codes, Unix milliseconds) and <code>carrier</code> (upper-case words, ISO 8601 with local offsets). Refunds go through <code>orders</code> and must stay under $500 without a person's approval.</p></div>
+
+			<!-- ===== Two points ===== -->
+			<h2 id="s1">Two interception points</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">Before a tool runs, and after it returns.</span></p>
+				<ul>
+					<li><strong><code>PreToolUse</code></strong> runs after Claude has chosen a tool and its arguments but before the tool executes. It can <strong>deny</strong> the call (with a reason Claude reads), <strong>allow</strong> it, <strong>ask</strong> for a person's approval, <strong>defer</strong> it (the turn ends with stop reason <code>tool_deferred</code> so your application can resume the call later), or rewrite its arguments with <code>updatedInput</code>. This is where compliance rules go: once a refund has run, no later hook can undo it.</li>
+					<li><strong><code>PostToolUse</code></strong> runs after a tool has finished successfully, with both its arguments (<code>tool_input</code>) and its result (<code>tool_response</code>). It can <strong>replace</strong> what Claude sees with <code>updatedToolOutput</code>, add a note with <code>additionalContext</code>, or attach a reason with <code>decision: "block"</code> (which leaves the original output visible). This is where normalisation goes. Failed calls go to <code>PostToolUseFailure</code> instead.</li>
+				</ul>
+				<p>Both match on the tool name. MCP tools are named <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>, so a regular-expression matcher such as <code>^mcp__orders__</code> covers every tool on one server.</p>
+			</div>
+
+			<!-- ===== Normalising ===== -->
+			<h2 id="s2">Normalising tool results</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">One date format and one status vocabulary, whichever tool answered.</span></p>
+				<p>When each system speaks its own format, Claude has to translate every result, and it will sometimes get it wrong: <code>1763460000</code> and <code>2025-11-18T11:00:00+01:00</code> are the same moment, <code>3</code>, <code>DS</code> and <code>IN_TRANSIT</code> all mean "shipped", and comparing "is the parcel later than the promised date" across them invites mistakes. A <code>PostToolUse</code> hook converts every result to one convention before the model reads it, so the agent reasons about data that's already consistent.</p>
+				<div class="code"><span class="file">normalize_hook.py (Python, claude-agent-sdk hook)</span>
+<pre><code>"""PostToolUse hook that gives the agent one date format and one status vocabulary, whichever MCP tool answered."""
+import json
+from datetime import datetime, timezone
+
+<span class="c"># Each back-end system reports status its own way.</span>
+STATUS = {
+    "orders": {1: "placed", 2: "paid", 3: "shipped", 4: "delivered", 9: "cancelled"},       <span class="c"># numeric codes</span>
+    "warehouse": {"PK": "packed", "DS": "shipped", "RT": "returned"},                         <span class="c"># short codes</span>
+    "carrier": {"IN_TRANSIT": "shipped", "DELIVERED": "delivered", "EXCEPTION": "delayed"},   <span class="c"># upper-case words</span>
+}
+TIME_FIELDS = {"created", "updated", "shipped_at", "eta", "delivered_at"}
+
+
+def to_iso(value):
+    """Unix seconds, Unix milliseconds or ISO 8601 in; ISO 8601 UTC out."""
+    if isinstance(value, (int, float)):
+        seconds = value / 1000 if value &gt; 10**11 else value
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value
+
+
+def normalise(record: dict, server: str) -&gt; dict:
+    out = {}
+    for key, value in record.items():
+        if key in TIME_FIELDS:
+            out[key] = to_iso(value)
+        elif key in ("status", "state"):
+            out["status"] = STATUS[server].get(value, f"unknown ({value})")  <span class="c"># never guess silently</span>
+        else:
+            out[key] = value
+    return out
+
+
+def rewrite_text(text: str, server: str) -&gt; str:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text  <span class="c"># not JSON: leave it alone</span>
+    if isinstance(data, list):
+        return json.dumps([normalise(r, server) for r in data])
+    return json.dumps(normalise(data, server))
+
+
+async def normalise_result(input_data, tool_use_id, context):
+    server = input_data["tool_name"].split("__")[1]  <span class="c"># mcp__&lt;server&gt;__&lt;tool&gt;</span>
+    if server not in STATUS:
+        return {}
+    response = input_data["tool_response"]
+    <span class="c"># MCP output isn't schema-checked, so return the same shape that came in.</span>
+    if isinstance(response, str):
+        new = rewrite_text(response, server)
+    else:
+        blocks = response["content"] if isinstance(response, dict) else response
+        new_blocks = [{**b, "text": rewrite_text(b["text"], server)} if b.get("type") == "text" else b for b in blocks]
+        new = {**response, "content": new_blocks} if isinstance(response, dict) else new_blocks
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": new}}</code></pre></div>
+				<p>Translation lives in a table in code, so adding a fourth system means adding its codes, not rewriting the system prompt, and every conversation gets exactly the same conversion.</p>
+			</div>
+
+			<!-- ===== Rules ===== -->
+			<h2 id="s3">Rules for rewriting results</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">What the docs warn about when replacing tool output.</span></p>
+				<ul>
+					<li><strong>It changes what Claude sees, nothing else.</strong> The tool has already run, so its side effects stand, and telemetry such as OpenTelemetry spans records the original output, not your rewrite.</li>
+					<li><strong>Match the output shape.</strong> For built-in tools, a replacement that doesn't fit the tool's output schema is ignored and the original is used. MCP output isn't schema-checked, so the hook above returns the same shape it received: a string, a list of content blocks, or an object with <code>content</code>.</li>
+					<li><strong>Don't hide what Claude needs.</strong> Stripping error details can make it carry on as if something succeeded. The hook passes unknown status codes through as <code>unknown (7)</code> rather than guessing, and leaves non-JSON text alone.</li>
+					<li><strong>Prefer <code>updatedToolOutput</code>.</strong> The older <code>updatedMCPToolOutput</code> works for MCP tools only.</li>
+					<li><strong>Adding beats replacing when both would do.</strong> If the original is fine and only needs a hint ("times are UTC"), <code>additionalContext</code> keeps the raw result intact.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Intercepting ===== -->
+			<h2 id="s4">Intercepting outgoing calls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">Blocking a policy-violating action and pointing to the right workflow.</span></p>
+				<p>A <code>PreToolUse</code> hook on the refund tool checks the amount against the policy. Under the limit it returns nothing and the call proceeds; over it, it denies the call and uses the reason to <strong>redirect</strong>: it names the alternative workflow (escalating to a person) and what that workflow needs, so Claude's next step is the escalation rather than a retry with a slightly lower amount.</p>
+				<div class="code"><span class="file">agent_hooks.py (Python, claude-agent-sdk)</span>
+<pre><code>"""Register both kinds of hook: normalise what comes back, intercept what goes out."""
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+from normalize_hook import normalise_result
+
+REFUND_LIMIT = 500.00
+
+
+async def refund_policy(input_data, tool_use_id, context):
+    amount = input_data["tool_input"].get("amount", 0)
+    if amount &gt; REFUND_LIMIT:
+        <span class="c"># Block the action and name the alternative workflow, so Claude redirects instead of retrying.</span>
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (f"Refunds over {REFUND_LIMIT:.0f} need approval. Call escalate_to_human "
+                                         "with the customer ID, root cause, amount and your recommendation."),
+        }}
+    return {}
+
+
+def build_options(shop_servers: dict) -&gt; ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        mcp_servers=shop_servers,
+        hooks={
+            <span class="c"># Before the model reads a result: one format for every system.</span>
+            "PostToolUse": [HookMatcher(matcher="^mcp__(orders|warehouse|carrier)__", hooks=[normalise_result])],
+            <span class="c"># Before a tool runs: business rules that must hold every time.</span>
+            "PreToolUse": [HookMatcher(matcher="mcp__orders__process_refund", hooks=[refund_policy], on_failure="block")],
+        },
+    )</code></pre></div>
+				<ul>
+					<li><strong>Other ways to redirect.</strong> <code>ask</code> turns the call into an approval request for a person, and <code>defer</code> stops the turn so your application can hold the call for approval and resume it. <code>updatedInput</code> rewrites arguments (for example, capping a field), but silently changing a refund amount would mislead both the customer and Claude, so a deny with a clear reason is the cleaner fit here.</li>
+					<li><strong>Check arguments inside the callback.</strong> Matchers only see tool names; the amount is read from <code>tool_input</code>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Registering ===== -->
+			<h2 id="s5">Registering the hooks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">Where each hook goes, and how they combine.</span></p>
+				<ul>
+					<li>Hooks are passed in <code>ClaudeAgentOptions(hooks={...})</code>, keyed by event, each entry a <code>HookMatcher</code> with a matcher pattern and one or more async callbacks <code>(input_data, tool_use_id, context)</code>. Shell-command hooks from <code>.claude/settings.json</code> also run when that setting source is loaded.</li>
+					<li>Several hooks on one event run in parallel; for permission decisions the most restrictive wins (deny, then defer, then ask, then allow), so write each check to stand on its own.</li>
+					<li>For a compliance hook, set <code>on_failure="block"</code> so a crash blocks the call instead of letting it through, and remember that a <code>PreToolUse</code> timeout blocks too (task 1.4 has the details).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Hooks vs prompts ===== -->
+			<h2 id="s6">Hooks or prompt instructions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.5</span><span class="skill-text">Deterministic guarantees versus probabilistic compliance.</span></p>
+				<p>"Never refund more than $500 without approval" in the system prompt will be followed nearly always; a hook makes it always. "Treat 3 as shipped" in the prompt will usually be applied; a hook applies it to every result. Choose by the cost of the rare miss:</p>
+				<ul>
+					<li><strong>Hooks</strong> for rules that must hold every time (money, identity, data protection, irreversible actions) and for conversions that must be exact. They cost a little code and are tested like code.</li>
+					<li><strong>Prompt instructions</strong> for judgement and preferences: tone, which question to ask first, when an apology is due. Hard-coding these makes the agent rigid.</li>
+					<li><strong>Both</strong> for important rules: the prompt tells Claude the policy so it plans around it, and the hook is the guarantee.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Wrong answers that sound strong.</strong> Moving the rule to the top of the system prompt, writing it in capitals, repeating it in every turn, or adding examples of refused refunds all raise compliance without making it certain. When a scenario says the rule "must" hold or failures are unacceptable, pick the hook.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li><code>PreToolUse</code> runs before a tool executes: deny (reason to Claude), allow, ask, defer, or rewrite input. Compliance rules go here because executed actions can't be undone.</li>
+				<li><code>PostToolUse</code> runs after a successful call: <code>updatedToolOutput</code> replaces what Claude sees, <code>additionalContext</code> adds a note, <code>decision: "block"</code> attaches a reason but keeps the original.</li>
+				<li>Normalise heterogeneous results (Unix seconds or milliseconds, ISO 8601 with offsets, numeric or coded statuses) to one format in a <code>PostToolUse</code> hook matched to the MCP servers, keeping the output's shape and flagging unknown values.</li>
+				<li>Rewriting output doesn't undo side effects and isn't what telemetry records; mismatched shapes are ignored for built-in tools; MCP output isn't validated.</li>
+				<li>Block a policy violation (refund over $500) with a deny whose reason redirects to the alternative workflow (human escalation).</li>
+				<li>Hooks give deterministic guarantees, prompts probabilistic compliance: use hooks when a rule must always hold, prompts for judgement, both for important rules.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-4.html"><small>Previous</small>1.4: Enforced Workflows and Handoffs</a>
+				<a class="next" href="d2-task-2-1.html"><small>Next</small>2.1: Tool Interfaces</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude Agent SDK and Claude Code documentation, with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
