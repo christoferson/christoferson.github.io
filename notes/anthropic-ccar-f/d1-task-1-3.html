@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.3: Invoking Subagents and Passing Context | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.3: spawning subagents with the Agent tool (formerly Task) and what allowed_tools really does, AgentDefinition settings, passing context explicitly, handing complete findings to a synthesis subagent as structured data that keeps sources attached, spawning subagents in parallel, goal-based coordinator prompts, and forking sessions from a shared baseline.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.3: Invoking Subagents and Passing Context</h1>
+		<p>The mechanics under a coordinator: the tool that spawns subagents, how each one is defined, why everything it needs must be written into its brief, how to hand over findings without losing their sources, how to run several at once, and how to branch a session to try two approaches.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Agent tool</span><span class="tag">AgentDefinition</span><span class="tag">Context passing</span><span class="tag">Parallel subagents</span><span class="tag">Session forks</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The spawning tool</a></li>
+				<li><a href="#s2">Defining subagents</a></li>
+				<li><a href="#s3">Context is passed, not inherited</a></li>
+				<li><a href="#s4">Handing over complete findings</a></li>
+				<li><a href="#s5">Spawning in parallel</a></li>
+				<li><a href="#s6">Goals, not procedures</a></li>
+				<li><a href="#s7">Forking from a shared baseline</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.3</span>
+				<p><strong>Configure subagent invocation, context passing, and spawning.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the tool that spawns subagents and how a coordinator is allowed to use it, that a subagent's context has to be provided in its prompt, how an <code>AgentDefinition</code> describes each subagent type, and how forking a session lets you explore different approaches from one shared analysis. In practice it asks you to put complete earlier findings into the synthesis subagent's prompt, keep content and source metadata apart so attribution survives, start parallel subagents with several calls in one coordinator response, and write coordinator prompts as goals and quality criteria rather than step-by-step scripts. Why and when to use a coordinator at all is <a href="d1-task-1-2.html">task 1.2</a>.</p>
+			<p>Sources: the Claude Agent SDK documentation on subagents, permissions, sessions and the Python reference, and the Claude Code pages on subagents and tools, checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The code is my own and was tested with anthropic 2.10.0 and claude-agent-sdk 0.2.185 against a mocked API and a stand-in for the SDK's <code>query()</code>, not the live service.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's research coordinator from task 1.2: specialists for reviews, sales data and the web, and a synthesizer that writes the buying team's recommendation about an ultralight tent range.</p></div>
+
+			<!-- ===== Spawning tool ===== -->
+			<h2 id="s1">The spawning tool</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">The Task tool, now called Agent, and what allowedTools has to do with it.</span></p>
+				<p>A coordinator spawns a subagent by calling a built-in tool. The guide calls it <strong>Task</strong>; since Claude Code 2.1.63 it appears as <strong>Agent</strong> in <code>tool_use</code> blocks (the session's start-up tool list still shows <code>Task</code>), so code that detects subagent calls should accept both names. Its input carries a short <code>description</code>, the <code>prompt</code> that becomes the subagent's brief, and an optional <code>subagent_type</code> naming one of your defined agents; with no type, Claude gets the built-in general-purpose subagent.</p>
+				<div class="callout trap"><p><strong>"allowedTools must include Task": the guide's rule and today's behaviour.</strong> The guide states that a coordinator can invoke subagents only if <code>allowedTools</code> includes <code>"Task"</code>, so expect that as the answer to an exam question about it, and the docs' own examples still list <code>"Agent"</code> there. Current Agent SDK documentation adds a nuance: <code>allowed_tools</code> only <em>pre-approves</em> tools, and Agent is one of the tools that "don't ask before running", so in the default permission mode a coordinator can spawn subagents even when it isn't listed. To <em>stop</em> spawning, remove the tool with <code>disallowed_tools=["Agent"]</code>; to stop one subagent from spawning its own, leave Agent out of its <code>tools</code> list.</p></div>
+				<p>Other limits on spawning: subagents can nest up to three levels by default (<code>CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH</code>), at most 20 run at once, and a subagent inherits the main session's permission mode when that mode is plan, acceptEdits, auto or bypassPermissions.</p>
+			</div>
+
+			<!-- ===== AgentDefinition ===== -->
+			<h2 id="s2">Defining subagents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">AgentDefinition: description, system prompt and tool restrictions per subagent type.</span></p>
+				<ul>
+					<li><strong><code>description</code></strong> (required): when to use this subagent. The coordinator reads it to choose, so make it specific ("Reads exported customer reviews in data/reviews/") rather than generic ("Helps with research").</li>
+					<li><strong><code>prompt</code></strong> (required): the subagent's system prompt, its role, method and standards.</li>
+					<li><strong><code>tools</code></strong>: the tools it may use. Omit it to inherit every tool available to subagents; list tools to restrict it, such as read-only <code>Read</code>, <code>Grep</code> and <code>Glob</code> for an analyst that must never edit. <code>disallowedTools</code> removes specific tools instead.</li>
+					<li><strong><code>model</code></strong>: an alias such as <code>haiku</code>, <code>sonnet</code> or <code>opus</code>, a full model ID, or <code>inherit</code>.</li>
+					<li>Also: <code>maxTurns</code>, <code>effort</code>, <code>skills</code>, <code>mcpServers</code>, <code>memory</code>, <code>background</code> and <code>permissionMode</code>. The Python SDK keeps these camelCase names.</li>
+				</ul>
+				<p>Definitions can be passed in code through the <code>agents</code> option, which the SDK docs recommend, or written as Markdown files in <code>.claude/agents/</code>; a definition in code wins over a file with the same name. The 1.2 page's <a href="d1-task-1-2.html#s7">coordinator example</a> defines four.</p>
+			</div>
+
+			<!-- ===== Context ===== -->
+			<h2 id="s3">Context is passed, not inherited</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">What a subagent knows comes from its brief.</span></p>
+				<p>The SDK docs are explicit: unless the subagent is a fork, the only content passed from parent to subagent is the Agent tool's prompt string, so file paths, error messages and decisions it needs must be written into that prompt. A subagent doesn't see the coordinator's conversation, its tool results or its system prompt, and when a subagent finishes, the next one of the same type starts fresh: nothing carries over between invocations by default.</p>
+				<ul>
+					<li><strong>Persistent memory is opt-in.</strong> A subagent definition can set <code>memory</code> (<code>user</code>, <code>project</code> or <code>local</code>) to give it a directory it reads and writes across sessions, with a <code>MEMORY.md</code> loaded at start. Without it, there's no shared memory.</li>
+					<li><strong>Resuming is a different thing.</strong> A finished subagent can be resumed by its agent ID within the same session, with its own history intact; that continues one subagent, it doesn't share context between different ones.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Handover ===== -->
+			<h2 id="s4">Handing over complete findings</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">Full results into the synthesis prompt, with content and metadata kept apart.</span></p>
+				<p>The synthesis subagent can only combine what it's given. If the coordinator passes "the market scout found a cheaper rival tent", the synthesizer can't check it, quote it or cite it. Pass the <strong>complete findings</strong> from the earlier subagents (search results, document analysis) directly in its prompt, and pass them as <strong>structured data</strong>: each finding's content in one field and its metadata (source URL, document name, page number) in another.</p>
+				<div class="code"><span class="file">synthesis_handoff.py (Python, anthropic SDK)</span>
+<pre><code>"""Hand complete findings to a synthesis subagent as structured data, so every claim keeps its source."""
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+<span class="c"># What the web and document subagents returned: content separate from metadata.</span>
+FINDINGS = [
+    {"id": "F1", "claim": "Rival A sells a 1.1 kg two-person tent for 320 EUR.",
+     "source": {"type": "web", "url": "https://rival-a.example/tents/feather-2"}},
+    {"id": "F2", "claim": "14 of 120 tent reviews in 2026 complain about weight.",
+     "source": {"type": "document", "name": "reviews-2026.csv", "rows": "R-101 to R-388"}},
+    {"id": "F3", "claim": "Tents under 1.5 kg had a 9% return rate, against 4% for heavier ones.",
+     "source": {"type": "document", "name": "returns-report-q3.pdf", "page": 7}},
+]
+
+SYSTEM = (
+    "You write the buying team's recommendation from the findings provided. "
+    "Use only those findings, and cite their ids in brackets, like [F2], after every claim. "
+    "If the findings don't answer part of the question, say so instead of guessing."
+)
+
+
+def synthesise(question: str, findings: list[dict]) -&gt; str:
+    <span class="c"># The synthesizer starts with an empty context, so everything goes into its prompt:</span>
+    <span class="c"># the question and the complete findings, as JSON inside a tag.</span>
+    prompt = f"&lt;question&gt;{question}&lt;/question&gt;\n&lt;findings&gt;\n{json.dumps(findings, indent=2)}\n&lt;/findings&gt;"
+    response = client.messages.create(
+        model="claude-sonnet-5-5", max_tokens=2000, system=SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    report = "".join(b.text for b in response.content if b.type == "text")
+    cited = {part.split("]")[0] for part in report.split("[")[1:]}
+    unknown = cited - {f["id"] for f in findings}
+    if unknown:
+        raise ValueError(f"report cites findings that don't exist: {sorted(unknown)}")
+    return report
+
+
+def sources(report: str, findings: list[dict]) -&gt; list[str]:
+    """Rebuild the attribution list from the ids the report actually cites."""
+    by_id = {f["id"]: f["source"] for f in findings}
+    lines = []
+    for fid in sorted({p.split("]")[0] for p in report.split("[")[1:]}):
+        s = by_id[fid]
+        where = s.get("url") or f"{s['name']}" + (f", page {s['page']}" if "page" in s else "")
+        lines.append(f"[{fid}] {where}")
+    return lines
+
+
+if __name__ == "__main__":
+    report = synthesise("Should we stock an ultralight two-person tent range next spring?", FINDINGS)
+    print(report)
+    print("\n".join(sources(report, FINDINGS)))</code></pre></div>
+				<ul>
+					<li><strong>Why structure:</strong> when sources are mixed into prose, attribution gets lost or reworded at each hop. With an ID per finding, the synthesizer cites <code>[F3]</code> and code rebuilds "returns-report-q3.pdf, page 7" exactly.</li>
+					<li><strong>Checkable:</strong> because citations point at known IDs, the code can reject a report that cites a finding that doesn't exist, rather than shipping an invented source.</li>
+					<li><strong>Large results:</strong> when findings are too big to pass whole, store them and pass references with their metadata, as in task 1.2.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Parallel ===== -->
+			<h2 id="s5">Spawning in parallel</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">Several spawning calls in one coordinator response, not one per turn.</span></p>
+				<p>Independent subagents should start together. A coordinator does that the same way any agent runs tools in parallel: it emits several Agent calls in <strong>one</strong> response.</p>
+				<div class="code"><span class="file">parallel_spawn.json (JSON, one assistant response)</span>
+<pre><code>{
+  "role": "assistant",
+  "content": [
+    {"type": "text", "text": "I'll check reviews and competitors at the same time."},
+    {"type": "tool_use", "id": "toolu_01A", "name": "Agent",
+     "input": {"subagent_type": "review-analyst", "description": "Weight complaints",
+               "prompt": "Goal: how often 2026 tent reviews in data/reviews/ complain about weight. Return counts and review IDs."}},
+    {"type": "tool_use", "id": "toolu_01B", "name": "Agent",
+     "input": {"subagent_type": "market-scout", "description": "Rival ultralight tents",
+               "prompt": "Goal: weight and price of three rival two-person tents under 1.5 kg. Cite a URL for each."}}
+  ]
+}</code></pre></div>
+				<p>Emitting one call, waiting, and emitting the next in a later turn makes the work sequential, so the run takes the sum of the subagents' times instead of the longest one. In the Agent SDK, subagents now also start in the background by default and report in a later turn, which softens that cost, but the guide's rule still holds for any coordinator that waits for each result.</p>
+			</div>
+
+			<!-- ===== Goals ===== -->
+			<h2 id="s6">Goals, not procedures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">Coordinator prompts that state the goal and the quality bar.</span></p>
+				<div class="code"><span class="file">coordinator_prompts.txt (coordinator prompts)</span>
+<pre><code>PROCEDURAL (brittle): every subagent follows a script, whatever it finds
+  1. Ask market-scout to search "ultralight tent" on three named retailer sites.
+  2. Ask review-analyst to count reviews containing the word "heavy".
+  3. Ask sales-analyst to export last year's tent sales.
+  4. Ask synthesizer to write five bullet points.
+
+GOAL-BASED (adaptable): the goal, the standard, and room to choose how
+  Goal: decide whether an ultralight two-person tent range is worth stocking next spring.
+  A good answer: states expected demand and margin with figures; compares at least three
+    competing products on weight and price; says how weight affects complaints and returns;
+    cites a source for every figure; lists what could not be established.
+  Constraints: use only our own data and public web sources; finish within five subagent runs.
+  Delegate as you judge best, and tell each specialist the goal and standard that apply to its part.</code></pre></div>
+				<p>The procedural prompt fixes the steps, so when a retailer site changes, "heavy" misses reviews that say "weighs a ton", or the sales export lacks returns, no one adapts. The goal-based prompt says what a good answer must contain and leaves the method to the agents, which lets the coordinator choose specialists and lets each specialist change approach when its first attempt comes up short. Constraints (sources, budget) still belong in it; it's the step-by-step <em>method</em> that comes out.</p>
+			</div>
+
+			<!-- ===== Fork ===== -->
+			<h2 id="s7">Forking from a shared baseline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.3</span><span class="skill-text">One analysis, two directions, neither disturbing the other.</span></p>
+				<p>The Agent SDK saves each session's history and offers three ways back into it: <strong>continue</strong> (the most recent session), <strong>resume</strong> (a session by ID) and <strong>fork</strong>. A fork (<code>resume=session_id</code> plus <code>fork_session=True</code>) creates a new session that starts with a copy of the original's history and gets its own ID; the original is unchanged and can be resumed separately.</p>
+				<div class="code"><span class="file">fork_baseline.py (Python, claude-agent-sdk)</span>
+<pre><code>import anyio
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+TOOLS = ["Read", "Grep", "Glob"]
+
+
+async def run(prompt: str, **session) -&gt; str:
+    """Run one query and return its session ID (a fork gets a new one)."""
+    session_id = None
+    async for message in query(prompt=prompt, options=ClaudeAgentOptions(allowed_tools=TOOLS, max_turns=20, **session)):
+        if isinstance(message, ResultMessage):
+            session_id = message.session_id
+            print(f"[{message.subtype}] {message.result}")
+    return session_id
+
+
+async def main() -&gt; None:
+    <span class="c"># 1. One shared baseline: read the data once.</span>
+    baseline = await run("Analyse data/sales/ and data/reviews/ for the two-person tent range. Summarise demand, "
+                         "returns and complaints. Don't recommend anything yet.")
+    <span class="c"># 2. Two forks start from a copy of that analysis and diverge; the baseline is untouched.</span>
+    ultralight = await run("Option A: design an ultralight range. Price it and list the risks.",
+                           resume=baseline, fork_session=True)
+    budget = await run("Option B: design a budget range instead. Price it and list the risks.",
+                       resume=baseline, fork_session=True)
+    <span class="c"># 3. Back on the baseline, compare the two options it never saw being worked out.</span>
+    print("forks:", ultralight, budget)
+    await run(f"Two options were developed in sessions {ultralight} and {budget}. "
+              "List the questions we'd need answered to choose between them.", resume=baseline)
+
+
+if __name__ == "__main__":
+    anyio.run(main)</code></pre></div>
+				<ul>
+					<li><strong>Why fork:</strong> the expensive part (reading the data, building the analysis) happens once; each alternative starts from the same baseline instead of redoing it, and an approach that goes nowhere doesn't clutter the main thread.</li>
+					<li><strong>Only the conversation branches.</strong> Files a forked agent edits are real and visible to every session in that directory; use file checkpointing or separate working directories to branch files too.</li>
+					<li><strong>Same machine.</strong> Sessions are stored under <code>~/.claude/projects/</code>; to continue elsewhere, use a session store adapter or pass captured results into a fresh session.</li>
+					<li><strong>Subagent forks</strong> are the in-conversation version: a subagent started as a fork inherits the parent conversation instead of starting fresh.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Subagents are spawned with the Task tool, named Agent since Claude Code 2.1.63; match both names. The guide requires it in <code>allowedTools</code>; today that pre-approves rather than enables it, and <code>disallowed_tools</code> is how you block it.</li>
+				<li><code>AgentDefinition</code>: a specific <code>description</code> (for choosing), a <code>prompt</code> (system prompt), <code>tools</code> to restrict, <code>model</code> to size; code definitions override <code>.claude/agents/</code> files.</li>
+				<li>Subagents don't inherit the coordinator's context or share memory between invocations; the brief is the only channel. Persistent <code>memory</code> is opt-in.</li>
+				<li>Give the synthesizer the complete findings, as structured data with content and source metadata separated, so attribution survives and citations can be checked.</li>
+				<li>Start independent subagents with several Agent calls in one coordinator response, not one per turn.</li>
+				<li>Coordinator prompts state goals and quality criteria (plus constraints), not step-by-step procedures.</li>
+				<li>Fork a session (<code>resume</code> plus <code>fork_session=True</code>) to explore alternatives from one baseline; the original is untouched, and files aren't branched.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-2.html"><small>Previous</small>1.2: Coordinators and Subagents</a>
+				<a class="next" href="d1-task-1-4.html"><small>Next</small>1.4: Enforced Workflows and Handoffs</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude Agent SDK and Claude Code documentation, with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

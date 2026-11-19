@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.4: Enforced Workflows and Handoffs | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.4: prompt guidance versus programmatic enforcement, prerequisite gates that block a refund until the customer is verified (Agent SDK PreToolUse hooks), splitting multi-concern requests and investigating them in parallel with shared context, and structured handoff summaries for human agents.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.4: Enforced Workflows and Handoffs</h1>
+		<p>Making a multi-step process happen in the right order when it has to: instructions for what can bend, code gates for what can't, splitting a message with several problems into separate investigations, and handing a case to a person with everything they need.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Hooks</span><span class="tag">Prerequisite gates</span><span class="tag">PreToolUse</span><span class="tag">Decomposition</span><span class="tag">Escalation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Guidance or enforcement</a></li>
+				<li><a href="#s2">A prerequisite gate</a></li>
+				<li><a href="#s3">How the gate behaves</a></li>
+				<li><a href="#s4">Requests with several concerns</a></li>
+				<li><a href="#s5">Structured handoffs</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.4</span>
+				<p><strong>Implement multi-step workflows with enforcement and handoff patterns.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the difference between enforcing a workflow's order in code (hooks, prerequisite gates) and guiding it with the prompt, that prompt instructions alone have a non-zero failure rate when compliance must be deterministic (identity checks before money moves), and what a structured handoff to a person contains. In practice it asks you to block a downstream tool until its prerequisite has succeeded, split a customer message with several concerns into items investigated in parallel and answered together, and write handoff summaries for human agents who can't see the conversation. Hooks for normalising tool data are task 1.5; escalation design in general is task 5.2.</p>
+			<p>Sources: the Claude Agent SDK documentation on hooks, permissions and custom tools, and the Claude API documentation on structured outputs, checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The code is my own and was tested with anthropic 2.10.0 and claude-agent-sdk 0.2.185: the gate by calling its hook and tool handlers directly, the decomposition against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's support agent from task 1.1 now handles refunds. Its tools are <code>get_customer</code>, <code>process_refund</code> and <code>escalate_to_human</code>, and the shop's rule is that no money moves until the customer has been verified, and refunds over $200 go to a person.</p></div>
+
+			<!-- ===== Guidance vs enforcement ===== -->
+			<h2 id="s1">Guidance or enforcement</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.4</span><span class="skill-text">When an instruction is enough, and when only code will do.</span></p>
+				<p>A system prompt line such as "always verify the customer before refunding" is followed almost every time. Almost is the problem: an instruction is a strong influence on the model, not a guarantee, so across thousands of conversations some will skip the step, through an unusual phrasing, a long context, or a customer who says "I'm already verified". That non-zero failure rate is acceptable for preferences and dangerous for obligations.</p>
+				<ul>
+					<li><strong>Prompt guidance</strong> suits ordering that can bend: greet first, summarise at the end, suggest accessories after a sale. A miss is a style problem.</li>
+					<li><strong>Programmatic enforcement</strong> suits rules that must hold every time: identity verification before refunds or account changes, approval above a limit, no deletion without a backup. Code checks the condition before the action runs and refuses it otherwise, whatever the model decided.</li>
+				</ul>
+				<p>Use both together: the prompt tells Claude the intended order so it usually gets it right first time, and the gate catches the rare case where it doesn't. A gate without the instruction works but wastes turns on refused calls; an instruction without the gate is the exam's classic wrong answer for a compliance requirement.</p>
+			</div>
+
+			<!-- ===== Gate ===== -->
+			<h2 id="s2">A prerequisite gate</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.4</span><span class="skill-text">Blocking process_refund until get_customer has returned a verified customer ID.</span></p>
+				<div class="code"><span class="file">refund_gate.py (Python, claude-agent-sdk)</span>
+<pre><code>"""Support agent with a code-enforced prerequisite: no refund until get_customer has verified the customer."""
+import json
+
+import anyio
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, create_sdk_mcp_server, query, tool
+
+CUSTOMERS = {"sam@example.com": {"customer_id": "C-2041", "verified": True, "orders": ["A1042"]}}
+REFUND_LIMIT = 200.00          <span class="c"># above this, a person decides</span>
+verified_ids: set[str] = set()  <span class="c"># filled only by get_customer, never by the model</span>
+handoffs: list[dict] = []
+
+
+@tool("get_customer", "Look up and verify a customer by email. Call this before any refund.", {"email": str})
+async def get_customer(args):
+    customer = CUSTOMERS.get(args["email"].lower())
+    if customer is None:
+        return {"content": [{"type": "text", "text": "No customer with that email."}], "is_error": True}
+    if customer["verified"]:
+        verified_ids.add(customer["customer_id"])  <span class="c"># the gate opens here, in code</span>
+    return {"content": [{"type": "text", "text": json.dumps(customer)}]}
+
+
+@tool("process_refund", "Refund an order for a verified customer.",
+      {"customer_id": str, "order_id": str, "amount": float, "reason": str})
+async def process_refund(args):
+    return {"content": [{"type": "text", "text": f"Refunded {args['amount']:.2f} on {args['order_id']}."}]}
+
+
+@tool("escalate_to_human", "Hand the case to a human agent, who cannot see this conversation.",
+      {"type": "object",
+       "properties": {"customer_id": {"type": "string"}, "order_id": {"type": "string"},
+                      "issue_summary": {"type": "string"}, "root_cause": {"type": "string"},
+                      "refund_amount": {"type": "number"}, "steps_taken": {"type": "array", "items": {"type": "string"}},
+                      "recommended_action": {"type": "string"}},
+       "required": ["customer_id", "issue_summary", "root_cause", "refund_amount", "recommended_action"]})
+async def escalate_to_human(args):
+    handoffs.append(args)  <span class="c"># goes to the human queue as a self-contained case</span>
+    return {"content": [{"type": "text", "text": "Escalated. Tell the customer a person will reply within one business day."}]}
+
+
+def deny(reason: str) -&gt; dict:
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": reason}}
+
+
+async def refund_gate(input_data, tool_use_id, context):
+    args = input_data["tool_input"]
+    if args.get("customer_id") not in verified_ids:
+        <span class="c"># The reason goes back to Claude, so it can recover by calling get_customer.</span>
+        return deny("Blocked: call get_customer and get a verified customer_id before refunding.")
+    if args.get("amount", 0) &gt; REFUND_LIMIT:
+        return deny(f"Blocked: refunds over {REFUND_LIMIT:.2f} need a person. Use escalate_to_human.")
+    return {}
+
+
+SHOP = create_sdk_mcp_server(name="shop", tools=[get_customer, process_refund, escalate_to_human])
+
+OPTIONS = ClaudeAgentOptions(
+    system_prompt="You handle refunds for an outdoor-gear shop. Verify the customer before any refund.",
+    mcp_servers={"shop": SHOP},
+    allowed_tools=["mcp__shop__get_customer", "mcp__shop__process_refund", "mcp__shop__escalate_to_human"],
+    <span class="c"># The prompt asks for the right order; this hook makes it impossible to skip. A crash blocks, not allows.</span>
+    hooks={"PreToolUse": [HookMatcher(matcher="mcp__shop__process_refund", hooks=[refund_gate], on_failure="block")]},
+)
+
+
+async def main(request: str) -&gt; None:
+    async for message in query(prompt=request, options=OPTIONS):
+        if isinstance(message, ResultMessage):
+            print(message.result)
+
+
+if __name__ == "__main__":
+    anyio.run(main, "I'm sam@example.com. Please refund the 89.00 tent footprint on order A1042, it arrived torn.")</code></pre></div>
+				<ul>
+					<li><strong>The state comes from code.</strong> Only the <code>get_customer</code> tool, running your code, adds an ID to <code>verified_ids</code>. A customer ID the model invents or copies from the customer's message fails the gate because it was never verified.</li>
+					<li><strong>The hook runs before the tool.</strong> A <code>PreToolUse</code> hook matched to <code>mcp__shop__process_refund</code> (the naming pattern for tools on an MCP server) returns <code>permissionDecision: "deny"</code> when the prerequisite isn't met.</li>
+					<li><strong>The refusal is useful.</strong> <code>permissionDecisionReason</code> goes back to Claude, so it can recover by calling <code>get_customer</code>, or route a large refund to <code>escalate_to_human</code>.</li>
+					<li><strong>Per conversation in production.</strong> The example keeps one set for the process; a real service keys verified IDs by session or conversation so one customer's verification can't open the gate for another.</li>
+				</ul>
+				<p>On the Messages API without the SDK, the same gate goes in your own tool dispatcher: before running <code>process_refund</code>, check the verified set and return an error <code>tool_result</code> explaining what's missing (task 1.1's loop).</p>
+			</div>
+
+			<!-- ===== Gate behaviour ===== -->
+			<h2 id="s3">How the gate behaves</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.4</span><span class="skill-text">The details that make a hook a reliable control.</span></p>
+				<ul>
+					<li><strong>Failures:</strong> by default, a hook callback that raises an error lets the tool call carry on to the normal permission checks. For a control, set <code>on_failure="block"</code> on the matcher (Python SDK 0.2.177 and later) so a crashing guard blocks instead; a callback that returns nothing also counts as failing.</li>
+					<li><strong>Timeouts:</strong> a <code>PreToolUse</code> callback that runs past its timeout (600 seconds by default) blocks the call.</li>
+					<li><strong>Several hooks:</strong> matching hooks run in parallel and the most restrictive decision wins (deny over defer, ask and allow), so independent checks can't undo each other.</li>
+					<li><strong>Order in the permission flow:</strong> hooks run first; a hook's deny holds even in <code>bypassPermissions</code> mode, while a hook's allow doesn't skip deny rules.</li>
+					<li><strong>Matchers match tool names only.</strong> To gate on an argument (an amount, a file path), check <code>tool_input</code> inside the callback, as the example does with <code>amount</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Telling the model isn't enforcing.</strong> Answer choices that add "IMPORTANT: never refund unverified customers" to the prompt, add a few-shot example, or ask Claude to confirm verification in its reply all reduce the failure rate but leave it above zero. Only an answer where code blocks the call satisfies "must always".</p></div>
+			</div>
+
+			<!-- ===== Multi-concern ===== -->
+			<h2 id="s4">Requests with several concerns</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.4</span><span class="skill-text">Decompose, investigate in parallel with shared context, answer once.</span></p>
+				<p>"My footprint arrived torn, I was charged twice for another order, and can you change my delivery address?" is three problems. Handled as one blob, the agent tends to solve the first and skim the rest. Handled one per message, the customer gets three replies and repeats themselves. The guide's pattern:</p>
+				<div class="code"><span class="file">multi_concern.py (Python, anthropic SDK)</span>
+<pre><code>"""Split a multi-concern message into items, investigate each in parallel with shared context, then answer once."""
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+SPLIT_SCHEMA = {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, "concern": {"type": "string"}, "order_id": {"type": ["string", "null"]}},
+        "required": ["id", "concern", "order_id"], "additionalProperties": False}}},
+    "required": ["items"], "additionalProperties": False,
+}
+
+
+def text_of(response) -&gt; str:
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def split(message: str) -&gt; list[dict]:
+    response = client.messages.create(
+        model="claude-haiku-5-5", max_tokens=1000,
+        system="List each separate thing the customer wants resolved, one item per concern.",
+        messages=[{"role": "user", "content": message}],
+        output_config={"format": {"type": "json_schema", "schema": SPLIT_SCHEMA}},
+    )
+    return json.loads(text_of(response))["items"]
+
+
+def investigate(item: dict, shared: str) -&gt; dict:
+    <span class="c"># Every investigation gets the same shared context: the customer record and the original message.</span>
+    response = client.messages.create(
+        model="claude-sonnet-5-5", max_tokens=1500,
+        system="Investigate one customer concern. State the finding and the action you'd take.",
+        messages=[{"role": "user", "content": f"{shared}\n&lt;concern id=\"{item['id']}\"&gt;{item['concern']}&lt;/concern&gt;"}],
+    )
+    return {"id": item["id"], "finding": text_of(response)}
+
+
+def resolve(message: str, customer: dict) -&gt; str:
+    items = split(message)
+    shared = f"&lt;customer&gt;{json.dumps(customer)}&lt;/customer&gt;\n&lt;message&gt;{message}&lt;/message&gt;"
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        findings = list(pool.map(lambda it: investigate(it, shared), items))
+    <span class="c"># One reply that covers every concern, not one reply per concern.</span>
+    response = client.messages.create(
+        model="claude-sonnet-5-5", max_tokens=1500,
+        system="Write one reply to the customer that resolves every concern below, in order.",
+        messages=[{"role": "user", "content": f"{shared}\n&lt;findings&gt;{json.dumps(findings)}&lt;/findings&gt;"}],
+    )
+    return text_of(response)
+
+
+if __name__ == "__main__":
+    print(resolve("My order A1042 arrived with a torn footprint, I was charged twice for A1050, "
+                  "and can you change my delivery address for A1061?",
+                  {"customer_id": "C-2041", "name": "Sam", "orders": ["A1042", "A1050", "A1061"]}))</code></pre></div>
+				<ol class="flow">
+					<li><b>Decompose</b>Split the message into distinct items; structured output keeps the list machine-readable.</li>
+					<li><b>Investigate in parallel</b>One investigation per item, run at the same time, each given the same <strong>shared context</strong> (customer record, original message) so none has to fetch it again or works from a different picture.</li>
+					<li><b>Synthesise one resolution</b>A single reply that addresses every item, so nothing is dropped and the customer reads one answer.</li>
+				</ol>
+				<p>The investigations here are separate calls; in an agent they could equally be subagents (task 1.2) or parallel tool calls. The point is the shape: split, share context, investigate side by side, merge.</p>
+			</div>
+
+			<!-- ===== Handoffs ===== -->
+			<h2 id="s5">Structured handoffs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.4</span><span class="skill-text">Escalating mid-process to a person who can't see the transcript.</span></p>
+				<p>A human agent who picks up an escalated case usually sees a ticket, not the conversation. "Customer is upset about a refund, please help" forces them to start over and ask the customer to repeat everything. A structured handoff makes the case self-contained, with fields the escalation tool's schema requires:</p>
+				<ul>
+					<li><strong>Customer details:</strong> the verified customer ID and the order involved.</li>
+					<li><strong>Issue summary:</strong> what the customer wants, in a sentence.</li>
+					<li><strong>Root cause:</strong> what the investigation found ("damaged in transit", "duplicate charge from a retried payment").</li>
+					<li><strong>Refund amount</strong> or other value at stake.</li>
+					<li><strong>Steps taken:</strong> what the agent already checked or did, so it isn't repeated.</li>
+					<li><strong>Recommended action:</strong> what the agent would do if it were allowed to.</li>
+				</ul>
+				<p>In the example, <code>escalate_to_human</code> takes exactly these fields and the gate sends refunds over the limit there. Making them <em>required</em> in the tool's schema is itself enforcement: the agent can't escalate without stating a root cause and a recommendation. After escalating, the agent tells the customer what happens next.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Prompt instructions guide order but fail occasionally; where compliance must be deterministic (verification before money moves), enforce it in code. Use the prompt and the gate together.</li>
+				<li>A prerequisite gate blocks the downstream tool until the prerequisite succeeded, using state your code set (a verified ID from <code>get_customer</code>), not anything the model asserts.</li>
+				<li>In the Agent SDK: a <code>PreToolUse</code> hook matched to the tool returns <code>permissionDecision: "deny"</code> with a reason Claude can act on; set <code>on_failure="block"</code>; hooks combine most-restrictive-wins and a deny holds in every mode.</li>
+				<li>Multi-concern requests: decompose into items, investigate in parallel with the same shared context, then write one unified resolution.</li>
+				<li>Handoffs to people must be self-contained: customer ID, issue, root cause, amount, steps taken, recommended action, enforced as required fields of the escalation tool.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-3.html"><small>Previous</small>1.3: Invoking Subagents and Passing Context</a>
+				<a class="next" href="d2-task-2-1.html"><small>Next</small>2.1: Tool Interfaces</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude Agent SDK and Claude API documentation, with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
