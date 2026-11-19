@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.7: Sessions, Resumption and Forking | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.7: what a Claude Code or Agent SDK session holds, naming and resuming sessions with --resume, forking with /branch, --fork-session and fork_session, telling a resumed session which files changed, and starting fresh with a structured summary when old tool results are stale.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.7</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.7: Sessions, Resumption and Forking</h1>
+		<p>Coming back to work that spans days: naming a session so you can resume it, branching it to try two approaches, telling it what changed while you were away, and knowing when a clean start with a summary beats picking up an old conversation.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Claude Code</span><span class="tag">--resume</span><span class="tag">--fork-session</span><span class="tag">Agent SDK</span><span class="tag">Context</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What a session holds</a></li>
+				<li><a href="#s2">Naming and resuming</a></li>
+				<li><a href="#s3">Forking</a></li>
+				<li><a href="#s4">Resuming after the code changed</a></li>
+				<li><a href="#s5">Resume or start fresh</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.7</span>
+				<p><strong>Manage session state, resumption, and forking.</strong></p>
+			</div>
+			<p>The exam guide asks you to know how to resume a specific earlier conversation by name with <code>--resume</code>, how <code>fork_session</code> creates independent branches from one shared analysis, why a resumed session must be told about files that changed since it analysed them, and why a new session with a structured summary can be more reliable than resuming with stale tool results. In practice it asks you to continue named investigations across days, fork to compare two testing strategies or refactors, choose between resuming and starting fresh, and point a resumed session at specific changed files instead of making it explore everything again. Forking is introduced in <a href="d1-task-1-3.html#s7">task 1.3</a>; this page adds the Claude Code side and the decisions around it.</p>
+			<p>Sources: the Claude Code documentation on sessions and the CLI reference, and the Claude Agent SDK documentation on sessions, checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The decision helper is my own and was tested with claude-agent-sdk 0.2.185; the shell commands were syntax-checked, not run against a live account.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A developer at the outdoor-gear shop spends three days with Claude Code tracing why refunds are sometimes a cent off, while teammates keep committing to the same repository.</p></div>
+
+			<!-- ===== Holds ===== -->
+			<h2 id="s1">What a session holds</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.7</span><span class="skill-text">The saved conversation, and what isn't in it.</span></p>
+				<p>A session is a saved conversation: your prompts, Claude's replies, every tool call and every tool result, stored locally as a transcript tied to the project directory (under <code>~/.claude/projects/</code>). Resuming one gives Claude back everything it knew: the files it read, the analysis it did, the decisions it made.</p>
+				<ul>
+					<li><strong>Tool results are snapshots.</strong> A file read on Monday is in the transcript as it was on Monday. If someone changed it on Tuesday, the resumed session still "remembers" the old version until it reads the file again.</li>
+					<li><strong>The filesystem isn't part of the session.</strong> Sessions persist the conversation; files are whatever is on disk now.</li>
+					<li><strong>Some settings aren't restored.</strong> The model carries on, and a terminal resume restores the permission mode, but flags such as <code>--add-dir</code>, <code>--mcp-config</code> and <code>--settings</code> have to be passed again.</li>
+					<li><strong>Same machine.</strong> Transcripts are local files; to continue elsewhere, move the transcript, use the SDK's session store, or start fresh with a summary.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Naming ===== -->
+			<h2 id="s2">Naming and resuming</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.7</span><span class="skill-text">Returning to a specific investigation by name.</span></p>
+				<div class="code"><span class="file">sessions.sh (shell, Claude Code CLI)</span>
+<pre><code><span class="c"># Monday: start a named investigation (or name it later with /rename inside the session)</span>
+claude -n returns-investigation
+
+<span class="c"># Tuesday: pick it up by name; the history, files read and conclusions are still there</span>
+claude --resume returns-investigation
+
+<span class="c"># Try two refactoring approaches from the same analysis, each in its own session</span>
+claude --resume returns-investigation --fork-session   <span class="c"># branch A: new session ID</span>
+claude --resume returns-investigation --fork-session   <span class="c"># branch B: another new ID</span>
+<span class="c"># (inside a running session, /branch try-event-sourcing does the same and switches you into the copy)</span>
+
+<span class="c"># Ask a saved session for a structured summary without opening it, for a fresh start later</span>
+claude -p --resume returns-investigation --output-format json \
+  "Summarise the findings, decisions and open questions as JSON" | jq -r '.result' &gt; summary.json</code></pre></div>
+				<ul>
+					<li><strong>Name it</strong> at the start with <code>claude -n &lt;name&gt;</code> (or <code>--name</code>), or during the session with <code>/rename</code>. Unnamed sessions get a default display name or a generated title.</li>
+					<li><strong>Resume it</strong> with <code>claude --resume &lt;name&gt;</code> (or <code>-r</code>), which also accepts a session ID or a transcript path; with no argument it opens a picker. Inside a session, <code>/resume</code> switches to another one. If a name matches more than one session, the picker opens with it as a search.</li>
+					<li><strong><code>--continue</code></strong> needs no name: it reopens the most recent session in the current directory. That's fine for one thread of work, but with several investigations running, a name says which one.</li>
+					<li>In the Agent SDK the same thing is <code>resume=session_id</code> (or <code>continue_conversation=True</code>); sessions started by the SDK or <code>claude -p</code> don't appear in Claude Code's picker but can be resumed by ID.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Forking ===== -->
+			<h2 id="s3">Forking</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.7</span><span class="skill-text">Independent branches from one shared baseline.</span></p>
+				<p>Forking copies the conversation so far into a new session with its own ID and leaves the original unchanged. Do the expensive analysis once, then fork to compare, say, two testing strategies or two refactors, each branch building on the same understanding without seeing the other's work.</p>
+				<ul>
+					<li><strong>In Claude Code:</strong> <code>/branch [name]</code> inside a session copies the transcript and switches you into the copy; from the shell, add <code>--fork-session</code> to <code>--resume</code> or <code>--continue</code>. A <code>/branch</code> keeps your "allow for this session" approvals; a separate <code>--fork-session</code> process starts without them.</li>
+					<li><strong>In the Agent SDK:</strong> <code>resume=session_id, fork_session=True</code>; the result message carries the fork's new ID (example in <a href="d1-task-1-3.html#s7">task 1.3</a>).</li>
+					<li><strong>Only the conversation branches.</strong> Edits a branch makes to files are real and visible to every session in that directory; use separate worktrees or checkpoints to branch the code too.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Don't resume one session twice at once.</strong> Two terminals (or two <code>claude -p</code> runs) resuming the same session both write to one transcript, and messages can be lost when it's resumed later. To run two lines of work in parallel, fork each one.</p></div>
+			</div>
+
+			<!-- ===== Changes ===== -->
+			<h2 id="s4">Resuming after the code changed</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.7</span><span class="skill-text">Telling a resumed session exactly what's different.</span></p>
+				<p>On Wednesday the refund investigation resumes, but a teammate has merged changes to two files the session read on Monday. Left alone, Claude reasons from its Monday copies. The fix isn't to make it re-read the whole repository, which wastes time and context, but to tell it <strong>which files changed</strong>, so it re-reads those and trusts the rest. Version control gives you the list: everything that changed between the commit the session last saw and now.</p>
+				<div class="code"><span class="file">resume_or_fresh.py (Python, claude-agent-sdk)</span>
+<pre><code>"""Decide how to continue an investigation after the code has changed: resume with a targeted update,
+or start fresh with a structured summary when too much of the old context is stale."""
+import json
+import subprocess
+from dataclasses import dataclass
+
+from claude_agent_sdk import ClaudeAgentOptions
+
+TOOLS = ["Read", "Grep", "Glob"]
+
+
+@dataclass
+class Investigation:
+    session_id: str
+    commit: str             <span class="c"># HEAD when the session last ran</span>
+    analysed: list[str]     <span class="c"># files the session read</span>
+    summary: dict           <span class="c"># findings, decisions, open questions (saved at the end of each run)</span>
+
+
+def changed_since(commit: str) -&gt; list[str]:
+    out = subprocess.run(["git", "diff", "--name-only", f"{commit}..HEAD"], capture_output=True, text=True, check=True)
+    return [line for line in out.stdout.splitlines() if line]
+
+
+def next_step(inv: Investigation, changed: list[str], task: str, stale_limit: float = 0.25):
+    touched = [f for f in changed if f in inv.analysed]
+    if len(touched) &lt;= stale_limit * len(inv.analysed):
+        <span class="c"># Most earlier reads are still true: resume, and say exactly what to look at again.</span>
+        note = (f"Since your last run these files changed: {', '.join(touched) or 'none you read'}. "
+                "Re-read only those before relying on them; everything else you analysed is unchanged.")
+        return f"{note}\n\n{task}", ClaudeAgentOptions(resume=inv.session_id, allowed_tools=TOOLS)
+    <span class="c"># Too much of the old context is stale: a new session seeded with the summary, not old tool results.</span>
+    prompt = (f"&lt;summary_of_previous_work&gt;\n{json.dumps(inv.summary, indent=2)}\n&lt;/summary_of_previous_work&gt;\n"
+              f"These files changed since that work and must be read fresh: {', '.join(touched)}.\n\n{task}")
+    return prompt, ClaudeAgentOptions(allowed_tools=TOOLS)</code></pre></div>
+				<p>The note is specific ("these files changed; re-read only those; everything else is unchanged"), which gives the session a targeted re-analysis instead of either trusting stale results or starting its exploration over.</p>
+			</div>
+
+			<!-- ===== Resume or fresh ===== -->
+			<h2 id="s5">Resume or start fresh</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.7</span><span class="skill-text">When old context helps, and when it misleads.</span></p>
+				<ul>
+					<li><strong>Resume</strong> when most of the earlier context is still valid: the code has barely moved, the conversation holds reasoning worth keeping, and a short note can cover what changed.</li>
+					<li><strong>Start fresh with a structured summary</strong> when much of what the session read is out of date: a large merge, a refactor, a dependency upgrade. A transcript full of stale file contents and old test output can anchor Claude on things that are no longer true, and the stale material also takes up context. A new session that receives a summary (findings, decisions, open questions) plus the list of files to read fresh starts from what's still true.</li>
+					<li><strong>Get the summary from the old session.</strong> <code>claude -p --resume &lt;session&gt; --output-format json "..."</code> asks a saved session for a summary without opening it; saving one at the end of each working day makes the fresh start cheap.</li>
+				</ul>
+				<p>The helper above makes the choice explicit: if only a small share of the files the session analysed have changed, it resumes with a targeted note; otherwise it starts a new session seeded with the saved summary. Within one session, <code>/compact</code> (replace history with a summary) and <code>/clear</code> (start empty, keeping the old session resumable) are the in-session versions of the same trade-off.</p>
+				<div class="callout tip"><p><strong>Spotting the right answer.</strong> If a scenario says the code has changed a lot since the session ran, the answer is a fresh session with a summary, not "resume and ask Claude to double-check". If only a couple of files changed, it's resume and name those files, not "re-explore the codebase".</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>A session is the saved conversation, including tool results as they were when read; it isn't the filesystem, and some flags aren't restored on resume.</li>
+				<li>Name sessions (<code>claude -n</code>, <code>/rename</code>) and resume them by name (<code>claude --resume &lt;name&gt;</code>); <code>--continue</code> reopens only the most recent one. The SDK uses <code>resume=</code> with a session ID.</li>
+				<li>Fork to explore alternatives from one baseline: <code>/branch</code>, <code>--fork-session</code>, or the SDK's <code>fork_session=True</code>. Each fork gets a new ID; the original is untouched; files aren't branched. Never resume one session in two places at once.</li>
+				<li>When resuming after code changes, tell the session which files changed so it re-reads just those.</li>
+				<li>Resume when prior context is mostly valid; start fresh with a structured summary (findings, decisions, open questions) when prior tool results are stale.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-6.html"><small>Previous</small>1.6: Task Decomposition Strategies</a>
+				<a class="next" href="d2-task-2-1.html"><small>Next</small>2.1: Tool Interfaces</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude Code and Claude Agent SDK documentation, with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
