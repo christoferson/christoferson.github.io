@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.2: Coordinators and Subagents | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 1.2: hub-and-spoke multi-agent systems with a coordinator, subagents' isolated context, decomposition and delegation briefs, choosing subagents by query complexity, partitioning research scope, iterative refinement loops, building it with the Claude Agent SDK and on the Messages API, and when one agent is better.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agentic Architecture &amp; Orchestration &middot; 27%</span>
+		<h1>1.2: Coordinators and Subagents</h1>
+		<p>How a coordinator agent splits a broad task among specialist subagents, briefs each one completely because they can't see its conversation, chooses how many to use, keeps their work from overlapping, and loops until the combined answer has no gaps.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Multi-agent</span><span class="tag">Coordinator</span><span class="tag">Subagents</span><span class="tag">Agent SDK</span><span class="tag">Context isolation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Hub and spoke</a></li>
+				<li><a href="#s2">Isolated context</a></li>
+				<li><a href="#s3">Delegating well</a></li>
+				<li><a href="#s4">How many subagents</a></li>
+				<li><a href="#s5">Partitioning the scope</a></li>
+				<li><a href="#s6">The refinement loop</a></li>
+				<li><a href="#s7">With the Agent SDK</a></li>
+				<li><a href="#s8">On the Messages API</a></li>
+				<li><a href="#s9">When one agent is better</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 1.2</span>
+				<p><strong>Orchestrate multi-agent systems with coordinator-subagent patterns.</strong></p>
+			</div>
+			<p>The exam guide asks you to know the hub-and-spoke shape (a coordinator that handles all communication between subagents, their errors and the routing of information), that subagents start with isolated context, what the coordinator decides (decomposition, delegation, aggregation, and which subagents a query needs), and the risk of splitting a broad topic too narrowly. In practice it asks you to choose subagents per query instead of always running the whole pipeline, divide the scope so subagents don't duplicate each other, run a refinement loop that re-delegates to fill gaps, and keep every message going through the coordinator. Passing context into a subagent in detail is task 1.3; the single-agent loop is <a href="d1-task-1-1.html">task 1.1</a>.</p>
+			<p>Sources: the Claude Agent SDK documentation on subagents and the Python reference, the Claude Code subagents page, and Anthropic's "How we built our multi-agent research system" (June 2025), checked on 19 November 2026. The docs are copyrighted, so they're paraphrased here with short quotes. The code is my own and was tested with anthropic 2.10.0 and claude-agent-sdk 0.2.185 against a mocked API and a stand-in for the SDK's <code>query()</code>, not the live service.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's buying team asks research questions such as "Should we stock an ultralight two-person tent range next spring?" A coordinator answers them with four specialists: one reads customer reviews, one reads sales and returns data, one searches competitors on the web, and one writes the combined recommendation.</p></div>
+
+			<!-- ===== Hub and spoke ===== -->
+			<h2 id="s1">Hub and spoke</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">A coordinator in the middle, routing everything.</span></p>
+				<p>In the hub-and-spoke pattern, which Anthropic's research write-up calls orchestrator-worker, one <strong>coordinator</strong> (or lead) agent plans the work, hands pieces to <strong>subagents</strong>, and combines what they return. Subagents don't talk to each other: every brief goes out from the coordinator and every result comes back to it. That central position is the point of the pattern:</p>
+				<ul>
+					<li><strong>Observability:</strong> one place sees every delegation and every result, so it can log, trace and audit the whole run.</li>
+					<li><strong>Consistent error handling:</strong> when a subagent fails, the coordinator decides whether to retry, ask another subagent or answer without that part, by one policy.</li>
+					<li><strong>Controlled information flow:</strong> the coordinator chooses what each subagent sees, which keeps briefs focused and keeps one subagent's mistakes from spreading directly into another's work.</li>
+				</ul>
+				<div class="callout tip"><p><strong>Peer messaging exists, but isn't the exam's pattern.</strong> Claude Code lets named agents in a session message each other through a <code>SendMessage</code> tool. The guide's skill is the opposite: route all subagent communication through the coordinator. If an answer choice has subagents passing results directly to each other, it trades away observability and consistent error handling.</p></div>
+			</div>
+
+			<!-- ===== Isolated context ===== -->
+			<h2 id="s2">Isolated context</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">What a subagent knows when it starts, and what comes back.</span></p>
+				<p>A subagent is a separate agent instance with its own conversation. In the Agent SDK it starts with its own system prompt, the brief the coordinator writes when it calls the Agent tool, the project's CLAUDE.md and its tool definitions. It does <strong>not</strong> get the coordinator's conversation history, tool results or system prompt: the brief is the only thing passed from parent to child. When it finishes, only its final message returns to the coordinator; its intermediate tool calls stay inside it.</p>
+				<ul>
+					<li><strong>Write complete briefs.</strong> File paths, the user's constraints, decisions already made and what "done" means must be in the brief, or the subagent works without them. "Research that question we discussed" fails.</li>
+					<li><strong>The upside is a clean context.</strong> A subagent can read dozens of files and the coordinator receives only a summary, which is why isolation is listed first among the SDK's benefits.</li>
+					<li><strong>Pass references for big outputs.</strong> The research write-up has subagents store large results (code, reports, data) in an external system and return a lightweight reference, rather than relaying everything through the coordinator in a "game of telephone".</li>
+				</ul>
+				<div class="callout trap"><p><strong>Forks are the exception.</strong> Claude Code can also start a <em>fork</em>, a subagent that copies the conversation so far instead of starting fresh. The exam's model is the ordinary subagent with isolated context; assume no shared history unless a question says fork.</p></div>
+			</div>
+
+			<!-- ===== Delegation ===== -->
+			<h2 id="s3">Delegating well</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">The coordinator's jobs: decompose, delegate, aggregate.</span></p>
+				<p>The coordinator breaks the request into parts, writes a brief for each, runs the subagents (in parallel where the parts are independent), and combines the results into one answer. Anthropic's lesson from its research system was that vague briefs are the main failure: each subagent needs</p>
+				<ul>
+					<li>an <strong>objective</strong>: the specific question it answers;</li>
+					<li>an <strong>output format</strong>: what to return, so results can be combined;</li>
+					<li><strong>guidance on tools and sources</strong>: where to look;</li>
+					<li><strong>clear task boundaries</strong>: what belongs to someone else.</li>
+				</ul>
+				<p>Without these, the write-up says, subagents duplicate work, leave gaps, or miss information. A <code>description</code> on each subagent definition tells the coordinator what that specialist is for, which is how it picks the right one.</p>
+			</div>
+
+			<!-- ===== How many ===== -->
+			<h2 id="s4">How many subagents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">Selecting subagents for the query instead of always running the full pipeline.</span></p>
+				<p>A coordinator that sends every question through every specialist wastes time and money on easy questions. Anthropic's research system scales effort to complexity with explicit rules in the coordinator's prompt: a simple fact-finding question gets one agent with 3 to 10 tool calls; a direct comparison gets two to four subagents with 10 to 15 calls each; complex research gets more than ten subagents with clearly divided responsibilities.</p>
+				<ul>
+					<li><strong>"What did the 2-person tent sell last month?"</strong> One specialist (sales), or none if the coordinator already has the figure.</li>
+					<li><strong>"Are our tents heavier than the competition's?"</strong> Two: sales data for the shop's range, the market scout for competitors.</li>
+					<li><strong>"Should we stock an ultralight range next spring?"</strong> All four: reviews, sales, market and the synthesizer.</li>
+				</ul>
+				<p>Selection is a judgement the coordinator makes from the question, guided by its prompt and the subagents' descriptions. A fixed pipeline that calls every subagent in order is the anti-pattern the guide names.</p>
+			</div>
+
+			<!-- ===== Partitioning ===== -->
+			<h2 id="s5">Partitioning the scope</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">Dividing the work so subagents don't overlap, and don't leave holes.</span></p>
+				<p>Give each subagent a distinct slice: a subtopic, a time period, or a <strong>source type</strong> (the shop's split by reviews, sales data and the web is a source-type split). The research write-up's example of getting this wrong: asked vaguely to research the semiconductor shortage, one subagent covered the 2021 car-industry chip crisis while two others both covered 2025 supply chains, duplicating each other.</p>
+				<div class="callout trap"><p><strong>Too narrow is a failure too.</strong> The guide names the opposite risk: a coordinator that decomposes a broad topic into a few narrow pieces covers only those pieces. Asked about ultralight tents, a coordinator that briefs only "competitor prices for 1 kg tents" never learns whether customers complain about weight or whether lighter tents get returned more. Check the partition against the whole question, not just for overlap.</p></div>
+				<p>A brief's "out of scope" line does both jobs: it names what another subagent covers, which stops duplication, and it shows the coordinator the full set of slices, which makes a gap easier to see.</p>
+			</div>
+
+			<!-- ===== Refinement ===== -->
+			<h2 id="s6">The refinement loop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">Evaluate, re-delegate the gaps, re-synthesise.</span></p>
+				<ol class="flow">
+					<li><b>Delegate the first round</b>Briefs for the specialists the question needs, run in parallel.</li>
+					<li><b>Synthesise</b>Combine the reports, or ask a synthesis subagent to, with a section listing what's still missing.</li>
+					<li><b>Evaluate the synthesis</b>Does it answer the whole question? Are there contradictions, unsupported claims or missing parts?</li>
+					<li><b>Re-delegate with targeted queries</b>Only the gaps, to the subagent whose source can fill them ("return rates for tents under 1.5 kg, 2025 to 2026"), not the whole question again.</li>
+					<li><b>Re-synthesise, and stop when coverage is sufficient</b>Or when a round limit or budget is reached, saying what remains open.</li>
+				</ol>
+				<p>Anthropic's lead researcher works this way: after combining results it decides whether more research is needed and, if so, creates more subagents or changes its strategy. Its write-up also notes the cost of the synchronous version: the coordinator waits for each round to finish, so one slow subagent holds up everything.</p>
+			</div>
+
+			<!-- ===== Agent SDK ===== -->
+			<h2 id="s7">With the Agent SDK</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">Defining specialists and letting the coordinator delegate through the Agent tool.</span></p>
+				<div class="code"><span class="file">research_coordinator.py (Python, claude-agent-sdk)</span>
+<pre><code>import anyio
+from claude_agent_sdk import AgentDefinition, AssistantMessage, ClaudeAgentOptions, ResultMessage, ToolUseBlock, query
+
+COORDINATOR = """You coordinate research for an outdoor-gear shop's buying team.
+Decide which specialists a question needs. Answer a narrow factual question with one specialist;
+split a broad question across several, each with a distinct part of the question and a distinct source.
+Every Agent call must state the objective, the sources to use, what is out of bounds, and the output format.
+Specialists can't see this conversation, so put everything they need in the Agent prompt.
+When reports come back, check them against the question. If anything is missing or contradictory,
+send a targeted follow-up to the right specialist, then call the synthesizer again before answering."""
+
+AGENTS = {
+    "review-analyst": AgentDefinition(
+        description="Reads exported customer reviews in data/reviews/. Use for what customers say about products.",
+        prompt="You analyse customer reviews. Cite a review ID for every claim and give counts, not impressions.",
+        tools=["Read", "Grep", "Glob"],
+        model="haiku",
+    ),
+    "sales-analyst": AgentDefinition(
+        description="Reads sales and returns exports in data/sales/. Use for volumes, margins and return rates.",
+        prompt="You analyse the shop's sales data. Give every figure with its period and the file it came from.",
+        tools=["Read", "Grep", "Glob"],
+        model="sonnet",
+    ),
+    "market-scout": AgentDefinition(
+        description="Searches the web for competitors' ranges and prices. Use for anything outside the shop's own data.",
+        prompt="You research competitors on the web. Cite the URL for every fact; say when you found nothing.",
+        tools=["WebSearch", "WebFetch"],
+        model="sonnet",
+    ),
+    "synthesizer": AgentDefinition(
+        description="Combines specialist reports into one recommendation. Use last, after the research is in.",
+        prompt="Combine the reports you are given. End with a 'Missing' section listing anything unanswered.",
+        tools=["Read"],
+        model="sonnet",
+    ),
+}
+
+OPTIONS = ClaudeAgentOptions(
+    system_prompt=COORDINATOR,
+    model="opus",
+    agents=AGENTS,
+    <span class="c"># Pre-approves these tools; it doesn't restrict the coordinator to them.</span>
+    allowed_tools=["Agent", "Read", "Grep", "Glob", "WebSearch", "WebFetch"],
+    <span class="c"># Bound the tree of agents: no nesting, five at a time, and a spend cap for the whole run.</span>
+    env={"CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "5"},
+    max_budget_usd=5.0,
+)
+
+
+async def main(question: str) -&gt; None:
+    async for message in query(prompt=question, options=OPTIONS):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                <span class="c"># The tool is "Agent" (it was "Task" before Claude Code 2.1.63): match both.</span>
+                if isinstance(block, ToolUseBlock) and block.name in ("Agent", "Task"):
+                    brief = block.input.get("prompt", "").splitlines()[0]
+                    print(f"delegated to {block.input.get('subagent_type')}: {brief}")
+            if message.parent_tool_use_id:  <span class="c"># produced inside a subagent</span>
+                print(f"  (from subagent call {message.parent_tool_use_id})")
+        elif isinstance(message, ResultMessage):
+            print(message.subtype, f"${message.total_cost_usd}")
+            print(message.result)
+
+
+if __name__ == "__main__":
+    anyio.run(main, "Should we stock an ultralight two-person tent range next spring?")</code></pre></div>
+				<ul>
+					<li><strong>Definitions:</strong> each <code>AgentDefinition</code> needs a <code>description</code> (when to use it) and a <code>prompt</code> (its system prompt); <code>tools</code> limits what it can do, and <code>model</code> lets cheap work run on a smaller model. Files in <code>.claude/agents/</code> work too; programmatic definitions win on a name clash.</li>
+					<li><strong>The Agent tool</strong> is how the coordinator delegates; it was called <code>Task</code> before Claude Code 2.1.63, so detection code checks both names. Messages produced inside a subagent carry a <code>parent_tool_use_id</code>.</li>
+					<li><strong>Background by default:</strong> a spawned subagent now runs in the background and its report arrives in a later turn, unless the coordinator needs it for its next step.</li>
+					<li><strong>Bounding the tree:</strong> subagents can spawn subagents (three levels by default), up to 20 run at once, and the spend counts against the whole query. Cap depth and concurrency with <code>CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH</code> and <code>CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS</code>, and spend with <code>max_budget_usd</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong><code>allowed_tools</code> doesn't make a coordinator delegate.</strong> It pre-approves tools; it doesn't restrict the agent to them. Whether the coordinator does work itself or hands it off is steered by its prompt and the subagents' descriptions. To remove a tool from an agent entirely, use <code>disallowed_tools</code> (or an <code>AgentDefinition</code>'s <code>tools</code> list for a subagent).</p></div>
+			</div>
+
+			<!-- ===== Messages API ===== -->
+			<h2 id="s8">On the Messages API</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">The same pattern built by hand, where every hop is visible.</span></p>
+				<p>Without the SDK, a coordinator is an ordinary agent loop (task 1.1) whose one tool is "delegate". Your code runs each delegated task as a separate, fresh conversation and returns the result as a tool result. That makes the guide's points concrete: the specialist's request contains only the brief, every result passes through one function that logs it and turns failures into error results, and the coordinator's next turn decides whether to re-delegate.</p>
+				<div class="code"><span class="file">coordinator_loop.py (Python, anthropic SDK)</span>
+<pre><code>"""Hub-and-spoke research on the Messages API: the coordinator delegates through one tool,
+and this code runs every specialist in a fresh context and routes every result back."""
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import anthropic
+
+client = anthropic.Anthropic()
+log = logging.getLogger("research")
+
+SPECIALISTS = {
+    "reviews": "You analyse the shop's customer reviews. Cite a review ID for every claim.",
+    "sales": "You analyse the shop's sales and returns figures. Give each figure with its period.",
+    "market": "You summarise competitor research notes. Name the source of every fact.",
+}
+
+COORDINATOR = (
+    "You coordinate research for an outdoor-gear shop's buying team. Use the delegate tool; "
+    "pick only the specialists the question needs, and give each a distinct part of it. "
+    "Before you answer, check the reports for gaps or contradictions and delegate targeted "
+    "follow-ups if needed. Your final answer is the synthesis."
+)
+
+DELEGATE = {
+    "name": "delegate",
+    "description": "Send one research task to a specialist. The specialist sees only these fields, not this conversation.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "specialist": {"type": "string", "enum": list(SPECIALISTS)},
+            "objective": {"type": "string"},
+            "out_of_scope": {"type": "string", "description": "What another specialist covers, to avoid overlap."},
+            "output_format": {"type": "string"},
+        },
+        "required": ["specialist", "objective", "out_of_scope", "output_format"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+def text_of(response) -&gt; str:
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def run_specialist(call) -&gt; dict:
+    task = call.input
+    source = Path("data", f"{task['specialist']}.txt").read_text(encoding="utf-8")
+    brief = (f"Objective: {task['objective']}\nOut of scope: {task['out_of_scope']}\n"
+             f"Return: {task['output_format']}\n\n&lt;source&gt;\n{source}\n&lt;/source&gt;")
+    try:
+        <span class="c"># A fresh conversation: the specialist gets its own system prompt and this brief, nothing else.</span>
+        response = client.messages.create(
+            model="claude-sonnet-5-5", max_tokens=4000,
+            system=SPECIALISTS[task["specialist"]],
+            messages=[{"role": "user", "content": brief}],
+        )
+        log.info("%s done: %d output tokens", task["specialist"], response.usage.output_tokens)
+        return {"type": "tool_result", "tool_use_id": call.id, "content": text_of(response)}
+    except anthropic.APIError as e:
+        <span class="c"># One place handles every specialist's failure, and the coordinator decides what to do next.</span>
+        log.warning("%s failed: %s", task["specialist"], e)
+        return {"type": "tool_result", "tool_use_id": call.id, "is_error": True,
+                "content": f"{task['specialist']} failed ({type(e).__name__}); retry or work around it."}
+
+
+def research(question: str, max_rounds: int = 6) -&gt; str:
+    messages = [{"role": "user", "content": question}]
+    for _ in range(max_rounds):
+        response = client.messages.create(
+            model="claude-opus-5-5", max_tokens=8000, system=COORDINATOR, tools=[DELEGATE], messages=messages,
+        )
+        if response.stop_reason == "end_turn":
+            return text_of(response)
+        if response.stop_reason != "tool_use":
+            raise RuntimeError(f"coordinator stopped: {response.stop_reason}")
+        messages.append({"role": "assistant", "content": response.content})
+        calls = [b for b in response.content if b.type == "tool_use"]
+        with ThreadPoolExecutor(max_workers=5) as pool:  <span class="c"># independent specialists run in parallel</span>
+            results = list(pool.map(run_specialist, calls))
+        messages.append({"role": "user", "content": results})  <span class="c"># all results, in one message</span>
+    raise RuntimeError("research did not converge")
+
+
+if __name__ == "__main__":
+    print(research("Should we stock an ultralight two-person tent range next spring?"))</code></pre></div>
+				<p>Independent tool calls from one coordinator turn run in parallel, and all their results go back in a single user message. The strict schema guarantees every brief has an objective, an out-of-scope line and an output format.</p>
+			</div>
+
+			<!-- ===== When not ===== -->
+			<h2 id="s9">When one agent is better</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 1.2</span><span class="skill-text">The costs of going multi-agent.</span></p>
+				<ul>
+					<li><strong>It works for breadth.</strong> Anthropic's system, with an Opus 4 lead and Sonnet 4 subagents, beat a single Opus 4 agent by 90.2% on its internal research evaluation, and running subagents and tools in parallel cut research time by up to 90%.</li>
+					<li><strong>It costs tokens.</strong> Agents use about four times the tokens of a chat and multi-agent systems about fifteen times, so the task's value has to justify it.</li>
+					<li><strong>It suits independent parts.</strong> The write-up calls multi-agent systems a poor fit where all agents need the same context or depend heavily on each other, and says most coding has fewer truly parallel parts than research.</li>
+					<li><strong>Newer models delegate eagerly.</strong> The SDK docs warn that Opus 5 spawns subagents more readily than earlier models, so set the depth, concurrency and spend caps rather than relying on prompts alone.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Hub and spoke: the coordinator decomposes, delegates, aggregates, and routes every message and error, which gives observability, consistent error handling and controlled information flow. Subagents don't talk to each other.</li>
+				<li>Subagents start with isolated context: their own prompt plus the brief, not the coordinator's history. Only their final message comes back. Put everything they need in the brief.</li>
+				<li>Each brief needs an objective, an output format, tool and source guidance, and clear boundaries.</li>
+				<li>Choose subagents per query (one for a fact, a few for a comparison, many for broad research), not the full pipeline every time.</li>
+				<li>Partition by subtopic or source type to avoid duplication, and check the partition covers the whole question; too-narrow decomposition leaves gaps.</li>
+				<li>Refine: synthesise, look for gaps, re-delegate targeted queries, re-synthesise, stop when coverage is sufficient or a limit is reached.</li>
+				<li>In the Agent SDK: <code>AgentDefinition</code> plus the Agent tool (formerly Task); cap depth, concurrency and budget. Multi-agent costs about 15 times a chat's tokens; use it for broad, parallel work.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d1-task-1-1.html"><small>Previous</small>1.1: Agentic Loops</a>
+				<a class="next" href="d2-task-2-1.html"><small>Next</small>2.1: Tool Interfaces</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Short quotes from the Claude Agent SDK documentation and from "How we built our multi-agent research system" (Anthropic), with everything else in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
