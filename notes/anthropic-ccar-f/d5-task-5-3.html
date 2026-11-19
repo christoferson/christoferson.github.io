@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.3: Error Propagation Across Agents | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 5.3: structured error reports from subagents (failure type, what was attempted, partial results, alternatives), telling access failures from valid empty results, why generic error statuses, silent suppression and aborting the whole run are anti-patterns, local recovery of transient failures, and coverage annotations in the synthesis.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Context Management &amp; Reliability &middot; 15%</span>
+		<h1>5.3: Error Propagation Across Agents</h1>
+		<p>What happens when one subagent's search fails: fixing what can be fixed where it happened, reporting the rest with enough detail for the coordinator to decide, and finishing the job with the gaps marked rather than hidden.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Multi-agent</span><span class="tag">Error handling</span><span class="tag">Retries</span><span class="tag">Partial results</span><span class="tag">Coverage</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Failed or found nothing</a></li>
+				<li><a href="#s2">Two anti-patterns</a></li>
+				<li><a href="#s3">Recover locally, report the rest</a></li>
+				<li><a href="#s4">What an error report carries</a></li>
+				<li><a href="#s5">The coordinator's decisions</a></li>
+				<li><a href="#s6">Coverage in the synthesis</a></li>
+				<li><a href="#s7">Agent SDK result types</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.3</span>
+				<p><strong>Implement error propagation strategies across multi-agent systems.</strong></p>
+			</div>
+			<p>The exam guide asks you to know four things:</p>
+			<ul>
+				<li>structured error context (the failure type, the query that was tried, partial results and alternatives) lets a coordinator make sensible recovery decisions;</li>
+				<li>an access failure, such as a timeout that needs a retry decision, is different from a valid empty result;</li>
+				<li>generic statuses like "search unavailable" hide that context;</li>
+				<li>silently returning empty results as success and terminating the whole workflow on one failure are both anti-patterns.</li>
+			</ul>
+			<p>In practice it asks you to return structured error context, keep access failures and empty results apart, have subagents retry transient failures themselves and pass up only what they can't fix, and annotate the final synthesis with which areas are well supported and which have gaps.</p>
+			<p>Error responses from a single MCP tool to Claude, including the <code>isError</code> flag and error categories, are task 2.2. This page is the layer above: subagent to coordinator to final output.</p>
+			<p>Sources: the exam guide for the error-handling principles; the Agent SDK agent-loop documentation and the Claude API error documentation for the supporting detail, checked on 19 November 2026 and paraphrased. The code is my own and was tested with anthropic 2.10.0 against mocked search backends and a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's research coordinator sends subagents to look into reviews, returns, competitor pricing and stock before deciding whether to stock ultralight tents. The market-data service sometimes times out, and the shop's key for one pricing feed has expired.</p></div>
+
+			<!-- ===== Empty vs failure ===== -->
+			<h2 id="s1">Failed or found nothing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">Access failures and valid empty results mean different things.</span></p>
+				<ul>
+					<li><strong>Valid empty result:</strong> the search ran and nothing matched. That's an answer: "no returns mention ultralight tents" is evidence about the product. Retrying won't change it.</li>
+					<li><strong>Access failure:</strong> the search didn't run properly: a timeout, an expired key, a service outage. Nothing is known about the topic. Whether to retry, try another source or accept the gap is a decision someone has to make.</li>
+				</ul>
+				<p>If both come back as an empty list, the coordinator can't tell "we looked and there's nothing" from "we couldn't look". The final report will then say there's no evidence about competitor pricing when in fact nobody could read the feed.</p>
+			</div>
+
+			<!-- ===== Anti-patterns ===== -->
+			<h2 id="s2">Two anti-patterns</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">Hiding the failure, or letting it stop everything.</span></p>
+				<ul>
+					<li><strong>Silent suppression:</strong> catching the error and returning an empty success. The workflow looks healthy, and the gap turns into a false negative in the final answer.</li>
+					<li><strong>Terminating the whole workflow:</strong> one subagent's timeout aborts the run, throwing away the three topics that succeeded. One missing source rarely makes the rest worthless.</li>
+					<li><strong>The milder version, a generic status:</strong> "search unavailable" admits the failure but nothing else. Was it a timeout worth retrying or a permission problem that never will be? Which query? Was anything found before it failed? The coordinator can only guess.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Local recovery ===== -->
+			<h2 id="s3">Recover locally, report the rest</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">A subagent fixes transient failures itself and propagates only what it can't.</span></p>
+				<div class="code"><span class="file">subagent_errors.py (Python)</span>
+<pre><code>"""A research subagent's search layer: recover from transient failures locally, report the rest with full context."""
+import time
+
+
+class SearchTimeout(Exception):
+    pass
+
+
+class SearchAccessDenied(Exception):
+    pass
+
+
+def search_with_recovery(search, query: str, attempts: int = 3, delay: float = 1.0, sleep=time.sleep) -&gt; dict:
+    for attempt in range(1, attempts + 1):
+        try:
+            hits = search(query)
+            return {"status": "ok", "query": query, "hits": hits}       <span class="c"># [] is a valid answer: the search ran, nothing matched</span>
+        except SearchTimeout as e:                                        <span class="c"># transient: retry here, don't bother the coordinator</span>
+            if attempt == attempts:
+                return {"status": "error", "failure_type": "timeout", "query": query, "attempts": attempt,
+                        "retryable": True, "detail": str(e)}
+            sleep(delay * 2 ** (attempt - 1))
+        except SearchAccessDenied as e:                                   <span class="c"># permanent: retrying won't help</span>
+            return {"status": "error", "failure_type": "access_denied", "query": query, "attempts": attempt,
+                    "retryable": False, "detail": str(e)}
+
+
+def run_subagent(topic: str, queries: list[str], search, alternatives: list[str], **retry) -&gt; dict:
+    outcomes = [search_with_recovery(search, q, **retry) for q in queries]
+    errors = [o for o in outcomes if o["status"] == "error"]
+    report = {
+        "topic": topic,
+        "status": "complete" if not errors else "partial" if len(errors) &lt; len(outcomes) else "failed",
+        "findings": [h for o in outcomes if o["status"] == "ok" for h in o["hits"]],              <span class="c"># partial results kept</span>
+        "no_matches": [o["query"] for o in outcomes if o["status"] == "ok" and not o["hits"]],    <span class="c"># searched, found nothing</span>
+    }
+    if errors:  <span class="c"># only what local recovery couldn't fix, with what was tried and where else to look</span>
+        report["errors"] = [{k: e[k] for k in ("failure_type", "query", "attempts", "retryable", "detail")} for e in errors]
+        report["alternatives"] = alternatives
+    return report</code></pre></div>
+				<ul>
+					<li><strong>Transient failures are retried where they happen:</strong> a timeout gets up to three attempts with exponential backoff. If the second attempt works, the coordinator never hears about it and doesn't spend context on it. The Anthropic SDK does the same for the API's own transient errors: rate limits, overloads and server errors are retried twice by default.</li>
+					<li><strong>Permanent failures are reported at once:</strong> an access-denied error won't fix itself, so retrying only wastes time.</li>
+					<li><strong>Empty is not an error:</strong> a search that ran and matched nothing returns <code>status: ok</code> with no hits, and is listed under <code>no_matches</code>.</li>
+					<li><strong>Partial results survive:</strong> a subagent with four queries where two failed returns the two that worked, with status <code>partial</code>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Report contents ===== -->
+			<h2 id="s4">What an error report carries</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">Enough for the coordinator to decide without guessing.</span></p>
+				<p>For each failure the report includes:</p>
+				<ul>
+					<li><strong>The failure type</strong> (<code>timeout</code>, <code>access_denied</code>), so the coordinator knows whether trying again could help.</li>
+					<li><strong>What was attempted:</strong> the exact query and how many attempts were made. A timeout after three tries is different from one after one.</li>
+					<li><strong>Whether it's retryable,</strong> and the raw detail ("403 from market-data") for logs and people.</li>
+					<li><strong>Partial results</strong> collected before or alongside the failure.</li>
+					<li><strong>Alternatives:</strong> other places the same information might be found, such as an archived price list.</li>
+				</ul>
+				<p>The subagent knows these things because it was there; the coordinator only knows what it's told. This is task 5.1's point about structured outputs between agents, applied to failures.</p>
+			</div>
+
+			<!-- ===== Coordinator ===== -->
+			<h2 id="s5">The coordinator's decisions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">Retry elsewhere, accept the gap, but keep going.</span></p>
+				<div class="code"><span class="file">coordinator.py (Python, anthropic SDK)</span>
+<pre><code>"""Coordinator: recover per report, never abort the run for one failure, and tell the synthesis step where the gaps are."""
+import json
+
+import anthropic
+
+from subagent_errors import run_subagent
+
+client = anthropic.Anthropic()
+
+
+def recover(report: dict, backends: dict) -&gt; dict:
+    """Retry only the failed queries, on an alternative source the subagent suggested."""
+    for alt in report.get("alternatives", []):
+        if alt not in backends or report["status"] == "complete":
+            continue
+        failed = [e["query"] for e in report["errors"]]
+        retry = run_subagent(report["topic"], failed, backends[alt], alternatives=[])
+        report["findings"] += retry["findings"]
+        report["no_matches"] += retry["no_matches"]
+        report["errors"] = retry.get("errors", [])
+        report["status"] = "complete" if not report["errors"] else "partial" if report["findings"] else "failed"
+        report["recovered_via"] = alt
+    return report
+
+
+def coverage(report: dict) -&gt; dict:
+    if report["status"] != "complete":
+        why = "; ".join(f"{e['failure_type']} on '{e['query']}'" for e in report["errors"])
+        return {"topic": report["topic"], "coverage": "gap" if not report["findings"] else "partial", "reason": why}
+    if not report["findings"]:
+        return {"topic": report["topic"], "coverage": "no_evidence", "reason": "searched; nothing matched"}
+    return {"topic": report["topic"], "coverage": "well_supported" if len(report["findings"]) &gt;= 2 else "thin"}
+
+
+def synthesize(question: str, reports: list[dict], backends: dict) -&gt; str:
+    reports = [recover(r, backends) for r in reports]
+    table = [coverage(r) for r in reports]
+    prompt = (f"&lt;coverage&gt;\n{json.dumps(table, indent=1)}\n&lt;/coverage&gt;\n"
+              f"&lt;reports&gt;\n{json.dumps(reports, indent=1)}\n&lt;/reports&gt;\n"
+              f"&lt;question&gt;{question}&lt;/question&gt;\n"
+              "Answer the question. Label each section with its coverage. For 'gap' topics say the source was "
+              "unavailable, not that the evidence is absent; for 'no_evidence' say the search found nothing.")
+    response = client.messages.create(model="claude-opus-5-5", max_tokens=3000,
+                                      messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in response.content if b.type == "text")</code></pre></div>
+				<ul>
+					<li><strong>Recovery per report:</strong> <code>recover</code> retries only the failed queries, on an alternative source the subagent suggested. Complete reports pass through untouched.</li>
+					<li><strong>No abort:</strong> however many reports failed, the run continues to synthesis with what it has.</li>
+					<li><strong>Escalation is still an option.</strong> If the missing topic is critical (the decision can't be made without pricing), the coordinator can stop and ask a person. That's a deliberate choice made with full information, not a crash.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Coverage ===== -->
+			<h2 id="s6">Coverage in the synthesis</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">Saying which conclusions rest on solid ground and which have holes.</span></p>
+				<p><code>coverage</code> gives each topic one of four labels, and the synthesis prompt asks Claude to carry the labels into its answer:</p>
+				<ul>
+					<li><strong>well_supported:</strong> complete, with several findings.</li>
+					<li><strong>thin:</strong> complete but with little evidence; here, pricing recovered from the archive with a single finding.</li>
+					<li><strong>no_evidence:</strong> searched successfully and nothing matched.</li>
+					<li><strong>partial</strong> or <strong>gap:</strong> a source was unavailable, with the reason. The prompt tells Claude to say the source was unavailable, not that the evidence is absent.</li>
+				</ul>
+				<p>The reader of the final report can then weigh the conclusion. "Reviews strongly favour lighter tents; we couldn't get current competitor prices" supports a different decision from a report that silently leaves pricing out. Attributing each claim to its source is task 5.6.</p>
+			</div>
+
+			<!-- ===== SDK ===== -->
+			<h2 id="s7">Agent SDK result types</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.3</span><span class="skill-text">How an SDK run reports the way it ended.</span></p>
+				<p>With the Agent SDK, every run ends with a <code>ResultMessage</code> whose <code>subtype</code> says how it ended:</p>
+				<ul>
+					<li><code>success</code>;</li>
+					<li><code>error_max_turns</code> or <code>error_max_budget_usd</code>, when a limit was hit;</li>
+					<li><code>error_during_execution</code>, for example after a cancelled request;</li>
+					<li><code>error_max_structured_output_retries</code>, when no valid structured output was produced.</li>
+				</ul>
+				<p>Only <code>success</code> carries the <code>result</code> text, so check the subtype first. Every subtype still carries the cost, turn count and session ID, so a run that hit its turn limit can be resumed with a higher one.</p>
+				<p>A single-shot <code>query()</code> raises an exception after yielding an error result; catch it if the caller should carry on. The budget cap covers subagents as well, and once it's reached, spawning another subagent fails.</p>
+				<p>Inside the loop, a tool call that's denied comes back to Claude as a rejection message in the tool result, and Claude typically tries another approach or reports that it couldn't continue. That's the same principle as the rest of this page: the failure is visible and described, so the agent can adapt.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Keep access failures (timeouts, denied access) apart from valid empty results (searched, nothing matched); conflating them turns outages into false "no evidence" conclusions.</li>
+				<li>Both silent suppression and aborting the whole workflow on one failure are anti-patterns; a generic "unavailable" status hides what the coordinator needs.</li>
+				<li>Subagents retry transient failures locally with backoff, report permanent ones at once, and propagate only what they couldn't fix.</li>
+				<li>Error reports carry the failure type, the query attempted, attempts made, retryability, partial results and alternative sources.</li>
+				<li>The coordinator recovers per report and continues. The synthesis labels each topic's coverage (well supported, thin, no evidence, partial or gap) so readers can see where the holes are.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-2.html"><small>Previous</small>5.2: Escalation and Ambiguity Resolution</a>
+				<a class="next" href="index.html#d5"><small>Next</small>Domain 5 overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude API and Agent SDK documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

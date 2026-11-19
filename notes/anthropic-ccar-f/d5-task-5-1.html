@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.1: Preserving Context in Long Interactions | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 5.1: why progressive summarisation loses amounts, dates and customer expectations, the lost-in-the-middle effect, how tool results crowd the context window, sending the full history each turn, and the fixes: a persistent case facts block, a per-issue layer, trimmed tool results, key findings first, and structured subagent outputs with metadata.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Context Management &amp; Reliability &middot; 15%</span>
+		<h1>5.1: Preserving Context in Long Interactions</h1>
+		<p>Keeping the details that matter through a long conversation: exact amounts and dates that a summary would blur, tool results cut down before they pile up, and inputs laid out so nothing important sits unnoticed in the middle.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Context window</span><span class="tag">Summarisation</span><span class="tag">Case facts</span><span class="tag">Tool results</span><span class="tag">Compaction</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How context fills up</a></li>
+				<li><a href="#s2">What summaries lose</a></li>
+				<li><a href="#s3">A case facts block</a></li>
+				<li><a href="#s4">Trimming tool results</a></li>
+				<li><a href="#s5">Position effects</a></li>
+				<li><a href="#s6">Lean outputs between agents</a></li>
+				<li><a href="#s7">Built-in context management</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.1</span>
+				<p><strong>Manage conversation context to preserve critical information across long interactions.</strong></p>
+			</div>
+			<p>The exam guide asks you to know four things. Progressive summarisation turns numbers, percentages, dates and what the customer said they expect into vague prose. Models handle the start and end of a long input reliably but can miss findings in the middle. Tool results pile up and use tokens far out of proportion to their relevance. And each request has to carry the complete conversation history. In practice it asks you to:</p>
+			<ul>
+				<li>keep transactional facts in a persistent block outside the summarised history, with one entry per issue when a session covers several;</li>
+				<li>trim tool output to the relevant fields;</li>
+				<li>put a key-findings summary first in aggregated inputs, with section headers for the details;</li>
+				<li>make subagents and upstream agents return structured data with metadata rather than long prose.</li>
+			</ul>
+			<p>Exploring a large codebase has its own context problems, covered in task 5.4; tracking where each claim came from is task 5.6.</p>
+			<p>Sources: the Claude API documentation on context windows, compaction, context editing and long-context prompting, checked on 19 November 2026 and paraphrased. The code is my own and was tested with anthropic 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A customer of the outdoor-gear shop spends an hour with the support agent on two orders: a torn tent footprint they want refunded, and a stove that never arrived. Separately, a research agent combines reports from several subagents before the shop decides what to stock.</p></div>
+
+			<!-- ===== Accumulation ===== -->
+			<h2 id="s1">How context fills up</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Full history every request, and everything counts.</span></p>
+				<p>The Messages API keeps no conversation state. Each request's input is all the previous turns plus the new message, and your application sends it. If you drop earlier turns, Claude no longer knows what was agreed, so the guide's rule is to send the complete history. Everything in the request counts against the context window: the system prompt, every message including tool results and documents, the tool definitions, and the output (thinking included). Cached prefixes count too; caching changes the price, not the size.</p>
+				<p>Current models have a 1M-token window, so running out is rarely the first problem. The docs describe <strong>context rot</strong>: as the token count grows, accuracy and recall degrade. What you put in the window matters as much as how big it is.</p>
+			</div>
+
+			<!-- ===== Summaries ===== -->
+			<h2 id="s2">What summaries lose</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Progressive summarisation and its blind spots.</span></p>
+				<p>The usual fix for a long history is to summarise older turns, often repeatedly. Each round makes the text shorter and vaguer. "Refund of 89.00 to the card by Friday 20 November for order A1042" becomes "customer wants a refund", and the next round may drop even that. The things that disappear are the ones the agent later needs to be exact about: amounts, percentages, dates, order numbers, statuses, and what the customer said they expect.</p>
+				<div class="callout trap"><p><strong>"Write a better summary prompt" isn't enough on its own.</strong> Asking the summariser to keep numbers helps, but every round is another chance to lose them. The guide's fix is structural: keep the exact values somewhere that never gets summarised.</p></div>
+			</div>
+
+			<!-- ===== Case facts ===== -->
+			<h2 id="s3">A case facts block</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Exact facts outside the summary, one entry per issue.</span></p>
+				<div class="code"><span class="file">case_context.py (Python, anthropic SDK)</span>
+<pre><code>"""Long support conversations: exact case facts kept outside the summarised history, and lean tool results."""
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+STATIC_SYSTEM = {"type": "text", "text": "You resolve returns and refunds for an outdoor-gear shop.",
+                 "cache_control": {"type": "ephemeral"}}  <span class="c"># stable prefix: cached</span>
+
+RETURN_FIELDS = ("order_id", "status", "delivered_at", "items", "amount_paid", "payment_method", "return_window_days")
+
+
+def trim_order(order: dict) -&gt; dict:
+    """The order API returns 40-odd fields; only these matter for a return."""
+    return {k: order[k] for k in RETURN_FIELDS if k in order}
+
+
+class Case:
+    def __init__(self):
+        self.facts: dict[str, dict] = {}   <span class="c"># one entry per issue, keyed by order ID: exact values, never summarised</span>
+        self.messages: list[dict] = []
+        self.summary = ""                  <span class="c"># older turns, condensed</span>
+
+    def record_order(self, order: dict) -&gt; str:
+        lean = trim_order(order)
+        self.facts.setdefault(lean["order_id"], {}).update(
+            {k: lean[k] for k in ("status", "amount_paid", "delivered_at") if k in lean})
+        return json.dumps(lean)            <span class="c"># what goes into the tool result, and so into history</span>
+
+    def record_expectation(self, order_id: str, expectation: str):
+        self.facts.setdefault(order_id, {})["customer_expects"] = expectation   <span class="c"># in the customer's words</span>
+
+    def system(self) -&gt; list[dict]:
+        facts = "&lt;case_facts&gt;\n" + json.dumps(self.facts, indent=1) + "\n&lt;/case_facts&gt;"
+        summary = f"&lt;earlier_conversation&gt;{self.summary}&lt;/earlier_conversation&gt;" if self.summary else ""
+        return [STATIC_SYSTEM, {"type": "text", "text": facts + summary}]
+
+    def compact(self, keep_last: int = 6):
+        """Summarise older turns, but the facts block keeps every number and date verbatim."""
+        if len(self.messages) &lt;= keep_last:
+            return
+        old, self.messages = self.messages[:-keep_last], self.messages[-keep_last:]
+        response = client.messages.create(
+            model="claude-haiku-5-5", max_tokens=800,
+            system="Summarise this support conversation in a few sentences. Numbers, dates and order IDs are "
+                   "kept separately, so describe what was discussed and decided.",
+            messages=[{"role": "user", "content": json.dumps(old, default=str)}],
+        )
+        self.summary = "".join(b.text for b in response.content if b.type == "text")
+
+    def ask(self, text: str) -&gt; str:
+        self.messages.append({"role": "user", "content": text})
+        response = client.messages.create(model="claude-sonnet-5-5", max_tokens=2000,
+                                          system=self.system(), messages=self.messages)  <span class="c"># full recent history every time</span>
+        reply = "".join(b.text for b in response.content if b.type == "text")
+        self.messages.append({"role": "assistant", "content": reply})
+        return reply</code></pre></div>
+				<ul>
+					<li><strong>Facts are extracted when they appear:</strong> when an order lookup returns, its status, amount and delivery date go into the facts store. When the customer states an expectation, it's recorded in their own words.</li>
+					<li><strong>The block goes into every request,</strong> in the system prompt, next to the summary of older turns. Compacting the history never touches it.</li>
+					<li><strong>One entry per issue:</strong> the store is keyed by order ID, so the footprint refund and the missing stove stay separate. Two orders' amounts and statuses can't be blended into one. That's the guide's structured issue layer for multi-issue sessions.</li>
+					<li><strong>The rest stays intact:</strong> recent turns are sent word for word. The static instructions are a cached prefix, and the facts block, which changes, comes after them.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Trimming ===== -->
+			<h2 id="s4">Trimming tool results</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Keep only the fields the task needs, before they reach history.</span></p>
+				<p>An order lookup can return 40-odd fields: warehouse codes, internal flags, marketing attributes. For a return, perhaps seven matter. Every tool result stays in the history and is re-sent on every later turn, so ten lookups of 40 fields cost far more context than they're worth, and the relevant values get buried. In the example, <code>trim_order</code> keeps only the return-relevant fields before the result goes into the conversation. The trimming happens in your code, in the tool handler or a post-tool hook (task 1.5), before the result is added to history.</p>
+				<p>This is the tool-design advice from task 2.1 seen from the other side: tools should return high-signal information, and when you don't control the API behind a tool, you filter its output yourself.</p>
+			</div>
+
+			<!-- ===== Position ===== -->
+			<h2 id="s5">Position effects</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Key findings first, details under clear headers.</span></p>
+				<p>The guide calls it the "lost in the middle" effect: in a long input, material at the start and end is processed reliably, but findings in the middle can be missed. When a synthesis step receives a long stack of subagent reports, the one report that matters may be fourth of nine. Claude's long-context prompting advice points the same way. Put long material at the top and the question at the end (Anthropic measured up to 30% better answers that way), and wrap each document in its own tags.</p>
+				<div class="code"><span class="file">synthesis_input.py (Python)</span>
+<pre><code>"""Build the input for a synthesis step from many subagent reports: key findings first, details in labelled sections."""
+import json
+
+
+def build_input(question: str, reports: list[dict]) -&gt; str:
+    """reports: structured subagent outputs, each with findings that carry their own metadata:
+    {"agent": ..., "findings": [{"fact", "source", "date", "method", "relevance"}]}"""
+    findings = [dict(f, agent=r["agent"]) for r in reports for f in r["findings"]]
+    key = sorted(findings, key=lambda f: -f["relevance"])[:5]
+    top = "\n".join(f"- {f['fact']} ({f['source']}, {f['date']})" for f in key)
+    sections = "\n".join(
+        f"&lt;section agent=\"{r['agent']}\"&gt;\n" + json.dumps(r["findings"], indent=1) + "\n&lt;/section&gt;" for r in reports)
+    <span class="c"># Most important material at the start, everything else under explicit headers, and the question last.</span>
+    return f"&lt;key_findings&gt;\n{top}\n&lt;/key_findings&gt;\n&lt;details&gt;\n{sections}\n&lt;/details&gt;\n&lt;question&gt;{question}&lt;/question&gt;"</code></pre></div>
+				<ul>
+					<li><strong>Key findings first:</strong> the most relevant findings across all reports, each with its source and date, open the input.</li>
+					<li><strong>Explicit sections:</strong> each agent's full results sit in a labelled <code>&lt;section&gt;</code>, so nothing is anonymous text in the middle.</li>
+					<li><strong>Question last.</strong></li>
+				</ul>
+			</div>
+
+			<!-- ===== Upstream ===== -->
+			<h2 id="s6">Lean outputs between agents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">Structured results with metadata, not reasoning transcripts.</span></p>
+				<p>A subagent's final message is all its parent receives (task 1.3), and the parent's context is limited. If every subagent returns pages of narrative and its whole chain of reasoning, the coordinator spends its budget reading prose. The guide's fix is to change the upstream agents:</p>
+				<ul>
+					<li><strong>Return structured data:</strong> key facts, citations and a relevance score per finding, as in the <code>reports</code> the synthesis example takes.</li>
+					<li><strong>Include metadata:</strong> the date of each fact, where it came from, and how it was obtained (a keyword count of reviews, a web page, a database query). Without that, the synthesis step can't tell a current figure from a stale one or weigh a survey against an anecdote.</li>
+					<li><strong>Leave out the working:</strong> the reasoning that led to a finding stays in the subagent's own context.</li>
+				</ul>
+				<p>How the synthesis step then keeps sources attached and handles conflicting claims is task 5.6.</p>
+			</div>
+
+			<!-- ===== Built-in ===== -->
+			<h2 id="s7">Built-in context management</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.1</span><span class="skill-text">What the API can do for you, and what it can't.</span></p>
+				<ul>
+					<li><strong>Compaction</strong> (beta, Claude 4.6 and later) replaces older turns with a summary Claude writes on the server. It can run on demand or automatically at a token threshold, and it can keep the most recent turns word for word. The docs suggest your own summarisation prompt when the default summary drops something a later turn needs. Even so, it's still a summary, so a case facts block remains the reliable place for exact values.</li>
+					<li><strong>Context editing</strong> (beta) clears the oldest tool results once input passes a trigger (100,000 tokens by default). By default it keeps the last three, and each cleared result is replaced with a placeholder so Claude knows something was removed. Named tools can be excluded, and old thinking blocks can be cleared too. Combined with the memory tool, Claude is warned before clearing so it can save what it needs.</li>
+				</ul>
+				<p>Both help with size. Neither decides which facts are critical; that remains your design.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Send the complete history each turn; everything in the request counts, and accuracy degrades as context grows (context rot).</li>
+				<li>Progressive summarisation blurs amounts, dates, statuses and customer expectations. Keep them in a case facts block that goes into every prompt and is never summarised, with one entry per issue.</li>
+				<li>Trim tool results to the relevant fields before they enter history; otherwise they accumulate and bury what matters.</li>
+				<li>Against the lost-in-the-middle effect: key findings first, details under explicit section headers, question last.</li>
+				<li>Upstream agents should return structured findings with dates, sources, methods and relevance, not verbose reasoning. Compaction and context editing manage size, not what's critical.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-6.html"><small>Previous</small>4.6: Multi-Instance and Multi-Pass Review</a>
+				<a class="next" href="d5-task-5-2.html"><small>Next</small>5.2: Escalation and Ambiguity Resolution</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude API documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

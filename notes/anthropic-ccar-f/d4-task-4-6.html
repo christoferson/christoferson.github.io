@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.6: Multi-Instance and Multi-Pass Review | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 4.6: why a model reviewing its own work in the same session misses problems, using an independent Claude instance without the generator's reasoning, multi-pass reviews with per-file and integration passes, and verification passes that report confidence per finding so findings can be routed to posting, human triage or the bin.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.6</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Prompt Engineering &amp; Structured Output &middot; 20%</span>
+		<h1>4.6: Multi-Instance and Multi-Pass Review</h1>
+		<p>Reviews that actually catch things: a second Claude instance that never saw how the code was written, passes that split a large review so nothing gets skimmed, and a verification step whose confidence decides which findings reach developers.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Code review</span><span class="tag">Independent review</span><span class="tag">Multi-pass</span><span class="tag">Verification</span><span class="tag">Confidence</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The limits of self-review</a></li>
+				<li><a href="#s2">An independent reviewer</a></li>
+				<li><a href="#s3">Multi-pass review</a></li>
+				<li><a href="#s4">Verification and confidence routing</a></li>
+				<li><a href="#s5">Anthropic's own reviewer</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 4.6</span>
+				<p><strong>Design multi-instance and multi-pass review architectures.</strong></p>
+			</div>
+			<p>The exam guide asks you to know why self-review is limited (a model keeps the reasoning that produced its output and is less likely to question it in the same session), that independent review instances catch subtle issues better than self-review instructions or extended thinking, and that splitting large reviews into per-file and cross-file passes avoids attention dilution and contradictory findings. In practice it asks you to review generated code with a second, independent instance, to split multi-file reviews into local and integration passes, and to run verification passes in which the model reports its confidence per finding so findings can be routed. Splitting a review is worked through in <a href="d1-task-1-6.html#s3">task 1.6</a>; writing the criteria is <a href="d4-task-4-1.html">task 4.1</a>.</p>
+			<p>Sources: the exam guide for the self-review argument; the Claude Code Code Review documentation and Claude's prompting best-practices guide for the supporting practice, checked on 19 November 2026 and paraphrased. The code is my own and was tested with anthropic 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> At the outdoor-gear shop, Claude writes a refund calculation from a short specification, and the pull-request reviewer then checks changes across <code>src/api</code> and <code>packages/payments</code>.</p></div>
+
+			<!-- ===== Self-review ===== -->
+			<h2 id="s1">The limits of self-review</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.6</span><span class="skill-text">Why "now check your work" in the same session misses things.</span></p>
+				<p>When the instance that wrote the code is asked to review it in the same conversation, everything that led to the code is still in its context: the assumptions it made, the edge cases it decided not to handle, the reasons it found convincing. The guide's point is that this context makes it less likely to question those decisions. It tends to confirm the reasoning it already followed, so the same blind spot that produced a bug hides it in the review.</p>
+				<p>Asking harder ("review carefully", "be critical") or giving it more room to think doesn't remove that context; it reasons more about the same premises. The guide's claim is that an <strong>independent instance</strong>, one that sees only the requirement and the output, does better than either self-review instructions or extended thinking.</p>
+			</div>
+
+			<!-- ===== Independent ===== -->
+			<h2 id="s2">An independent reviewer</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.6</span><span class="skill-text">A second instance without the generator's reasoning context.</span></p>
+				<div class="code"><span class="file">independent_review.py (Python, anthropic SDK)</span>
+<pre><code>"""Generate code in one instance, review it in another that never saw the generator's reasoning."""
+import anthropic
+
+client = anthropic.Anthropic()
+
+SPEC = ("Write a TypeScript function refundAmount(order, items) for the shop: refund the listed items, "
+        "never more than was paid, and keep amounts in integer cents.")
+
+
+def text_of(response) -&gt; str:
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+def generate(spec: str) -&gt; str:
+    response = client.messages.create(model="claude-sonnet-5-5", max_tokens=4000,
+                                      messages=[{"role": "user", "content": spec}])
+    return text_of(response)
+
+
+def independent_review(spec: str, code: str) -&gt; str:
+    <span class="c"># A fresh conversation: the reviewer gets the requirement and the code, not the generator's</span>
+    <span class="c"># messages or reasoning, so it has no prior decisions to defend.</span>
+    response = client.messages.create(
+        model="claude-opus-5-5", max_tokens=4000,
+        system=("You review code written by someone else against its specification. "
+                "List every way it can violate the spec, with the input that triggers it."),
+        messages=[{"role": "user", "content": f"&lt;spec&gt;{spec}&lt;/spec&gt;\n&lt;code&gt;{code}&lt;/code&gt;"}],
+    )
+    return text_of(response)
+
+
+if __name__ == "__main__":
+    code = generate(SPEC)
+    print(independent_review(SPEC, code))</code></pre></div>
+				<ul>
+					<li><strong>Fresh conversation:</strong> the review request contains the specification and the code, and nothing from the generation turn. The reviewer has no prior decisions to defend, so "what if the same item is listed twice?" is a new question to it.</li>
+					<li><strong>A reviewer's framing:</strong> its system prompt casts the code as someone else's and asks for violations with the inputs that trigger them, which makes findings testable.</li>
+					<li><strong>A different model is optional:</strong> the example uses a stronger model to review, but the key property is the independent context, not the model.</li>
+				</ul>
+				<p>In agent systems the same effect comes from a reviewer subagent: subagents start without the parent's history (task 1.2), so delegating review to one is an independent instance by construction. Claude's prompting guide makes a related point about chains: run draft, review and refine as separate calls, so each step can be logged and evaluated on its own.</p>
+			</div>
+
+			<!-- ===== Multi-pass ===== -->
+			<h2 id="s3">Multi-pass review</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.6</span><span class="skill-text">Local passes per file, then integration passes across files.</span></p>
+				<p>One pass over a large multi-file change spreads attention thinly and can produce contradictory findings: the same pattern called fine in one file and a bug in another, because each judgement was made with a different slice of the change in view. The multi-pass design (built out in <a href="d1-task-1-6.html#s3">task 1.6</a>) gives each file a focused pass for local issues, then runs a separate integration pass that sees all the per-file results and the diff together, and looks only at cross-file data flow: a caller and callee that disagree on units, a type changed on one side, a check moved out of one file and lost. Because the integration pass sees every local finding, it can also reconcile contradictions between them.</p>
+			</div>
+
+			<!-- ===== Verification ===== -->
+			<h2 id="s4">Verification and confidence routing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.6</span><span class="skill-text">A pass that re-checks each finding and says how sure it is.</span></p>
+				<div class="code"><span class="file">verify_and_route.py (Python, anthropic SDK)</span>
+<pre><code>"""Second pass over review findings: an independent verifier re-checks each one and reports its confidence,
+and the result decides where the finding goes."""
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+VERIFY = ("You check one code-review finding against the code. Reply as JSON: "
+          '{"verdict": "confirmed" | "rejected", "confidence": 0.0-1.0, "evidence": "file:line and why"}. '
+          "Reject findings that rely on behaviour the code doesn't show.")
+
+
+def verify(finding: dict, files: dict[str, str]) -&gt; dict:
+    path = finding["location"].split(":")[0]
+    response = client.messages.create(
+        model="claude-sonnet-5-5", max_tokens=1000, system=VERIFY,
+        messages=[{"role": "user", "content": f"&lt;finding&gt;{json.dumps(finding)}&lt;/finding&gt;\n&lt;file path=\"{path}\"&gt;{files[path]}&lt;/file&gt;"}],
+    )
+    return {**finding, **json.loads("".join(b.text for b in response.content if b.type == "text"))}
+
+
+def route(checked: dict) -&gt; str:
+    if checked["verdict"] == "rejected":
+        return "drop"
+    if checked["confidence"] &gt;= 0.8:
+        return "post"           <span class="c"># inline comment on the pull request</span>
+    return "triage"             <span class="c"># a person looks before it's posted</span>
+
+
+def review_pass(findings: list[dict], files: dict[str, str]) -&gt; dict[str, list[dict]]:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        checked = list(pool.map(lambda f: verify(f, files), findings))
+    routed = {"post": [], "triage": [], "drop": []}
+    for c in checked:
+        routed[route(c)].append(c)
+    return routed</code></pre></div>
+				<ul>
+					<li><strong>Each finding is re-checked independently:</strong> the verifier sees one finding and the file it's about, decides whether the code really shows the problem, and cites the evidence.</li>
+					<li><strong>Confidence routes, it doesn't define scope:</strong> confirmed findings with high confidence are posted, uncertain ones go to a person for triage, rejected ones are dropped. That's different from task 4.1's warning about "only report high-confidence findings": the categories have already decided what's in scope; confidence only decides where an in-scope finding goes.</li>
+					<li><strong>Calibrate the threshold:</strong> self-reported confidence is only useful if it tracks reality. Compare it with what developers did (fixed or dismissed, task 4.4) and move the threshold so "post" findings are nearly always acted on.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Anthropic's reviewer ===== -->
+			<h2 id="s5">Anthropic's own reviewer</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 4.6</span><span class="skill-text">The same architecture in Claude Code's Code Review.</span></p>
+				<p>Claude Code's managed Code Review is built from these pieces. Several agents search the change in parallel; a <strong>verification step</strong> checks the candidate findings against the code and filters out false positives; the survivors are deduplicated and ranked by severity before being posted. A finding can carry a "Why this was flagged" section recording why it was raised and how it was verified. Multiple independent instances, a separate verification pass, and only verified findings reaching developers: the exam's architecture, in production.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Self-review in the same session is weak: the reviewer keeps the reasoning that produced the output and tends to confirm it. More critical instructions or more thinking don't remove that context.</li>
+				<li>Review with an independent instance (a fresh call or a subagent) that sees only the requirement and the output.</li>
+				<li>For large multi-file changes, use per-file local passes plus integration passes for cross-file data flow, which avoids attention dilution and contradictory findings.</li>
+				<li>Add a verification pass that re-checks each finding against the code and reports confidence; route confirmed high-confidence findings to developers, uncertain ones to triage, and drop rejected ones. Calibrate the threshold against outcomes.</li>
+				<li>Claude Code's Code Review follows the same pattern: parallel agents, a verification step that removes false positives, then deduplication and severity ranking.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d4-task-4-5.html"><small>Previous</small>4.5: Batch Processing Strategies</a>
+				<a class="next" href="d5-task-5-1.html"><small>Next</small>5.1: Preserving Context in Long Interactions</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude API and Claude Code documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
