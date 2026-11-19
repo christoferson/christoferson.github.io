@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.4: Context in Large Codebase Exploration | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 5.4: how long exploration sessions degrade into generic answers, delegating specific questions to subagents, scratchpad files of key findings, summarising each phase before the next, manifests for crash recovery, and using /compact, what survives compaction in Claude Code, and the Agent SDK equivalents.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Context Management &amp; Reliability &middot; 15%</span>
+		<h1>5.4: Context in Large Codebase Exploration</h1>
+		<p>Keeping a long investigation of a big repository sharp: specific questions handed to subagents, findings written to files rather than trusted to memory, phases that start from a summary, and state that survives a crash.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Claude Code</span><span class="tag">Agent SDK</span><span class="tag">Subagents</span><span class="tag">Scratchpad</span><span class="tag">/compact</span><span class="tag">Crash recovery</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How long sessions degrade</a></li>
+				<li><a href="#s2">Questions for subagents</a></li>
+				<li><a href="#s3">A phased exploration</a></li>
+				<li><a href="#s4">Scratchpad files</a></li>
+				<li><a href="#s5">Summaries between phases</a></li>
+				<li><a href="#s6">Manifests for crash recovery</a></li>
+				<li><a href="#s7">/compact and what survives it</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.4</span>
+				<p><strong>Manage context effectively in large codebase exploration.</strong></p>
+			</div>
+			<p>The exam guide asks you to know four things:</p>
+			<ul>
+				<li>long sessions degrade: answers become inconsistent and drift to "typical patterns" instead of the specific classes found earlier;</li>
+				<li>scratchpad files keep key findings across context boundaries;</li>
+				<li>subagents keep verbose exploration out of the main agent, which coordinates;</li>
+				<li>for crash recovery, each agent exports state to a known location and the coordinator loads a manifest on resume.</li>
+			</ul>
+			<p>In practice it asks you to spawn subagents for specific questions, keep and consult scratchpad files, summarise each phase before starting the next, build manifest-based recovery, and use <code>/compact</code> when discovery output fills the context.</p>
+			<p>The built-in Explore and Plan subagents are described in <a href="d3-task-3-4.html#s5">task 3.4</a>. Resuming and forking sessions is <a href="d1-task-1-7.html">task 1.7</a>. Keeping exact facts through a long conversation is <a href="d5-task-5-1.html">task 5.1</a>.</p>
+			<p>Sources: the Claude Code documentation on the context window and sessions, and the Agent SDK documentation on the agent loop and structured outputs, checked on 19 November 2026 and paraphrased. The coordinator is my own and was tested with claude-agent-sdk 0.2.185 against a fake <code>query()</code>, including a failed run and a resume.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A developer at the outdoor-gear shop has to change how refunds work in a large, unfamiliar monorepo. First they need to know where the tests are and how a refund travels from the API to the payment provider. Then they need to know which refund steps are untested and how provider errors are handled.</p></div>
+
+			<!-- ===== Degradation ===== -->
+			<h2 id="s1">How long sessions degrade</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">The symptoms of a context full of discovery output.</span></p>
+				<p>Exploring a codebase is mostly reading: dozens of files, long grep results, test output. All of it stays in the conversation. Two hours in, the guide's symptoms appear. The agent gives a different answer to a question it answered earlier. And instead of "<code>RefundService.issue()</code> calls <code>PaymentGateway.reverse()</code>", it says "refund services usually call a payment gateway". The specific findings are still somewhere in the context, buried under everything read since, and the answer falls back on general knowledge.</p>
+				<p>Claude's API documentation calls the general effect context rot: accuracy and recall drop as the token count grows (task 5.1). A bigger window delays it but doesn't cure it. The remedies below all reduce what the main conversation has to hold.</p>
+			</div>
+
+			<!-- ===== Subagents ===== -->
+			<h2 id="s2">Questions for subagents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">Verbose exploration in a separate context; the main agent keeps the big picture.</span></p>
+				<p>A subagent works in its own context window. Its file reads, searches and dead ends stay there, and only its summary (plus a small metadata trailer, in Claude Code) comes back. So the main agent hands out specific, answerable questions:</p>
+				<ul>
+					<li>"Find all test files, the framework they use and how they are run."</li>
+					<li>"Trace the refund flow's dependencies from the API route to the payment provider."</li>
+				</ul>
+				<p>The main agent then works with two short answers instead of the forty files behind them. A vague delegation ("look around the payments code") brings back a vague summary. A specific question brings back something the coordinator can build on.</p>
+			</div>
+
+			<!-- ===== Coordinator ===== -->
+			<h2 id="s3">A phased exploration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">All four techniques in one coordinator.</span></p>
+				<div class="code"><span class="file">explore_coordinator.py (Python, Agent SDK)</span>
+<pre><code>"""Explore a large codebase in phases: isolated explorers, a scratchpad of findings, and a manifest for crash recovery."""
+import asyncio
+import json
+from pathlib import Path
+
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+STATE = Path(".explore")                  <span class="c"># the known location every agent's state is exported to</span>
+MANIFEST = STATE / "manifest.json"
+SCRATCHPAD = STATE / "scratchpad.md"
+
+PHASES = [
+    {"tests": "Find all test files, the framework they use and how they are run.",
+     "refund-flow": "Trace the refund flow's dependencies from the API route to the payment provider."},
+    {"refund-gaps": "Which steps of the refund flow have no test covering them?",
+     "provider-errors": "How are payment-provider errors handled at each step of the refund flow?"},
+]
+
+FINDINGS = {"type": "object", "required": ["answer", "key_files", "facts"], "properties": {
+    "answer": {"type": "string"},
+    "key_files": {"type": "array", "items": {"type": "string"}},
+    "facts": {"type": "array", "items": {"type": "string"},
+              "description": "Short facts naming the specific classes, functions and files found"},
+    "open_questions": {"type": "array", "items": {"type": "string"}}}}
+
+
+def load_manifest() -&gt; dict:
+    return json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {"phase": 0, "agents": {}, "phase_summaries": []}
+
+
+def save_manifest(m: dict):
+    MANIFEST.write_text(json.dumps(m, indent=1))
+
+
+def explorer_prompt(question: str, summaries: list[str]) -&gt; str:
+    earlier = "\n".join(summaries) or "None yet: this is the first phase."
+    return (f"&lt;findings_from_earlier_phases&gt;\n{earlier}\n&lt;/findings_from_earlier_phases&gt;\n"
+            f"Question: {question}\n"
+            "Answer from what you find in this repository. Name the actual classes, functions and files; "
+            "don't describe what such code typically looks like.")
+
+
+async def explore(name: str, question: str, summaries: list[str]) -&gt; dict:
+    options = ClaudeAgentOptions(allowed_tools=["Read", "Grep", "Glob"], disallowed_tools=["Write", "Edit", "Bash"],
+                                 output_format={"type": "json_schema", "schema": FINDINGS}, max_turns=40)
+    async for message in query(prompt=explorer_prompt(question, summaries), options=options):
+        if isinstance(message, ResultMessage):
+            if message.subtype == "success" and not message.is_error and message.structured_output:
+                return message.structured_output
+            raise RuntimeError(f"{name}: {message.subtype}")
+    raise RuntimeError(f"{name}: no result")
+
+
+def note(name: str, findings: dict):
+    """Append to the scratchpad: the record the coordinator re-reads instead of trusting its memory."""
+    with SCRATCHPAD.open("a") as f:
+        f.write(f"\n## {name}\n" + "\n".join(f"- {x}" for x in findings["facts"])
+                + f"\nKey files: {', '.join(findings['key_files'])}\n")
+
+
+async def run():
+    STATE.mkdir(exist_ok=True)
+    m = load_manifest()                                       <span class="c"># on resume, finished work is skipped, not redone</span>
+    for p in range(m["phase"], len(PHASES)):
+        pending = {n: q for n, q in PHASES[p].items() if m["agents"].get(n, {}).get("status") != "done"}
+        results = await asyncio.gather(*(explore(n, q, m["phase_summaries"]) for n, q in pending.items()),
+                                       return_exceptions=True)
+        for (name, _), res in zip(pending.items(), results):
+            if isinstance(res, Exception):
+                m["agents"][name] = {"status": "failed", "error": str(res)}
+                continue
+            (STATE / f"{name}.json").write_text(json.dumps(res, indent=1))   <span class="c"># each agent's state exported</span>
+            note(name, res)
+            m["agents"][name] = {"status": "done", "state_file": f"{name}.json"}
+            save_manifest(m)                                                  <span class="c"># a crash after this keeps the work</span>
+        if any(m["agents"].get(n, {}).get("status") != "done" for n in PHASES[p]):
+            save_manifest(m)
+            raise SystemExit(f"phase {p} incomplete; fix and rerun to resume")
+        <span class="c"># Summarise the phase before the next one starts; the summary goes into every next-phase prompt.</span>
+        m["phase_summaries"].append(f"Phase {p + 1}: " + " ".join(
+            json.loads((STATE / f"{n}.json").read_text())["answer"] for n in PHASES[p]))
+        m["phase"] = p + 1
+        save_manifest(m)
+    return SCRATCHPAD.read_text()
+
+
+if __name__ == "__main__":
+    print(asyncio.run(run()))</code></pre></div>
+				<ul>
+					<li><strong>Each question runs in its own <code>query()</code> session:</strong> separate context, read-only tools, and Write, Edit and Bash explicitly blocked. The questions in a phase run in parallel. Inside an interactive session you'd get the same isolation by letting Claude spawn subagents; driving them from code makes the phases and the recovery explicit.</li>
+					<li><strong>Structured findings:</strong> each explorer returns JSON with an answer, key files and short facts naming specific classes, through the SDK's <code>output_format</code>. The coordinator checks the result's subtype and reads <code>structured_output</code>; a run that hit its turn limit is recorded as failed, not silently skipped.</li>
+					<li><strong>The prompt forbids generic answers:</strong> "name the actual classes, functions and files; don't describe what such code typically looks like".</li>
+				</ul>
+			</div>
+
+			<!-- ===== Scratchpad ===== -->
+			<h2 id="s4">Scratchpad files</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">Findings on disk, consulted instead of remembered.</span></p>
+				<p>Every finished explorer's facts and key files are appended to <code>.explore/scratchpad.md</code>. When a later question comes up ("does the provider-error path have tests?"), the agent reads the scratchpad rather than relying on something it saw two hours and a compaction ago. A file doesn't degrade, isn't summarised and survives the session.</p>
+				<p>In an interactive Claude Code session the same idea is simply an instruction: "keep a findings file in <code>notes/refunds.md</code>; add each key finding with its file path, and check it before answering". Claude's prompting guidance for work that spans several context windows says the same: keep state in files, structured where possible, so a fresh context can pick up from the filesystem.</p>
+			</div>
+
+			<!-- ===== Phase summaries ===== -->
+			<h2 id="s5">Summaries between phases</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">The next phase starts from what the last one concluded.</span></p>
+				<p>The second-phase questions ("which refund steps have no test?") depend on the first phase's answers. The coordinator therefore summarises phase 1 when it ends and puts that summary at the top of every phase-2 prompt, in <code>&lt;findings_from_earlier_phases&gt;</code>. A phase-2 explorer starts knowing where the tests live and what the refund path is, without re-exploring either and without inheriting phase 1's transcripts. Subagents don't see the parent's history (task 1.3), so anything they need has to be in the prompt.</p>
+			</div>
+
+			<!-- ===== Manifest ===== -->
+			<h2 id="s6">Manifests for crash recovery</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">Each agent's state exported; the coordinator resumes from a manifest.</span></p>
+				<ul>
+					<li><strong>Export to a known location:</strong> each explorer's result goes to <code>.explore/&lt;name&gt;.json</code> as soon as it finishes.</li>
+					<li><strong>The manifest</strong> (<code>.explore/manifest.json</code>) records the current phase, each agent's status and state file, and the phase summaries. It's saved after every agent, so a crash loses at most the work in flight.</li>
+					<li><strong>On resume</strong> the coordinator loads the manifest, skips agents marked done, reruns only failed or missing ones, and injects the saved phase summaries into their prompts. In the test, the provider-errors explorer hits its turn limit, the run stops, and a rerun in a fresh process calls only that one explorer.</li>
+				</ul>
+				<p>Session resumption (task 1.7) restores a single conversation. A manifest restores a whole multi-agent job, including what the coordinator had decided between agents.</p>
+			</div>
+
+			<!-- ===== /compact ===== -->
+			<h2 id="s7">/compact and what survives it</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.4</span><span class="skill-text">Shrinking an interactive session that's full of discovery output.</span></p>
+				<p>In Claude Code, <code>/compact</code> replaces the conversation with a structured summary. Pass instructions to steer it: <code>/compact keep the refund call chain and the list of test files</code>. Otherwise the summary keeps what the automatic pass guesses is important. Claude Code also compacts automatically as the window fills; <code>/autocompact</code> sets how full it gets first, and <code>/context</code> shows what's using the space. <code>/clear</code> is the better choice when switching to unrelated work.</p>
+				<p>What survives compaction:</p>
+				<ul>
+					<li><strong>Re-injected from disk:</strong> the system prompt, the project-root CLAUDE.md and unscoped rules, auto memory, and a plan written in plan mode.</li>
+					<li><strong>Re-read:</strong> up to five of the most recently modified files Claude read or edited. A file over 5,000 tokens comes back only as a path reference.</li>
+					<li><strong>Summarised away:</strong> path-scoped rules and nested CLAUDE.md files (they reload only when a matching file is touched again), context added by hooks, and everything Claude read and concluded.</li>
+				</ul>
+				<p>That's why findings belong in a file: the scratchpad is still there after compaction, when the conversation's version of them is a sentence in a summary. In the Agent SDK, compaction is automatic too. You can put "what to preserve" instructions in CLAUDE.md, run a <code>PreCompact</code> hook (for example to archive the transcript), or send <code>/compact</code> as a prompt.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Long exploration sessions degrade: inconsistent answers, and "typical patterns" instead of the specific classes found earlier.</li>
+				<li>Delegate specific questions ("find all test files", "trace the refund flow") to subagents; their verbose reads stay in their own context and only a summary returns.</li>
+				<li>Keep key findings in scratchpad files and consult them for later questions; files survive compaction and new sessions.</li>
+				<li>Summarise each phase before starting the next and inject the summary into the new subagents' prompts.</li>
+				<li>For crash recovery, export each agent's state to a known location and keep a manifest the coordinator loads on resume. Use <code>/compact</code> with focus instructions when discovery output fills an interactive session.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-3.html"><small>Previous</small>5.3: Error Propagation Across Agents</a>
+				<a class="next" href="d5-task-5-5.html"><small>Next</small>5.5: Human Review and Confidence Calibration</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude Code and Agent SDK documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>

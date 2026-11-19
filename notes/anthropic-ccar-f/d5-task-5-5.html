@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.5: Human Review and Confidence Calibration | Study Notes for CCAR-F</title>
+	<meta name="description" content="Study notes for CCAR-F task 5.5: why an overall accuracy figure can hide a weak document type or field, calibrating field-level confidence thresholds on a labelled validation set, validating each segment before automating, routing low-confidence and contradictory documents to people in priority order, and stratified random sampling of auto-accepted extractions.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-F</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Context Management &amp; Reliability &middot; 15%</span>
+		<h1>5.5: Human Review and Confidence Calibration</h1>
+		<p>Deciding which extractions a person must check: confidence thresholds earned on labelled data, accuracy checked for every document type and field, the review queue ordered by what matters most, and a steady random audit of what was let through.</p>
+		<div class="tags"><span class="tag code">CCAR-F</span><span class="tag">Human review</span><span class="tag">Confidence</span><span class="tag">Calibration</span><span class="tag">Sampling</span><span class="tag">Extraction</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What an overall figure hides</a></li>
+				<li><a href="#s2">The review pipeline</a></li>
+				<li><a href="#s3">Calibrating confidence</a></li>
+				<li><a href="#s4">Validating each segment</a></li>
+				<li><a href="#s5">Routing and priority</a></li>
+				<li><a href="#s6">Auditing what was auto-accepted</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Task 5.5</span>
+				<p><strong>Design human review workflows and confidence calibration.</strong></p>
+			</div>
+			<p>The exam guide asks you to know four things:</p>
+			<ul>
+				<li>an aggregate accuracy figure such as 97% can hide poor results on particular document types or fields;</li>
+				<li>stratified random sampling measures the error rate of high-confidence extractions and catches new kinds of error;</li>
+				<li>field-level confidence scores should be calibrated on a labelled validation set before they route review;</li>
+				<li>accuracy has to be checked per document type and field before high-confidence extractions are automated.</li>
+			</ul>
+			<p>In practice it asks you to sample auto-accepted work by stratum, analyse accuracy by segment before reducing review, calibrate per-field thresholds on labelled data, and send low-confidence or contradictory documents to people in a sensible order.</p>
+			<p>Related pages: designing the extraction schema is <a href="d4-task-4-3.html">task 4.3</a>, and validation with feedback loops is <a href="d4-task-4-4.html">task 4.4</a>. Confidence-based routing of review findings is <a href="d4-task-4-6.html#s4">task 4.6</a>.</p>
+			<p>Sources: the exam guide for the review-design principles, and Claude's documentation on building evaluations for the supporting practice, checked on 19 November 2026 and paraphrased. The code is my own and was tested on synthetic labelled data.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The outdoor-gear shop's finance team extracts totals and due dates from supplier documents with Claude. Most are invoices; a few are credit notes and receipts. Two reviewers can check about 300 documents a day, out of several thousand.</p></div>
+
+			<!-- ===== Aggregates ===== -->
+			<h2 id="s1">What an overall figure hides</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Good on average, bad where it counts.</span></p>
+				<p>In the test data behind the example, totals are extracted correctly 98.9% of the time overall. That sounds ready to automate. But almost every document is an invoice, and invoices are nearly perfect. On credit notes, which are rare, the total is wrong one time in ten, often because the sign is lost and a refund is read as a charge. The overall figure is dominated by the common case and says almost nothing about the rare one.</p>
+				<p>The same happens across fields. A document-level "correct" can average a reliable total with an unreliable due date. So accuracy has to be measured per <strong>segment</strong>, meaning each combination of document type and field, before anyone decides to review less. Claude's evaluation guidance points the same way: test sets should mirror the real mix of inputs, including edge cases, and most tasks need several success criteria rather than one number.</p>
+			</div>
+
+			<!-- ===== Pipeline ===== -->
+			<h2 id="s2">The review pipeline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Calibrate, validate, route, audit.</span></p>
+				<div class="code"><span class="file">review_calibration.py (Python)</span>
+<pre><code>"""Decide which extractions a person must check: per-segment accuracy, calibrated field thresholds,
+routing with a priority, and a stratified audit sample of what was auto-accepted."""
+import random
+from collections import defaultdict
+
+<span class="c"># Each field the model extracts comes back as {"value", "confidence" (0-1), "evidence"}, plus a document-level</span>
+<span class="c"># "conflict" flag when the source contradicts itself (two different totals, say). A labelled record adds "correct".</span>
+
+
+def calibrate(labelled: list[dict], target: float = 0.99, min_n: int = 50) -&gt; dict:
+    """Per field: the lowest confidence threshold above which the labelled set is at least `target` accurate.
+    Run this first; segment_accuracy then checks each segment above these thresholds."""
+    by_field = defaultdict(list)
+    for r in labelled:
+        by_field[r["field"]].append((r["confidence"], r["correct"]))
+    thresholds = {}
+    for field, rows in by_field.items():
+        rows.sort(key=lambda r: -r[0])
+        best, ok = None, 0
+        for i, (conf, correct) in enumerate(rows, 1):   <span class="c"># walk down from the most confident</span>
+            ok += correct
+            last_at_conf = i == len(rows) or rows[i][0] != conf
+            if last_at_conf and i &gt;= min_n and ok / i &gt;= target:
+                best = conf                              <span class="c"># everything at or above conf is still accurate enough</span>
+        thresholds[field] = best                         <span class="c"># None: no threshold meets the target, always review</span>
+    return thresholds
+
+
+def segment_accuracy(labelled: list[dict], thresholds: dict, target: float = 0.99, min_n: int = 50) -&gt; dict:
+    """Accuracy per (document type, field) of what WOULD be auto-accepted. The overall figure can hide a weak segment."""
+    seg = defaultdict(lambda: [0, 0])
+    for r in labelled:
+        t = thresholds.get(r["field"])
+        if t is None or r["confidence"] &lt; t:
+            continue                                     <span class="c"># would go to review anyway</span>
+        s = seg[(r["doc_type"], r["field"])]
+        s[0] += r["correct"]
+        s[1] += 1
+    return {k: {"accuracy": ok / n, "n": n, "validated": n &gt;= min_n and ok / n &gt;= target} for k, (ok, n) in seg.items()}
+
+
+def route(doc: dict, thresholds: dict, segments: dict) -&gt; dict:
+    reasons = []
+    if doc.get("conflict"):
+        reasons.append("source contradicts itself")
+    for field, x in doc["fields"].items():
+        t = thresholds.get(field)
+        if not segments.get((doc["doc_type"], field), {}).get("validated"):
+            reasons.append(f"{field}: segment not validated")
+        elif t is None or x["confidence"] &lt; t:
+            reasons.append(f"{field}: confidence {x['confidence']:.2f} below {t}")
+    if not reasons:
+        return {"route": "auto"}
+    <span class="c"># Limited reviewers: contradictions and high-value documents first, then the least confident.</span>
+    lowest = min(x["confidence"] for x in doc["fields"].values())
+    priority = 2 * bool(doc.get("conflict")) + (doc.get("amount", 0) &gt; 5000) + (1 - lowest)
+    return {"route": "review", "priority": round(priority, 2), "reasons": reasons}
+
+
+def audit_sample(auto_accepted: list[dict], per_stratum: int = 20, seed: int | None = None) -&gt; list[dict]:
+    """Random sample from every document type, so rare types are checked too; reviewers label these to keep
+    measuring the error rate of auto-accepted work and to spot new kinds of error."""
+    rng = random.Random(seed)
+    strata = defaultdict(list)
+    for d in auto_accepted:
+        strata[d["doc_type"]].append(d)
+    return [d for docs in strata.values() for d in rng.sample(docs, min(per_stratum, len(docs)))]</code></pre></div>
+				<p>The extraction itself returns, for each field, a value, a confidence between 0 and 1, and the evidence it relied on. A document-level <code>conflict</code> flag is set when the source contradicts itself. The four functions then answer four questions, in order: above what confidence is each field trustworthy, which segments have earned automation, which documents go to people and in what order, and how we keep checking what was let through.</p>
+			</div>
+
+			<!-- ===== Calibration ===== -->
+			<h2 id="s3">Calibrating confidence</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Thresholds set on labelled data, per field.</span></p>
+				<p>A confidence score is only useful once you know what it means. "0.9" from the model is a self-report, and on its own it's no more reliable than the self-reported confidence task 5.2 warns against for escalation. Calibration turns it into something measurable. Take a labelled validation set where people have marked each extracted field right or wrong. For each field, find the lowest confidence above which accuracy still meets the target.</p>
+				<ul>
+					<li><strong>Per field:</strong> due dates and totals get their own thresholds (0.95 and 0.51 in the test), because the model's confidence means different things for different fields.</li>
+					<li><strong>Whole confidence levels only:</strong> the threshold is checked only after every item at a given confidence has been counted. In an early version of the example, ties were sorted correct-first, which made a half-wrong confidence level look safe.</li>
+					<li><strong>Enough labels:</strong> with fewer than 50 labelled items there's no threshold, and the field is always reviewed. Ten correct answers prove nothing.</li>
+					<li><strong>Recalibrate</strong> when the model, the prompt or the document mix changes.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Segments ===== -->
+			<h2 id="s4">Validating each segment</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Every document type and field checked before automation.</span></p>
+				<p><code>segment_accuracy</code> measures what would actually be automated: the labelled items above each field's threshold, grouped by document type and field. A segment is <code>validated</code> only with enough items and accuracy at the target. Invoice totals and invoice due dates pass. Credit-note totals, at 90% even above the threshold, don't, so every credit note keeps going to a person however confident the model is. Reducing review is decided per segment, never from the overall figure.</p>
+			</div>
+
+			<!-- ===== Routing ===== -->
+			<h2 id="s5">Routing and priority</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Who goes to a person, and who first.</span></p>
+				<p>A document goes to review if any of these holds:</p>
+				<ul>
+					<li>a field's segment isn't validated;</li>
+					<li>a field's confidence is below its threshold;</li>
+					<li>the source is ambiguous or contradicts itself: two different totals on one invoice is a question for a person, however confident the model is about which one it picked.</li>
+				</ul>
+				<p>Each routed document carries its reasons, so the reviewer knows what to check.</p>
+				<p>Reviewer time is limited, so the queue is ordered. Contradictions come first, then high-value documents, then the least confident. When the queue is longer than a day's capacity, what's left at the end is the lowest-risk work. Reviewers' corrections become new labelled data for the next calibration (the feedback loop in task 4.4).</p>
+			</div>
+
+			<!-- ===== Audit ===== -->
+			<h2 id="s6">Auditing what was auto-accepted</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Task 5.5</span><span class="skill-text">Stratified random sampling of high-confidence output.</span></p>
+				<p>Once extractions are accepted without review, nobody looks at them, so nobody would notice if they got worse: a supplier changes its invoice layout, a new document type appears. <code>audit_sample</code> takes a random sample of auto-accepted documents every day and sends it to reviewers to label.</p>
+				<ul>
+					<li><strong>Stratified:</strong> the sample is drawn from each document type separately, so the seven receipts are all checked, not swamped by 500 invoices in a simple random sample.</li>
+					<li><strong>Random within each stratum,</strong> so the measured error rate is an honest estimate for that type, and new error patterns turn up where nobody thought to look.</li>
+					<li><strong>Acted on:</strong> errors found in the audit lower the segment's measured accuracy. If it falls below the target, the segment goes back to full review until it's recalibrated.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>An overall accuracy figure can hide a weak document type or field; measure accuracy per segment (document type by field).</li>
+				<li>Have the model output field-level confidence, then calibrate per-field thresholds on a labelled validation set; without enough labels, there's no threshold.</li>
+				<li>Validate each segment on what would actually be automated before reducing review; unvalidated segments stay fully reviewed.</li>
+				<li>Route low confidence, unvalidated segments and ambiguous or contradictory sources to people, with reasons, ordered by risk to fit limited capacity.</li>
+				<li>Keep a stratified random audit of auto-accepted work to measure ongoing error rates and catch new error patterns; feed corrections back into calibration.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Task navigation">
+				<a href="d5-task-5-4.html"><small>Previous</small>5.4: Context in Large Codebase Exploration</a>
+				<a class="next" href="index.html#d5"><small>Next</small>Domain 5 overview</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Foundations (CCAR-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Task statement from the CCAR-F exam guide, version 1.1. Facts from the Claude API documentation, in the author's own words; code examples are original.</div>
+</footer>
+
+</body>
+</html>
