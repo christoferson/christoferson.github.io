@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.4: Context Composition and Token Economics | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 2.4 (7 December 2026 guide): breaking a prompt's context down by section, pricing it at the stated call volume with and without prompt caching, and finding cuts that keep the task-relevant information, with a tested budget model.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Claude Models, Prompting, and Context Engineering &middot; 13%</span>
+		<h1>2.4: Context Composition and Token Economics</h1>
+		<p>Taking a request apart section by section (tool definitions, instructions, documents, history, tool results), pricing each at real call volumes with caching in mind, and cutting the tokens that don't help the task while keeping the ones that do.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Tokens</span><span class="tag">Prompt caching</span><span class="tag">Cost</span><span class="tag">Context</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How caching changes the arithmetic</a></li>
+				<li><a href="#s2">A budget by section</a></li>
+				<li><a href="#s3">Where tokens can go</a></li>
+				<li><a href="#s4">Keeping task-relevant information</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.4</span>
+				<p><strong>Context Composition and Token Economics</strong>: "Analyzing context composition and caching behavior against a token budget and a defined call volume to determine where token consumption can be reduced without loss of task-relevant information."</p>
+			</div>
+			<p>Exam items give a request's composition, a call volume and a budget, and ask which change cuts cost without hurting results. Placing breakpoints and packaging reusable content is <a href="index.html#d2">skill 2.5</a>; managing context over a long session is <a href="index.html#d2">skill 2.6</a>.</p>
+			<p>Sources: the Claude prompt caching, pricing and rate limits documentation, checked on 19 and 20 November 2026 and paraphrased. The agent and its token counts are my own; the budget model is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An online retailer's support agent on Sonnet 5.5 makes 200,000 model calls a month, about four per conversation. Finance wants the input bill roughly halved.</p></div>
+
+			<!-- ===== Caching ===== -->
+			<h2 id="s1">How caching changes the arithmetic</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">The rules that decide what a token really costs.</span></p>
+				<ul>
+					<li><strong>Prefix only:</strong> a cache covers everything up to a breakpoint, in the order tools, system, then messages. Anything that varies per request breaks the prefix from that point on.</li>
+					<li><strong>Prices:</strong> writing costs 1.25 times the input price for a 5-minute cache (2 times for 1 hour); reading costs 0.05 times on Opus and Sonnet 5.5 (0.1 times on most others, 0.025 times on Fable 5.2).</li>
+					<li><strong>Minimum length:</strong> 512 tokens on the current models (1,024 on some older ones); shorter prefixes are silently not cached.</li>
+					<li><strong>Invalidation:</strong> changing tool definitions invalidates the whole cache; changing system-level settings invalidates system and messages; changing <code>tool_choice</code> or images invalidates messages.</li>
+					<li><strong>Throughput too:</strong> cache reads don't count toward the input-tokens-per-minute rate limit (<a href="d1-skill-1-2.html#s2">skill 1.2</a>).</li>
+				</ul>
+				<p>So a token's cost depends on where it sits: a stable token near the front is cheap after the first call; a token that changes every call is paid in full every time.</p>
+			</div>
+
+			<!-- ===== Budget ===== -->
+			<h2 id="s2">A budget by section</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Three compositions at 200,000 calls a month.</span></p>
+				<div class="code"><span class="file">context_budget.py (context_budget.py)</span>
+<pre><code>"""Where do a support agent's input tokens go, and which cuts keep the task-relevant information?
+
+Sonnet 5.5 prices (USD per million tokens, Nov 2026): input $2.00, 5-minute cache write $2.50,
+cache read $0.10. Caching needs a prefix of at least 512 tokens and covers everything before the
+breakpoint, in the order tools -&gt; system -&gt; messages."""
+
+CALLS = 200_000          <span class="c"># model calls a month</span>
+TURNS = 4                <span class="c"># calls per conversation: the cache is written once, read on later turns</span>
+
+BEFORE = [  <span class="c"># section, tokens, stable across calls?</span>
+    ("tool definitions (40 tools; 6 used in 95% of chats)", 14_000, True),
+    ("system prompt", 3_000, True),
+    ("all 22 policy documents, pasted in", 30_000, True),
+    ("conversation history", 8_000, False),
+    ("order lookup results (full JSON)", 6_000, False),
+    ("customer message", 300, False),
+]
+
+KEEP_ALL_POLICIES = [   <span class="c"># alternative: no retrieval risk, everything stable is cached</span>
+    ("tool definitions (6 core tools; others loaded on demand)", 3_000, True),
+    ("system prompt", 3_000, True),
+    ("all 22 policy documents, pasted in", 30_000, True),
+    ("conversation history", 8_000, False),
+    ("order lookup results (fields the agent needs)", 900, False),
+    ("customer message", 300, False),
+]
+
+AFTER = [
+    ("tool definitions (6 core tools; others loaded on demand)", 3_000, True),
+    ("system prompt", 3_000, True),
+    ("policy sections retrieved for this question (top 3)", 4_000, False),
+    ("conversation history", 8_000, False),
+    ("order lookup results (fields the agent needs)", 900, False),
+    ("customer message", 300, False),
+]
+
+
+def monthly_cost(sections, cache: bool) -&gt; float:
+    stable = sum(t for _, t, s in sections if s)
+    dynamic = sum(t for _, t, s in sections if not s)
+    if not cache or stable &lt; 512:
+        return CALLS * (stable + dynamic) * 2.00 / 1e6
+    writes = CALLS / TURNS                         <span class="c"># first call of each conversation writes the prefix</span>
+    reads = CALLS - writes                         <span class="c"># (a pessimistic case: no sharing across conversations)</span>
+    return (writes * stable * 2.50 + reads * stable * 0.10 + CALLS * dynamic * 2.00) / 1e6
+
+
+if __name__ == "__main__":
+    for label, sections in [("before", BEFORE), ("trim tools and JSON, keep all policies", KEEP_ALL_POLICIES),
+                            ("trim tools and JSON, retrieve policies", AFTER)]:
+        total = sum(t for _, t, _ in sections)
+        print(f"{label}: {total:,} input tokens per call")
+        for name, t, s in sections:
+            print(f"  {t:&gt;6,}  {'stable ' if s else 'dynamic'}  {name}")
+        print(f"  monthly input cost: no cache ${monthly_cost(sections, False):,.0f}, "
+              f"stable prefix cached ${monthly_cost(sections, True):,.0f}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>before: 61,300 input tokens per call
+  14,000  stable   tool definitions (40 tools; 6 used in 95% of chats)
+   3,000  stable   system prompt
+  30,000  stable   all 22 policy documents, pasted in
+   8,000  dynamic  conversation history
+   6,000  dynamic  order lookup results (full JSON)
+     300  dynamic  customer message
+  monthly input cost: no cache $24,520, stable prefix cached $12,300
+trim tools and JSON, keep all policies: 45,200 input tokens per call
+   3,000  stable   tool definitions (6 core tools; others loaded on demand)
+   3,000  stable   system prompt
+  30,000  stable   all 22 policy documents, pasted in
+   8,000  dynamic  conversation history
+     900  dynamic  order lookup results (fields the agent needs)
+     300  dynamic  customer message
+  monthly input cost: no cache $18,080, stable prefix cached $8,720
+trim tools and JSON, retrieve policies: 19,200 input tokens per call
+   3,000  stable   tool definitions (6 core tools; others loaded on demand)
+   3,000  stable   system prompt
+   4,000  dynamic  policy sections retrieved for this question (top 3)
+   8,000  dynamic  conversation history
+     900  dynamic  order lookup results (fields the agent needs)
+     300  dynamic  customer message
+  monthly input cost: no cache $7,680, stable prefix cached $6,120</code></pre></div>
+				<ul>
+					<li><strong>Before:</strong> 61,300 tokens a call, $24,520 a month uncached. Caching the stable 47,000-token prefix halves it, but that prefix carries 34 unused tools and 22 policies when a question needs two or three.</li>
+					<li><strong>Trim tools and JSON, keep all policies:</strong> six core tools (others loaded only when needed) and only the order fields the agent uses; cached, $8,720. No risk of a missing policy.</li>
+					<li><strong>Also retrieve policies:</strong> the top three sections per question instead of all 22; cached, $6,120. Cheapest, but retrieved text is dynamic and can miss the section that matters.</li>
+					<li><strong>The model is pessimistic:</strong> it assumes each conversation writes its own cache; when many conversations share a prefix within the cache lifetime, reads replace more writes.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Where ===== -->
+			<h2 id="s3">Where tokens can go</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">A checklist, roughly from safest to riskiest (my ordering).</span></p>
+				<ul>
+					<li><strong>Cache what's stable:</strong> tools, system prompt and reference material at the front, above the 512-token minimum. No information is lost.</li>
+					<li><strong>Trim tool results:</strong> return the fields the agent uses, not whole records; large JSON is often the biggest dynamic cost.</li>
+					<li><strong>Prune tool definitions:</strong> keep the tools used in most conversations; load rare ones on demand (for example with the tool search tool) or move them to a specialised step.</li>
+					<li><strong>Remove duplication:</strong> the same policy pasted in the system prompt and in retrieved text; instructions repeated every turn.</li>
+					<li><strong>Retrieve instead of pasting everything:</strong> only after checking retrieval finds what the answers need.</li>
+					<li><strong>Shorten history:</strong> summarise or clear old tool results in long sessions (<a href="index.html#d2">skill 2.6</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Keep ===== -->
+			<h2 id="s4">Keeping task-relevant information</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">"Without loss" has to be measured.</span></p>
+				<ul>
+					<li><strong>Run the evaluation set before and after</strong> each cut; a cheaper prompt that answers fewer questions correctly hasn't saved anything.</li>
+					<li><strong>For retrieval, check recall:</strong> on a sample of real questions, does the retrieved set contain the policy the correct answer depends on?</li>
+					<li><strong>Know what's load-bearing:</strong> tools used in 5% of chats may be the ones for refunds or safety recalls; route those cases rather than dropping the tools.</li>
+					<li><strong>Prefer cuts that are clearly irrelevant</strong> (unused JSON fields, duplicate text) over cuts that are probably irrelevant (documents a retriever didn't pick).</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Switch to a cheaper model"</strong> is the usual distractor in a token-economics question. It cuts price per token but leaves the waste in place, and changes quality; the question asks where tokens can be removed or made cheaper without losing information.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Price each section of the context at the stated volume: stable content near the front is cheap once cached; dynamic content is paid in full every call.</li>
+				<li>Caching: prefix order tools, system, messages; at least 512 tokens on current models; writes 1.25x (5 minutes) or 2x (1 hour), reads 0.05x on Opus and Sonnet 5.5; tool changes invalidate everything.</li>
+				<li>Safest cuts first: cache the stable prefix, trim tool results, prune rarely used tools, remove duplicates; then retrieval and history shortening.</li>
+				<li>"Without loss" means measured: run the evaluation set before and after, and check retrieval recall.</li>
+				<li>A cheaper model isn't a context fix; remove waste first.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-3.html"><small>Previous</small>2.3: Prompting Technique Selection</a>
+				<a class="next" href="index.html#d2"><small>Next</small>Domain 2</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the example and code are original.</div>
+</footer>
+
+</body>
+</html>
