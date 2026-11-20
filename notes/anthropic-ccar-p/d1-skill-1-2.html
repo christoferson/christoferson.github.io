@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.2: End-to-End Architecture Evaluation | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 1.2 (7 December 2026 guide): checking a Claude architecture's input, processing, output and feedback stages against scalability, maintainability and access-control requirements, and finding the component that fails first under a given load or trust condition, with a tested capacity model.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Solution Design and Architecture &middot; 18%</span>
+		<h1>1.2: End-to-End Architecture Evaluation</h1>
+		<p>Walking a proposed Claude system from input to feedback, testing each stage against the stated scale, maintenance and access requirements, and naming the one component that breaks first when load rises or trust drops.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Architecture review</span><span class="tag">Rate limits</span><span class="tag">Prompt caching</span><span class="tag">Workspaces</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Four stages, three requirements</a></li>
+				<li><a href="#s2">The model's limits</a></li>
+				<li><a href="#s3">Finding the first to fail under load</a></li>
+				<li><a href="#s4">After the first bottleneck</a></li>
+				<li><a href="#s5">Failing first under a trust condition</a></li>
+				<li><a href="#s6">Maintainability</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.2</span>
+				<p><strong>End-to-End Architecture Evaluation</strong>: "Evaluating whether a proposed end-to-end architecture (input, processing, output, feedback) satisfies stated scalability, maintainability, and access-control requirements, and identifying the component that fails first under a specified load or trust condition."</p>
+			</div>
+			<p>Exam items describe an architecture and a condition, such as a seasonal peak, a new tenant or untrusted input, and ask which component fails first or which requirement is unmet. The answer is usually one specific component, not "the model". Choosing the pattern is <a href="index.html#d1">skill 1.3</a>; relieving a performance constraint in depth is <a href="index.html#d3">skill 3.3</a>.</p>
+			<p>Sources: the Claude API rate limits documentation and the API key and workspace guidance, checked on 20 November 2026 and paraphrased. The pipeline and its capacities are my own; the capacity model is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A freight forwarder processes customs documents: invoices and packing lists arrive by email, Claude (Sonnet 5.5) extracts and validates the fields against a tariff extract, results go into the ERP, flagged documents go to customs brokers, and broker corrections feed back into the prompts. Peak season triples the volume.</p></div>
+
+			<!-- ===== Stages ===== -->
+			<h2 id="s1">Four stages, three requirements</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">A grid to walk any architecture through (my framing).</span></p>
+				<ul>
+					<li><strong>Input</strong> (email intake, file parsing, queues): scale means burst handling and back-pressure; access control means who can send content in, and whether that content is trusted.</li>
+					<li><strong>Processing</strong> (Claude calls, tools, retrieval): scale means rate limits, latency and cost per item; access control means what each call can read and do.</li>
+					<li><strong>Output</strong> (ERP writes, notifications): scale means the downstream system's capacity; access control means the credentials the writer holds and whether writes can be repeated safely.</li>
+					<li><strong>Feedback</strong> (human review, corrections, evaluation): scale means reviewer capacity; maintainability means corrections reach prompts and tests through a controlled change, not ad hoc edits.</li>
+				</ul>
+				<p>For each cell, ask: what is the stated requirement, what is the capacity or control, and what happens at the stated condition?</p>
+			</div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s2">The model's limits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">What the Messages API actually caps.</span></p>
+				<ul>
+					<li><strong>Three rate limits per model:</strong> requests per minute (RPM), input tokens per minute (ITPM) and output tokens per minute (OTPM), set by the organisation's usage tier. For Sonnet 5.5 they are 4,000 / 2,000,000 / 400,000 on the Start tier and 10,000 / 5,000,000 / 1,000,000 on Build. Exceeding any one returns a 429 that names it.</li>
+					<li><strong>Token bucket:</strong> capacity refills continuously, so short bursts can trip a limit even when the per-minute average is fine.</li>
+					<li><strong>Cache-aware ITPM:</strong> only uncached input counts. Tokens read from the prompt cache don't count toward ITPM, so caching a large, repeated prefix raises effective throughput.</li>
+					<li><strong>Ramp limits:</strong> a sharp increase in usage can return 429 below the rate limits; grow by about a step per minute, and start bulk jobs slowly. The Message Batches API isn't subject to ramp limits and has its own limits, including a cap on batch requests in the processing queue.</li>
+					<li><strong>Spend caps:</strong> each tier has a monthly cap; reaching it returns a 429 with no <code>retry-after</code>, and retries keep failing until the month resets or the tier rises.</li>
+					<li><strong>Workspaces:</strong> you can give each workspace lower limits so one workload can't starve another; organisation limits always apply.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Load ===== -->
+			<h2 id="s3">Finding the first to fail under load</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Utilisation of every component at the stated load.</span></p>
+				<div class="code"><span class="file">first_to_fail.py (first_to_fail.py)</span>
+<pre><code>"""Which component of the customs-document pipeline fails first under a given load?
+
+Each component has a capacity per minute; demand is derived from the documents arriving per minute.
+Utilisation above 100% means that component is the binding constraint. Limits for the model are the
+Messages API's per-model RPM, ITPM (uncached input only) and OTPM for the organisation's tier."""
+from dataclasses import dataclass
+
+
+@dataclass
+class Load:
+    docs_per_min: float
+    calls_per_doc: int = 2               <span class="c"># extract, then validate</span>
+    prompt_tokens: int = 12_000          <span class="c"># instructions + tariff extract, identical on every call</span>
+    doc_tokens: int = 6_000              <span class="c"># the document itself, different every time</span>
+    output_tokens: int = 900
+    cache_hit_rate: float = 0.0          <span class="c"># share of prompt_tokens read from the cache</span>
+
+
+@dataclass
+class Limits:                            <span class="c"># Sonnet 5.5, Start tier (rate limits page, Nov 2026)</span>
+    rpm: int = 4_000
+    itpm: int = 2_000_000
+    otpm: int = 400_000
+    erp_writes_per_min: int = 400        <span class="c"># the ERP's import API</span>
+    reviewers: int = 14                  <span class="c"># customs brokers checking flagged documents</span>
+    review_minutes: float = 4.0
+    flag_rate: float = 0.05              <span class="c"># share of documents sent to a broker</span>
+
+
+def utilisation(load: Load, lim: Limits) -&gt; dict:
+    calls = load.docs_per_min * load.calls_per_doc
+    uncached = load.prompt_tokens * (1 - load.cache_hit_rate) + load.doc_tokens
+    return {
+        "model RPM": calls / lim.rpm,
+        "model ITPM": calls * uncached / lim.itpm,              <span class="c"># cache reads don't count toward ITPM</span>
+        "model OTPM": calls * load.output_tokens / lim.otpm,
+        "ERP import": load.docs_per_min / lim.erp_writes_per_min,
+        "broker review": load.docs_per_min * lim.flag_rate * lim.review_minutes / lim.reviewers,
+    }
+
+
+def first_to_fail(load: Load, lim: Limits) -&gt; tuple[str, float]:
+    name, u = max(utilisation(load, lim).items(), key=lambda kv: kv[1])
+    return name, round(u, 2)
+
+
+if __name__ == "__main__":
+    lim = Limits()
+    for label, load in [("normal: 20 docs/min", Load(docs_per_min=20)),
+                        ("peak x3, no caching", Load(docs_per_min=60)),
+                        ("peak x3, 90% cache hits", Load(docs_per_min=60, cache_hit_rate=0.9))]:
+        u = utilisation(load, lim)
+        print(f"{label:24} " + "  ".join(f"{k} {v:.0%}" for k, v in u.items()))
+        print(f"{'':24} highest: {first_to_fail(load, lim)}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>normal: 20 docs/min      model RPM 1%  model ITPM 36%  model OTPM 9%  ERP import 5%  broker review 29%
+                         highest: ('model ITPM', 0.36)
+peak x3, no caching      model RPM 3%  model ITPM 108%  model OTPM 27%  ERP import 15%  broker review 86%
+                         highest: ('model ITPM', 1.08)
+peak x3, 90% cache hits  model RPM 3%  model ITPM 43%  model OTPM 27%  ERP import 15%  broker review 86%
+                         highest: ('broker review', 0.86)</code></pre></div>
+				<ul>
+					<li><strong>At peak without caching</strong>, input tokens per minute hit 108%: each call sends a 12,000-token instruction and tariff prefix plus a 6,000-token document. RPM is only 3%, so "add more workers" or "request more RPM" doesn't help.</li>
+					<li><strong>Caching the prefix</strong> takes ITPM to 43%, because cache reads don't count. The model is no longer the constraint.</li>
+					<li><strong>The broker queue is next</strong> at 86%: a human feedback stage, not a technical one, and the next one to fail if volume grows further.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Use a more capable model" or "add retries"</strong> are common wrong answers to a throughput failure. A bigger model doesn't change the limit that binds, and retries add load to a component already over capacity.</p></div>
+			</div>
+
+			<!-- ===== After ===== -->
+			<h2 id="s4">After the first bottleneck</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Each fix moves the constraint somewhere else.</span></p>
+				<ul>
+					<li><strong>Model limits:</strong> cache stable prefixes, trim what's sent, move non-urgent work to Message Batches (half price, within 24 hours), raise the tier, or isolate workloads in workspaces with their own limits.</li>
+					<li><strong>Peak arrival:</strong> a queue between intake and processing smooths bursts and respects ramp limits, at the cost of latency.</li>
+					<li><strong>Downstream writes:</strong> batch ERP writes and make them idempotent, so a retried write doesn't duplicate a record.</li>
+					<li><strong>Human review:</strong> tune the flag rate with evaluation data, add reviewers for the season, or prioritise the queue by risk.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Trust ===== -->
+			<h2 id="s5">Failing first under a trust condition</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">When the condition is untrusted input or a new party, not load.</span></p>
+				<ul>
+					<li><strong>Untrusted documents:</strong> inbound email is attacker-controlled. If the extraction step also holds a tool that writes to the ERP, an instruction hidden in an invoice can reach it. The component that fails first is the one combining untrusted input with write access; split reading from writing and validate outputs before the write.</li>
+					<li><strong>A second client or business unit:</strong> one shared API key, one retrieval index without per-tenant filtering, or one reviewer queue with everyone's documents fails access control first. Separate workspaces with workspace-scoped keys, tenant filters on retrieval, and per-tenant queues.</li>
+					<li><strong>Keys in the wrong place:</strong> a key in a browser or desktop client can be read by anyone; calls belong in the back end, with IP allowlisting limiting where a leaked key works.</li>
+					<li><strong>Broad credentials:</strong> an output connector with admin rights turns any processing error into a data-integrity incident; give it only the operations it needs.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Maintain ===== -->
+			<h2 id="s6">Maintainability</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Signs an architecture won't stay correct as it changes.</span></p>
+				<ul>
+					<li><strong>Prompts and tariff data hard-coded</strong> in several services, so one change needs several releases.</li>
+					<li><strong>Corrections applied directly to prompts</strong> without an evaluation set, so a fix for one document type breaks another unnoticed.</li>
+					<li><strong>No per-stage metrics:</strong> without throughput, error and queue-length figures for each stage, the first-to-fail component is found in production.</li>
+					<li><strong>Model choice baked in:</strong> pin model IDs in configuration with a tested upgrade path.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Walk input, processing, output and feedback against each stated requirement: scalability, maintainability, access control.</li>
+				<li>The Messages API limits RPM, ITPM and OTPM per model by tier, with token-bucket refills, ramp limits on sharp increases, and spend caps that return a 429 without <code>retry-after</code>.</li>
+				<li>Cache reads don't count toward ITPM, so caching a large repeated prefix often removes an input-token bottleneck; Batches suit non-urgent work and skip ramp limits.</li>
+				<li>Compute utilisation for every component at the stated load; the highest one fails first, and fixing it moves the constraint, often to a human review queue.</li>
+				<li>Under a trust condition, the first to fail is the component that mixes untrusted input with write access, or shares keys, indexes or queues across parties.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-1.html"><small>Previous</small>1.1: Task Delegation Between Claude and Humans</a>
+				<a class="next" href="index.html#d1"><small>Next</small>Domain 1</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the example pipeline and code are original.</div>
+</footer>
+
+</body>
+</html>
