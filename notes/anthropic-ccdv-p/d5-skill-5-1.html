@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.1: Evaluation System Design | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 5.1: offline evaluation systems for Claude applications: golden sets, capability and regression suites, behavioural checks, pass@k and pass^k, retrieval precision and groundedness, CI release gates for prompt, model and agent changes, and keeping suites valid against contamination, saturation and coverage gaps, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Evaluation Engineering and Quality Assurance &middot; 12%</span>
+		<h1>5.1: Evaluation System Design</h1>
+		<p>An offline evaluation system decides whether a prompt, model or agent change ships. This page builds one: the kinds of suites it holds, the metrics for retrieval and grounding, the gate CI runs, and the upkeep that stops the suite from quietly measuring the wrong thing.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Golden sets</span><span class="tag">Regression suites</span><span class="tag">CI gates</span><span class="tag">Suite health</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What the suite contains</a></li>
+				<li><a href="#s2">Trials, graders and pass@k</a></li>
+				<li><a href="#s3">Retrieval and groundedness metrics</a></li>
+				<li><a href="#s4">The CI release gate</a></li>
+				<li><a href="#s5">Keeping the suite valid</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.1</span>
+				<p><strong>Evaluation System Design</strong>: "Evaluating and designing offline evaluation systems for Claude applications, including golden sets, regression suites, behavioral checks, CI/CD evaluation gates, retrieval precision and groundedness metrics, and release criteria for prompt, model, and agent changes, and maintaining suite validity over time against contamination, saturation, and coverage gaps."</p>
+			</div>
+			<p>Exam items describe an evaluation setup that let a bad change through, or that stopped telling the team anything, and ask what to change. Building a single evaluation is <a href="../anthropic-ccdv-f/d4-skill-4-1.html">CCDV-F 4.1</a>; finding the missing dimension after an incident is <a href="../anthropic-ccar-p/d4-skill-4-1.html">CCAR-P 4.1</a>; calibrating model graders is <a href="d5-skill-5-2.html">skill 5.2</a>.</p>
+			<p>Sources: Anthropic&rsquo;s "Demystifying evals for AI agents" (January 2026, read on 21 November 2026) and the define-success and develop-tests pages used earlier, paraphrased. The thresholds, coverage rule and contamination check are my own; the car maker, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A car maker&rsquo;s dealer-support assistant answers warranty, parts and recall questions from technical bulletins. Prompts change weekly, the model changes a few times a year, and a wrong warranty answer costs real money.</p></div>
+
+			<!-- ===== Contents ===== -->
+			<h2 id="s1">What the suite contains</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Different suites answer different questions.</span></p>
+				<ul>
+					<li><strong>Golden set:</strong> labelled questions with reference answers and the passages that support them, stratified to match production traffic by segment (warranty, parts, recalls), with edge cases on top.</li>
+					<li><strong>Regression suite:</strong> "does it still handle what it used to?" It should pass nearly 100%. Every incident adds its captured requests here (<a href="d4-skill-4-2.html">skill 4.2</a>).</li>
+					<li><strong>Capability suite:</strong> "what can it do well?" It starts with a low pass rate and measures improvement. Tasks that pass consistently graduate to the regression suite.</li>
+					<li><strong>Behavioural checks:</strong> must-pass rules: decline out-of-scope requests, say "not found" when the bulletins don&rsquo;t cover it, never promise a price or a goodwill payment.</li>
+					<li><strong>Where to start:</strong> Anthropic suggests 20 to 50 simple tasks drawn from real failures, with a reference solution for each, and warns evals get harder to build the longer you wait.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Trials ===== -->
+			<h2 id="s2">Trials, graders and pass@k</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Vocabulary from Anthropic&rsquo;s agent-evals guidance.</span></p>
+				<ul>
+					<li><strong>Task, trial, transcript, outcome:</strong> a task is one test; each attempt is a trial; the transcript records everything; the outcome is the final state (a warranty claim actually created, not the agent saying it was).</li>
+					<li><strong>pass@k versus pass^k:</strong> pass@k is the chance at least one of k trials succeeds; pass^k that all k do. A 75% task has pass^3 of about 42%. Use pass^k where consistency matters, as for a dealer who asks once and acts.</li>
+					<li><strong>Graders:</strong> code graders are fast, cheap and reproducible but brittle; model graders capture nuance but need calibration against human labels; human grading is the gold standard but slow. "Deterministic graders where possible, LLM graders where necessary."</li>
+					<li><strong>Grade outcomes, not exact paths,</strong> with partial credit for multi-part tasks. Insisting on one tool sequence fails valid solutions.</li>
+					<li><strong>Isolate trials:</strong> each starts from a clean environment. Anthropic describes Claude gaining an unfair advantage by reading the git history of earlier trials.</li>
+					<li><strong>Read transcripts:</strong> failures should look fair. A task at 0% across many trials is usually a broken task, not an incapable agent.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Retrieval ===== -->
+			<h2 id="s3">Retrieval and groundedness metrics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Measure retrieval and answers separately.</span></p>
+				<ul>
+					<li><strong>Retrieval precision at k:</strong> of the top k passages, how many are relevant. Recall at k: whether the passage holding the answer is among them. Labelled questions record the gold passages, so both are code-graded.</li>
+					<li><strong>Groundedness:</strong> the share of claims in the answer supported by a retrieved passage. Citations make this checkable claim by claim (<a href="d2-skill-2-4.html">skill 2.4</a>).</li>
+					<li><strong>Correctness:</strong> whether the answer matches the reference. A grounded answer can still be wrong if it cited an outdated bulletin, so keep both.</li>
+					<li><strong>Not-found accuracy:</strong> questions the library can&rsquo;t answer, where the right output is "not found".</li>
+				</ul>
+			</div>
+
+			<!-- ===== Gate ===== -->
+			<h2 id="s4">The CI release gate</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">Release criteria as code (my thresholds).</span></p>
+				<div class="code"><span class="file">gate.py (gate.py)</span>
+<pre><code>"""CI evaluation gate for a car maker's dealer-support assistant (warranty rules and parts lookup).
+Runs on every prompt, model or agent change; the thresholds are the team's release criteria."""
+
+CRITERIA = {
+    "regression_pass_hat_3": 0.98,   <span class="c"># pass^3: all three trials pass; consistency matters for dealers</span>
+    "capability_drop": 0.02,         <span class="c"># capability suite may not drop more than 2 points</span>
+    "segment_floor": 0.85,           <span class="c"># every segment, not just the average</span>
+    "retrieval_precision_at_5": 0.80,
+    "groundedness": 0.97,            <span class="c"># share of answer claims supported by a retrieved passage</span>
+    "behavioural": 1.00,             <span class="c"># must-pass checks: out-of-scope refusal, "not found", no price promises</span>
+}
+
+
+def pass_at_k(trials: list[bool]) -&gt; bool:
+    return any(trials)
+
+
+def pass_hat_k(trials: list[bool]) -&gt; bool:
+    return all(trials)
+
+
+def gate(results: dict, baseline: dict) -&gt; list[str]:
+    fails = []
+    reg = [pass_hat_k(t) for t in results["regression"].values()]
+    if sum(reg) / len(reg) &lt; CRITERIA["regression_pass_hat_3"]:
+        fails.append(f"regression pass^3 {sum(reg) / len(reg):.2f}")
+    cap = sum(pass_at_k(t[:1]) for t in results["capability"].values()) / len(results["capability"])
+    if baseline["capability"] - cap &gt; CRITERIA["capability_drop"]:
+        fails.append(f"capability {cap:.2f} vs {baseline['capability']:.2f}")
+    for seg, score in results["segments"].items():
+        if score &lt; CRITERIA["segment_floor"]:
+            fails.append(f"segment {seg} at {score:.2f}")
+    for metric in ("retrieval_precision_at_5", "groundedness", "behavioural"):
+        if results[metric] &lt; CRITERIA[metric]:
+            fails.append(f"{metric} {results[metric]:.2f} &lt; {CRITERIA[metric]:.2f}")
+    return fails</code></pre></div>
+				<ul>
+					<li><strong>Runs on every change type:</strong> prompt edits, model version changes, agent and tool changes, retrieval re-indexes.</li>
+					<li><strong>Regression by pass^3:</strong> three trials each, all must pass, at least 98% of tasks.</li>
+					<li><strong>Capability can&rsquo;t fall</strong> more than two points against the current release, compared on the same tasks.</li>
+					<li><strong>Every segment has a floor:</strong> recalls at 80% fails the release even though the average looks fine.</li>
+					<li><strong>Retrieval, groundedness and behavioural checks</strong> have their own thresholds; behavioural checks must all pass.</li>
+					<li><strong>Different changes, different extras:</strong> a model change also gets shadow traffic before rollout; a prompt change can rely on replays (<a href="../anthropic-ccar-p/d4-skill-4-2.html">CCAR-P 4.2</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Health ===== -->
+			<h2 id="s5">Keeping the suite valid</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.1</span><span class="skill-text">A living artefact with an owner.</span></p>
+				<div class="code"><span class="file">health.py (health.py)</span>
+<pre><code>"""Keep the suite valid over time: saturation, coverage gaps and contamination (my checks)."""
+import hashlib
+import re
+
+
+def saturated(history: dict[str, list[float]], ceiling=0.95, releases=3) -&gt; list[str]:
+    """Capability tasks passing near 100% for several releases give no signal: graduate them."""
+    return [t for t, h in history.items() if len(h) &gt;= releases and min(h[-releases:]) &gt;= ceiling]
+
+
+def coverage_gaps(production_mix: dict[str, float], tasks_per_segment: dict[str, int], total=400) -&gt; list[str]:
+    """Segments with fewer tasks than their share of real traffic warrants (at least 20 each)."""
+    out = []
+    for seg, share in production_mix.items():
+        need = max(20, round(share * total))
+        if tasks_per_segment.get(seg, 0) &lt; need:
+            out.append(f"{seg}: {tasks_per_segment.get(seg, 0)} tasks, need {need}")
+    return out
+
+
+def _shingles(text: str, n=8) -&gt; set:
+    words = re.findall(r"\w+", text.lower())
+    return {hashlib.sha1(" ".join(words[i:i + n]).encode()).hexdigest() for i in range(len(words) - n + 1)}
+
+
+def contaminated(tasks: dict[str, str], exposed: list[str], threshold=0.3) -&gt; list[str]:
+    """Tasks whose text largely appears in prompt examples, the retrieval corpus or published docs."""
+    pool = set().union(*(_shingles(x) for x in exposed)) if exposed else set()
+    return [tid for tid, text in tasks.items() if (s := _shingles(text)) and len(s &amp; pool) / len(s) &gt;= threshold]</code></pre></div>
+				<ul>
+					<li><strong>Saturation:</strong> "An eval at 100% tracks regressions but provides no signal for improvement." Tasks at or near the ceiling for several releases graduate to regression, and new harder tasks replace them.</li>
+					<li><strong>Coverage gaps:</strong> compare tasks per segment with the production mix. Recalls are 10% of traffic but have 12 tasks, so the suite can&rsquo;t detect a recall regression.</li>
+					<li><strong>Contamination</strong> (my check): a test question that also appears in the prompt&rsquo;s few-shot examples, the retrieval corpus or published material measures recall of the example, not the skill. Flag tasks with high text overlap and replace them; keep a held-out set that never goes into prompts.</li>
+					<li><strong>Staleness:</strong> bulletins change; a reference answer from last year&rsquo;s warranty terms now fails a correct model. Re-label on a schedule and when the source changes.</li>
+					<li><strong>Ownership:</strong> Anthropic suggests an evals team owning the infrastructure while domain experts and product teams contribute tasks, with maintenance as routine as unit tests.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"The suite has been at 99% for months, so quality is stable"</strong> may mean the suite is saturated, missing a segment, or contaminated by examples copied into the prompt. A suite that never fails a release isn&rsquo;t evidence of quality; check its health before trusting its verdict.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Keep separate golden, regression (near 100%), capability (starts low) and behavioural (must-pass) suites; start with 20 to 50 tasks from real failures.</li>
+				<li>Run several trials, choose pass@k or pass^k by whether consistency matters, grade outcomes, isolate trials, and read transcripts.</li>
+				<li>Measure retrieval precision and recall, groundedness, correctness and not-found accuracy separately.</li>
+				<li>Gate every prompt, model, agent and index change in CI with per-segment floors, not only an average.</li>
+				<li>Maintain the suite: graduate saturated tasks, fill coverage gaps from the production mix, remove contaminated tasks, refresh stale labels, and give it an owner.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-2.html"><small>Previous</small>4.2: Incident Response and Learning Loops</a>
+				<a class="next" href="d5-skill-5-2.html"><small>Next</small>5.2: LLM-as-Judge Engineering</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

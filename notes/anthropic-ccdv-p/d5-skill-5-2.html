@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.2: LLM-as-Judge Engineering | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 5.2: measuring an LLM-as-judge against human-labelled data: weighted kappa and leniency per criterion, the human inter-rater ceiling, rubric design with anchors and checks, position, verbosity and self-preference effects, and judge drift across model versions, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Evaluation Engineering and Quality Assurance &middot; 12%</span>
+		<h1>5.2: LLM-as-Judge Engineering</h1>
+		<p>A model grader is a measuring instrument, and an uncalibrated instrument can gate releases with confident nonsense. This page measures a judge against people, criterion by criterion, sets realistic targets from how well people agree with each other, and keeps the judge honest when its own model changes.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">LLM-as-judge</span><span class="tag">Calibration</span><span class="tag">Kappa</span><span class="tag">Judge drift</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Calibrating against human labels</a></li>
+				<li><a href="#s2">Inter-rater reliability sets the ceiling</a></li>
+				<li><a href="#s3">Rubric design</a></li>
+				<li><a href="#s4">Bias and position effects</a></li>
+				<li><a href="#s5">Judge drift across model versions</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.2</span>
+				<p><strong>LLM-as-Judge Engineering</strong>: "Analyzing LLM-as-judge evaluator quality against human-labeled data, including calibration, rubric design, bias and position effects, inter-rater reliability, and judge drift across model versions."</p>
+			</div>
+			<p>Exam items give agreement figures between a judge and human raters and ask whether the judge can be trusted, what is wrong with it, or what to do first. The four classic biases and their corrections are in <a href="../anthropic-ccar-p/d4-skill-4-3.html">CCAR-P 4.3</a>; this page is about measuring a judge&rsquo;s quality in the first place.</p>
+			<p>Sources: Anthropic&rsquo;s develop-tests page and "Demystifying evals for AI agents", as used on earlier pages, paraphrased. Kappa, the thresholds and the ceiling rule are general evaluation statistics or my own choices, labelled as such. The utility company, files and code are original; the code is tested on synthetic labels.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A water utility drafts replies to customer emails with Claude. A judge model scores every draft from 1 to 5 on accuracy (billing facts), tone and policy (what the utility may promise). The team wants the judge to replace human spot checks in the release gate.</p></div>
+
+			<!-- ===== Calibration ===== -->
+			<h2 id="s1">Calibrating against human labels</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Per criterion, on a labelled set, before the judge gates anything.</span></p>
+				<div class="code"><span class="file">judge_quality.py (judge_quality.py)</span>
+<pre><code>"""Measure an LLM judge against human labels before it gates anything.
+Scores are 1-5 per criterion on drafted customer emails (accuracy, tone, policy)."""
+from collections import Counter
+
+
+def weighted_kappa(a: list[int], b: list[int], k=5) -&gt; float:
+    """Quadratic-weighted Cohen's kappa: agreement beyond chance, near misses penalised less."""
+    n = len(a)
+    obs = sum((x - y) ** 2 for x, y in zip(a, b)) / n
+    ca, cb = Counter(a), Counter(b)
+    exp = sum(ca[i] * cb[j] * (i - j) ** 2 for i in range(1, k + 1) for j in range(1, k + 1)) / n ** 2
+    return 1 - obs / exp if exp else 1.0
+
+
+def calibration(judge: dict, human_a: dict, human_b: dict) -&gt; dict:
+    """Per criterion: judge vs the human consensus, the human-human ceiling, and leniency."""
+    out = {}
+    for crit in judge:
+        consensus = [round((x + y) / 2) for x, y in zip(human_a[crit], human_b[crit])]
+        out[crit] = {
+            "judge_kappa": round(weighted_kappa(judge[crit], consensus), 2),
+            "human_kappa": round(weighted_kappa(human_a[crit], human_b[crit]), 2),   <span class="c"># the realistic ceiling</span>
+            "leniency": round(sum(judge[crit]) / len(judge[crit]) - sum(consensus) / len(consensus), 2),
+        }
+    return out
+
+
+def verdict(c: dict, min_ratio=0.85, max_leniency=0.3) -&gt; dict:
+    """Trust a criterion when the judge isn't systematically kind or harsh and gets close to human-human agreement."""
+    v = {}
+    for crit, m in c.items():
+        if m["human_kappa"] &lt; 0.6:
+            v[crit] = "fix the rubric first: people don't agree either"
+        elif abs(m["leniency"]) &gt; max_leniency:
+            v[crit] = "judge is systematically offset: anchor the score bands, then re-measure"
+        elif m["judge_kappa"] &lt; min_ratio * m["human_kappa"]:
+            v[crit] = "judge below human agreement: add anchors, split into checks, or keep humans"
+        else:
+            v[crit] = "trusted for gating"
+    return v
+
+
+def drift(old: dict, new: dict, tolerance=0.05) -&gt; list[str]:
+    """Rerun the same calibration set on a new judge model version before switching."""
+    return [f"{c}: kappa {old[c]['judge_kappa']} -&gt; {new[c]['judge_kappa']}"
+            for c in old if old[c]["judge_kappa"] - new[c]["judge_kappa"] &gt; tolerance]</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output on 200 labelled drafts)</span>
+<pre><code>accuracy {'judge_kappa': 0.91, 'human_kappa': 0.91, 'leniency': -0.03} -&gt; trusted for gating
+tone {'judge_kappa': 0.76, 'human_kappa': 0.91, 'leniency': 0.73} -&gt; judge is systematically offset: anchor the score bands, then re-measure
+policy {'judge_kappa': 0.03, 'human_kappa': 0.91, 'leniency': 0.05} -&gt; judge below human agreement: add anchors, split into checks, or keep humans</code></pre></div>
+				<ul>
+					<li><strong>Anthropic&rsquo;s rule:</strong> test a model grader&rsquo;s reliability first, then scale; model graders need calibration against human graders.</li>
+					<li><strong>Label a set:</strong> a few hundred outputs, each scored independently by two people, covering every segment and the hard cases.</li>
+					<li><strong>Measure agreement beyond chance:</strong> weighted kappa (quadratic) treats a 4-versus-5 disagreement as smaller than 1-versus-5. Raw percent agreement looks good when most scores are the same.</li>
+					<li><strong>Measure leniency separately:</strong> the mean difference between judge and humans. A judge can rank drafts like people do and still score everything a point higher.</li>
+					<li><strong>Per criterion:</strong> here accuracy is trusted, tone is a point too generous, and the policy scores are unrelated to human judgement. One overall agreement figure would have hidden the policy problem.</li>
+				</ul>
+			</div>
+
+			<!-- ===== IRR ===== -->
+			<h2 id="s2">Inter-rater reliability sets the ceiling</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Compare the judge with how well people agree.</span></p>
+				<ul>
+					<li><strong>Human-human agreement</strong> is the realistic target. If two trained raters agree at a kappa of 0.91, a judge at 0.88 is close to human; if they agree at 0.55, no judge can be validated, because the criterion itself is unclear.</li>
+					<li><strong>The rules in <code>verdict()</code></strong> (my thresholds): fix the rubric when people don&rsquo;t agree (below 0.6); recalibrate when the judge is offset by more than 0.3 points; keep humans when the judge reaches less than 85% of human agreement.</li>
+					<li><strong>Resolve human disagreements</strong> into a consensus label, and record cases people disagreed on: they are often where the rubric needs a rule.</li>
+					<li><strong>Enough labels per segment:</strong> a judge can be good on billing emails and poor on complaints; measure where it will be used.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Rubric ===== -->
+			<h2 id="s3">Rubric design</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Make the judge&rsquo;s job specific.</span></p>
+				<ul>
+					<li><strong>Anthropic&rsquo;s tips:</strong> detailed, clear rubrics (possibly several per criterion), specific outputs (correct or incorrect, or a 1&ndash;5 scale), and reasoning before the score.</li>
+					<li><strong>Anchors for every score:</strong> what a 2 and a 4 look like for tone, with a short example of each. Unanchored scales drift toward the generous middle, which is where the tone offset comes from.</li>
+					<li><strong>Split vague criteria into checks:</strong> "follows policy" becomes yes/no questions: promises a refund amount? commits to a repair date? mentions a payment plan only when eligible? Binary checks agree better, and some can be code-graded.</li>
+					<li><strong>Give the judge the facts it needs:</strong> the account data and the policy text, so accuracy is checked against a source, not the judge&rsquo;s own knowledge.</li>
+					<li><strong>Use a different model from the generator,</strong> as Anthropic&rsquo;s grader example does.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Bias ===== -->
+			<h2 id="s4">Bias and position effects</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">Systematic errors to test for.</span></p>
+				<ul>
+					<li><strong>Leniency or severity:</strong> a constant offset from people, as with tone here. Anchors fix it; a score transformation hides it.</li>
+					<li><strong>Verbosity:</strong> longer drafts scored higher when people preferred concise ones. Check scores against length on the labelled set.</li>
+					<li><strong>Self-preference:</strong> a judge favouring outputs from its own model; use a different judge model.</li>
+					<li><strong>Position effects in pairwise comparison:</strong> verdicts that change when the two answers swap places; judge both orders and count only consistent wins. Absolute scoring against a rubric, as here, avoids order effects but still needs calibration.</li>
+					<li><strong>Diagnose before correcting:</strong> each bias has its own signature, and a fix for one doesn&rsquo;t help another (<a href="../anthropic-ccar-p/d4-skill-4-3.html">CCAR-P 4.3</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Drift ===== -->
+			<h2 id="s5">Judge drift across model versions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.2</span><span class="skill-text">The judge is a dependency with versions.</span></p>
+				<ul>
+					<li><strong>Pin the judge&rsquo;s model ID and prompt,</strong> and record them with every score, so results from different months are comparable.</li>
+					<li><strong>Rerun calibration on any judge change:</strong> a new judge model, a rubric edit or a retiring snapshot. <code>drift()</code> flags criteria whose kappa fell by more than 0.05.</li>
+					<li><strong>Re-check on a schedule</strong> even without changes, because the outputs being judged change: a new generator model may write differently enough to move a judge that was calibrated on older drafts.</li>
+					<li><strong>Don&rsquo;t switch judges mid-comparison:</strong> a release compared with its baseline by two different judges measures the judges.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"The judge agrees with humans 90% of the time overall, so let it gate releases"</strong> can hide a criterion where it agrees no better than chance, or a consistent one-point generosity. Calibrate per criterion with chance-corrected agreement and leniency, compare with human-human agreement, and only then give it gating authority.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Calibrate before scaling: a labelled set scored by two people, measured per criterion with weighted kappa and leniency.</li>
+				<li>Human-human agreement is the ceiling; if people don&rsquo;t agree, fix the rubric before blaming the judge.</li>
+				<li>Anchor every score, split vague criteria into yes/no checks, give the judge source facts, and use a different model from the generator.</li>
+				<li>Test for leniency, verbosity, self-preference and, in pairwise setups, position effects; diagnose before correcting.</li>
+				<li>Pin the judge, rerun calibration on any change and on a schedule, and never compare releases scored by different judges.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-1.html"><small>Previous</small>5.1: Evaluation System Design</a>
+				<a class="next" href="index.html#d5"><small>Next</small>Domain 5</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the utility, files and code are original.</div>
+</footer>
+
+</body>
+</html>
