@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>6.1: Context Management for Long-Running Sessions | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 6.1 (7 December 2026 guide): recognising context bloat and drift in a long session or agent, and choosing between tool-output pruning with context editing, compaction (threshold or on demand, and /compact in Claude Code), subagent isolation, and starting a fresh session with a summary.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d6">Domain 6</a><span class="sep">/</span><span class="here">6.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 6 &middot; Prompt and Context Engineering &middot; 15%</span>
+		<h1>6.1: Context Management for Long-Running Sessions</h1>
+		<p>When a long session or agent starts to slow, forget or wander: working out what is filling the context, and choosing between clearing old tool output, summarising the conversation, moving work to a subagent, or starting again.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Context window</span><span class="tag">Compaction</span><span class="tag">Context editing</span><span class="tag">Subagents</span><span class="tag">Fresh sessions</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Bloat or drift</a></li>
+				<li><a href="#s2">Choosing the technique</a></li>
+				<li><a href="#s3">Tool-output pruning</a></li>
+				<li><a href="#s4">Compaction</a></li>
+				<li><a href="#s5">Subagent isolation</a></li>
+				<li><a href="#s6">When to start fresh</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 6.1</span>
+				<p><strong>Context Management for Long-Running Sessions</strong>: "Analyzing context bloat or drift in a long-running session or agent and selecting the management technique that restores intended behavior, such as compaction, tool-output pruning, subagent isolation, or criteria for starting a fresh session."</p>
+			</div>
+			<p>Exam items describe a session that has gone wrong and ask which technique fixes it. The answer depends on what is in the context, not just how much. The architect notes cover keeping exact facts through summarisation (<a href="../anthropic-ccar-f/d5-task-5-1.html">task 5.1</a>) and long codebase exploration (<a href="../anthropic-ccar-f/d5-task-5-4.html">task 5.4</a>). This page is about the API and Claude Code mechanics, and how to choose between them.</p>
+			<p>Sources: Claude's documentation on context windows, context editing and compaction (threshold and on demand), and the Claude Code documentation on the context window, checked on 19 and 20 November 2026 and paraphrased. The example was tested with the anthropic Python SDK 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's investigation agent spends a day on refund disputes. It calls an order API dozens of times, the conversation grows past 100,000 tokens, its answers start contradicting earlier findings, and in the afternoon it's asked to switch to planning a CSV export.</p></div>
+
+			<!-- ===== Diagnose ===== -->
+			<h2 id="s1">Bloat or drift</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Two problems with different fixes.</span></p>
+				<ul>
+					<li><strong>Bloat:</strong> the window is filling. Requests get slower and costlier, and accuracy falls as the token count grows (context rot). Ask what the tokens are. Old tool results, conversation turns and file contents each need a different remedy.</li>
+					<li><strong>Drift:</strong> behaviour has moved away from what was intended. Early instructions are followed less, earlier findings are contradicted, or the agent keeps working from facts that are no longer true. Drift can happen well before the window is full. The usual causes are instructions buried under hours of other material, stale tool results, or a task change that leaves old context misleading.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Choose ===== -->
+			<h2 id="s2">Choosing the technique</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Match the technique to what is filling the window.</span></p>
+				<div class="code"><span class="file">session_policy.py (Python, anthropic SDK)</span>
+<pre><code>"""Pick the context-management technique for a long session from what is actually filling it, then send the request."""
+import anthropic
+
+client = anthropic.Anthropic()
+
+PRUNE = {"edits": [{"type": "clear_tool_uses_20250919",          <span class="c"># drop old tool results, keep the last few</span>
+                    "trigger": {"type": "input_tokens", "value": 80_000},
+                    "keep": {"type": "tool_uses", "value": 3},
+                    "exclude_tools": ["get_case_facts"]}]}          <span class="c"># never clear the facts lookup</span>
+COMPACT = {"edits": [{"type": "compact_20260112",                  <span class="c"># summarise older turns on the server</span>
+                      "trigger": {"type": "input_tokens", "value": 150_000},
+                      "instructions": "Keep order IDs, amounts, dates and every decision verbatim."}]}
+
+
+def diagnose(s: dict) -&gt; str:
+    """s: {"input_tokens", "tool_result_tokens", "task_changed", "stale_reads", "next_step_reads_many_files"}"""
+    if s["task_changed"] or s["stale_reads"]:
+        return "fresh"        <span class="c"># old context is irrelevant or wrong: carry a short summary, not the history</span>
+    if s["next_step_reads_many_files"]:
+        return "subagent"     <span class="c"># keep the bulk reading out of this context altogether</span>
+    if s["input_tokens"] &gt; 60_000 and s["tool_result_tokens"] / s["input_tokens"] &gt; 0.5:
+        return "prune"        <span class="c"># the bloat is tool output: clear it, keep the conversation</span>
+    if s["input_tokens"] &gt; 120_000:
+        return "compact"      <span class="c"># the conversation itself is long: summarise older turns</span>
+    return "none"
+
+
+def send(messages: list, action: str, summary: str = "") -&gt; tuple[list, object]:
+    if action == "fresh":
+        messages = [{"role": "user", "content": f"&lt;summary_of_earlier_work&gt;{summary}&lt;/summary_of_earlier_work&gt;\n"
+                                                f"{messages[-1]['content']}"}]
+    extra = {"prune": {"betas": ["context-management-2025-06-27"], "context_management": PRUNE},
+             "compact": {"betas": ["compact-2026-01-12"], "context_management": COMPACT}}.get(action, {})
+    response = client.beta.messages.create(model="claude-opus-5-5", max_tokens=4000, messages=messages, **extra)
+    <span class="c"># Append the whole content: a compaction block must go back as-is, and the API ignores what came before it.</span>
+    messages.append({"role": "assistant", "content": [b.to_dict() for b in response.content]})
+    return messages, response</code></pre></div>
+				<ul>
+					<li><strong>Old context is wrong or irrelevant</strong> (a task change, stale reads): start fresh with a short summary.</li>
+					<li><strong>The next step reads a lot:</strong> send it to a subagent so the reading never enters this context.</li>
+					<li><strong>Most of the tokens are tool results:</strong> prune them, and keep the conversation.</li>
+					<li><strong>The conversation itself is long:</strong> compact it.</li>
+				</ul>
+				<p>The checks run in that order because the earlier problems aren't solved by the later techniques: compacting a stale context just produces a summary of stale facts. After each call, the whole response content goes back into the history, so a compaction block returns unchanged.</p>
+			</div>
+
+			<!-- ===== Prune ===== -->
+			<h2 id="s3">Tool-output pruning</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Context editing clears old tool results.</span></p>
+				<ul>
+					<li><strong>Setup:</strong> <code>clear_tool_uses_20250919</code> (beta header <code>context-management-2025-06-27</code>) clears the oldest tool results once input passes a trigger, 100,000 tokens by default. It keeps the most recent few (three by default) and leaves a placeholder so Claude knows something was removed. <code>exclude_tools</code> protects results that must stay; here, the case-facts lookup.</li>
+					<li><strong>Your copy stays whole:</strong> the edit happens on the server before the prompt reaches Claude, so your application's history is unchanged. Old thinking blocks can be cleared the same way with <code>clear_thinking_20251015</code>.</li>
+					<li><strong>Prune before it piles up:</strong> trimming each result to the fields the task needs before it enters history is cheaper still (<a href="../anthropic-ccar-f/d5-task-5-1.html#s4">trimming tool results</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Compact ===== -->
+			<h2 id="s4">Compaction</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Summarising older turns, on the server or in Claude Code.</span></p>
+				<ul>
+					<li><strong>At a threshold</strong> (beta, <code>compact-2026-01-12</code>): add a <code>compact_20260112</code> edit. When input passes the trigger (150,000 tokens by default, at least 50,000), the response starts with a <code>compaction</code> block holding the summary. Append the whole response to your history; on later requests the API ignores everything before the block. Use <code>instructions</code> to say what the summary must keep. Billing for that request is the sum of <code>usage.iterations</code>.</li>
+					<li><strong>On demand</strong> (beta): send <code>compaction: {"type": "summarize"}</code> to compact now. You get a signed block back, and send it first in <code>messages</code> in place of what it summarises. This lets your application choose when, for example between tasks, rather than mid-request.</li>
+					<li><strong>Pitfall:</strong> serialising response blocks with a plain <code>model_dump()</code> adds null fields that make the API reject the next request. Use <code>to_dict()</code>, as the example does, or <code>model_dump(exclude_none=True)</code>.</li>
+					<li><strong>In Claude Code:</strong> compaction is automatic near the limit, and <code>/compact keep the refund decisions</code> steers it. Project CLAUDE.md and auto memory are re-read afterwards. Path-scoped rules and everything Claude concluded become part of a summary.</li>
+				</ul>
+				<p>A summary is still lossy. Keep must-not-lose facts in a block or file outside it (<a href="../anthropic-ccar-f/d5-task-5-1.html#s3">case facts</a>).</p>
+			</div>
+
+			<!-- ===== Subagent ===== -->
+			<h2 id="s5">Subagent isolation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Keeping bulk work out of the main context.</span></p>
+				<p>When the next step will read many files, logs or pages, run it in a subagent. Its reads stay in its own context window and only a summary comes back, so the main session stays small without losing anything it needed. It is prevention rather than repair: the cheapest tokens are the ones that never enter the context. Give the subagent a complete brief, since it doesn't see the parent's history.</p>
+			</div>
+
+			<!-- ===== Fresh ===== -->
+			<h2 id="s6">When to start fresh</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Criteria for a clean session.</span></p>
+				<ul>
+					<li><strong>The task changed:</strong> refund disputes are done and the CSV export starts. In Claude Code that's <code>/clear</code>, and the old session stays resumable.</li>
+					<li><strong>Earlier context is stale:</strong> the files or data it read have changed, so its old tool results now mislead.</li>
+					<li><strong>Corrections aren't sticking:</strong> after a couple of failed corrections, the context is full of wrong attempts. Start again with a better first prompt.</li>
+					<li><strong>Compaction has already run several times</strong> and quality keeps falling: a summary of a summary keeps losing detail.</li>
+				</ul>
+				<p>Carry over a short, structured summary of findings, decisions and open questions (the example's <code>&lt;summary_of_earlier_work&gt;</code>), not the old transcript. If most of the earlier context is still valid, resume and say what changed instead (<a href="../anthropic-ccar-f/d1-task-1-7.html#s5">resume or start fresh</a>).</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Diagnose first: bloat (what kind of tokens?) or drift (buried instructions, stale facts, a changed task).</li>
+				<li>Tool results dominate: prune with <code>clear_tool_uses_20250919</code>, protecting must-keep tools with <code>exclude_tools</code>, or trim results before they enter history.</li>
+				<li>Long conversation: compact. Threshold <code>compact_20260112</code> (default 150,000, minimum 50,000) or on-demand <code>compaction: {"type": "summarize"}</code>; send the compaction block back unchanged (<code>to_dict()</code>, not a plain <code>model_dump()</code>); <code>/compact</code> in Claude Code.</li>
+				<li>Bulk reading ahead: a subagent keeps it out of the context altogether.</li>
+				<li>Start fresh, with a structured summary, when the task changes, context is stale, corrections keep failing, or repeated compaction has worn quality down.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-3.html"><small>Previous</small>5.3: Cost Diagnosis and Optimization</a>
+				<a class="next" href="index.html#d6"><small>Next</small>Domain 6</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
