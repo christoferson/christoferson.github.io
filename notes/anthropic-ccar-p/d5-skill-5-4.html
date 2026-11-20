@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.4: Human-in-the-Loop Checkpoints | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 5.4 (7 December 2026 guide): deciding where human checkpoints must sit in an agentic workflow with irreversible or high-stakes actions, and building gates that pause execution (Agent SDK hooks that defer a tool call) without stalling acceptable-risk work, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Governance, Safety, and Risk Management &middot; 16%</span>
+		<h1>5.4: Human-in-the-Loop Checkpoints</h1>
+		<p>Putting a person in front of the actions that can't be undone or that carry real risk, and only those, with gates that park the request until someone decides rather than freezing the whole agent, so the routine work keeps flowing.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Human in the loop</span><span class="tag">Approvals</span><span class="tag">Hooks</span><span class="tag">Agent SDK</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Where checkpoints must sit</a></li>
+				<li><a href="#s2">Gates that pause, not stall</a></li>
+				<li><a href="#s3">Gating a cloud-operations agent</a></li>
+				<li><a href="#s4">Keeping approvals meaningful</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.4</span>
+				<p><strong>Human-in-the-Loop Checkpoints</strong>: "Analyzing where human-in-the-loop checkpoints must sit in an agentic workflow containing irreversible or high-stakes actions, and specifying gates that pause execution without stalling acceptable-risk paths."</p>
+			</div>
+			<p>Exam items describe a workflow with some dangerous actions and ask where approvals go and how, often against a design that gates too much or too little. The guide's own sample question in this area isn't reproduced here. Deciding what a process delegates to Claude at all is <a href="d1-skill-1-1.html">skill 1.1</a>; guardrails without a person are <a href="d5-skill-5-1.html">skill 5.1</a>.</p>
+			<p>Sources: the Agent SDK hooks and permissions documentation, checked on 19 and 20 November 2026 and paraphrased. The agent, risk classes and code are my own; the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A software company's operations agent diagnoses incidents and acts on cloud infrastructure: reads logs and metrics, restarts and scales services, and can (with the right tools) delete volumes, change access policies and deploy.</p></div>
+
+			<!-- ===== Where ===== -->
+			<h2 id="s1">Where checkpoints must sit</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Immediately before the effect, for the actions that need it (my rules).</span></p>
+				<ul>
+					<li><strong>Irreversible:</strong> deleting data, dropping a database, rotating root keys. A person approves every time, in any environment.</li>
+					<li><strong>High blast radius:</strong> access-policy changes, production deploys, changes outside a bounded range. A person approves.</li>
+					<li><strong>Bounded and reversible:</strong> scaling production up to double the current size, restarting a staging service. No gate; monitor and allow rollback.</li>
+					<li><strong>Read-only:</strong> logs, metrics, descriptions. Never gated.</li>
+					<li><strong>At the effect, not the plan:</strong> the gate sits on the tool call that changes the world, so the agent can investigate and prepare freely, and the approver sees the exact action and arguments.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Pause ===== -->
+			<h2 id="s2">Gates that pause, not stall</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">The Agent SDK mechanisms.</span></p>
+				<ul>
+					<li><strong>A PreToolUse hook</strong> can return allow (an empty result), deny, ask or defer for each tool call; when several hooks answer, the most restrictive wins (deny, then defer, then ask, then allow).</li>
+					<li><strong>Defer</strong> ends the turn with stop reason <code>tool_deferred</code>, so the call can be resumed later. Nothing sits waiting on an open process while the approver is at lunch; the application records the request and resumes the session when a decision arrives.</li>
+					<li><strong>Ask</strong> or a <code>can_use_tool</code> callback waits for an answer in the moment, which suits an interactive user beside the agent, not an overnight queue.</li>
+					<li><strong>Deny with a reason</strong> tells the agent why, so it can take another route or report back.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s3">Gating a cloud-operations agent</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">Classify, then allow or defer.</span></p>
+				<div class="code"><span class="file">ops_gates.py (ops_gates.py)</span>
+<pre><code>"""Human checkpoints for a cloud-operations agent, as an Agent SDK PreToolUse hook.
+
+Most actions are routine and run straight away. Irreversible or high-blast-radius ones are deferred:
+the hook returns "defer", the turn ends with stop_reason "tool_deferred", a request goes to the
+on-call engineer, and the session is resumed when they decide. Nothing waits on an open process."""
+import json
+import uuid
+
+PENDING = {}                                     <span class="c"># in production: a table the approval UI reads and writes</span>
+
+
+def classify(tool: str, args: dict) -&gt; str:
+    env = args.get("env", "staging")
+    if tool in ("describe", "get_logs", "get_metrics"):
+        return "auto"                            <span class="c"># read-only</span>
+    if tool in ("restart_service", "scale_service") and env == "staging":
+        return "auto"
+    if tool == "scale_service" and env == "prod" and args.get("replicas", 0) &lt;= 2 * args.get("current", 1):
+        return "auto"                            <span class="c"># bounded and reversible: at most double, scale back any time</span>
+    if tool in ("delete_volume", "drop_database", "change_iam_policy", "rotate_root_keys"):
+        return "human"                           <span class="c"># irreversible or high blast radius</span>
+    if env == "prod":
+        return "human"                           <span class="c"># anything else in production</span>
+    return "auto"
+
+
+async def gate(input_data, tool_use_id, context):
+    tool = input_data["tool_name"].split("__")[-1]
+    args = input_data["tool_input"]
+    if classify(tool, args) == "auto":
+        return {}
+    ticket = str(uuid.uuid4())[:8]
+    PENDING[ticket] = {"tool": tool, "args": args, "tool_use_id": tool_use_id, "status": "waiting"}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "defer",
+            "permissionDecisionReason": f"Sent to on-call for approval (ticket {ticket}). Continue with other work."}}
+
+
+def decide(ticket: str, approved: bool, who: str) -&gt; dict:
+    """Called by the approval UI; the application then resumes the session with the outcome."""
+    PENDING[ticket].update(status="approved" if approved else "rejected", by=who)
+    return PENDING[ticket]</code></pre></div>
+				<ul>
+					<li><strong>Routine paths never wait:</strong> reads, staging restarts and bounded production scaling run straight away. The test checks that scaling from 4 to 6 replicas isn't gated, while 4 to 20 is.</li>
+					<li><strong>Irreversible means everywhere:</strong> dropping a database is deferred even in staging.</li>
+					<li><strong>A safe default:</strong> any production action not explicitly classed as routine goes to a person.</li>
+					<li><strong>The agent keeps working:</strong> the deferral message tells it to carry on with other work while the request waits.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Require approval for every production tool call"</strong> stalls the routine work, builds a queue and trains approvers to click through. <strong>"Let the agent ask the user in chat"</strong> leaves the gate in the model's hands. Gate the specific risky actions, in code.</p></div>
+			</div>
+
+			<!-- ===== Meaningful ===== -->
+			<h2 id="s4">Keeping approvals meaningful</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.4</span><span class="skill-text">So the person actually checks.</span></p>
+				<ul>
+					<li><strong>Show the exact action:</strong> tool, arguments, environment, and the agent's reason, not a summary.</li>
+					<li><strong>Route to someone accountable</strong> for that system, with the authority to say no.</li>
+					<li><strong>Time out to "no":</strong> an unanswered request expires as rejected, never as approved.</li>
+					<li><strong>Watch the rates:</strong> very high approval rates on a gate suggest it could be narrowed; very fast approvals suggest nobody is reading.</li>
+					<li><strong>Log decisions</strong> with who decided, for the audit trail.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Put checkpoints immediately before irreversible or high-blast-radius actions, in every environment; leave read-only and bounded, reversible actions ungated.</li>
+				<li>Gate the effect, not the investigation, and show the approver the exact action.</li>
+				<li>Agent SDK hooks return allow, deny, ask or defer; defer ends the turn with <code>tool_deferred</code> so the call resumes after approval without holding a process open.</li>
+				<li>Use a safe default (unclassified production actions go to a person) and time out to rejection.</li>
+				<li>Too many gates stall work and breed rubber-stamping; too few let the agent act alone on what matters.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-3.html"><small>Previous</small>5.3: Risk Assessment and Ranking</a>
+				<a class="next" href="index.html#d5"><small>Next</small>Domain 5</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the agent and code are original.</div>
+</footer>
+
+</body>
+</html>
