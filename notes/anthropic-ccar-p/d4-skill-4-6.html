@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.6: Cost and Latency Optimization | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 4.6 (7 December 2026 guide): reading cost and latency telemetry, including cache hit rates, to find where spend or latency concentrates, and choosing the optimization (caching, token hygiene, batching, prompt audit, then model or effort) that cuts it without breaking the quality floor, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.6</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Evaluation, Testing, and Optimization &middot; 17%</span>
+		<h1>4.6: Cost and Latency Optimization</h1>
+		<p>Using the telemetry to find the few places where most of the money and waiting goes, then applying the cheapest fix that works there, in the order Anthropic recommends, and stopping at any change that would drop quality below the agreed floor.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Cost</span><span class="tag">Latency</span><span class="tag">Cache hit rate</span><span class="tag">Telemetry</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Where to look in the telemetry</a></li>
+				<li><a href="#s2">Anthropic's order of levers</a></li>
+				<li><a href="#s3">Hot spots and their levers</a></li>
+				<li><a href="#s4">Holding the quality floor</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.6</span>
+				<p><strong>Cost and Latency Optimization</strong>: "Analyzing cost and latency telemetry, including cache hit rates, to determine where spend or latency is concentrated, and specifying the optimization that reduces it without violating the stated quality floor."</p>
+			</div>
+			<p>Exam items show telemetry (cost by route, cache hit rates, latency percentiles) and a quality floor, and ask which change to make. Pricing a single context is <a href="d2-skill-2-4.html">skill 2.4</a>, placing cache breakpoints <a href="d2-skill-2-5.html">skill 2.5</a>, and trading accuracy against latency <a href="d3-skill-3-3.html">skill 3.3</a>; this skill starts from production data.</p>
+			<p>Sources: Anthropic's "Optimizing for cost and intelligence" guidance, the rate limits page and Claude Code best practices, checked on 19 and 20 November 2026 and paraphrased. The telemetry and code are my own; the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An insurance broker's platform runs four Claude routes and spent about $39,400 last month. Leadership wants it cut by a third, and every route has a quality floor of 0.90 on its evaluation set.</p></div>
+
+			<!-- ===== Look ===== -->
+			<h2 id="s1">Where to look in the telemetry</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.6</span><span class="skill-text">The views that locate the spend.</span></p>
+				<ul>
+					<li><strong>Cost by route, feature or agent:</strong> usually a few routes carry most of the spend; start there, not with an across-the-board change.</li>
+					<li><strong>Cache read share:</strong> the share of input tokens read from cache. Anthropic reports a median of 84% for agent loops, and suggests that below about 80% something is breaking the cached prefix. The Console's Usage page charts this cache rate per model.</li>
+					<li><strong>Tokens per request, split by part:</strong> tool definitions, retrieved text, history and output, to see what's growing.</li>
+					<li><strong>Latency percentiles per route</strong>, and whether a person is waiting at all.</li>
+					<li><strong>The tail:</strong> Anthropic recommends pricing the tail of the workload; a few very long sessions can dominate a route's cost.</li>
+					<li><strong>In Claude Code:</strong> <code>/usage</code> breaks usage down by skill, subagent, plugin and MCP server, and flags long context or frequent cache misses.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Order ===== -->
+			<h2 id="s2">Anthropic's order of levers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.6</span><span class="skill-text">Cheapest and safest first.</span></p>
+				<ul>
+					<li><strong>1. Caching</strong>, which Anthropic calls usually the largest lever: no change to answers, lower cost and faster time to first token.</li>
+					<li><strong>2. Token hygiene:</strong> remove unused tool definitions, trim tool results and duplicate text.</li>
+					<li><strong>3. Batching</strong> for unattended work: half price on every token, which Anthropic calls the second-largest free lever after caching for unattended agent work.</li>
+					<li><strong>4. A prompt audit:</strong> instructions that cause long outputs or unnecessary steps.</li>
+					<li><strong>Then model and effort:</strong> upgrade if you're a model or two behind, otherwise sweep effort; tune one model well before adding a second.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Hot ===== -->
+			<h2 id="s3">Hot spots and their levers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.6</span><span class="skill-text">Telemetry by route, then the first lever that applies.</span></p>
+				<div class="code"><span class="file">optimize.py (optimize.py)</span>
+<pre><code>"""Find where spend and latency concentrate, then pick the cheapest safe optimization per hot spot.
+
+Telemetry: one month of request logs from an insurance broker's agent platform, aggregated by route.
+Order of levers follows Anthropic's "Optimizing for cost and intelligence": caching first, then token
+hygiene, then batching, then a prompt audit; model or effort changes only after those, and only if the
+evaluation stays above the quality floor."""
+
+ROUTES = {  <span class="c"># route: monthly cost $, share of input read from cache, p95 s, interactive?, quality on eval</span>
+    "policy-compare agent": {"cost": 21_400, "cache_read": 0.31, "p95": 18.0, "interactive": True,  "quality": 0.93},
+    "nightly renewal letters": {"cost": 9_800, "cache_read": 0.86, "p95": 40.0, "interactive": False, "quality": 0.95},
+    "chat triage":          {"cost": 1_900, "cache_read": 0.88, "p95": 2.1,  "interactive": True,  "quality": 0.97},
+    "document intake":      {"cost": 6_300, "cache_read": 0.82, "p95": 6.5,  "interactive": True,  "quality": 0.91,
+                             "unused_tool_tokens": 9_000},
+}
+QUALITY_FLOOR = 0.90
+
+
+def hot_spots(routes, share=0.8):
+    """The few routes that make up most of the spend (Pareto)."""
+    total = sum(r["cost"] for r in routes.values())
+    acc, out = 0, []
+    for name, r in sorted(routes.items(), key=lambda kv: -kv[1]["cost"]):
+        out.append((name, round(r["cost"] / total, 2)))
+        acc += r["cost"]
+        if acc / total &gt;= share:
+            break
+    return out
+
+
+def lever(r: dict, eval_delta: dict) -&gt; str:
+    if r["cache_read"] &lt; 0.80:
+        return "caching: find what breaks the prefix (timestamps, reordered tools, per-user text up front)"
+    if r.get("unused_tool_tokens", 0) &gt; 5_000:
+        return "token hygiene: drop or defer unused tool definitions; trim tool results"
+    if not r["interactive"]:
+        return "batching: Message Batches at 50% off; nobody is waiting"
+    downgrade = eval_delta.get("smaller model or lower effort")
+    if downgrade is not None and r["quality"] + downgrade &gt;= QUALITY_FLOOR:
+        return "model/effort: cheaper setting passes the quality floor on the eval"
+    return "keep: no safe lever left; revisit the prompt audit"
+
+
+if __name__ == "__main__":
+    print("hot spots:", hot_spots(ROUTES))
+    deltas = {"chat triage": {"smaller model or lower effort": -0.02},
+              "document intake": {"smaller model or lower effort": -0.04}}
+    for name, r in ROUTES.items():
+        print(f"{name:24} -&gt; {lever(r, deltas.get(name, {}))}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>hot spots: [('policy-compare agent', 0.54), ('nightly renewal letters', 0.25), ('document intake', 0.16)]
+policy-compare agent     -&gt; caching: find what breaks the prefix (timestamps, reordered tools, per-user text up front)
+nightly renewal letters  -&gt; batching: Message Batches at 50% off; nobody is waiting
+chat triage              -&gt; model/effort: cheaper setting passes the quality floor on the eval
+document intake          -&gt; token hygiene: drop or defer unused tool definitions; trim tool results</code></pre></div>
+				<ul>
+					<li><strong>Policy-compare agent (54% of spend, 31% cache read):</strong> far below the 80% mark, so something breaks the prefix. Fixing caching cuts cost and the 18-second p95 together, without touching answers.</li>
+					<li><strong>Nightly renewal letters (25%):</strong> already well cached, but nobody waits for them: Batches halve the cost.</li>
+					<li><strong>Document intake (16%):</strong> cache rate is fine, but 9,000 tokens of unused tool definitions ride on every call: defer or remove them.</li>
+					<li><strong>Chat triage (5%):</strong> small, but a cheaper model setting keeps it above the floor on the evaluation (0.95 against 0.90), so it qualifies; it's the last place to look, not the first.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Switch every route to a smaller model"</strong> is the tempting answer to a cost target. It risks the quality floor everywhere and leaves the real problem, a broken cache on the route that is over half the spend, in place.</p></div>
+			</div>
+
+			<!-- ===== Floor ===== -->
+			<h2 id="s4">Holding the quality floor</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.6</span><span class="skill-text">Which levers can and can't move quality.</span></p>
+				<ul>
+					<li><strong>Caching and batching don't change answers</strong>: safe by construction, though check batch turnaround fits the schedule.</li>
+					<li><strong>Token hygiene can:</strong> removing a tool or trimming a result might remove something a hard case needed; rerun the evaluation.</li>
+					<li><strong>Model and effort changes do:</strong> accept them only when the evaluation, ideally the paired design from <a href="d4-skill-4-4.html">skill 4.4</a>, shows the new setting above the floor.</li>
+					<li><strong>Watch afterwards:</strong> cost per route, cache rate and quality metrics in monitoring, so a later prompt change doesn't quietly undo the saving.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Locate the spend: cost by route, cache read share, tokens by part, latency percentiles and the tail; a few routes usually dominate.</li>
+				<li>A cache read share well below about 80% (Anthropic's agent-loop median is 84%) means something is breaking the prefix: fix that first.</li>
+				<li>Apply levers in Anthropic's order: caching, token hygiene, batching for unattended work, a prompt audit, then model or effort.</li>
+				<li>Caching and batching don't change answers; token hygiene and model or effort changes must be re-evaluated against the quality floor.</li>
+				<li>Monitor cost, cache rate and quality afterwards so savings stick.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-5.html"><small>Previous</small>4.5: Root-Cause Isolation from Logs and Traces</a>
+				<a class="next" href="d4-skill-4-7.html"><small>Next</small>4.7: Model Version Migration</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the telemetry and code are original.</div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.5: Root-Cause Isolation from Logs and Traces | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 4.5 (7 December 2026 guide): telling a prompt failure, retrieval failure, hallucination, tool or subagent error and model mismatch apart from a Claude system's logs and traces, and the corrective action for each, with a tested triage function.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Evaluation, Testing, and Optimization &middot; 17%</span>
+		<h1>4.5: Root-Cause Isolation from Logs and Traces</h1>
+		<p>A wrong answer can come from five different places: a tool that failed, a model or prompt that isn't the one tested, a search that missed the right document, a model that invented something, or an instruction that wasn't clear. The trace shows which, if you read it in the right order.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Debugging</span><span class="tag">Traces</span><span class="tag">Hallucination</span><span class="tag">Retrieval</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What each cause leaves in a trace</a></li>
+				<li><a href="#s2">Checking in order</a></li>
+				<li><a href="#s3">The corrective action for each</a></li>
+				<li><a href="#s4">What the trace must contain</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.5</span>
+				<p><strong>Root-Cause Isolation from Logs and Traces</strong>: "Isolating the root cause of a failing Claude system from its logs or traces among prompt failure, retrieval failure, hallucination, tool or subagent error, and model mismatch, and specifying the corrective action."</p>
+			</div>
+			<p>Exam items give a trace excerpt or log lines and ask what went wrong and what to fix. The developer view of failure modes in a single exchange (refusals, under-acting, format drift) is <a href="../anthropic-ccdv-f/d4-skill-4-2.html">CCDV-F 4.2</a>; designing the telemetry is <a href="d3-skill-3-4.html">skill 3.4</a>.</p>
+			<p>Sources: Anthropic's guidance on reducing hallucinations and prompting best practices, and the Agent SDK observability guide, checked on 20 November 2026 and paraphrased. The checking order is my own; the system and code are my own and tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An IT-support assistant retrieves knowledge-base articles, can hand ticket lookups to a subagent, and answers with citations. Five wrong answers were flagged this week, each with a full trace.</p></div>
+
+			<!-- ===== Signatures ===== -->
+			<h2 id="s1">What each cause leaves in a trace</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.5</span><span class="skill-text">The evidence to look for (my mapping).</span></p>
+				<ul>
+					<li><strong>Tool or subagent error:</strong> an error status or exception on a tool span or a subagent's result, often followed by an answer that sounds confident anyway. In Agent SDK traces, a subagent's spans sit under the parent's tool span, so the failure is visible in context.</li>
+					<li><strong>Model mismatch:</strong> the model name on the request spans, or the prompt version, differs from what the evaluation approved: a silent fallback, a config change, a new default.</li>
+					<li><strong>Retrieval failure:</strong> the article that answers the question isn't among the retrieved results; the model answered from what it was given, or from general knowledge.</li>
+					<li><strong>Hallucination:</strong> the right article was retrieved, but the answer contains a claim no retrieved text supports.</li>
+					<li><strong>Prompt failure:</strong> inputs complete and claims supported, yet the answer breaks an instruction: wrong scope, wrong format, a step it shouldn't take. Anthropic notes current models follow instructions precisely, so an ambiguous instruction produces a literal answer.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Order ===== -->
+			<h2 id="s2">Checking in order</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.5</span><span class="skill-text">Each check rules out a cause before the next one is blamed.</span></p>
+				<div class="code"><span class="file">triage.py (triage.py)</span>
+<pre><code>"""Isolate the root cause of a bad answer from one trace of an IT-support assistant.
+
+Pipeline: retrieve knowledge-base articles -&gt; (optionally) a ticket-lookup subagent -&gt; answer with
+citations. Evidence is checked in an order where each step rules out a cause before blaming the next:
+infrastructure first, then configuration, then inputs to the model, then what the model did with them."""
+
+
+def triage(t: dict) -&gt; tuple[str, str]:
+    <span class="c"># 1. Tool or subagent error: the model was answering without data it asked for.</span>
+    for step in t["steps"]:
+        if step.get("error"):
+            return "tool/subagent error", f"{step['name']} failed ({step['error']}); surface the error to the model, retry or fail the request, alert"
+    <span class="c"># 2. Model mismatch: production isn't running what was evaluated.</span>
+    if t["served_model"] != t["evaluated_model"] or t["prompt_version"] != t["evaluated_prompt"]:
+        return "model mismatch", f"served {t['served_model']} / prompt {t['prompt_version']}, evaluated {t['evaluated_model']} / {t['evaluated_prompt']}; pin versions in config and re-run the eval before switching"
+    <span class="c"># 3. Retrieval failure: the article that answers the question never reached the model.</span>
+    if t["gold_doc"] not in t["retrieved"]:
+        return "retrieval failure", f"{t['gold_doc']} not retrieved; fix the index or query (contextual chunks, hybrid search, reranking), not the prompt"
+    <span class="c"># 4. Hallucination: the right article was there, but the answer asserts something it doesn't say.</span>
+    unsupported = [c for c in t["claims"] if not c["supported_by"]]
+    if unsupported:
+        return "hallucination", f"claim not in any retrieved text: {unsupported[0]['text']!r}; require quotes or citations per claim, allow 'I don't know'"
+    <span class="c"># 5. Prompt failure: grounded and complete inputs, but the answer breaks an instruction.</span>
+    if t["violations"]:
+        return "prompt failure", f"{t['violations'][0]}; clarify the instruction or add an example, then add this case to the eval set"
+    return "no fault found", "compare with a known-good trace; check the grader"
+
+
+BASE = {"served_model": "claude-sonnet-5-5", "evaluated_model": "claude-sonnet-5-5", "prompt_version": "v14",
+        "evaluated_prompt": "v14", "gold_doc": "KB-2210", "retrieved": ["KB-2210", "KB-1033"],
+        "steps": [{"name": "kb_search"}, {"name": "ticket_lookup_subagent"}],
+        "claims": [{"text": "Reset the VPN token in the self-service portal", "supported_by": "KB-2210"}],
+        "violations": []}</code></pre></div>
+				<ul>
+					<li><strong>Infrastructure first:</strong> a failed tool explains a missing document better than the retriever does; the test plants both and expects the tool error.</li>
+					<li><strong>Then configuration:</strong> if production isn't running the evaluated model and prompt, every later check is about the wrong system.</li>
+					<li><strong>Then inputs:</strong> only once the right document was retrieved can an unsupported claim be called a hallucination.</li>
+					<li><strong>Then behaviour:</strong> with good inputs and grounded claims, what's left is the instruction.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"The answer is wrong, so it's a hallucination; add 'don't make things up' to the prompt"</strong> is the most common misdiagnosis. If the right article was never retrieved, or the ticket subagent failed, no prompt change fixes it.</p></div>
+			</div>
+
+			<!-- ===== Fix ===== -->
+			<h2 id="s3">The corrective action for each</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.5</span><span class="skill-text">Fix the cause, then lock it in.</span></p>
+				<ul>
+					<li><strong>Tool or subagent error:</strong> return the error to the model so it can adapt rather than guess, retry or fail the request explicitly, and alert; then fix the tool (a 403 means a credential or permission).</li>
+					<li><strong>Model mismatch:</strong> pin model and prompt versions in configuration, and rerun the evaluation before any switch takes effect.</li>
+					<li><strong>Retrieval failure:</strong> improve the index or query (contextual chunks, hybrid keyword and embedding search, reranking; <a href="d3-skill-3-5.html">skill 3.5</a>), and track recall on the failing questions.</li>
+					<li><strong>Hallucination:</strong> Anthropic's guidance: let the model say it doesn't know, have it quote the source before answering, require citations and retract claims without one, and restrict it to the provided documents.</li>
+					<li><strong>Prompt failure:</strong> state the instruction explicitly or add an example of the boundary case.</li>
+					<li><strong>Every case:</strong> add the failing trace's input to the evaluation set as a regression test.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Contents ===== -->
+			<h2 id="s4">What the trace must contain</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.5</span><span class="skill-text">You can only isolate what you recorded.</span></p>
+				<ul>
+					<li><strong>Per step:</strong> name, status, errors, timing.</li>
+					<li><strong>Per request:</strong> model ID and prompt version.</li>
+					<li><strong>Retrieval:</strong> the IDs of what was retrieved (and scores), so you can check whether the right document was there.</li>
+					<li><strong>The answer's claims and citations</strong>, so support can be checked claim by claim.</li>
+					<li><strong>Linked spans</strong> for subagents, so their failures appear in the parent's trace.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Five causes, five signatures: an error on a tool or subagent span; a served model or prompt that differs from the evaluated one; the answering document not retrieved; a claim no retrieved text supports; a clear breach of an instruction despite good inputs.</li>
+				<li>Check in order: infrastructure, configuration, inputs, then model behaviour, so a downstream symptom isn't blamed on the wrong cause.</li>
+				<li>Fix the cause: surface tool errors and alert; pin versions and re-evaluate; fix retrieval; ground and cite answers; clarify instructions.</li>
+				<li>Add each failure as a regression case.</li>
+				<li>Record what isolation needs: step status, model and prompt versions, retrieved IDs, claims with citations, and linked subagent spans.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-4.html"><small>Previous</small>4.4: Experimental Design for Configuration Comparison</a>
+				<a class="next" href="d4-skill-4-6.html"><small>Next</small>4.6: Cost and Latency Optimization</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the system and code are original.</div>
+</footer>
+
+</body>
+</html>
