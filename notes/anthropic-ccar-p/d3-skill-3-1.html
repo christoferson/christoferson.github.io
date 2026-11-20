@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.1: Least-Privilege Tool Configuration | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 3.1 (7 December 2026 guide): reviewing an agent's or subagent's tools against least privilege and minimal footprint, and deciding which to remove, scope down, or replace with a context-efficient pattern such as an aggregate tool, programmatic tool calling or tool search, with a tested audit.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Integration &middot; 21%</span>
+		<h1>3.1: Least-Privilege Tool Configuration</h1>
+		<p>Going through every tool an agent has and asking whether the task needs it, whether it needs all of what the tool can do, and whether there's a way to get the same information that costs less context. Each tool ends up kept, removed, narrowed, or replaced.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Least privilege</span><span class="tag">Tools</span><span class="tag">Tool search</span><span class="tag">Programmatic tool calling</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Two principles</a></li>
+				<li><a href="#s2">Auditing a subagent</a></li>
+				<li><a href="#s3">Remove and scope down</a></li>
+				<li><a href="#s4">Context-efficient access patterns</a></li>
+				<li><a href="#s5">The configuration after</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.1</span>
+				<p><strong>Least-Privilege Tool Configuration</strong>: "Evaluating an agent or subagent tool configuration against least-privilege and minimal-footprint principles, and determining which tool connections to remove, scope down, or replace with a context-efficient access pattern."</p>
+			</div>
+			<p>Exam items list an agent's tools and its task and ask which change to make. Enforcing limits with hooks, permission rules and sandboxes is in the developer notes (<a href="../anthropic-ccdv-f/d7-skill-7-2.html">CCDV-F 7.2</a>); credentials and authorisation are <a href="d3-skill-3-2.html">skill 3.2</a>.</p>
+			<p>Sources: the Claude documentation on the tool search tool, programmatic tool calling and Agent SDK permissions and subagents, checked on 19 and 20 November 2026 and paraphrased. The agent, audit rules and code are my own and tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A B2B software company's "renewal-risk researcher" subagent reads account, billing, usage and support data and returns a risk summary to the account manager. It was set up quickly with every connector the team had.</p></div>
+
+			<!-- ===== Principles ===== -->
+			<h2 id="s1">Two principles</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">What each asks of a tool list (my reading of the guide's terms).</span></p>
+				<ul>
+					<li><strong>Least privilege:</strong> each tool grants only the capabilities the task needs: read rather than write, one object type rather than the whole system, specific fields rather than full records. If an injected instruction or a reasoning error gets through, a narrow tool limits the damage.</li>
+					<li><strong>Minimal footprint:</strong> the agent carries and touches as little as it can: few tool definitions in context, small tool results, no side effects it doesn't need, and no paths out of the system (sending, posting, fetching the web) unless the task requires them.</li>
+					<li><strong>Why it matters twice:</strong> fewer tools is also better tool use. Anthropic's tool search documentation notes that Claude's ability to pick the right tool degrades past 30&ndash;50 available tools.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Audit ===== -->
+			<h2 id="s2">Auditing a subagent</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">Each tool's capabilities against the task, plus 30 days of usage.</span></p>
+				<div class="code"><span class="file">tool_audit.py (tool_audit.py)</span>
+<pre><code>"""Audit a subagent's tools against its task: remove, scope down, or replace with a context-efficient pattern.
+
+Subagent: "renewal-risk researcher" at a B2B software company. Task: read account data and usage,
+write a risk summary for the account manager. It never needs to change records or contact customers."""
+
+TASK_NEEDS = {"read"}                          <span class="c"># the job only reads; the summary is returned, not sent</span>
+
+TOOLS = {  <span class="c"># name: (capabilities, definition tokens)</span>
+    "crm_full":          ({"read", "write", "delete"}, 2_400),   <span class="c"># admin-scoped CRM connector</span>
+    "billing_lookup":    ({"read"}, 600),
+    "usage_query":       ({"read"}, 700),
+    "email_send":        ({"send"}, 500),
+    "slack_post":        ({"send"}, 450),
+    "file_write":        ({"write"}, 300),
+    "web_fetch":         ({"read", "egress"}, 400),
+    "support_tickets":   ({"read"}, 650),
+}
+
+USAGE_30D = {"crm_full": 410, "billing_lookup": 380, "usage_query": 3_900, "support_tickets": 25,
+             "email_send": 0, "slack_post": 0, "file_write": 2, "web_fetch": 0}   <span class="c"># calls in the last 30 days</span>
+CALLS_PER_RUN = {"usage_query": 30}            <span class="c"># 30 weekly usage pulls per account, each returning ~2,000 tokens</span>
+
+
+def audit():
+    findings = []
+    for name, (caps, tokens) in TOOLS.items():
+        extra = caps - TASK_NEEDS
+        used = USAGE_30D.get(name, 0)
+        if not caps &amp; TASK_NEEDS:
+            findings.append((name, "remove", f"capability {sorted(caps)} not needed by the task"))
+        elif used == 0:
+            findings.append((name, "remove", f"unused in 30 days, and {sorted(extra) or 'it'} widens the footprint"))
+        elif extra:
+            findings.append((name, "scope down", f"drop {sorted(extra)}; keep a read-only, field-limited tool"))
+        elif CALLS_PER_RUN.get(name, 0) &gt;= 10:
+            findings.append((name, "replace pattern", "many calls per run: aggregate behind one tool, or call it "
+                             "from code (programmatic tool calling) so only the result returns"))
+        else:
+            findings.append((name, "keep", f"read-only and used ({used} calls)"))
+    return findings
+
+
+if __name__ == "__main__":
+    for name, action, why in audit():
+        print(f"{name:16} {action:15} {why}")
+    before = sum(t for _, t in TOOLS.values())
+    removed = {n for n, a, _ in audit() if a == "remove"}
+    assert len(TOOLS) &lt; 10, "with 10+ tools or 10k+ tokens of definitions, add tool search (defer_loading)"
+    print(f"definition tokens: {before:,} before, {before - sum(TOOLS[n][1] for n in removed):,} after removals "
+          f"(less again once crm_full is replaced by a narrow read tool)")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>crm_full         scope down      drop ['delete', 'write']; keep a read-only, field-limited tool
+billing_lookup   keep            read-only and used (380 calls)
+usage_query      replace pattern many calls per run: aggregate behind one tool, or call it from code (programmatic tool calling) so only the result returns
+email_send       remove          capability ['send'] not needed by the task
+slack_post       remove          capability ['send'] not needed by the task
+file_write       remove          capability ['write'] not needed by the task
+web_fetch        remove          unused in 30 days, and ['egress'] widens the footprint
+support_tickets  keep            read-only and used (25 calls)
+definition tokens: 6,000 before, 4,350 after removals (less again once crm_full is replaced by a narrow read tool)</code></pre></div>
+			</div>
+
+			<!-- ===== Remove ===== -->
+			<h2 id="s3">Remove and scope down</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">The first two outcomes.</span></p>
+				<ul>
+					<li><strong>Remove</strong> what the task never needs: <code>email_send</code>, <code>slack_post</code> and <code>file_write</code> give a read-only researcher ways to act and to send data out. Remove what's unused, too: <code>web_fetch</code> has had no calls in 30 days and is an egress path.</li>
+					<li><strong>Scope down</strong> what's needed but too broad: the admin CRM connector can read, write and delete across the whole CRM; the task needs a read-only tool for one account's fields. Narrow it at the source (a read-only credential or a purpose-built tool), not only in the prompt.</li>
+					<li><strong>Keep</strong> what's needed and already narrow: the billing and support lookups are read-only and used.</li>
+					<li><strong>Deny as well as remove:</strong> list removed tools in <code>disallowed_tools</code> too, so a server that adds them back doesn't quietly restore them.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Tell the subagent in its prompt never to send emails"</strong> leaves the capability in place. Least privilege is about what the agent <em>can</em> do; instructions are what it's asked to do.</p></div>
+			</div>
+
+			<!-- ===== Patterns ===== -->
+			<h2 id="s4">Context-efficient access patterns</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">When a needed tool costs too much context.</span></p>
+				<ul>
+					<li><strong>Aggregate behind one tool:</strong> 30 raw weekly usage pulls of about 2,000 tokens each become one tool that returns the trend. The detail stays in the system; only the answer enters context.</li>
+					<li><strong>Programmatic tool calling</strong> (Messages API): Claude writes code that calls the tool inside the code execution container, so intermediate results don't enter its context window; it needs <code>allowed_callers</code> on the tool and code execution <code>code_execution_20260120</code> or later. It isn't eligible for zero data retention.</li>
+					<li><strong>Tool search:</strong> mark rarely used tools <code>defer_loading: true</code> and let Claude search for them. Anthropic cites a multi-server setup with about 55,000 tokens of definitions that tool search typically cuts by over 85%, and recommends it from about 10 tools or 10,000 tokens of definitions; below that, standard tool calling fits better. Keep the 3&ndash;5 most-used tools loaded.</li>
+					<li><strong>Move bulk work to a subagent</strong> whose context is discarded, returning only its conclusion.</li>
+				</ul>
+			</div>
+
+			<!-- ===== After ===== -->
+			<h2 id="s5">The configuration after</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">The researcher as an Agent SDK subagent.</span></p>
+				<div class="code"><span class="file">researcher_after.py (researcher_after.py)</span>
+<pre><code>"""The renewal-risk researcher after the audit, as an Agent SDK subagent."""
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
+
+researcher = AgentDefinition(
+    description="Researches renewal risk for one account and returns a summary. Read-only.",
+    prompt="Read the account, billing, usage and support data for the account named in the task. "
+           "Return a risk summary with evidence. You can't change records or contact anyone.",
+    tools=["mcp__crm__get_account",            <span class="c"># was crm_full: now one read-only, field-limited tool</span>
+           "mcp__billing__lookup",
+           "mcp__support__tickets",
+           "mcp__usage__weekly_trend"],        <span class="c"># replaces 30 raw usage pulls with one aggregate per account</span>
+    model="sonnet",
+    maxTurns=20,
+)
+
+options = ClaudeAgentOptions(
+    agents={"renewal-researcher": researcher},
+    disallowed_tools=["Write", "Edit", "Bash", "WebFetch", "WebSearch",
+                      "mcp__email__send", "mcp__slack__post"],   <span class="c"># removed, and denied in case a server re-adds them</span>
+)</code></pre></div>
+				<ul>
+					<li><strong>Four read-only tools</strong>, one of them an aggregate; no sending, writing, shell or web access.</li>
+					<li><strong>Removed tools are also denied</strong>, and turns are capped.</li>
+					<li><strong>The return path is the summary itself:</strong> the parent agent or the application decides what happens with it.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Audit every tool against the task's needed capabilities and its actual usage.</li>
+				<li>Remove tools the task doesn't need or doesn't use, especially ones that send, write or reach outside; deny them too.</li>
+				<li>Scope down tools that are needed but too broad: read-only credentials, single-object tools, limited fields, enforced at the source.</li>
+				<li>Replace context-heavy access with aggregate tools, programmatic tool calling (results stay out of context), tool search with deferred loading (10+ tools or 10k+ tokens of definitions), or a subagent.</li>
+				<li>Prompt instructions don't reduce privilege; capabilities do. Fewer, narrower tools also improve tool selection.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-6.html"><small>Previous</small>2.6: Reasoning Effort and Context Lifecycle</a>
+				<a class="next" href="d3-skill-3-2.html"><small>Next</small>3.2: Authentication and Authorization Posture</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the example and code are original.</div>
+</footer>
+
+</body>
+</html>

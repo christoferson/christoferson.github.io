@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.5: Cache Breakpoints and Reusable Packaging | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 2.5 (7 December 2026 guide): ordering a repeated prompt so stable content comes first, placing cache breakpoints and TTLs to match the call pattern, and moving reusable procedures into modules or Skills, with a tested simulation of a day's calls.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Claude Models, Prompting, and Context Engineering &middot; 13%</span>
+		<h1>2.5: Cache Breakpoints and Reusable Packaging</h1>
+		<p>Arranging a prompt that runs again and again so its unchanging parts come first, putting cache breakpoints where each layer stops changing, matching their lifetimes to how often the calls actually arrive, and packaging reusable content so it isn't carried when it isn't needed.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Prompt caching</span><span class="tag">cache_control</span><span class="tag">TTL</span><span class="tag">Agent Skills</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Breakpoint rules</a></li>
+				<li><a href="#s2">Layering by rate of change</a></li>
+				<li><a href="#s3">A morning's calls, two layouts</a></li>
+				<li><a href="#s4">Matching TTLs to the call pattern</a></li>
+				<li><a href="#s5">Modular and Skill-based packaging</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.5</span>
+				<p><strong>Cache Breakpoints and Reusable Packaging</strong>: "Applying cache breakpoints and modular or Skill-based packaging to a repeated prompt sequence so that stable content precedes dynamic content and reuse is maximized across the stated call pattern."</p>
+			</div>
+			<p>Exam items describe a repeated prompt and how calls arrive, and ask where to put breakpoints, which TTL to use, or why the cache hit rate is low. Pricing a context is <a href="d2-skill-2-4.html">skill 2.4</a>; the developer's view of cost diagnosis with caching is in <a href="../anthropic-ccdv-f/d5-skill-5-3.html">CCDV-F 5.3</a>.</p>
+			<p>Sources: the Claude prompt caching documentation, "Optimizing for cost and intelligence" and the Agent Skills documentation, checked on 19 and 20 November 2026 and paraphrased. The assistant and simulation are my own; the simulation simplifies the caching rules and is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An engineering firm's tender-review assistant: analysts ask about ten questions about each tender, a few minutes apart, against the firm's 12,000-token review guide and a 40,000-token set of tender documents.</p></div>
+
+			<!-- ===== Rules ===== -->
+			<h2 id="s1">Breakpoint rules</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">What <code>cache_control</code> actually does.</span></p>
+				<ul>
+					<li><strong>A breakpoint marks the end of a cached prefix.</strong> Writes happen only at breakpoints; on a later request the system finds the longest prefix already cached.</li>
+					<li><strong>Up to four breakpoints</strong>, so sections that change at different rates can be cached separately. Each breakpoint looks back up to 20 blocks for a match.</li>
+					<li><strong>Order is fixed:</strong> tools, then system, then messages. A change to an earlier part invalidates everything after it; changing tool definitions invalidates the whole cache.</li>
+					<li><strong>Lifetimes:</strong> 5 minutes by default (writes at 1.25 times input price) or 1 hour (2 times); a 1-hour entry must come before any 5-minute entry. The lifetime is measured from the start of the request.</li>
+					<li><strong>Minimum size:</strong> 512 tokens on current models; below that, nothing is cached and no error is raised.</li>
+					<li><strong>Automatic caching</strong> (a top-level <code>cache_control</code>) places the breakpoint on the last block; it's the wrong choice when that block changes every request.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Layering ===== -->
+			<h2 id="s2">Layering by rate of change</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">Most stable first, one breakpoint per layer.</span></p>
+				<ul>
+					<li><strong>Layer 1, changes rarely:</strong> tool definitions and the firm-wide guide; same for everyone all day. 1-hour breakpoint.</li>
+					<li><strong>Layer 2, changes per work item:</strong> the tender's documents; same for a run of questions. 5-minute breakpoint.</li>
+					<li><strong>Layer 3, changes per call:</strong> the question, after the last breakpoint.</li>
+					<li><strong>Keep volatile values out of stable layers:</strong> timestamps, user names, request IDs and "today's date" at the top of a system prompt make every prefix unique. Put them after the last breakpoint, or leave them out.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Simulation ===== -->
+			<h2 id="s3">A morning's calls, two layouts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">Same content, same calls; only the order and breakpoints differ.</span></p>
+				<div class="code"><span class="file">tender_cache.py (tender_cache.py)</span>
+<pre><code>"""An engineering firm's tender-review assistant: lay out the prompt so the call pattern reuses the cache.
+
+Call pattern (one analyst's morning): 3 tenders, about 10 questions each, a few minutes apart.
+Layers, most stable first:
+  1. firm review guide + tools      12,000 tokens, same all day   -&gt; 1-hour breakpoint
+  2. this tender's documents        40,000 tokens, same per tender -&gt; 5-minute breakpoint
+  3. the question                       150 tokens, new every call -&gt; after the last breakpoint
+Simplified model of the prompt-caching rules: a breakpoint's prefix is read if the same prefix was
+written or read within its TTL, otherwise written; anything after a changed block is uncached."""
+
+GUIDE, TENDER, QUESTION = 12_000, 40_000, 150
+
+
+def good_request(tender_id: str, docs: str, question: str) -&gt; dict:
+    return {
+        "model": "claude-sonnet-5-5", "max_tokens": 2048,
+        "system": [
+            {"type": "text", "text": "&lt;firm review guide&gt;", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            {"type": "text", "text": f"&lt;tender id='{tender_id}'&gt;{docs}&lt;/tender&gt;", "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [{"role": "user", "content": question}],
+    }
+
+
+def bad_request(tender_id: str, docs: str, question: str, now: str) -&gt; dict:
+    return {  <span class="c"># a timestamp first and the question before the documents: nothing stable leads the prompt</span>
+        "model": "claude-sonnet-5-5", "max_tokens": 2048,
+        "system": [{"type": "text", "text": f"Current time: {now}\n&lt;firm review guide&gt;",
+                    "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": f"{question}\n&lt;tender id='{tender_id}'&gt;{docs}&lt;/tender&gt;"}],
+    }
+
+
+def simulate(calls, layout: str) -&gt; dict:
+    """calls: list of (minute, tender_id). Returns tokens billed as write, read and plain input."""
+    seen, tot = {}, {"write": 0, "read": 0, "input": 0}
+
+    def hit(key, ttl, minute):
+        ok = key in seen and minute - seen[key] &lt;= ttl
+        seen[key] = minute                         <span class="c"># a write or a read refreshes the entry</span>
+        return ok
+
+    for minute, tender in calls:
+        if layout == "good":
+            tot["read" if hit("guide", 60, minute) else "write"] += GUIDE
+            tot["read" if hit(("tender", tender), 5, minute) else "write"] += TENDER
+            tot["input"] += QUESTION
+        else:                                      <span class="c"># timestamp changes every call: the prefix never matches</span>
+            tot["write"] += GUIDE
+            tot["input"] += TENDER + QUESTION
+    return tot
+
+
+def cost(t: dict) -&gt; float:                        <span class="c"># Sonnet 5.5: write $2.50, read $0.10, input $2.00 per MTok</span>
+    return round((t["write"] * 2.50 + t["read"] * 0.10 + t["input"] * 2.00) / 1e6, 2)
+
+
+MORNING = [(m, "T1") for m in range(0, 30, 3)] + [(m, "T2") for m in range(30, 60, 3)] + \
+          [(m, "T3") for m in range(60, 100, 4)]
+
+if __name__ == "__main__":
+    for layout in ("bad", "good"):
+        t = simulate(MORNING, layout)
+        share = t["read"] / sum(t.values())
+        print(f"{layout:4}  write {t['write']:&gt;8,}  read {t['read']:&gt;8,}  input {t['input']:&gt;8,}  "
+              f"cache-read share {share:.0%}  cost ${cost(t)}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>bad   write  360,000  read        0  input 1,204,500  cache-read share 0%  cost $3.31
+good  write  132,000  read 1,428,000  input    4,500  cache-read share 91%  cost $0.48</code></pre></div>
+				<ul>
+					<li><strong>Bad layout:</strong> a timestamp opens the system prompt and the documents follow the question, so no prefix ever repeats: $3.31 for the morning, 0% read from cache.</li>
+					<li><strong>Good layout:</strong> guide (1 hour), then tender (5 minutes), then question: the guide is written once, each tender once, and everything else is read: $0.48, 91% read from cache.</li>
+					<li><strong>A useful benchmark:</strong> Anthropic reports that agent loops read a median 84% of their input from cache, and suggests that below about 80% you look for something breaking the prefix.</li>
+				</ul>
+			</div>
+
+			<!-- ===== TTL ===== -->
+			<h2 id="s4">Matching TTLs to the call pattern</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">The stated call pattern decides the lifetime.</span></p>
+				<ul>
+					<li><strong>Calls closer together than 5 minutes:</strong> the default lifetime is enough, and each read keeps the entry warm.</li>
+					<li><strong>Gaps longer than 5 minutes but under an hour</strong> (an analyst who reads for ten minutes between questions): the 5-minute entry expires and the 40,000 tokens are written again; a 1-hour entry costs more to write (2 times rather than 1.25 times) but saves the rewrites. The test shows one pause of nine minutes adding a second write.</li>
+					<li><strong>Shared across users:</strong> the firm guide serves every analyst, so a 1-hour entry at the front is reused by everyone's calls.</li>
+					<li><strong>Batches:</strong> caching within the Message Batches API is best-effort, so don't count on cache hits there.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Packaging ===== -->
+			<h2 id="s5">Modular and Skill-based packaging</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">Don't carry what most calls don't need.</span></p>
+				<ul>
+					<li><strong>Modules:</strong> split the guide into a core module (always loaded, cached) and specialist modules added only for the tenders that need them, each in its own block in a fixed order so combinations still share the core prefix.</li>
+					<li><strong>Skills:</strong> package procedures that apply to some tenders (structural steel checks, environmental compliance) as Agent Skills. Only each Skill's name and description, about 100 tokens, sits in context until it's needed; the body and any scripts load when a request triggers it.</li>
+					<li><strong>Skills' requirements:</strong> on the API they run in the code execution container (no network access, up to 20 Skills a request); custom Skills are shared workspace-wide through the Skills API; they aren't eligible for zero data retention or HIPAA.</li>
+					<li><strong>Stability still matters:</strong> changing which tools or Skills are present changes the front of the prompt; keep the set fixed for a workload rather than toggling per call.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add a breakpoint after every block"</strong> doesn't help: there are only four, writes cost more than plain input, and a breakpoint after content that changes every call writes a cache that's never read.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Order content by rate of change: tools and firm-wide guidance, then per-item material, then the per-call request; one breakpoint at the end of each stable layer (four at most).</li>
+				<li>Keep volatile values (timestamps, names, IDs) out of the stable layers; one changing token at the front makes every prefix unique.</li>
+				<li>Choose TTLs from the call pattern: 5 minutes for bursts, 1 hour (2x write) when gaps are longer or content is shared across users; 1-hour entries come first.</li>
+				<li>Measure the share of input read from cache; Anthropic's median for agent loops is 84%, and below about 80% something is breaking the prefix.</li>
+				<li>Package rarely needed procedures as modules or Skills (about 100 tokens each until triggered), and keep the tool and Skill set stable across calls.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-4.html"><small>Previous</small>2.4: Context Composition and Token Economics</a>
+				<a class="next" href="d2-skill-2-6.html"><small>Next</small>2.6: Reasoning Effort and Context Lifecycle</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the example and code are original.</div>
+</footer>
+
+</body>
+</html>

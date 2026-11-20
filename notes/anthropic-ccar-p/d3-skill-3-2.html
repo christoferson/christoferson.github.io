@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.2: Authentication and Authorization Posture | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 3.2 (7 December 2026 guide): reviewing a Claude integration's authentication and authorization for credential exposure and privilege escalation (keys in clients, long-lived keys, token passthrough, shared admin credentials, guessable handles, wide scopes, unvetted local MCP servers) and the mitigation for each.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Integration &middot; 21%</span>
+		<h1>3.2: Authentication and Authorization Posture</h1>
+		<p>Reading an integration design for two kinds of hole: credentials that can leak or outlive their purpose, and paths by which a user or an attacker gets the agent to do more than they're allowed to. Each one gets a specific fix.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Authentication</span><span class="tag">Authorization</span><span class="tag">MCP security</span><span class="tag">API keys</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Credential exposure</a></li>
+				<li><a href="#s2">Privilege escalation</a></li>
+				<li><a href="#s3">Reviewing a design</a></li>
+				<li><a href="#s4">The check every MCP server makes</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.2</span>
+				<p><strong>Authentication and Authorization Posture</strong>: "Analyzing the authentication and authorization posture of an integration design to identify credential exposure and privilege escalation risks, and specifying the mitigation for each."</p>
+			</div>
+			<p>Exam items describe an integration (keys, tokens, MCP servers, service accounts) and ask which risk is present and what fixes it. Handling Anthropic API keys day to day is in the developer notes (<a href="../anthropic-ccdv-f/d7-skill-7-3.html">CCDV-F 7.3</a>); reducing what tools can do is <a href="d3-skill-3-1.html">skill 3.1</a>.</p>
+			<p>Sources: the Claude authentication and Admin API documentation, and the Model Context Protocol security best practices, checked on 20 November 2026 and paraphrased. The design and code are my own and tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A manufacturer's procurement agent drafts and approves purchase orders through an MCP server in front of its ERP system. Staff use it from a mobile app and from the web.</p></div>
+
+			<!-- ===== Exposure ===== -->
+			<h2 id="s1">Credential exposure</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Where secrets leak, and the fix for each.</span></p>
+				<ul>
+					<li><strong>Keys in client code:</strong> anyone can read a key shipped in a browser or mobile app. Call Claude from your back end; Apple apps can use App Attest, which issues short-lived, workspace-scoped tokens for the Messages API.</li>
+					<li><strong>Long-lived static keys in production:</strong> Anthropic describes Workload Identity Federation (short-lived tokens exchanged from your cloud identity provider) as preferred over long-lived keys. Otherwise store keys in a secrets manager, set an expiry, rotate, and use IP allowlisting so a leaked key doesn't work elsewhere.</li>
+					<li><strong>Keys that outlive people:</strong> personal keys stop when the user is removed; production workloads should use service account keys, which survive the creator, and admin keys (<code>sk-ant-admin</code>) belong only in organisation-management tooling.</li>
+					<li><strong>Unvetted local MCP servers:</strong> a local server runs with the user's privileges; its startup command can exfiltrate files. The MCP guidance: install from trusted sources, show the exact command before running it, and sandbox it.</li>
+					<li><strong>Secrets in prompts or tool results:</strong> anything in context can be repeated in output or logs; inject tool credentials outside the model (for example through an egress proxy).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Escalation ===== -->
+			<h2 id="s2">Privilege escalation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Ways a caller gets more than their own rights.</span></p>
+				<ul>
+					<li><strong>Shared high-privilege credential:</strong> the agent calls the ERP as an admin service account for everyone, so any user can ask it to approve orders they couldn't approve themselves. Act on behalf of the user with a delegated token, or check the user's own entitlement for each action.</li>
+					<li><strong>Token passthrough:</strong> the MCP server forwards the client's token to the ERP. The MCP specification forbids this: servers must not accept tokens that weren't issued for them (an audience check), and passing tokens on bypasses downstream controls and muddies audit trails.</li>
+					<li><strong>Confused deputy:</strong> an MCP proxy using one static client ID with a third-party authorisation server can be tricked into issuing codes without the user's consent; proxies must collect per-client consent and validate redirect URIs exactly.</li>
+					<li><strong>Guessable state handles:</strong> a sequential draft ID passed as a tool argument lets one user act on another's draft. Possession of a handle isn't authentication: use random handles bound server-side to the verified user.</li>
+					<li><strong>Wide scopes:</strong> a token with <code>erp:*</code> turns any leak into full access. Start with minimal scopes and step up for privileged operations when they're first needed.</li>
+					<li><strong>Prompt injection through tools:</strong> content read by the agent can carry instructions; with broad credentials, an injection inherits them. Narrow credentials limit what an injection can do.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Review ===== -->
+			<h2 id="s3">Reviewing a design</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Seven findings in the procurement design.</span></p>
+				<div class="code"><span class="file">posture_review.py (posture_review.py)</span>
+<pre><code>"""Review the auth posture of a procurement agent design: find credential exposure and privilege escalation.
+
+Each finding names the risk and the mitigation. The second half is the check an MCP server must make
+before acting on a request: the token was issued for this server, and the action is within the
+caller's own rights, not the server's."""
+
+DESIGN = {
+    "anthropic_key":   {"kind": "static API key", "where": ["mobile app", "agent container env"], "expires": "never"},
+    "erp_mcp_server":  {"accepts": "user SSO token", "forwards_token_downstream": True},
+    "erp_credential":  {"principal": "erp-admin service account", "shared_by_all_users": True},
+    "state_handles":   {"format": "sequential order-draft IDs", "bound_to_user": False},
+    "oauth_scopes":    ["erp:*"],
+    "local_mcp":       {"source": "unvetted npm package", "startup_command_shown_to_user": False},
+}
+
+
+def review(d: dict) -&gt; list[tuple[str, str]]:
+    f = []
+    k = d["anthropic_key"]
+    if "mobile app" in k["where"]:
+        f.append(("exposure: key shipped in a client app", "call Claude from a back end; for Apple apps, App Attest's short-lived tokens"))
+    if k["kind"] == "static API key" and k["expires"] == "never":
+        f.append(("exposure: long-lived key in production", "Workload Identity Federation, or a key with an expiry, rotation, IP allowlisting"))
+    if d["erp_mcp_server"]["forwards_token_downstream"]:
+        f.append(("escalation: token passthrough", "accept only tokens issued for this MCP server (audience check); obtain its own downstream token"))
+    c = d["erp_credential"]
+    if c["shared_by_all_users"] and "admin" in c["principal"]:
+        f.append(("escalation: agent acts with admin rights for every user", "act on behalf of the user (delegated token) or check the user's own entitlement per action"))
+    s = d["state_handles"]
+    if not s["bound_to_user"] or "sequential" in s["format"]:
+        f.append(("escalation: guessable state handles", "random handles bound server-side to the verified user; possession is not authentication"))
+    if any(x.endswith(":*") for x in d["oauth_scopes"]):
+        f.append(("blast radius: wildcard scope", "minimal initial scopes; step-up challenges for privileged operations"))
+    if not d["local_mcp"]["startup_command_shown_to_user"]:
+        f.append(("exposure: unvetted local MCP server", "trusted sources only; show the exact command; run it sandboxed"))
+    return f
+
+
+def authorize(token: dict, action: dict, server_audience: str, entitlements: dict) -&gt; str:
+    """What the ERP MCP server checks before executing an action."""
+    if token.get("aud") != server_audience:
+        return "reject: token not issued for this server"
+    user = token["sub"]                                    <span class="c"># from the verified token, never from the client</span>
+    if action["type"] not in entitlements.get(user, set()):
+        return f"reject: {user} may not {action['type']}"
+    return "allow"
+
+
+if __name__ == "__main__":
+    for risk, fix in review(DESIGN):
+        print(f"- {risk}\n    fix: {fix}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>- exposure: key shipped in a client app
+    fix: call Claude from a back end; for Apple apps, App Attest's short-lived tokens
+- exposure: long-lived key in production
+    fix: Workload Identity Federation, or a key with an expiry, rotation, IP allowlisting
+- escalation: token passthrough
+    fix: accept only tokens issued for this MCP server (audience check); obtain its own downstream token
+- escalation: agent acts with admin rights for every user
+    fix: act on behalf of the user (delegated token) or check the user's own entitlement per action
+- escalation: guessable state handles
+    fix: random handles bound server-side to the verified user; possession is not authentication
+- blast radius: wildcard scope
+    fix: minimal initial scopes; step-up challenges for privileged operations
+- exposure: unvetted local MCP server
+    fix: trusted sources only; show the exact command; run it sandboxed</code></pre></div>
+				<p>The test applies all seven fixes (federated identity, no passthrough, delegated tokens, bound handles, narrow scopes, a vetted local server) and checks that the review then finds nothing.</p>
+			</div>
+
+			<!-- ===== Check ===== -->
+			<h2 id="s4">The check every MCP server makes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Before acting on any request.</span></p>
+				<ul>
+					<li><strong>Audience:</strong> the token was issued for this server, not for the ERP or anything else.</li>
+					<li><strong>Identity from the token:</strong> the user comes from the verified token, never from a field the client supplies.</li>
+					<li><strong>The user's rights, not the server's:</strong> Ana may draft orders but not approve them, so the server refuses her approval even though its own ERP credential could do it.</li>
+					<li><strong>Downstream:</strong> the server obtains its own token for the ERP rather than forwarding the client's.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Tell the agent to check the user's role before approving"</strong> puts authorisation in the prompt, where an injection or a mistake can skip it. Authorisation belongs in the server that performs the action.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Credential exposure: no keys in clients (back end, or App Attest for Apple apps); prefer Workload Identity Federation; otherwise expiring, rotated, IP-allowlisted keys in a secrets manager; service accounts for production; vet local MCP servers.</li>
+				<li>Privilege escalation: a shared admin credential lets every user act as admin; act on behalf of the user or check each user's entitlement.</li>
+				<li>MCP servers must reject tokens not issued for them, must not pass client tokens downstream, and must not treat a state handle as authentication.</li>
+				<li>Proxies need per-client consent and exact redirect URI checks; scopes start minimal and step up.</li>
+				<li>Enforce authorisation in the server that acts, from the verified identity; never in the prompt.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-1.html"><small>Previous</small>3.1: Least-Privilege Tool Configuration</a>
+				<a class="next" href="index.html#d3"><small>Next</small>Domain 3</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's and the Model Context Protocol's documentation summarized in the author's own words; the design and code are original.</div>
+</footer>
+
+</body>
+</html>

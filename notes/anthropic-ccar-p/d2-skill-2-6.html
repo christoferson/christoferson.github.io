@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.6: Reasoning Effort and Context Lifecycle | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 2.6 (7 December 2026 guide): allocating reasoning effort by phase and choosing context editing, the memory tool or compaction so a long-running agent keeps performing across its session under latency and accuracy requirements, with tested request settings.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.6</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Claude Models, Prompting, and Context Engineering &middot; 13%</span>
+		<h1>2.6: Reasoning Effort and Context Lifecycle</h1>
+		<p>Keeping a long-running agent sharp for hours: spending reasoning where accuracy needs it and saving it where speed matters, and choosing how the context is kept healthy as it fills: clearing old tool output, keeping durable notes outside the window, or summarising the conversation.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Effort</span><span class="tag">Context editing</span><span class="tag">Memory tool</span><span class="tag">Compaction</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Effort as a budget</a></li>
+				<li><a href="#s2">Three lifecycle tools</a></li>
+				<li><a href="#s3">Which tool for which growth</a></li>
+				<li><a href="#s4">An overnight agent, phase by phase</a></li>
+				<li><a href="#s5">Sustaining performance</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.6</span>
+				<p><strong>Reasoning Effort and Context Lifecycle</strong>: "Allocating reasoning effort and selecting a context lifecycle strategy (context editing, memory tool, compaction) that sustains task performance across the stated session length for a long-running agent workload with stated latency and accuracy requirements."</p>
+			</div>
+			<p>Exam items describe a long-running agent, how its context grows and its latency and accuracy targets, and ask which effort and lifecycle strategy fit. The developer view, diagnosing bloat in a session that's already struggling, is <a href="../anthropic-ccdv-f/d6-skill-6-1.html">CCDV-F 6.1</a>; this skill is designing for the whole session up front.</p>
+			<p>Sources: the Claude documentation on effort, compaction, context editing, the memory tool and prompt caching, checked on 19 and 20 November 2026 and paraphrased. The agent and code are my own; each phase's request is tested against the SDK with a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A retail chain runs an overnight agent on Opus 5.5 that cleans 40,000 product records. It runs for about six hours, may be interrupted, must not push wrong prices live at 06:00, and must answer a 07:00 status check within seconds.</p></div>
+
+			<!-- ===== Effort ===== -->
+			<h2 id="s1">Effort as a budget</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.6</span><span class="skill-text">Spend it where errors are costly.</span></p>
+				<ul>
+					<li><strong>Levels:</strong> low, medium, high, xhigh (Opus 4.7 and newer) and max. More effort means more thinking: more thorough, but slower and more output tokens. Opus 5.5 defaults to medium.</li>
+					<li><strong>Allocate by phase, not by session:</strong> planning and hard judgement calls get more; repetitive tool loops get less. One high setting for six hours of routine work wastes time and money; one low setting risks the hard cases.</li>
+					<li><strong>Changing effort mid-session:</strong> each request can set its own effort. On Opus 5.5 (and Fable 5.2 and 5.1) a mid-conversation system message can change effort, in beta, and Anthropic's caching notes say a per-message effort change keeps the cached prefix.</li>
+					<li><strong>Latency-bound turns</strong> (a status check, a user waiting) get low effort and a small context, not the agent's full working state.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Tools ===== -->
+			<h2 id="s2">Three lifecycle tools</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.6</span><span class="skill-text">What each one keeps and what it drops.</span></p>
+				<ul>
+					<li><strong>Context editing</strong> (<code>clear_tool_uses_20250919</code>, beta): when input passes a trigger (100,000 tokens by default), old tool results are replaced with placeholders, keeping the most recent few (3 by default). You can exclude tools whose results must stay. Your application still holds the full history.</li>
+					<li><strong>Memory tool</strong> (<code>memory_20250818</code>): a set of files Claude reads and writes through your code. Claude checks its memory before starting and records progress, so work survives a context reset or a restart. It's client-side storage, eligible for zero data retention and HIPAA. Validate every path it asks for.</li>
+					<li><strong>Compaction</strong> (<code>compact_20260112</code>, beta): when input passes a trigger (150,000 by default, at least 50,000), the server summarises older turns into a compaction block, which you send back as it is. Custom instructions say what must survive verbatim.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Which ===== -->
+			<h2 id="s3">Which tool for which growth</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.6</span><span class="skill-text">Match the tool to what is filling the window (my mapping).</span></p>
+				<ul>
+					<li><strong>Tool output piles up</strong> (query results, file reads) and old results aren't needed: context editing. Nothing in the conversation is summarised, so decisions stay exact.</li>
+					<li><strong>Facts must outlive the window or the session</strong> (progress, decisions, what's left): the memory tool. It's the only one of the three that survives a restart.</li>
+					<li><strong>The conversation itself grows</strong> (long operator discussions, many reasoning turns): compaction, with instructions to keep identifiers and decisions verbatim. It's lossy by design, so don't rely on it for exact values that matter.</li>
+					<li><strong>Bulk reading that doesn't need to stay at all:</strong> a subagent, so the reading never enters the main context.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Turn on compaction and let it handle everything"</strong> loses exact values in the summary and does nothing for a restart. Durable state belongs in memory; bulky tool output is cleared, not summarised.</p></div>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s4">An overnight agent, phase by phase</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.6</span><span class="skill-text">Effort and context settings for each part of the run.</span></p>
+				<div class="code"><span class="file">lifecycle_plan.py (lifecycle_plan.py)</span>
+<pre><code>"""Overnight catalogue clean-up agent (40,000 product records): effort and context lifecycle by phase.
+
+Requirements: fixes must be right (wrong prices go live at 06:00), the run lasts about six hours and
+may be interrupted, and the 07:00 status check-in must answer within seconds.
+Context tools (Claude API, Nov 2026):
+  clear_tool_uses_20250919  context editing: drops old tool results, keeps recent ones (beta header below)
+  memory_20250818           client-side memory files: durable progress across context resets and restarts
+  compact_20260112          server compaction of older turns at an input-token threshold (beta header below)"""
+
+MODEL = "claude-opus-5-5"
+MEMORY_TOOL = {"type": "memory_20250818", "name": "memory"}
+DB_TOOLS = [{"name": "query_products", "description": "Read up to 200 product records matching a filter.",
+             "input_schema": {"type": "object", "properties": {"filter": {"type": "string"}}, "required": ["filter"]}},
+            {"name": "propose_fix", "description": "Queue a change to one record for the 05:30 validation job.",
+             "input_schema": {"type": "object", "properties": {"sku": {"type": "string"}, "change": {"type": "object"}},
+                              "required": ["sku", "change"]}}]
+
+PRUNE = {"edits": [{"type": "clear_tool_uses_20250919",
+                    "trigger": {"type": "input_tokens", "value": 60_000},
+                    "keep": {"type": "tool_uses", "value": 4},
+                    "exclude_tools": ["memory"]}]}           <span class="c"># never clear what it read from memory</span>
+COMPACT = {"edits": [{"type": "compact_20260112", "trigger": {"type": "input_tokens", "value": 150_000},
+                      "instructions": "Keep every SKU, field and value changed, verbatim, and open questions."}]}
+
+
+def plan(phase: str) -&gt; dict:
+    """Request settings for each phase of the run."""
+    base = {"model": MODEL, "max_tokens": 16_000, "tools": [MEMORY_TOOL, *DB_TOOLS]}
+    if phase == "plan":                 <span class="c"># once: read memory, decide the batches; worth the thinking</span>
+        return {**base, "output_config": {"effort": "high"}}
+    if phase == "bulk":                 <span class="c"># thousands of routine fixes: fast, cheap turns; tool output piles up</span>
+        return {**base, "output_config": {"effort": "low"},
+                "betas": ["context-management-2025-06-27"], "context_management": PRUNE}
+    if phase == "ambiguous":            <span class="c"># conflicting supplier data: accuracy matters more than speed</span>
+        return {**base, "output_config": {"effort": "xhigh"},
+                "betas": ["context-management-2025-06-27"], "context_management": PRUNE}
+    if phase == "long_discussion":      <span class="c"># the conversation itself grows (operator back-and-forth): summarise it</span>
+        return {**base, "output_config": {"effort": "medium"},
+                "betas": ["compact-2026-01-12"], "context_management": COMPACT}
+    if phase == "status":               <span class="c"># 07:00 check-in: answer from memory, quickly, with no tools needed</span>
+        return {"model": MODEL, "max_tokens": 1_000, "output_config": {"effort": "low"}}
+    raise ValueError(phase)</code></pre></div>
+				<ul>
+					<li><strong>Plan (high):</strong> read memory, see what's done, decide the batches.</li>
+					<li><strong>Bulk (low, context editing):</strong> thousands of routine fixes; old query results are cleared, but anything read from memory is excluded.</li>
+					<li><strong>Ambiguous records (xhigh, context editing):</strong> conflicting supplier data, where a wrong price is the costly error.</li>
+					<li><strong>Long operator discussion (medium, compaction):</strong> if a person starts a long back-and-forth, older turns are summarised with every changed SKU kept verbatim.</li>
+					<li><strong>07:00 status (low, no tools):</strong> answers from the progress file in memory, quickly.</li>
+					<li><strong>Safety net outside the model:</strong> fixes are proposed to a validation job, not written live; accuracy doesn't depend on effort alone.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sustain ===== -->
+			<h2 id="s5">Sustaining performance</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.6</span><span class="skill-text">Checks that the strategy holds for the stated session length.</span></p>
+				<ul>
+					<li><strong>Test the whole length:</strong> run an evaluation that lasts as long as production sessions; accuracy at hour five is what matters.</li>
+					<li><strong>Test interruption:</strong> kill the run midway and confirm it resumes from memory without redoing or skipping work.</li>
+					<li><strong>Watch the triggers:</strong> how often context editing and compaction fire, and whether quality drops after they do.</li>
+					<li><strong>Mind the cache:</strong> clearing content or compacting changes the prompt, so expect cache writes after each event; place triggers so they don't fire every few turns.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Allocate effort by phase: high or xhigh where errors are costly, low for routine loops and latency-bound replies; each request can set its own effort.</li>
+				<li>Context editing clears old tool results (trigger, keep, exclude); the memory tool keeps durable state outside the window and across restarts; compaction summarises older turns at a threshold (default 150,000, minimum 50,000).</li>
+				<li>Match the tool to the growth: tool output, clear it; durable facts, memory; long conversation, compaction with verbatim instructions; bulk reading, a subagent.</li>
+				<li>Compaction is lossy and doesn't survive a restart; don't make it the only strategy.</li>
+				<li>Prove the strategy over the full session length, through an interruption, and with an accuracy safety net outside the model.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-5.html"><small>Previous</small>2.5: Cache Breakpoints and Reusable Packaging</a>
+				<a class="next" href="d3-skill-3-1.html"><small>Next</small>3.1: Least-Privilege Tool Configuration</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the agent and code are original.</div>
+</footer>
+
+</body>
+</html>
