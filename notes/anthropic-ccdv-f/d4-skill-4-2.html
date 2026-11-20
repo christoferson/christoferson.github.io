@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.2: Failure-Mode Diagnosis | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 4.2 (7 December 2026 guide): recognising hallucination, refusal, under-acting, context loss, format drift and inconsistent output in a trace, telling integration-layer bugs from model-output problems, and choosing the recovery that fixes the cause rather than hiding the symptom.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Eval, Testing, and Debugging &middot; 10%</span>
+		<h1>4.2: Failure-Mode Diagnosis</h1>
+		<p>When a Claude feature gives a bad result: naming what kind of failure it is, finding out whether your code or the model's output caused it, and fixing the cause rather than adding a patch that hides it.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Debugging</span><span class="tag">Hallucination</span><span class="tag">Refusal</span><span class="tag">Format drift</span><span class="tag">Context loss</span><span class="tag">Root cause</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Six failure modes</a></li>
+				<li><a href="#s2">Integration layer or model output</a></li>
+				<li><a href="#s3">A triage function</a></li>
+				<li><a href="#s4">Recoveries that fix the cause</a></li>
+				<li><a href="#s5">Fixes that only hide the symptom</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.2</span>
+				<p><strong>Failure-Mode Diagnosis</strong>: "Analyzing a trace excerpt or reproduction to identify the failure mode, such as hallucination, refusal, under-acting, context loss, format drift, or inconsistent output; isolating whether it originates in the integration layer or in model output; and selecting a recovery that addresses the cause rather than the symptom."</p>
+			</div>
+			<p>There are three steps, and exam items test each: name the failure, place it (your code or the model's output), and pick the fix aimed at the cause. Diagnosing an agent's design (loop termination, subagent isolation) is <a href="d1-skill-1-3.html">skill 1.3</a>. Errors the API returns, such as rate limits and overloads, are <a href="d2-skill-2-4.html">skill 2.4</a>. Measuring how often a failure happens is <a href="d4-skill-4-1.html">skill 4.1</a>.</p>
+			<p>Sources: Claude's prompting best practices and its guides on reducing hallucinations and increasing consistency, plus the Messages API documentation already summarised in Domain 2, checked on 19 and 20 November 2026 and paraphrased. The triage function is plain Python, tested on synthetic requests and responses.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The support team forwards complaints about the shop's assistant: blank answers, made-up order numbers, broken JSON, answers that change from run to run, and a coding agent that only describes fixes instead of making them.</p></div>
+
+			<!-- ===== Modes ===== -->
+			<h2 id="s1">Six failure modes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">What each looks like in a trace.</span></p>
+				<ul>
+					<li><strong>Hallucination:</strong> a confident claim with no support in what Claude was given, such as an order number or a policy that isn't in the sources.</li>
+					<li><strong>Refusal:</strong> Claude declines. Through the API, that's HTTP 200 with <code>stop_reason: "refusal"</code> and <code>stop_details</code> explaining it, not an error.</li>
+					<li><strong>Under-acting:</strong> Claude describes, suggests or asks instead of doing. Claude's prompting guide notes that current models follow instructions precisely, so "can you suggest some changes" gets suggestions, not edits.</li>
+					<li><strong>Context loss:</strong> Claude forgets what was said or found earlier: missing history, a truncated window, or a summary that dropped the fact.</li>
+					<li><strong>Format drift:</strong> the output doesn't have the agreed shape, such as broken JSON, extra prose or missing fields.</li>
+					<li><strong>Inconsistent output:</strong> the same input gives different answers across runs.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Isolate ===== -->
+			<h2 id="s2">Integration layer or model output</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Compare what was sent, what came back, and what the app did.</span></p>
+				<p>Many failures that look like the model's fault are your code's. To isolate one, log the raw request and the raw response, then compare them with what the application showed:</p>
+				<ul>
+					<li><strong>The response was fine, the app mishandled it:</strong> it read <code>content[0].text</code> when the first block was thinking, ignored a <code>tool_use</code> stop and showed nothing, or parsed JSON that <code>max_tokens</code> had cut off. That's integration.</li>
+					<li><strong>The request was wrong:</strong> the history wasn't resent (the API keeps none), a document wasn't attached, or the system prompt wasn't what you thought. That's also integration, even though the symptom is "Claude forgot".</li>
+					<li><strong>The request was right and the response itself is wrong:</strong> that's model output, and the fix is in the prompt, the schema, the grounding or the model choice.</li>
+				</ul>
+				<p>Replaying the logged raw request on its own is the quickest test. If the replay is fine, look at your code.</p>
+			</div>
+
+			<!-- ===== Triage ===== -->
+			<h2 id="s3">A triage function</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Integration causes first, then model causes.</span></p>
+				<div class="code"><span class="file">triage.py (Python)</span>
+<pre><code>"""Classify a failed Claude call from what was sent, what came back, and what the application did with it.
+Integration-layer causes are checked first: they look like model failures but are fixed in your code."""
+import re
+
+
+def triage(sent: dict, got: dict, app: dict) -&gt; dict:
+    """sent: the request body; got: the raw response; app: what the app showed or parsed, plus context such as
+    {"turn": 3, "shown": "...", "parse_error": True, "retried_same": True, "runs": ["...", "..."], "sources": "..."}"""
+    blocks, stop = got["content"], got["stop_reason"]
+    text = "".join(b.get("text", "") for b in blocks if b["type"] == "text")
+
+    <span class="c"># ---- integration layer: the model's output was fine, the code mishandled it ----</span>
+    if app.get("turn", 1) &gt; 1 and len(sent["messages"]) == 1:
+        return verdict("context loss", "integration", "earlier turns weren't resent; the API keeps no history",
+                       "append each assistant reply and user turn and send the full messages list")
+    if blocks and blocks[0]["type"] != "text" and text and not app.get("shown"):
+        return verdict("empty answer", "integration", "code read content[0].text but the first block was thinking or tool_use",
+                       "select blocks by type instead of position")
+    if stop == "max_tokens" and app.get("parse_error"):
+        return verdict("format drift (apparent)", "integration", "output was cut off at max_tokens, so the JSON is incomplete",
+                       "raise max_tokens or shorten the task, and check stop_reason before parsing")
+    if stop == "tool_use" and not app.get("tool_results_sent"):
+        return verdict("under-acting (apparent)", "integration", "the loop stopped while Claude was still asking for a tool",
+                       "run the requested tools, return tool_result blocks and continue while stop_reason == 'tool_use'")
+    if stop == "refusal" and app.get("retried_same"):
+        return verdict("refusal", "integration", "the app retried the identical request after a refusal",
+                       "read stop_details, don't resend unchanged; rephrase with legitimate context or route to a person")
+
+    <span class="c"># ---- model output: the call worked as designed, the content is wrong ----</span>
+    if stop == "refusal":
+        return verdict("refusal", "model", "the model declined (HTTP 200, stop_reason 'refusal', stop_details explains)",
+                       "if the request is legitimate, give context and purpose; otherwise handle it as a refusal")
+    claims = set(re.findall(r"\b[A-Z]\d{3,5}\b", text))
+    if app.get("sources") is not None and claims - set(re.findall(r"\b[A-Z]\d{3,5}\b", app["sources"])):
+        return verdict("hallucination", "model", f"cites {sorted(claims)} not present in the provided sources",
+                       "restrict answers to the sources, allow 'I don't know', ask for quotes first or use citations")
+    if app.get("parse_error") and "output_config" not in sent:
+        return verdict("format drift", "model", "JSON was requested only in the prompt, so the shape can drift",
+                       "use structured outputs (output_config.format) or a strict tool; keep a parser check")
+    if len(set(app.get("runs", []))) &gt; 1:
+        return verdict("inconsistent output", "model", "the same input gives different answers across runs",
+                       "specify the exact format, add examples, ground in retrieved facts, split into chained steps")
+    if re.search(r"\b(suggest|could you|can you)\b", sent["messages"][-1]["content"] if isinstance(
+            sent["messages"][-1]["content"], str) else "", re.I) and not any(b["type"] == "tool_use" for b in blocks):
+        return verdict("under-acting", "model", "the request asked for suggestions, so Claude suggested instead of acting",
+                       "ask for the action directly ('Change this function...') or add a default-to-action instruction")
+    return verdict("unclassified", "unknown", "no rule matched", "reproduce with the raw request and response")
+
+
+def verdict(mode, layer, cause, recovery):
+    return {"failure_mode": mode, "layer": layer, "cause": cause, "recovery": recovery}</code></pre></div>
+				<p>The order matters. Every integration check comes first, because an integration bug can produce any of the model-looking symptoms: a cut-off response reads as format drift, a stopped tool loop reads as under-acting. Each verdict names the layer, the cause and the recovery. Real diagnosis needs judgement, but these are the checks to run, in this order.</p>
+			</div>
+
+			<!-- ===== Recoveries ===== -->
+			<h2 id="s4">Recoveries that fix the cause</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">One cause, one fix.</span></p>
+				<ul>
+					<li><strong>Hallucination:</strong> ground Claude in sources and say to use only them. Allow "I don't know". For long documents, have it quote the relevant passages first. Use citations, or make it retract any claim it can't support with a quote. In agentic coding, tell it never to speculate about code it hasn't opened.</li>
+					<li><strong>Refusal:</strong> read <code>stop_details</code>. If the request is legitimate, give the purpose and context. Don't resend the identical request, and route genuine refusals to a person or another flow.</li>
+					<li><strong>Under-acting:</strong> ask for the action ("Change this function to...") rather than suggestions, or add a default-to-action instruction to the system prompt. If the cause is a stopped tool loop, fix the loop.</li>
+					<li><strong>Context loss:</strong> resend the full history, keep exact facts in a block that's never summarised, trim bulky tool results, and use memory for what must survive sessions (<a href="../anthropic-ccar-f/d5-task-5-1.html">context in long interactions</a>).</li>
+					<li><strong>Format drift:</strong> use structured outputs (<code>output_config.format</code>) or a strict tool, which guarantee the schema except on refusal and truncation. Check <code>stop_reason</code> before parsing. For prose formatting, say what you want rather than what you don't, and match the prompt's own style.</li>
+					<li><strong>Inconsistent output:</strong> specify the exact format, add examples, ground answers in retrieved facts, and break a complex task into chained steps.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Symptom fixes ===== -->
+			<h2 id="s5">Fixes that only hide the symptom</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">The wrong answers exam items like to offer.</span></p>
+				<ul>
+					<li><strong>Retry until it parses:</strong> hides a cut-off or a missing schema, and costs a call each time.</li>
+					<li><strong>Regex the JSON out of the prose:</strong> works until the prose changes. Structured outputs remove the problem.</li>
+					<li><strong>"Lower the temperature" for inconsistency:</strong> under API version <code>2026-10-21</code>, which the current SDKs send, <code>temperature</code>, <code>top_p</code> and <code>top_k</code> are rejected for every model. The consistency guide's remedies are format, examples, retrieval and chaining.</li>
+					<li><strong>"Tell it harder" in the prompt</strong> for a missing-history bug, or for a hallucinated fact that was never in the sources: the cause is the request, not the wording.</li>
+					<li><strong>Switching to a bigger model</strong> for an integration bug: the same code mishandles the bigger model's response too.</li>
+				</ul>
+				<div class="callout trap"><p><strong>Hiding a symptom is not recovering from it.</strong> Exam options often include a fix that would make the error disappear from the logs. Choose the one that removes the reason the error occurs.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Six modes: hallucination, refusal (HTTP 200, <code>stop_reason: "refusal"</code>), under-acting, context loss, format drift, inconsistent output.</li>
+				<li>Isolate with the raw request and response: if the response was fine, it's integration (block order, tool loop, truncation, missing history); if a correct request got a wrong response, it's model output.</li>
+				<li>Check integration causes first; they masquerade as model failures.</li>
+				<li>Fix the cause: grounding, quotes, citations and "I don't know" for hallucination; explicit action requests for under-acting; full history and fact blocks for context loss; structured outputs and a <code>stop_reason</code> check for format; format, examples, retrieval and chaining for consistency.</li>
+				<li>Retry loops, regex clean-up, temperature tweaks and bigger models hide symptoms; temperature isn't even accepted under the current API version.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-1.html"><small>Previous</small>4.1: Evaluation Design</a>
+				<a class="next" href="d5-skill-5-1.html"><small>Next</small>5.1: Generation Mechanics and Model Options</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

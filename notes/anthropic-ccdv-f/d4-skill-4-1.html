@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.1: Evaluation Design | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 4.1 (7 December 2026 guide): turning a quality goal into measurable criteria, building a golden set with edge cases, choosing code, human or LLM grading, calibrating an LLM judge against human labels with agreement and kappa, behavioural checks, regression gates, and metrics you can defend.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Eval, Testing, and Debugging &middot; 10%</span>
+		<h1>4.1: Evaluation Design</h1>
+		<p>Measuring whether a Claude feature is good enough, in a way others will accept: criteria you can count, test cases that look like real traffic, graders matched to each criterion, a judge you've checked against people, and a gate that catches regressions.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Evals</span><span class="tag">Golden sets</span><span class="tag">LLM-as-judge</span><span class="tag">Calibration</span><span class="tag">Regression tests</span><span class="tag">Metrics</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">From goal to criteria</a></li>
+				<li><a href="#s2">The golden set</a></li>
+				<li><a href="#s3">Choosing a grader</a></li>
+				<li><a href="#s4">An evaluation suite</a></li>
+				<li><a href="#s5">Calibrating the judge</a></li>
+				<li><a href="#s6">Behavioural checks and regression tests</a></li>
+				<li><a href="#s7">Defensible metrics</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.1</span>
+				<p><strong>Evaluation Design</strong>: "Constructing an evaluation that measures a stated quality goal for a Claude application or component, including LLM-as-judge harnesses calibrated against human-labeled data, golden sets, regression tests, and behavioral checks, and selecting defensible metrics."</p>
+			</div>
+			<p>Exam items state a goal ("replies must be correct and polite") and ask which evaluation would measure it, which grader suits a criterion, or why a reported score can't be trusted. Using an evaluation to find why a specific run failed is <a href="d4-skill-4-2.html">skill 4.2</a>. Accuracy broken down by segment, and sampling in production, are covered in the architect notes (<a href="../anthropic-ccar-f/d5-task-5-5.html">human review and calibration</a>).</p>
+			<p>Sources: Anthropic's guides on defining success criteria and developing tests, checked on 19 and 20 November 2026 and paraphrased. The suite below was tested with the anthropic Python SDK 2.10.0 against a mocked judge; the trust thresholds in it are my own choice, not Anthropic's.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's assistant sorts each customer email into a category and drafts a reply. Before switching to a cheaper model, the team needs an evaluation that says whether the replies are still good enough.</p></div>
+
+			<!-- ===== Criteria ===== -->
+			<h2 id="s1">From goal to criteria</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Measurable, specific, and more than one dimension.</span></p>
+				<p>"Good replies" can't be measured. Break the goal into criteria that can each be checked, with a target:</p>
+				<ul>
+					<li>the category matches the label;</li>
+					<li>the reply never promises a refund;</li>
+					<li>it quotes the order number;</li>
+					<li>a reviewer would call it polite, helpful and concrete about the next step.</li>
+				</ul>
+				<p>Anthropic's guidance is that most applications need several criteria at once. Its example sets targets for accuracy, toxicity, how bad errors are and latency together, all on a held-out test set. Targets should be ambitious but achievable, based on a baseline or benchmarks.</p>
+			</div>
+
+			<!-- ===== Golden set ===== -->
+			<h2 id="s2">The golden set</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Inputs with known right answers.</span></p>
+				<ul>
+					<li><strong>Representative:</strong> mirror the real mix of traffic, not the easy cases.</li>
+					<li><strong>Edge cases on purpose:</strong> sarcasm ("Love waiting 3 weeks. Great."), two topics in one email, irrelevant or empty input, very long input, hostile input, and cases where even people would disagree. Tag them, so results can be read per tag.</li>
+					<li><strong>Volume over polish:</strong> Anthropic prefers many cases with slightly noisier automated grading over a few hand-graded ones.</li>
+					<li><strong>Held out:</strong> don't tune prompts on the cases you report.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Graders ===== -->
+			<h2 id="s3">Choosing a grader</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">The fastest reliable method for each criterion.</span></p>
+				<ul>
+					<li><strong>Code-based</strong> (exact match, string or pattern match, schema checks): fastest, most reliable and endlessly scalable, but rigid. Use it wherever the criterion allows: the category, the forbidden phrase, the order number.</li>
+					<li><strong>Human:</strong> the most flexible and highest quality, but slow and expensive. Anthropic says to avoid it where you can, and to use it to create the labels other graders are checked against.</li>
+					<li><strong>LLM-as-judge:</strong> fast, flexible and scalable for judgements code can't make, such as tone or helpfulness. In Anthropic's words, "test to ensure reliability first, then scale". The tips:
+						<ul>
+							<li>a detailed rubric, possibly several per criterion;</li>
+							<li>a specific output (pass or fail, or a 1 to 5 score), not free-form commentary;</li>
+							<li>reasoning before the verdict;</li>
+							<li>a different model from the one being evaluated.</li>
+						</ul>
+					</li>
+				</ul>
+			</div>
+
+			<!-- ===== Suite ===== -->
+			<h2 id="s4">An evaluation suite</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Golden set, code checks, judge, metrics, regressions.</span></p>
+				<div class="code"><span class="file">eval_suite.py (Python, anthropic SDK)</span>
+<pre><code>"""Evaluate the support assistant's email replies against a stated goal: correct category, required behaviours, and
+a helpful tone, with an LLM judge that is checked against human labels before its scores are trusted."""
+import re
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+GOLDEN = [  <span class="c"># a golden set: real-shaped inputs with known right answers, edge cases tagged</span>
+    {"id": "g1", "email": "Order A1042: the footprint tore after one trip.", "category": "return", "tags": ["typical"]},
+    {"id": "g2", "email": "Love waiting 3 weeks for a 'next-day' tent. Great.", "category": "delivery", "tags": ["edge:sarcasm"]},
+    {"id": "g3", "email": "Do you sell gift cards? Also my stove never came (B77).", "category": "delivery", "tags": ["edge:two-topics"]},
+]
+
+RUBRIC = """The reply is acceptable only if ALL of these hold:
+1. It answers the customer's actual question or problem.
+2. It is polite and does not blame the customer.
+3. It gives a concrete next step (what happens, and when).
+Output only &lt;result&gt;pass&lt;/result&gt; or &lt;result&gt;fail&lt;/result&gt; after your reasoning."""
+
+
+def code_checks(case: dict, out: dict) -&gt; dict:
+    """Fast, deterministic checks: exact match against the golden label, plus behavioural rules."""
+    order_ids = re.findall(r"\b[A-Z]\d{2,5}\b", case["email"])
+    return {
+        "category": out["category"] == case["category"],
+        "no_refund_promise": not re.search(r"\b(we will|we'll) refund\b", out["reply"], re.I),
+        "quotes_order_id": all(o in out["reply"] for o in order_ids),
+    }
+
+
+def judge(case: dict, reply: str) -&gt; bool:
+    <span class="c"># A different, stronger model grades; its thinking is always on, so it reasons before the verdict.</span>
+    msg = client.messages.create(model="claude-opus-5-5", max_tokens=3000, messages=[{"role": "user", "content":
+          f"&lt;rubric&gt;{RUBRIC}&lt;/rubric&gt;\n&lt;customer_email&gt;{case['email']}&lt;/customer_email&gt;\n&lt;reply&gt;{reply}&lt;/reply&gt;"}])
+    text = "".join(b.text for b in msg.content if b.type == "text")
+    return "&lt;result&gt;pass&lt;/result&gt;" in text.lower()
+
+
+def calibrate(human: dict[str, bool], judged: dict[str, bool]) -&gt; dict:
+    """Agreement and Cohen's kappa between the judge and human labels on the same replies."""
+    ids = sorted(human)
+    n = len(ids)
+    agree = sum(human[i] == judged[i] for i in ids) / n
+    p_h, p_j = sum(human[i] for i in ids) / n, sum(judged[i] for i in ids) / n
+    chance = p_h * p_j + (1 - p_h) * (1 - p_j)
+    kappa = (agree - chance) / (1 - chance) if chance &lt; 1 else 1.0
+    false_pass = sum(judged[i] and not human[i] for i in ids) / max(1, sum(not human[i] for i in ids))
+    return {"n": n, "agreement": round(agree, 3), "kappa": round(kappa, 3), "false_pass_rate": round(false_pass, 3),
+            "trusted": n &gt;= 50 and agree &gt;= 0.9 and kappa &gt;= 0.7}
+
+
+def run(outputs: dict[str, dict], judge_trusted: bool) -&gt; dict:
+    results = {}
+    for case in GOLDEN:
+        checks = code_checks(case, outputs[case["id"]])
+        if judge_trusted:                       <span class="c"># an uncalibrated judge doesn't get a vote</span>
+            checks["tone_and_help"] = judge(case, outputs[case["id"]]["reply"])
+        results[case["id"]] = checks
+    metrics = {}
+    for criterion in next(iter(results.values())):
+        passed = [r[criterion] for r in results.values()]
+        metrics[criterion] = f"{sum(passed)}/{len(passed)}"          <span class="c"># report counts, not just percentages</span>
+    by_tag = {t: [results[c["id"]]["category"] for c in GOLDEN if t in c["tags"]] for c in GOLDEN for t in c["tags"]}
+    return {"results": results, "metrics": metrics, "category_by_tag": {t: f"{sum(v)}/{len(v)}" for t, v in by_tag.items()}}
+
+
+def regressions(baseline: dict, current: dict) -&gt; list[str]:
+    """Cases and criteria that passed on the last accepted version and fail now: block the release on these."""
+    return [f"{cid}:{k}" for cid, checks in current["results"].items()
+            for k, ok in checks.items() if not ok and baseline["results"].get(cid, {}).get(k)]</code></pre></div>
+				<ul>
+					<li><strong>Code checks first:</strong> the category against the golden label, and two behavioural rules as patterns.</li>
+					<li><strong>The judge</strong> uses a rubric with all-or-nothing conditions and returns only <code>&lt;result&gt;pass&lt;/result&gt;</code> or <code>fail</code>. It runs on Opus 5.5, a different and stronger model than the assistant under test, whose thinking is always on, so it reasons before deciding.</li>
+					<li><strong>An unchecked judge gets no vote:</strong> <code>run</code> includes the judge's criterion only when calibration has passed.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Calibration ===== -->
+			<h2 id="s5">Calibrating the judge</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Checking the judge against human labels.</span></p>
+				<p>People label a sample of replies pass or fail, the judge labels the same replies, and <code>calibrate</code> compares them:</p>
+				<ul>
+					<li><strong>Agreement:</strong> how often the two match.</li>
+					<li><strong>Cohen's kappa:</strong> agreement corrected for chance. If 90% of replies are good, a judge that always says pass agrees 90% of the time, but its kappa is 0.</li>
+					<li><strong>False-pass rate:</strong> how often the judge passes a reply people failed. This is usually the costlier error, because it hides problems.</li>
+				</ul>
+				<p>The example trusts the judge only with at least 50 labels, 90% agreement and a kappa of 0.7. Those thresholds are a reasonable choice, not an Anthropic rule. When the judge falls short, sharpen the rubric, split it into narrower rubrics, or give it examples, then recheck. Re-calibrate whenever the judge's model or rubric changes.</p>
+				<div class="callout trap"><p><strong>"The judge scored 94%, so quality is 94%"</strong> means nothing until the judge has been compared with human labels. An uncalibrated judge measures its own preferences. Anthropic also advises grading with a different model from the one that produced the output.</p></div>
+			</div>
+
+			<!-- ===== Behaviour and regression ===== -->
+			<h2 id="s6">Behavioural checks and regression tests</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Rules that must always hold, and changes that must not break them.</span></p>
+				<ul>
+					<li><strong>Behavioural checks</strong> test properties rather than exact answers: never promises a refund, always quotes the order number, refuses requests outside policy, output always parses as the schema. Each is cheap and deterministic, so it can run on every case.</li>
+					<li><strong>Regression tests</strong> compare a candidate (a new prompt, model or setting) with the last accepted version on the same golden set. <code>regressions</code> lists every case and criterion that used to pass and now fails. Gate the release on that list being empty or explained, not only on the overall score staying flat: an average can hold steady while individual cases break.</li>
+					<li><strong>Run them in CI</strong> on every change to prompts, models or tools, the same way unit tests guard code (<a href="d2-skill-2-3.html">skill 2.3</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Metrics ===== -->
+			<h2 id="s7">Defensible metrics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Numbers that survive questioning.</span></p>
+				<ul>
+					<li><strong>Tied to the goal:</strong> one metric per criterion, not a single blended score.</li>
+					<li><strong>Counts with the rate:</strong> "2/3" says how much evidence there is; "67%" hides it.</li>
+					<li><strong>Broken down:</strong> per tag or segment. In the example, the overall category score looks fine while the sarcasm case fails (<code>category_by_tag</code>).</li>
+					<li><strong>The right statistic for the task:</strong> precision and recall, or F1, for imbalanced classes; agreement and kappa for judges; percentiles for latency.</li>
+					<li><strong>Reproducible:</strong> the same golden set version, model ID and prompt version for every run you compare.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Turn the goal into several measurable criteria with targets, on a held-out set.</li>
+				<li>Golden sets mirror real traffic, include tagged edge cases, and favour volume over hand-polish.</li>
+				<li>Grade with code where possible; use an LLM judge (rubric, specific output, reasoning, different model) for judgement calls; use people to label the calibration set.</li>
+				<li>Trust a judge only after comparing it with human labels: agreement, Cohen's kappa and false-pass rate, rechecked when anything about the judge changes.</li>
+				<li>Behavioural checks for must-hold rules, regression gates on case-level changes, and metrics reported per criterion and segment with counts.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-2.html"><small>Previous</small>3.2: Claude Code Customization and Extension</a>
+				<a class="next" href="d4-skill-4-2.html"><small>Next</small>4.2: Failure-Mode Diagnosis</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
