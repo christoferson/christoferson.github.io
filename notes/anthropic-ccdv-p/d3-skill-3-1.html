@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.1: Telemetry and Instrumentation | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 3.1: instrumenting production Claude systems: OpenTelemetry traces from the Claude API, the SDK and the Agent SDK, token and cost metrics counted once, cache diagnostics, grounding and reasoning traceability, structured security events, and content capture under ZDR and HIPAA constraints, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Observability and Production Monitoring &middot; 12%</span>
+		<h1>3.1: Telemetry and Instrumentation</h1>
+		<p>What to record about every model call, tool call and agent turn so that failures can be debugged, cost can be attributed and quality can be traced, without copying sensitive conversations into a monitoring tool that wasn&rsquo;t meant to hold them.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">OpenTelemetry</span><span class="tag">Traces</span><span class="tag">Cost metrics</span><span class="tag">Privacy</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Where traces come from</a></li>
+				<li><a href="#s2">Traces for agent loops and tool calls</a></li>
+				<li><a href="#s3">Token, cost and cache metrics</a></li>
+				<li><a href="#s4">Grounding, reasoning and security events</a></li>
+				<li><a href="#s5">Content capture under privacy rules</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.1</span>
+				<p><strong>Telemetry and Instrumentation</strong>: "Applying instrumentation practice to production Claude systems under debuggability and privacy requirements, including distributed traces for agent loops and tool calls, token and cost metrics, cache-performance diagnostics, grounding and reasoning traceability, structured log events, and content-capture configuration under privacy constraints such as zero-data-retention."</p>
+			</div>
+			<p>Exam items describe a system and a privacy rule, then ask which telemetry setup lets the team debug a failure, or why a cost figure or cache rate is wrong. Choosing monitors for a failure that went unseen is <a href="../anthropic-ccar-p/d3-skill-3-4.html">CCAR-P 3.4</a>; turning these signals into SLOs and alerts is <a href="index.html#d3">skill 3.2</a>.</p>
+			<p>Sources: the Claude API OpenTelemetry pages and span reference (beta; read on 21 November 2026), and the Agent SDK observability page used for CCAR-P, paraphrased. Span names can change during the beta. The insurer, files and code are my own; the code is tested on synthetic spans.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A health insurer&rsquo;s member-services assistant answers benefit questions and drafts letters. It runs on Sonnet 5.5 with the Agent SDK for a claims-lookup agent; the organisation has a HIPAA arrangement with Anthropic.</p></div>
+
+			<!-- ===== Sources ===== -->
+			<h2 id="s1">Where traces come from</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">Three emitters, one trace.</span></p>
+				<ul>
+					<li><strong>Anthropic SDK tracing</strong> (set up in code): a client span per request, the tool runner, client tools you run, tools in a self-hosted sandbox, and other API calls such as file uploads.</li>
+					<li><strong>Claude API tracing</strong> (an Admin adds a destination in the Console): server spans for each request, each model run inside it, server tools and MCP connector tools the API runs, and Managed Agents turns. It covers any client, on the Claude API and Claude Platform on AWS.</li>
+					<li><strong>Agent SDK and Claude Code:</strong> the CLI exports its own OpenTelemetry metrics, log events and (beta) traces once <code>CLAUDE_CODE_ENABLE_TELEMETRY=1</code> is set.</li>
+					<li><strong>Join them:</strong> the API and SDK use the GenAI semantic conventions, propagate W3C trace context (<code>traceparent</code>), and send OTLP to any platform that accepts it. Wrap each call in your own span carrying route, tenant and user, so model spans sit inside the business request.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Agent traces ===== -->
+			<h2 id="s2">Traces for agent loops and tool calls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">One trace per user request, however many turns it takes.</span></p>
+				<ul>
+					<li><strong>Messages API with the tool runner:</strong> an <code>anthropic.messages.tool_runner</code> span contains one <code>anthropic.messages.create</code> per request (client and server), model-request spans, server tool spans and <code>anthropic.custom_tool_use</code> spans for your tools.</li>
+					<li><strong>Agent SDK:</strong> <code>claude_code.interaction</code>, <code>claude_code.llm_request</code> (model, latency, tokens), <code>claude_code.tool</code> (with time blocked on a user) and <code>claude_code.hook</code>. Subagent spans nest under the parent&rsquo;s tool span.</li>
+					<li><strong>Managed Agents:</strong> turn spans per agent turn; group by <code>gen_ai.conversation.id</code> for one thread or <code>anthropic.session.id</code> for a whole session.</li>
+					<li><strong>Useful attributes:</strong> requested and served model, <code>anthropic.request.id</code>, stop reason, <code>error.type</code>, tool name and arguments. Stop reason matters, because refusals and truncations are 200s (<a href="d2-skill-2-1.html">skill 2.1</a>).</li>
+					<li><strong>Export errors are silent</strong> in the Agent SDK by default; set <code>CLAUDE_CODE_OTEL_DIAG_STDERR=1</code> and alert when spans stop arriving.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Metrics ===== -->
+			<h2 id="s3">Token, cost and cache metrics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">Count each token once.</span></p>
+				<div class="code"><span class="file">span_metrics.py (span_metrics.py)</span>
+<pre><code>"""Token, cost and cache metrics from exported Claude API spans (beta; names from the span reference).
+Count each token once: prefer SERVER spans, drop duplicate deliveries, add compaction separately."""
+from collections import defaultdict
+
+PRICE = {"claude-sonnet-5-5": {"in": 2.00, "write": 2.50, "read": 0.10, "out": 10.00}}   <span class="c"># $/MTok, 5-minute writes</span>
+
+
+def counted(spans: list[dict]) -&gt; list[dict]:
+    seen, keep = set(), []
+    for s in spans:
+        key = (s["trace_id"], s["span_id"])
+        if key in seen:
+            continue                                    <span class="c"># a retried delivery</span>
+        seen.add(key)
+        if s["name"] == "anthropic.messages.create" and s["kind"] == "SERVER":
+            keep.append(s)
+    return keep
+
+
+def metrics(spans: list[dict], route_of: dict) -&gt; dict:
+    """route_of: trace ID -&gt; route, taken from your own application span that wraps the call."""
+    by_route = defaultdict(lambda: {"usd": 0.0, "input": 0, "cache_read": 0, "truncated": 0, "requests": 0})
+    for s in counted(spans):
+        a, p = s["attributes"], PRICE[s["attributes"]["gen_ai.response.model"]]
+        read, write = a.get("gen_ai.usage.cache_read.input_tokens", 0), a.get("gen_ai.usage.cache_write.input_tokens", 0)
+        total_in = a["gen_ai.usage.input_tokens"]        <span class="c"># already includes cache reads and writes</span>
+        plain = total_in - read - write
+        out = a["gen_ai.usage.output_tokens"] + a.get("anthropic.usage.compaction.output_tokens", 0)
+        plain += a.get("anthropic.usage.compaction.input_tokens", 0)
+        r = by_route[route_of.get(s["trace_id"], "unknown")]
+        r["usd"] += (plain * p["in"] + write * p["write"] + read * p["read"] + out * p["out"]) / 1e6
+        r["input"] += total_in
+        r["cache_read"] += read
+        r["truncated"] += bool(a.get("anthropic.content.truncated"))
+        r["requests"] += 1
+    return {k: {"usd": round(v["usd"], 4), "cache_read_share": round(v["cache_read"] / v["input"], 2),
+                "requests": v["requests"], "flag": "cache below 80%" if v["cache_read"] / v["input"] &lt; 0.8 else ""}
+            for k, v in by_route.items()}</code></pre></div>
+				<ul>
+					<li><strong>One source per request:</strong> when both exist, sum the API&rsquo;s <code>SERVER</code> span, not the SDK&rsquo;s <code>CLIENT</code> span. Sum either request spans or model-request spans, never both.</li>
+					<li><strong>Duplicates happen:</strong> a retried delivery repeats a span, so deduplicate by trace ID and span ID.</li>
+					<li><strong>Cache tokens are inside the input count:</strong> <code>gen_ai.usage.input_tokens</code> already includes cache reads and writes, so subtract them to price the uncached part, rather than adding them on. Compaction tokens are separate (<code>anthropic.usage.compaction.*</code>).</li>
+					<li><strong>Cache diagnostics:</strong> cache read share per route, flagged below about 80% (Anthropic&rsquo;s agent-loop median is 84%). Here the letters route reads only 20% from cache, so something is breaking its prefix.</li>
+					<li><strong>Spans aren&rsquo;t the ledger:</strong> delivery is best effort, and a caller can switch sampling off. For complete usage by key, use the Usage and Cost Analytics API, which typically updates within about four hours.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Grounding ===== -->
+			<h2 id="s4">Grounding, reasoning and security events</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">Trace why an answer said what it said.</span></p>
+				<ul>
+					<li><strong>Grounding:</strong> record retrieved document IDs and versions, and the citations in the answer, on your application span. Then a wrong answer can be traced to its source passage or its absence (<a href="d2-skill-2-4.html">skill 2.4</a>).</li>
+					<li><strong>Reasoning:</strong> spans carry reasoning-token counts (<code>gen_ai.usage.reasoning.output_tokens</code>) and the effort requested. Record the effort, model and prompt version on each request so a behaviour change can be tied to a configuration change.</li>
+					<li><strong>Structured log events:</strong> the Agent SDK emits <code>claude_code.tool_decision</code>, <code>tool_result</code>, <code>mcp_server_connection</code> and <code>permission_mode_changed</code> events, which suit a SIEM. Add end-user and tenant IDs as attributes (<code>enduser.id</code>, <code>tenant.id</code>).</li>
+					<li><strong>Log IDs, not text:</strong> request IDs, document IDs and citation locations let you rebuild what happened from the system of record without copying the content.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Content ===== -->
+			<h2 id="s5">Content capture under privacy rules</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.1</span><span class="skill-text">Who may hold the prompts and responses.</span></p>
+				<div class="code"><span class="file">telemetry_config.py (telemetry_config.py)</span>
+<pre><code>"""Content-capture settings per environment, decided by data rules rather than convenience."""
+
+
+def content_mode(env: str, org: dict) -&gt; dict:
+    if org["hipaa_or_ferpa"]:
+        <span class="c"># API destinations export metadata only for these organisations, whatever you set; match it in the SDK.</span>
+        return {"api_destination": "metadata_only", "sdk": "metadata_only"}
+    if env == "production":
+        <span class="c"># ZDR still allows full content (held in memory until delivered), but your platform then stores</span>
+        <span class="c"># members' text under its own retention. Keep production structural by default.</span>
+        return {"api_destination": "metadata_only", "sdk": "metadata_only"}
+    return {"api_destination": "content", "sdk": "content", "max_content_mb": 0.75}   <span class="c"># staging and eval capture</span>
+
+
+AGENT_SDK_ENV = {                                   <span class="c"># Agent SDK / Claude Code CLI export (structural by default)</span>
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",     <span class="c"># traces (beta): interaction, llm_request, tool, hook spans</span>
+    "OTEL_TRACES_EXPORTER": "otlp", "OTEL_METRICS_EXPORTER": "otlp", "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_SERVICE_NAME": "member-assistant",
+    "CLAUDE_CODE_OTEL_DIAG_STDERR": "1",            <span class="c"># export errors are silent by default</span>
+    <span class="c"># Not set in production: OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_DETAILS, OTEL_LOG_TOOL_CONTENT, OTEL_LOG_RAW_API_BODIES</span>
+}</code></pre></div>
+				<ul>
+					<li><strong>Two content modes:</strong> metadata only (the default: IDs, timing, status, token counts, tool and agent names) or full content (prompts and responses in <code>gen_ai.input.messages</code>, <code>gen_ai.output.messages</code> and <code>gen_ai.system_instructions</code>).</li>
+					<li><strong>ZDR doesn&rsquo;t forbid full content:</strong> for Messages API requests the API holds exported content only in memory until delivery. But your observability platform then stores it under its own retention, so ZDR at Anthropic doesn&rsquo;t mean nothing is kept anywhere. Managed Agents isn&rsquo;t ZDR eligible.</li>
+					<li><strong>HIPAA, FERPA and K-12 arrangements:</strong> API destinations export metadata only, whatever mode is set. SDK spans aren&rsquo;t affected, so set the SDK to metadata only yourself, as the config does.</li>
+					<li><strong>Size limits:</strong> full content is capped at 0.75 MB per span by default; longer content is shortened (system prompt and earliest messages first) and marked <code>anthropic.content.truncated</code>.</li>
+					<li><strong>Agent SDK opt-ins</strong> (<code>OTEL_LOG_USER_PROMPTS</code>, <code>OTEL_LOG_TOOL_DETAILS</code>, <code>OTEL_LOG_TOOL_CONTENT</code>, <code>OTEL_LOG_RAW_API_BODIES</code>) stay off in production.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"We have ZDR, so full-content tracing is safe"</strong> confuses where data is kept. ZDR covers Anthropic; the traces land in your observability platform with its own access and retention. Decide content capture by where the text ends up, and for HIPAA organisations remember the SDK side isn&rsquo;t forced to metadata.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Combine SDK spans (client side, your tools), API spans (server side, model runs, server tools, Managed Agents) and Agent SDK telemetry, joined by trace context under your own business span.</li>
+				<li>Count tokens once: server spans over client spans, no double levels, deduplicate by trace and span ID, cache tokens already inside input, compaction separate.</li>
+				<li>Watch cache read share by route; reconcile spend with the Usage and Cost Analytics API, since spans are best effort.</li>
+				<li>Record model, prompt version, effort, retrieved document IDs and citations so answers can be traced; send security events to a SIEM.</li>
+				<li>Default to metadata only in production; ZDR doesn&rsquo;t cover your platform&rsquo;s storage, and HIPAA forces metadata on API destinations but not on SDK spans.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-4.html"><small>Previous</small>2.4: Retrieval and Knowledge Grounding at Scale</a>
+				<a class="next" href="index.html#d3"><small>Next</small>Domain 3</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the insurer, files and code are original.</div>
+</footer>
+
+</body>
+</html>
