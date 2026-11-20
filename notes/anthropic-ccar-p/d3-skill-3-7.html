@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.7: Progressive Discovery vs. Monolithic Context Loading | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 3.7 (7 December 2026 guide): deciding whether to load everything into context up front or let the agent discover what it needs as it goes, from the task's context demands and latency tolerance, with a tested model of tokens and round trips.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.7</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Integration &middot; 21%</span>
+		<h1>3.7: Progressive Discovery vs. Monolithic Context Loading</h1>
+		<p>Two ways to give an agent what it needs: put it all in the prompt at the start, or give it a map and let it fetch pieces as it goes. One is faster when everything fits; the other is the only option when it doesn't, and often the more accurate one when most of the material isn't relevant.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Context engineering</span><span class="tag">Progressive disclosure</span><span class="tag">Just-in-time</span><span class="tag">Latency</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The two strategies</a></li>
+				<li><a href="#s2">The economics</a></li>
+				<li><a href="#s3">Two workloads</a></li>
+				<li><a href="#s4">Designing progressive discovery well</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.7</span>
+				<p><strong>Progressive Discovery vs. Monolithic Context Loading</strong>: "Evaluating progressive discovery against loading everything into context up front for a task with stated context demands and latency tolerance, and selecting the strategy whose context economics fit the workload."</p>
+			</div>
+			<p>Exam items state how much material a task might need and how long it can take, and ask which loading strategy fits. Choosing a retrieval architecture is <a href="d3-skill-3-5.html">skill 3.5</a>; trimming tools and results is <a href="d3-skill-3-1.html">skill 3.1</a>; the cost arithmetic of a context is <a href="d2-skill-2-4.html">skill 2.4</a>.</p>
+			<p>Sources: Anthropic's posts on effective context engineering and Contextual Retrieval, and the Agent Skills and tool search documentation, checked on 20 November 2026 and paraphrased. The workloads and model are my own; per-step latencies in the model are assumptions, and it is tested.</p>
+
+			<!-- ===== Two ===== -->
+			<h2 id="s1">The two strategies</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.7</span><span class="skill-text">And where Anthropic uses each.</span></p>
+				<ul>
+					<li><strong>Monolithic loading:</strong> everything the task might need goes into the prompt before the first turn. One call, nothing to look up, and a stable prompt caches well. For knowledge bases under about 200,000 tokens, Anthropic's advice is simply to include the whole thing.</li>
+					<li><strong>Progressive discovery:</strong> the prompt holds a map (names, descriptions, file paths, queries) and the agent loads pieces with tools when it needs them. Anthropic's context-engineering post calls this just-in-time context and progressive disclosure: the agent keeps lightweight references and discovers relevant context through exploration.</li>
+					<li><strong>Anthropic's own products use both:</strong> Claude Code puts CLAUDE.md in context up front and finds everything else with grep and glob; Agent Skills keep only each Skill's name and description (about 100 tokens) loaded until one is needed; the tool search tool loads 3&ndash;5 tool definitions on demand.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Economics ===== -->
+			<h2 id="s2">The economics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.7</span><span class="skill-text">What each strategy costs, and when.</span></p>
+				<ul>
+					<li><strong>Latency:</strong> monolithic is one round trip; progressive adds a model turn and a tool call per piece. Anthropic notes that run-time exploration is slower than retrieving pre-computed data.</li>
+					<li><strong>Tokens:</strong> monolithic pays for the whole corpus every call, though a stable prefix is cached (reads at 0.05 times the input price on Opus and Sonnet 5.5). Progressive pays for the map plus what it loads, but each later turn re-reads what earlier turns loaded.</li>
+					<li><strong>Accuracy:</strong> Anthropic describes context rot: as context grows, the model's ability to recall information from it decreases, so context is a finite resource with diminishing returns. A huge, mostly irrelevant prompt can hurt as well as cost.</li>
+					<li><strong>Hard limit:</strong> the context window (1M tokens on current models). Anything beyond it can only be discovered.</li>
+					<li><strong>Risk on the progressive side:</strong> without good guidance, an agent can waste context on wrong tools and dead ends.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Workloads ===== -->
+			<h2 id="s3">Two workloads</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.7</span><span class="skill-text">Tokens per task and round trips, side by side.</span></p>
+				<div class="code"><span class="file">loading_strategy.py (loading_strategy.py)</span>
+<pre><code>"""Monolithic loading vs progressive discovery: tokens and round trips per task for two workloads.
+
+Monolithic: everything relevant is in the prompt from the start (cacheable if it's stable).
+Progressive: the prompt holds an index (names, descriptions, paths); the agent loads pieces with tools.
+Latency per step and per round trip are illustrative assumptions; measure your own."""
+
+STEP_SECONDS = 2.5          <span class="c"># one model turn that ends in a tool call (assumed)</span>
+TOOL_SECONDS = 0.4          <span class="c"># one tool call (assumed)</span>
+
+
+def monolithic(corpus_tokens: int, tasks: int) -&gt; dict:
+    return {"input_tokens_per_task": corpus_tokens, "round_trips": 1,
+            "first_answer_s": STEP_SECONDS, "fits": corpus_tokens &lt;= 1_000_000}   <span class="c"># 1M-token context window</span>
+
+
+def progressive(index_tokens: int, pieces_needed: int, piece_tokens: int) -&gt; dict:
+    trips = 1 + pieces_needed                  <span class="c"># one turn per lookup, then the answer</span>
+    <span class="c"># each turn re-reads the growing context: index + pieces loaded so far</span>
+    tokens = sum(index_tokens + i * piece_tokens for i in range(trips))
+    return {"input_tokens_per_task": tokens, "round_trips": trips,
+            "first_answer_s": round(trips * STEP_SECONDS + pieces_needed * TOOL_SECONDS, 1), "fits": True}
+
+
+WORKLOADS = {
+    <span class="c"># many quick questions over one stable 120k-token product spec; answers needed in ~3 s</span>
+    "spec Q&amp;A (latency-sensitive)": (monolithic(120_000, 5_000), progressive(2_000, 3, 4_000)),
+    <span class="c"># deep tasks over a 6M-token monorepo; each task touches ~8 files; minutes are acceptable</span>
+    "monorepo changes (context-heavy)": (monolithic(6_000_000, 40), progressive(3_000, 8, 6_000)),
+}
+
+if __name__ == "__main__":
+    for name, (mono, prog) in WORKLOADS.items():
+        print(name)
+        print(f"  monolithic : {mono}")
+        print(f"  progressive: {prog}")</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>spec Q&amp;A (latency-sensitive)
+  monolithic : {'input_tokens_per_task': 120000, 'round_trips': 1, 'first_answer_s': 2.5, 'fits': True}
+  progressive: {'input_tokens_per_task': 32000, 'round_trips': 4, 'first_answer_s': 11.2, 'fits': True}
+monorepo changes (context-heavy)
+  monolithic : {'input_tokens_per_task': 6000000, 'round_trips': 1, 'first_answer_s': 2.5, 'fits': False}
+  progressive: {'input_tokens_per_task': 243000, 'round_trips': 9, 'first_answer_s': 25.7, 'fits': True}</code></pre></div>
+				<ul>
+					<li><strong>Spec Q&amp;A, latency-sensitive:</strong> a stable 120,000-token product spec and thousands of quick questions. Monolithic answers in one round trip, and caching makes the repeated 120,000 tokens cheap; progressive needs four round trips, which breaks a 3-second expectation. Load it all.</li>
+					<li><strong>Monorepo changes, context-heavy:</strong> 6 million tokens can't fit a 1M window, and each task needs about eight files. Progressive is the only option, and minutes of latency are acceptable. Discover as you go, with context editing for what piles up.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Load everything, the context window is 1M tokens"</strong> ignores context rot and per-call cost for material that's mostly irrelevant. <strong>"Always discover just in time"</strong> ignores latency when everything needed would fit and cache.</p></div>
+			</div>
+
+			<!-- ===== Design ===== -->
+			<h2 id="s4">Designing progressive discovery well</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.7</span><span class="skill-text">Making the map good enough to navigate.</span></p>
+				<ul>
+					<li><strong>A good index:</strong> meaningful names, short descriptions and paths that say what's inside, so the agent picks the right piece first time.</li>
+					<li><strong>Hybrid:</strong> load what nearly every task needs up front (conventions, the schema, the top tools) and discover the rest; Anthropic suggests a hybrid suits less dynamic content.</li>
+					<li><strong>Load summaries before full text:</strong> head or tail of a large file, a query that counts rather than lists, so whole objects never enter context unless needed.</li>
+					<li><strong>Keep the growth in check:</strong> clear old tool results or compact during long runs (<a href="d2-skill-2-6.html">skill 2.6</a>), or push bulk reading into a subagent.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Monolithic: one round trip, caches well, best when the material fits comfortably (Anthropic: under about 200,000 tokens) and latency is tight.</li>
+				<li>Progressive discovery: a map plus tools to fetch pieces; needed when material exceeds the window or most of it is irrelevant to any one task; slower per task.</li>
+				<li>Weigh latency (round trips), tokens (whole corpus per call versus a growing context), accuracy (context rot) and the hard window limit.</li>
+				<li>Anthropic's products mix both: CLAUDE.md up front and grep later; Skills metadata up front and bodies on demand; tool search for large tool sets.</li>
+				<li>Make discovery work with a clear index, a hybrid core loaded up front, summaries before full text, and context editing or subagents to contain growth.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-6.html"><small>Previous</small>3.6: Connection Mechanism Selection</a>
+				<a class="next" href="index.html#d3"><small>Next</small>Domain 3</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the workloads and code are original.</div>
+</footer>
+
+</body>
+</html>
