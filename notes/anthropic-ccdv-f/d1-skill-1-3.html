@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.3: Agent Pattern Diagnosis | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 1.3 (7 December 2026 guide): reading a trace of a misbehaving agent and naming the missing pattern: loop termination, progress detection, subagent isolation, memory across sessions or context-window management, with a rule-based trace checker and a safe client-side handler for the memory tool.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Agents and Workflows &middot; 17%</span>
+		<h1>1.3: Agent Pattern Diagnosis</h1>
+		<p>Reading what a misbehaving agent did and naming what's missing: a loop that stops at the wrong moment, an agent stuck repeating itself, a subagent briefed with context it never saw, an agent that forgets between sessions, or one drowning in its own context.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Traces</span><span class="tag">Agent loop</span><span class="tag">Subagents</span><span class="tag">Memory tool</span><span class="tag">Context window</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Symptoms to patterns</a></li>
+				<li><a href="#s2">A trace checker</a></li>
+				<li><a href="#s3">Loop termination and progress</a></li>
+				<li><a href="#s4">Subagent isolation</a></li>
+				<li><a href="#s5">Memory across sessions</a></li>
+				<li><a href="#s6">Context-window management</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.3</span>
+				<p><strong>Agent Pattern Diagnosis</strong>: "Analyzing a trace or description of a misbehaving agent to identify which design pattern is missing or misapplied, such as tool-use loop termination, subagent isolation, memory, or context-window management, and selecting the pattern that corrects the behavior."</p>
+			</div>
+			<p>Exam items give a trace excerpt or a description ("the agent stops halfway", "the subagent says it can't find the file"), and the answer is the pattern that fixes the cause. The four patterns the guide names each leave a recognisable mark in a trace. Diagnosing failures of the model's output itself (hallucination, refusal, format drift) is <a href="index.html#d4">skill 4.2</a>; this skill is about the agent's design.</p>
+			<p>Sources: Claude's documentation on the memory tool, stop reasons, context windows and context editing, and the Agent SDK subagent documentation, checked on 19 and 20 November 2026 and paraphrased. Both examples are plain Python and were tested on synthetic traces and a temporary directory.</p>
+			<div class="callout note"><p><strong>Running example.</strong> Support engineers send the shop's agent team traces of runs that went wrong: order lookups, refund investigations, a code agent working on the refund service, and a returns assistant used across many days.</p></div>
+
+			<!-- ===== Symptoms ===== -->
+			<h2 id="s1">Symptoms to patterns</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">What each missing pattern looks like from outside.</span></p>
+				<ul>
+					<li><strong>Stops too early, or answers half-done:</strong> loop termination. The loop ended on something other than the stop reason, such as text in the response, or treated a <code>max_tokens</code> cut-off as the answer.</li>
+					<li><strong>Same call again and again:</strong> progress detection. Nothing notices the agent isn't getting anywhere, so it only stops at the turn cap.</li>
+					<li><strong>Subagent can't find what the coordinator saw, or duplicates its work:</strong> subagent isolation misapplied. The brief assumes shared context, or the scopes overlap.</li>
+					<li><strong>Coordinator's context explodes after delegating:</strong> subagent output. The subagent returned its whole transcript rather than a summary.</li>
+					<li><strong>Each session asks the same questions again:</strong> memory. Nothing persists between conversations.</li>
+					<li><strong>Quality drops late in a long run, files are re-read and earlier facts are contradicted:</strong> context-window management.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Checker ===== -->
+			<h2 id="s2">A trace checker</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">The same reasoning as rules over a trace.</span></p>
+				<div class="code"><span class="file">trace_doctor.py (Python)</span>
+<pre><code>"""Read an agent trace and name the missing or misapplied pattern, with the evidence and the fix.
+A trace is a list of steps: {"kind": "response", "stop_reason", "input_tokens", "tool_calls": [{"name", "input"}]},
+{"kind": "loop_exit", "reason"}, {"kind": "subagent", "prompt", "returned_tokens"}, {"kind": "session_start", "asks_user": [...]}."""
+import json
+
+FIX = {
+    "loop termination": "Loop while stop_reason == 'tool_use'; end on end_turn; treat max_tokens and refusal as their own cases; "
+                        "keep the iteration cap only as a safety net that reports an error.",
+    "progress detection": "Detect repeated identical calls and return an is_error result that says what to try instead.",
+    "subagent isolation": "Write a complete brief: the subagent sees only its prompt, not the parent's conversation.",
+    "subagent output": "Have the subagent return a short structured summary, not its whole transcript.",
+    "memory": "Persist what was learned (memory tool, CLAUDE.md, a progress file) and read it at the start of each session.",
+    "context-window management": "Delegate large reads to subagents, clear old tool results or compact, and keep key facts "
+                                 "in a file or block that survives summarisation.",
+}
+
+
+def diagnose(trace: list[dict], context_budget: int = 200_000) -&gt; list[dict]:
+    found = []
+    def add(pattern, evidence):
+        found.append({"pattern": pattern, "evidence": evidence, "fix": FIX[pattern]})
+
+    responses = [s for s in trace if s["kind"] == "response"]
+    for i, s in enumerate(trace):
+        if s["kind"] == "loop_exit" and i &gt; 0 and trace[i - 1].get("stop_reason") == "tool_use":
+            add("loop termination", f"loop exited ({s['reason']}) while the last response still asked for tools")
+        if s["kind"] == "loop_exit" and i &gt; 0 and trace[i - 1].get("stop_reason") == "max_tokens":
+            add("loop termination", "a response cut off by max_tokens was treated as the final answer")
+
+    calls = [json.dumps(c, sort_keys=True) for r in responses for c in r.get("tool_calls", [])]
+    repeated = {c for c in calls if calls.count(c) &gt;= 3}
+    if repeated:
+        add("progress detection", f"the same call was made {max(calls.count(c) for c in repeated)} times: {sorted(repeated)[0]}")
+
+    for s in (x for x in trace if x["kind"] == "subagent"):
+        if any(p in s["prompt"].lower() for p in ("as discussed", "the file above", "the earlier", "same as before")):
+            add("subagent isolation", f"subagent brief refers to context it never saw: {s['prompt'][:60]!r}")
+        if s.get("returned_tokens", 0) &gt; 20_000:
+            add("subagent output", f"subagent returned {s['returned_tokens']} tokens to the parent")
+
+    starts = [s for s in trace if s["kind"] == "session_start"]
+    asked = [q for s in starts for q in s.get("asks_user", [])]
+    if any(asked.count(q) &gt; 1 for q in asked):
+        add("memory", f"each new session asks again: {sorted({q for q in asked if asked.count(q) &gt; 1})}")
+
+    if responses and max(r["input_tokens"] for r in responses) &gt; 0.8 * context_budget:
+        reads = [c for r in responses for c in r.get("tool_calls", []) if c["name"] == "Read"]
+        paths = [c["input"].get("file_path") for c in reads]
+        reread = sorted({p for p in paths if paths.count(p) &gt; 1})
+        add("context-window management", f"input reached {max(r['input_tokens'] for r in responses)} tokens"
+                                         + (f"; re-read {reread}" if reread else ""))
+    return found</code></pre></div>
+				<p>Each rule looks for the evidence an engineer would look for. Did the loop exit right after a response whose stop reason was <code>tool_use</code>? Is an identical call repeated three times? Does a brief say "the file above"? Do two sessions ask the same question? Is the input close to the budget, with files read twice? Each finding names the pattern, quotes its evidence and gives the fix. A healthy trace returns nothing. Real traces need judgement, but practising the mapping this way is exactly what the exam asks.</p>
+			</div>
+
+			<!-- ===== Loop ===== -->
+			<h2 id="s3">Loop termination and progress</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">Ending the loop for the right reason.</span></p>
+				<ul>
+					<li><strong>The rule:</strong> continue while <code>stop_reason</code> is <code>tool_use</code>, and stop on <code>end_turn</code>. Every other stop reason has its own handling: <code>max_tokens</code> means the output was cut off, <code>pause_turn</code> means send it back to continue, and <code>refusal</code> means don't retry the same request.</li>
+					<li><strong>Misapplied versions:</strong> ending when the response contains any text (Claude often writes a sentence before a tool call), ending after a fixed number of turns, or parsing "I'm done" out of the text.</li>
+					<li><strong>Progress:</strong> a turn cap is a safety net, not a stopping rule. When the same call keeps failing, return an <code>is_error</code> result that says what to try instead, or escalate.</li>
+				</ul>
+				<p>The full loop is in the architect notes (<a href="../anthropic-ccar-f/d1-task-1-1.html#s3">stop reasons</a>, <a href="../anthropic-ccar-f/d1-task-1-1.html#s7">anti-patterns</a>).</p>
+			</div>
+
+			<!-- ===== Subagents ===== -->
+			<h2 id="s4">Subagent isolation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">Fresh context is the point, and the pitfall.</span></p>
+				<ul>
+					<li><strong>Applied correctly,</strong> isolation keeps a subagent's large reads out of the coordinator and gives it a clean, focused context. Only its final message comes back.</li>
+					<li><strong>Misapplied, part 1:</strong> the brief relies on the coordinator's conversation ("check the file above"), which the subagent never saw. The fix is a self-contained brief: the objective, the inputs, the output format and the boundaries.</li>
+					<li><strong>Misapplied, part 2:</strong> the subagent returns everything it read, so the coordinator's context fills up anyway. The fix is a short, structured result.</li>
+					<li><strong>Missing:</strong> one agent does everything, and a broad task's reading crowds out its reasoning. The fix is delegating independent parts to subagents.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Memory ===== -->
+			<h2 id="s5">Memory across sessions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">The memory tool and its client-side handler.</span></p>
+				<p>Every conversation starts empty, so an agent that should remember a customer's preferred carrier between sessions needs somewhere to keep it.</p>
+				<ul>
+					<li><strong>The memory tool</strong> (<code>memory_20250818</code>, generally available) lets Claude create, read, edit and delete files under <code>/memories</code>. The API adds an instruction to check memory before starting, and to record progress as it goes.</li>
+					<li><strong>Client-side:</strong> Claude only asks for the operation; your application runs it against storage you choose, such as a directory or database keys per user. That's why it's eligible for zero data retention.</li>
+				</ul>
+				<div class="code"><span class="file">safe_memory.py (Python)</span>
+<pre><code>"""The client-side half of the memory tool: run Claude's memory commands against one user's directory,
+refusing any path that escapes /memories."""
+from pathlib import Path
+from urllib.parse import unquote
+
+MEMORY_TOOL = {"type": "memory_20250818", "name": "memory"}   <span class="c"># the whole tool definition</span>
+
+
+class Memory:
+    def __init__(self, root: str):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, virtual: str) -&gt; Path:
+        virtual = unquote(virtual)                              <span class="c"># catch %2e%2e%2f as well as ../</span>
+        if not (virtual == "/memories" or virtual.startswith("/memories/")):
+            raise PermissionError(f"{virtual} is outside /memories")
+        real = (self.root / virtual.removeprefix("/memories").lstrip("/")).resolve()
+        if real != self.root and self.root not in real.parents:  <span class="c"># canonical form must stay inside the root</span>
+            raise PermissionError(f"{virtual} is outside /memories")
+        return real
+
+    def run(self, cmd: dict) -&gt; tuple[str, bool]:
+        """Returns (tool_result content, is_error)."""
+        try:
+            c = cmd["command"]
+            if c == "view":
+                p = self._path(cmd["path"])
+                if p.is_dir():
+                    files = "\n".join(f"{f.stat().st_size}\t/memories/{f.relative_to(self.root).as_posix()}"
+                                      for f in sorted(p.rglob("*")) if f.is_file())
+                    return f"Here're the files and directories up to 2 levels deep in {cmd['path']}:\n{files}", False
+                if not p.exists():
+                    return f"The path {cmd['path']} does not exist. Please provide a valid path.", True
+                lines = p.read_text().splitlines()
+                return f"Here's the content of {cmd['path']} with line numbers:\n" + \
+                       "\n".join(f"{i:6d}\t{l}" for i, l in enumerate(lines, 1)), False
+            if c == "create":
+                p = self._path(cmd["path"])
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(cmd["file_text"])
+                return f"File created successfully at: {cmd['path']}", False
+            if c == "str_replace":
+                p = self._path(cmd["path"])
+                text = p.read_text() if p.is_file() else None
+                if text is None or text.count(cmd["old_str"]) != 1:
+                    return f"No replacement was performed, old_str `{cmd['old_str']}` did not appear exactly once in {cmd['path']}.", True
+                p.write_text(text.replace(cmd["old_str"], cmd.get("new_str", "")))
+                return "The memory file has been edited.", False
+            if c == "delete":
+                p = self._path(cmd["path"])
+                if p == self.root:
+                    return "Error: the /memories directory itself can't be deleted", True
+                p.unlink()
+                return f"Successfully deleted {cmd['path']}", False
+            return f"Error: unsupported command {c}", True
+        except PermissionError as e:
+            return f"Error: {e}", True</code></pre></div>
+				<ul>
+					<li><strong>Your handler is the security boundary:</strong> a path such as <code>/memories/../secrets.env</code>, or its URL-encoded form, must be refused. Resolve each path to its canonical form and check it is still inside the user's directory. Also refuse deleting or renaming <code>/memories</code> itself.</li>
+					<li><strong>Other options:</strong> CLAUDE.md or a progress file for a coding agent, the <code>memory</code> field on an Agent SDK subagent, and memory stores in Managed Agents. The guide's point is the pattern: persist what must survive, and read it at the start.</li>
+					<li><strong>Multi-session work:</strong> the documented pattern is an initial session that sets up a progress log and a feature checklist. Each later session reads them first and updates them before it ends.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Context ===== -->
+			<h2 id="s6">Context-window management</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">When the agent's own history becomes the problem.</span></p>
+				<p>Long runs accumulate tool results, file contents and reasoning, and accuracy degrades as context grows. The symptoms are re-reading files, contradicting earlier findings, and generic answers. The fixes, in roughly the order to reach for them:</p>
+				<ul>
+					<li><strong>Delegate large reads</strong> to subagents.</li>
+					<li><strong>Clear old tool results</strong> with context editing, or <strong>compact</strong> older turns.</li>
+					<li><strong>Keep must-survive facts</strong> in memory or a file. The memory tool documentation pairs it with compaction for exactly this reason: the summary keeps the context small, and memory keeps what can't be lost.</li>
+				</ul>
+				<p>The detail is in the architect notes (<a href="../anthropic-ccar-f/d5-task-5-1.html">long interactions</a>, <a href="../anthropic-ccar-f/d5-task-5-4.html">codebase exploration</a>).</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Map the symptom to the pattern: stops early or on a cut-off (loop termination), repeats a call (progress detection), subagent missing context or flooding the parent (isolation, output), forgets between sessions (memory), degrades late in a long run (context management).</li>
+				<li>Loop while <code>stop_reason</code> is <code>tool_use</code>; never end on "contains text" or a fixed count; caps report errors.</li>
+				<li>Subagents see only their brief and return only their final message: write self-contained briefs and ask for short, structured results.</li>
+				<li>The memory tool (<code>memory_20250818</code>) is client-side: your handler runs each file command and must block path traversal outside <code>/memories</code>.</li>
+				<li>For long runs, delegate reads, clear or compact old context, and keep must-survive facts in memory.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-2.html"><small>Previous</small>1.2: Agent SDK Construction and Hooks</a>
+				<a class="next" href="d2-skill-2-1.html"><small>Next</small>2.1: Messages API Mechanics</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
