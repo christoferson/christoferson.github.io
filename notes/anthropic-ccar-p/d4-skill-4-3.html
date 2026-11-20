@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.3: LLM-as-Judge Design and Bias | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 4.3 (7 December 2026 guide): when an LLM judge disagrees with human reviewers, diagnosing whether position, verbosity, self-preference or drift is responsible, and applying the matching correction, with tested diagnostics.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Evaluation, Testing, and Optimization &middot; 17%</span>
+		<h1>4.3: LLM-as-Judge Design and Bias</h1>
+		<p>When a model grading other models' output keeps disagreeing with people, working out which systematic bias is to blame (where the answer sat, how long it was, who wrote it, or a judge that has changed over time) and fixing that bias rather than the rubric in general.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">LLM-as-judge</span><span class="tag">Evaluation</span><span class="tag">Bias</span><span class="tag">Calibration</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What Anthropic recommends for model graders</a></li>
+				<li><a href="#s2">Four biases and their signatures</a></li>
+				<li><a href="#s3">Diagnosing against human labels</a></li>
+				<li><a href="#s4">Choosing the correction</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.3</span>
+				<p><strong>LLM-as-Judge Design and Bias</strong>: "Evaluating the design of an LLM-as-judge or rubric-based evaluation whose results are inconsistent with human review, and selecting the correction that addresses the responsible bias (position, verbosity, self-preference, judge drift)."</p>
+			</div>
+			<p>Exam items describe a judge's setup and how its results differ from human review, and ask which bias is responsible and which change fixes it. Building and calibrating a judge from scratch is in the developer notes (<a href="../anthropic-ccdv-f/d4-skill-4-1.html#s3">CCDV-F 4.1</a>).</p>
+			<p>Sources: Anthropic's guidance on developing tests and grading, checked on 20 November 2026 and paraphrased. The four biases' names come from the exam guide; their diagnostics and corrections below are standard evaluation practice in my words. The setup and code are my own, tested on synthetic judgements.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A support team uses an LLM judge to compare two draft replies per ticket (a current prompt against a candidate). Human reviewers labelled 300 pairs, and the judge agrees with them on only 68%.</p></div>
+
+			<!-- ===== Anthropic ===== -->
+			<h2 id="s1">What Anthropic recommends for model graders</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.3</span><span class="skill-text">The baseline design.</span></p>
+				<ul>
+					<li><strong>Test reliability first, then scale:</strong> model grading is fast, flexible and good for judgement, but only after checking it against human judgements.</li>
+					<li><strong>Detailed, clear rubrics:</strong> spell out what earns each score, possibly several rubrics per criterion.</li>
+					<li><strong>Specific outputs:</strong> correct/incorrect or a defined 1&ndash;5 scale, not open-ended commentary.</li>
+					<li><strong>Reasoning before the verdict:</strong> let the grader think through the rubric before it scores.</li>
+					<li><strong>A different model from the generator:</strong> Anthropic's grading example says to grade with a different model from the one that produced the output.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Biases ===== -->
+			<h2 id="s2">Four biases and their signatures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.3</span><span class="skill-text">How each shows up in disagreement with humans.</span></p>
+				<ul>
+					<li><strong>Position bias:</strong> the judge favours whichever answer appears first (or last). Signature: swapping A and B changes its verdict; it picks one slot far more often than human labels would explain.</li>
+					<li><strong>Verbosity bias:</strong> the judge favours longer, more elaborate answers. Signature: disagreement concentrates on pairs where humans preferred the shorter reply.</li>
+					<li><strong>Self-preference:</strong> the judge favours output written by its own model, or in its own style. Signature: agreement with humans drops specifically when the judge's own model wrote the reply humans rejected.</li>
+					<li><strong>Judge drift:</strong> the judge's behaviour changes over time, because its model, prompt or rubric changed. Signature: agreement on a fixed calibration set falls from one period to the next while nothing else changed.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Diagnose ===== -->
+			<h2 id="s3">Diagnosing against human labels</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.3</span><span class="skill-text">One diagnostic per bias, each isolating it.</span></p>
+				<div class="code"><span class="file">judge_bias.py (judge_bias.py)</span>
+<pre><code>"""Find which bias makes an LLM judge disagree with human reviewers, so the right correction is applied.
+
+Setup: a support team compares two reply drafts (A, B) per ticket; the judge picks the better one.
+Human reviewers labelled 300 pairs. Each diagnostic isolates one bias using those labels."""
+from statistics import mean
+
+
+def position_bias(records):
+    """Judge the same pair in both orders: a fair judge's choice of reply doesn't depend on its slot."""
+    flips = [r for r in records if r["pick_ab"] != r["pick_ba"]]   <span class="c"># picks given as reply ids</span>
+    first_slot = mean(1 if r["pick_ab"] == r["a"] else 0 for r in records)
+    return {"inconsistent_when_swapped": round(len(flips) / len(records), 2), "picks_first_slot": round(first_slot, 2)}
+
+
+def verbosity_bias(records):
+    """Among pairs where humans preferred the shorter reply, how often does the judge pick the longer one?"""
+    hard = [r for r in records if r["human"] == r["shorter"]]
+    return {"picks_longer_when_humans_prefer_shorter": round(mean(r["pick_ab"] != r["shorter"] for r in hard), 2)}
+
+
+def self_preference(records, judge_model):
+    """Agreement with humans, split by whether the judge's own model wrote the reply humans rejected."""
+    own = [r for r in records if r["rejected_by"] == judge_model]
+    other = [r for r in records if r["rejected_by"] != judge_model]
+    agree = lambda rs: round(mean(r["pick_ab"] == r["human"] for r in rs), 2)
+    return {"agreement_when_own_model_lost": agree(own), "agreement_otherwise": agree(other)}
+
+
+def drift(calibration_runs):
+    """Same fixed calibration set, judged monthly: agreement with humans should hold steady."""
+    return {month: round(acc, 2) for month, acc in calibration_runs}
+
+
+CORRECTIONS = {
+    "position": "judge each pair in both orders; count a win only if it holds both ways, otherwise a tie",
+    "verbosity": "rubric criteria that reward completeness, not length; tell the judge length isn't a criterion; "
+                 "add short-but-correct anchor examples",
+    "self-preference": "use a judge from a different model than the generators being compared",
+    "drift": "pin the judge model and prompt; re-check agreement on the fixed calibration set on every change "
+             "and monthly; recalibrate when it falls",
+}</code></pre></div>
+				<ul>
+					<li><strong>Position:</strong> re-judge every pair in the opposite order; the share of verdicts that flip is the bias, measured directly.</li>
+					<li><strong>Verbosity:</strong> look only at pairs where humans chose the shorter reply; a fair judge agrees with them, a verbose-biased one picks the longer.</li>
+					<li><strong>Self-preference:</strong> split agreement by which model wrote the rejected reply.</li>
+					<li><strong>Drift:</strong> rerun a fixed, human-labelled calibration set on a schedule and on every judge change.</li>
+					<li><strong>The tests</strong> plant one bias at a time in synthetic judgements and confirm each diagnostic flags only its own.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Correct ===== -->
+			<h2 id="s4">Choosing the correction</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.3</span><span class="skill-text">Fix the bias you found, not everything at once.</span></p>
+				<ul>
+					<li><strong>Position:</strong> judge both orders and count a win only when it holds both ways; otherwise record a tie.</li>
+					<li><strong>Verbosity:</strong> rubric criteria for completeness and correctness rather than length, an explicit statement that length isn't a criterion, and short-but-correct anchor examples.</li>
+					<li><strong>Self-preference:</strong> a judge from a different model than the generators being compared, consistent with Anthropic's grading example.</li>
+					<li><strong>Drift:</strong> pin the judge model and prompt; re-check agreement on the calibration set whenever either changes and on a schedule; recalibrate when it falls.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Rewrite the rubric to be more detailed"</strong> is a reasonable general improvement, but it won't fix a judge that flips when answers swap places, or one comparing its own model's output. Diagnose first, then apply the matching correction.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Baseline (Anthropic): check a model grader against human judgements before scaling; detailed rubrics, specific scales, reasoning before the verdict, and a different model from the generator.</li>
+				<li>Position bias: verdicts change when order swaps; fix by judging both orders and counting only consistent wins.</li>
+				<li>Verbosity bias: longer answers win where humans preferred shorter; fix with length-neutral criteria and short anchor examples.</li>
+				<li>Self-preference: agreement drops when the judge's own model lost; fix with a judge from a different model.</li>
+				<li>Judge drift: agreement on a fixed calibration set falls over time; fix by pinning the judge and re-checking on every change and on a schedule.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-2.html"><small>Previous</small>4.2: Deriving Evaluations from Business Processes</a>
+				<a class="next" href="index.html#d4"><small>Next</small>Domain 4</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the setup and code are original.</div>
+</footer>
+
+</body>
+</html>
