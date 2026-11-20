@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>8.2: MCP Server Development and Integration | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 8.2 (7 December 2026 guide): building an MCP server with the Python SDK's MCPServer (tools, resources and prompts), choosing stdio or Streamable HTTP, adding OAuth bearer-token authentication for remote deployment, and integrating it with Claude Code, the Agent SDK and the Messages API's MCP connector.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d8">Domain 8</a><span class="sep">/</span><span class="here">8.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 8 &middot; Tools and MCP &middot; 10%</span>
+		<h1>8.2: MCP Server Development and Integration</h1>
+		<p>Writing an MCP server once and using it everywhere: tools, resources and prompts in one Python file, stdio for local use and Streamable HTTP with tokens for remote use, wired into Claude Code, the Agent SDK and the Messages API.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">MCP</span><span class="tag">MCPServer</span><span class="tag">stdio</span><span class="tag">Streamable HTTP</span><span class="tag">OAuth</span><span class="tag">MCP connector</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">A server with all three primitives</a></li>
+				<li><a href="#s2">Tools, resources and prompts</a></li>
+				<li><a href="#s3">stdio or HTTP</a></li>
+				<li><a href="#s4">Authentication</a></li>
+				<li><a href="#s5">In Claude Code and the Agent SDK</a></li>
+				<li><a href="#s6">From the Messages API</a></li>
+				<li><a href="#s7">Testing a server</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 8.2</span>
+				<p><strong>MCP Server Development and Integration</strong>: "Building, deploying, and integrating an MCP server into Claude applications and workflows, including its resources, tools, and prompts, the choice of transport (stdio or HTTP), and authentication."</p>
+			</div>
+			<p>Exam items describe an integration and ask which primitive, transport or auth setup fits, or why a client can't reach a server. The architect notes cover MCP scopes in Claude Code (<a href="../anthropic-ccar-f/d2-task-2-4.html">task 2.4</a>) and MCP error results (<a href="../anthropic-ccar-f/d2-task-2-2.html">task 2.2</a>). Tool design itself is <a href="d8-skill-8-1.html">skill 8.1</a>.</p>
+			<p>Sources: the MCP Python SDK 2.3 (its classes inspected directly), Claude's MCP connector documentation, and the earlier verified notes on Claude Code's MCP configuration, checked on 8 and 20 November 2026 and paraphrased. The server was tested through a real MCP client, both in-process and as a stdio subprocess, and the connector call against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop wants one orders server that developers run locally in Claude Code, that a hosted support agent reaches over the network, and that the help assistant calls straight from the Messages API.</p></div>
+
+			<!-- ===== Server ===== -->
+			<h2 id="s1">A server with all three primitives</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">One tool, two resources, one prompt, two transports.</span></p>
+				<div class="code"><span class="file">orders_server.py (Python, MCP Python SDK 2.x)</span>
+<pre><code>"""The shop's orders MCP server: one tool, two resources and a prompt. stdio for local clients, Streamable HTTP with
+OAuth bearer tokens when it is deployed for remote clients."""
+import json
+import os
+import sys
+
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel
+
+ORDERS = {"A1042": {"status": "delivered", "eta": None, "items": ["Ridge 2 footprint"]},
+          "B77": {"status": "in_transit", "eta": "2026-11-24", "items": ["Pocket stove"]}}
+
+
+class OrderStatus(BaseModel):          <span class="c"># a typed return gives the tool an output schema and structured content</span>
+    order_id: str
+    status: str
+    eta: str | None
+    items: list[str]
+
+
+RETURNS_POLICY = "Unused gear can be returned within 60 days. Damaged items: refund or replacement."
+
+
+class IntrospectionVerifier:
+    """Validates bearer tokens for the HTTP deployment. Replace the lookup with your identity provider's introspection."""
+    def __init__(self, valid: dict[str, list[str]]):
+        self.valid = valid
+
+    async def verify_token(self, token: str) -&gt; AccessToken | None:
+        scopes = self.valid.get(token)
+        return AccessToken(token=token, client_id="support-assistant", scopes=scopes) if scopes else None
+
+
+def build(remote: bool) -&gt; MCPServer:
+    kwargs = {}
+    if remote:   <span class="c"># only the HTTP deployment needs auth; a stdio server runs as the local user who started it</span>
+        kwargs = {"token_verifier": IntrospectionVerifier({os.environ.get("ORDERS_TOKEN", ""): ["orders:read"]}),
+                  "auth": AuthSettings(issuer_url="https://auth.shop.example",
+                                       resource_server_url="https://mcp.shop.example/mcp",
+                                       required_scopes=["orders:read"])}
+    mcp = MCPServer("shop-orders", instructions="Order status and return policy for the outdoor-gear shop.", **kwargs)
+
+    @mcp.tool()   <span class="c"># tools: actions the model chooses to call</span>
+    def get_order_status(order_id: str) -&gt; OrderStatus:
+        """Look up one order's delivery status, expected date and items. Read-only. Use the order ID the customer
+        gave, such as A1042; if there is no such order, say so and ask them to check it."""
+        order = ORDERS.get(order_id.strip().upper())
+        if order is None:
+            raise ToolError(f"No order {order_id}. Ask the customer to check the ID.")   <span class="c"># reaches the model as an error</span>
+        return OrderStatus(order_id=order_id.upper(), **order)
+
+    @mcp.resource("policy://returns")   <span class="c"># resources: context the application chooses to attach</span>
+    def returns_policy() -&gt; str:
+        return RETURNS_POLICY
+
+    @mcp.resource("order://{order_id}")
+    def order_record(order_id: str) -&gt; str:
+        return json.dumps(ORDERS.get(order_id, {}))
+
+    @mcp.prompt()   <span class="c"># prompts: templates the user invokes</span>
+    def delivery_reply(order_id: str) -&gt; str:
+        return f"Look up order {order_id} and write a short, friendly delivery update for the customer."
+
+    return mcp
+
+
+if __name__ == "__main__":
+    remote = "--http" in sys.argv
+    build(remote).run(transport="streamable-http" if remote else "stdio")</code></pre></div>
+				<ul>
+					<li><strong><code>MCPServer</code></strong> is the high-level server class in the MCP Python SDK 2.x, where it replaced <code>FastMCP</code>. Decorators register each primitive, and the docstring becomes the tool's description.</li>
+					<li><strong>A typed return</strong> (<code>OrderStatus</code>) gives the tool an output schema and structured content. A plain <code>dict</code> came back only as JSON text when I tested it.</li>
+					<li><strong><code>ToolError</code></strong> reaches the client as an error result the model can read. In SDK 2.x, a plain exception's message is hidden.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Primitives ===== -->
+			<h2 id="s2">Tools, resources and prompts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">Who decides when each is used.</span></p>
+				<ul>
+					<li><strong>Tools</strong> are actions the <em>model</em> chooses to call, such as <code>get_order_status</code>. Use them for anything Claude should decide to do mid-task.</li>
+					<li><strong>Resources</strong> are context the <em>application</em> chooses to attach. <code>policy://returns</code> is a fixed resource; <code>order://{order_id}</code> is a template with a parameter. In Claude Code, users reference them with <code>@server:...</code>.</li>
+					<li><strong>Prompts</strong> are templates the <em>user</em> invokes. <code>delivery_reply</code> appears in Claude Code as <code>/mcp__shop-orders__delivery_reply</code>.</li>
+					<li><strong>Choosing:</strong> if Claude must decide when to fetch it, use a tool. If a person or the app attaches it deliberately, use a resource. If it's a reusable instruction a user starts, use a prompt. Not every client supports all three; the Messages API connector, for one, supports only tools.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Transport ===== -->
+			<h2 id="s3">stdio or HTTP</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">Local subprocess or network service.</span></p>
+				<ul>
+					<li><strong>stdio:</strong> the client launches the server as a subprocess and talks over stdin and stdout. There's nothing to host and no network exposure. It runs with the permissions and environment of the user who started it, so it suits developer tools on a laptop and local files. One process per client.</li>
+					<li><strong>Streamable HTTP:</strong> the server is a web service many clients reach by URL. It suits shared, hosted or remote use, and it's the only option for clients that can't launch processes, such as the Messages API connector or cloud agents. It needs hosting, TLS and authentication. SSE is the older HTTP transport and is deprecated in favour of Streamable HTTP.</li>
+					<li><strong>Same code:</strong> the example's server is identical in both modes, and <code>run(transport=...)</code> chooses. Only the remote deployment adds auth.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Auth ===== -->
+			<h2 id="s4">Authentication</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">Bearer tokens on HTTP; the environment on stdio.</span></p>
+				<ul>
+					<li><strong>Remote servers are OAuth resource servers.</strong> The SDK's <code>AuthSettings</code> names the authorization server that issues tokens (<code>issuer_url</code>), the server's own URL as the resource identifier (<code>resource_server_url</code>, also where it publishes its protected-resource metadata), and the scopes it requires. A <code>TokenVerifier</code> checks each bearer token and returns its client, scopes and expiry, or <code>None</code> to reject it. In production, verification calls your identity provider rather than the example's lookup.</li>
+					<li><strong>Clients obtain the token:</strong> Claude Code can carry it in a header from an environment variable. The Messages API connector expects you to run the OAuth flow yourself and pass the access token, refreshing it as needed.</li>
+					<li><strong>stdio servers</strong> typically don't use that flow. They take credentials for the systems behind them from their environment, set by whoever launches them.</li>
+					<li><strong>Scope tokens narrowly</strong> (<code>orders:read</code> here). The server's tools can do whatever its own credentials allow, so least privilege applies to the server too (<a href="d7-skill-7-2.html#s4">skill 7.2</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Claude Code / SDK ===== -->
+			<h2 id="s5">In Claude Code and the Agent SDK</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">One committed file for the team.</span></p>
+				<div class="code"><span class="file">.mcp.json (JSON, .mcp.json (project scope))</span>
+<pre><code>{
+  "mcpServers": {
+    "shop-orders": {
+      "command": "python",
+      "args": ["tools/orders_server.py"]
+    },
+    "shop-orders-remote": {
+      "type": "http",
+      "url": "https://mcp.shop.example/mcp",
+      "headers": { "Authorization": "Bearer ${ORDERS_TOKEN}" }
+    }
+  }
+}</code></pre></div>
+				<ul>
+					<li><strong>Project scope:</strong> <code>.mcp.json</code> is committed, so the whole team gets both servers: the local one launched with <code>command</code>, and the remote one with <code>"type": "http"</code>. The token comes from <code>${ORDERS_TOKEN}</code>, never a literal, and project servers need each person's approval.</li>
+					<li><strong>Other scopes:</strong> local (the default, this project only) and user (all your projects) live in <code>~/.claude.json</code>. Add servers with <code>claude mcp add --scope ...</code>.</li>
+					<li><strong>Naming and limits:</strong> tools appear as <code>mcp__shop-orders__get_order_status</code>, which is the name to use in permission rules and hook matchers. Output is capped at 25,000 tokens by default.</li>
+					<li><strong>Agent SDK:</strong> pass the same server definitions in <code>mcp_servers</code> and pre-approve their tools in <code>allowed_tools</code>. For tools that live in your own process, <code>@tool</code> with <code>create_sdk_mcp_server</code> skips the separate server. A server that fails to start doesn't raise, so check the init message.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Connector ===== -->
+			<h2 id="s6">From the Messages API</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">The MCP connector: no MCP client in your code.</span></p>
+				<div class="code"><span class="file">api_connector.py (Python, anthropic SDK)</span>
+<pre><code>"""Use the deployed server straight from the Messages API with the MCP connector (beta): no MCP client in your code."""
+import os
+
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def ask(question: str) -&gt; str:
+    response = client.beta.messages.create(
+        model="claude-sonnet-5-5", max_tokens=1000, betas=["mcp-client-2025-11-20"],
+        mcp_servers=[{"type": "url", "url": "https://mcp.shop.example/mcp", "name": "shop-orders",
+                      "authorization_token": os.environ["ORDERS_TOKEN"]}],   <span class="c"># you run the OAuth flow and refresh it</span>
+        tools=[{"type": "mcp_toolset", "mcp_server_name": "shop-orders"}],
+        messages=[{"role": "user", "content": question}],
+    )
+    return "".join(b.text for b in response.content if b.type == "text")</code></pre></div>
+				<ul>
+					<li><strong>Shape:</strong> declare the server in <code>mcp_servers</code> (type <code>url</code>, an <code>https://</code> URL, a name, an optional <code>authorization_token</code>) and enable it with an <code>mcp_toolset</code> entry in <code>tools</code>. The toolset can allowlist, denylist or configure individual tools.</li>
+					<li><strong>What comes back:</strong> Anthropic calls the server, and the response contains <code>mcp_tool_use</code> and <code>mcp_tool_result</code> blocks next to the text.</li>
+					<li><strong>Limits:</strong> the connector is in beta. It supports only MCP tools, not resources or prompts. The server must be publicly reachable over HTTP (Streamable HTTP or SSE), and a local stdio server can't be connected. It isn't eligible for zero data retention.</li>
+					<li><strong>Managed Agents:</strong> MCP servers are declared on the agent, with credentials supplied from a vault for each session.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Testing ===== -->
+			<h2 id="s7">Testing a server</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.2</span><span class="skill-text">Through a real client, before any model sees it.</span></p>
+				<ul>
+					<li><strong>Test through the protocol:</strong> the SDK's <code>Client</code> can connect to an <code>MCPServer</code> in-process, launch it as a stdio subprocess, or reach it by URL. My test does the first two: list tools, call one, check a <code>ToolError</code> comes back as an error result, read both resources, render the prompt.</li>
+					<li><strong>Don't stop at the decorated function:</strong> calling it directly raises the <code>ToolError</code> instead of producing the error result a client sees, so only a protocol-level test shows what the model will receive.</li>
+					<li><strong>Then test with Claude:</strong> check that the model picks the tool from its description (<a href="d4-skill-4-1.html">skill 4.1</a>).</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li><code>MCPServer</code> (Python SDK 2.x, formerly FastMCP): decorators for tools, resources and prompts; typed returns give structured content; raise <code>ToolError</code> for errors the model should see.</li>
+				<li>Tools are model-chosen, resources application-attached, prompts user-invoked; the Messages API connector supports only tools.</li>
+				<li>stdio for local, single-user servers launched by the client; Streamable HTTP for shared or remote ones and any client that can't launch processes; SSE is deprecated.</li>
+				<li>HTTP servers authenticate bearer tokens as OAuth resource servers (<code>AuthSettings</code> plus a <code>TokenVerifier</code>, narrow scopes); clients obtain the token; stdio servers take credentials from their environment.</li>
+				<li>Integrate with a committed <code>.mcp.json</code> (<code>${VAR}</code> for secrets, <code>"type": "http"</code> for remote), Agent SDK <code>mcp_servers</code>, or the MCP connector (beta; public HTTPS, tools only, you supply the token). Test through a real MCP client.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d8-skill-8-1.html"><small>Previous</small>8.1: Tool Design and Response Shaping</a>
+				<a class="next" href="index.html#d8"><small>Next</small>Domain 8</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
