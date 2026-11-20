@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>8.1: Tool Design and Response Shaping | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 8.1 (7 December 2026 guide): implementing a Claude tool end to end: a strict schema, a description that drives the right call, results shaped to what the model needs, structured errors, client versus server execution, an approval step before side effects, and a tool set assembled for performance.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d8">Domain 8</a><span class="sep">/</span><span class="here">8.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 8 &middot; Tools and MCP &middot; 10%</span>
+		<h1>8.1: Tool Design and Response Shaping</h1>
+		<p>Building a tool Claude uses correctly: a schema it can't get wrong, a description that says when to call it, a result with only what matters, errors it can act on, a person in front of anything that moves money, and a tool set small enough to stay fast.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Tool use</span><span class="tag">Schemas</span><span class="tag">Descriptions</span><span class="tag">Response shaping</span><span class="tag">Approval</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Two tools for one integration</a></li>
+				<li><a href="#s2">Schema and description</a></li>
+				<li><a href="#s3">Shaping the response</a></li>
+				<li><a href="#s4">Errors Claude can act on</a></li>
+				<li><a href="#s5">Client or server execution</a></li>
+				<li><a href="#s6">An approval pattern</a></li>
+				<li><a href="#s7">Assembling the tool set</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 8.1</span>
+				<p><strong>Tool Design and Response Shaping</strong>: "Implementing a tool for an integration need: a function schema, a description that drives correct invocation, response shaping so the model receives a minimal and actionable result, error handling, the choice of execution side, and an approval pattern, and assembling the tool set for performance."</p>
+			</div>
+			<p>This is the implementation skill: exam items show a tool definition and handler, and ask what's wrong or what to change. The design principles are covered in the architect notes (<a href="../anthropic-ccar-f/d2-task-2-1.html">tool interfaces</a>, <a href="../anthropic-ccar-f/d2-task-2-2.html">structured errors</a>, <a href="../anthropic-ccar-f/d2-task-2-3.html">tool distribution</a>). Exposing tools through MCP is <a href="index.html#d8">skill 8.2</a>, and choosing a tool over a skill or MCP server is <a href="index.html#d8">skill 8.3</a>.</p>
+			<p>Sources: Claude's documentation on tool use, defining tools and strict tool use, plus the earlier verified notes on tool descriptions and errors, checked on 19 and 20 November 2026 and paraphrased. The tools were tested by calling the handler directly.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The support assistant needs to answer "can I return this?" from the order system and start refunds. The order API returns over forty fields per order, and refunds must be approved by staff.</p></div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s1">Two tools for one integration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">A read tool and a gated write tool.</span></p>
+				<div class="code"><span class="file">returns_tools.py (Python)</span>
+<pre><code>"""Two client tools for the support assistant: a read tool whose result is shaped to what Claude needs,
+and a refund tool that queues for human approval instead of paying out on the model's say-so."""
+import json
+
+TOOLS = [
+    {"name": "check_return",
+     "description": ("Check whether one order can be returned and what refund it would get. Use it before promising "
+                     "anything about a return. Returns eligible (true/false), the reason, the last return date, the refund "
+                     "amount and the next action. It doesn't change anything. Needs the order ID exactly as the customer "
+                     "gave it (for example A1042); ask for it if you don't have it."),
+     "strict": True,
+     "input_schema": {"type": "object", "additionalProperties": False, "required": ["order_id"],
+                      "properties": {"order_id": {"type": "string", "description": "Order ID such as A1042"}}}},
+    {"name": "request_refund",
+     "description": ("Ask for a refund to be paid for an order that check_return said is eligible. A person approves "
+                     "every refund, so this returns a ticket, not a payment: tell the customer it is being reviewed. "
+                     "Don't call it for ineligible orders."),
+     "strict": True,
+     "input_schema": {"type": "object", "additionalProperties": False, "required": ["order_id", "amount", "reason"],
+                      "properties": {"order_id": {"type": "string"}, "amount": {"type": "number"},
+                                     "reason": {"type": "string", "enum": ["damaged", "unused", "late_delivery", "other"]}}}},
+]
+
+
+def shape(order: dict) -&gt; dict:
+    """The order API returns 40-odd fields; Claude gets the five that decide a return, already worked out."""
+    eligible = order["status"] == "delivered" and order["days_since_delivery"] &lt;= order["return_window_days"]
+    return {"eligible": eligible,
+            "reason": "within the return window" if eligible else
+                      ("not delivered yet" if order["status"] != "delivered" else "return window has passed"),
+            "last_return_date": order["return_deadline"],
+            "refund_amount": order["amount_paid"] if eligible else 0,
+            "next_action": "offer request_refund" if eligible else "explain and offer a person"}
+
+
+def error(category: str, message: str, retryable: bool) -&gt; tuple[str, bool]:
+    return json.dumps({"error": category, "message": message, "retryable": retryable}), True
+
+
+def run_tool(name: str, args: dict, orders_api, approvals: list) -&gt; tuple[str, bool]:
+    """Returns (tool_result content, is_error)."""
+    if name == "check_return":
+        try:
+            order = orders_api(args["order_id"])
+        except TimeoutError:
+            return error("transient", "Order system timed out; try again once.", True)
+        if order is None:
+            return error("not_found", f"No order {args['order_id']}. Ask the customer to check the ID.", False)
+        return json.dumps(shape(order)), False
+    if name == "request_refund":
+        order = orders_api(args["order_id"])
+        result = shape(order) if order else None
+        if not result or not result["eligible"]:
+            return error("business_rule", "This order isn't eligible; don't request a refund.", False)
+        if args["amount"] &gt; result["refund_amount"]:
+            return error("validation", f"Amount exceeds the paid {result['refund_amount']}.", False)
+        ticket = f"RF-{len(approvals) + 1}"
+        approvals.append({"ticket": ticket, **args})       <span class="c"># a person approves before any money moves</span>
+        return json.dumps({"status": "pending_approval", "ticket": ticket}), False
+    return error("unknown_tool", name, False)</code></pre></div>
+				<p>One integration, two tools, because reading and acting have different risks. <code>check_return</code> can run freely. <code>request_refund</code> changes something, so it is narrower, checks eligibility itself, and queues for approval.</p>
+			</div>
+
+			<!-- ===== Schema ===== -->
+			<h2 id="s2">Schema and description</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">The schema makes the call valid; the description makes it the right call.</span></p>
+				<ul>
+					<li><strong>Schema:</strong>
+						<ul>
+							<li><code>strict: true</code> guarantees the call matches the schema.</li>
+							<li><code>additionalProperties: false</code> on every object, and required fields marked.</li>
+							<li>An enum for closed sets, such as the refund reason.</li>
+							<li>A description and example format on each parameter.</li>
+						</ul>
+						Strict mode ensures valid input; it doesn't choose the tool.</li>
+					<li><strong>Description:</strong> Claude decides whether to call a tool from its description, so say what it does, what it returns, when to use it, when not to, and what it needs. "Use it before promising anything about a return" and "Don't call it for ineligible orders" steer the behaviour that matters.</li>
+					<li><strong>Missing inputs:</strong> say what to do when information is missing ("ask for it if you don't have it"). The docs note that Opus models are more likely to ask for a missing required value, while Sonnet may infer one.</li>
+					<li><strong>Triggering:</strong> if Claude under-uses or over-uses a tool, adjust the description or a line in the system prompt, such as "Use the tools to investigate before responding."</li>
+				</ul>
+			</div>
+
+			<!-- ===== Shaping ===== -->
+			<h2 id="s3">Shaping the response</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Minimal and actionable.</span></p>
+				<ul>
+					<li><strong>Minimal:</strong> <code>shape</code> returns five fields instead of forty. Every token of a tool result is paid for, stays in the history and is re-sent on every later turn, and irrelevant fields bury the relevant ones.</li>
+					<li><strong>Actionable:</strong> the result is already worked out (<code>eligible: true</code>, a reason, a deadline, an amount) and names the <code>next_action</code>. Claude doesn't have to reproduce the return policy's arithmetic from raw dates, which is where mistakes creep in.</li>
+					<li><strong>Meaningful values:</strong> plain words and dates rather than internal codes, and IDs only where Claude needs them for a later call.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Errors ===== -->
+			<h2 id="s4">Errors Claude can act on</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">A category, a message with the next step, and retryability.</span></p>
+				<p>Each failure returns <code>is_error: true</code> with a JSON body:</p>
+				<ul>
+					<li><code>transient</code> (retry once);</li>
+					<li><code>not_found</code> (ask the customer to check the ID);</li>
+					<li><code>business_rule</code> (don't retry: not eligible);</li>
+					<li><code>validation</code> (fix the amount).</li>
+				</ul>
+				<p>A bare "error" leaves Claude guessing whether to retry, rephrase or give up. The handler also never raises into the loop: every path returns a result. "No such order" is a <code>not_found</code> error the customer can fix, while a search that ran and matched nothing would be a successful empty result (<a href="../anthropic-ccar-f/d2-task-2-2.html#s6">empty results</a>).</p>
+			</div>
+
+			<!-- ===== Execution side ===== -->
+			<h2 id="s5">Client or server execution</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Where the tool's code runs.</span></p>
+				<ul>
+					<li><strong>Client tools</strong> run in your application. That covers your own functions and Anthropic-schema tools such as bash, the text editor and memory. Claude returns <code>stop_reason: "tool_use"</code>, your code runs the call and sends a <code>tool_result</code>. Choose client side when the tool needs your systems, your data, your credentials or your approval step. Both shop tools are client tools for exactly that reason.</li>
+					<li><strong>Server tools</strong> run on Anthropic's infrastructure: web search, web fetch, code execution, tool search, the advisor tool and the MCP connector. The results come back in the same response with no handler code. Choose them for public web content, sandboxed computation, or remote MCP servers you'd otherwise have to connect yourself. Some add usage charges, such as per search.</li>
+					<li><strong>Mixed:</strong> when Claude calls a server tool alongside one of your client tools, your code still has to handle the client call.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Approval ===== -->
+			<h2 id="s6">An approval pattern</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">The model proposes, a person disposes.</span></p>
+				<ul>
+					<li><strong>Queue, don't execute:</strong> <code>request_refund</code> validates, records the request and returns <code>pending_approval</code> with a ticket. The description tells Claude to say the refund is being reviewed, so it doesn't promise a payment.</li>
+					<li><strong>Validate in the tool,</strong> whatever the model says: eligibility, and an amount no higher than what was paid. A persuaded or confused model can't approve its own request.</li>
+					<li><strong>With the Agent SDK,</strong> the same idea is the <code>can_use_tool</code> callback, an ask rule, or a <code>PreToolUse</code> hook returning <code>ask</code>. A <code>defer</code> decision ends the turn so the call can be resumed after review (<a href="d7-skill-7-2.html#s5">hooks and rules as hard stops</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Tool set ===== -->
+			<h2 id="s7">Assembling the tool set</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Fewer, clearer tools are faster and chosen more accurately.</span></p>
+				<ul>
+					<li><strong>Every tool costs tokens on every request:</strong> its name, description and schema, plus a tool-use system prompt of 286 tokens on the current 5.5 models. Keep the set to what this agent needs, and give subagents their own small sets.</li>
+					<li><strong>No overlap:</strong> two tools that sound alike get confused, so merge them or draw a clear boundary in their descriptions. Split a catch-all tool; merge thin wrappers that are always called together.</li>
+					<li><strong>Large catalogues:</strong> beyond roughly 30 to 50 tools, use tool search with deferred loading, so definitions load only when needed.</li>
+					<li><strong>Caching:</strong> tool definitions sit at the start of the prompt, so a stable tool list is cached with the system prompt. Changing the list invalidates that cache.</li>
+					<li><strong>Parallel calls:</strong> independent read tools can run in one turn. Use <code>disable_parallel_tool_use</code> when calls must happen one at a time.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Schema: <code>strict: true</code>, <code>additionalProperties: false</code>, required fields, enums, parameter descriptions. It guarantees valid input, not the right tool.</li>
+				<li>Description: what it does, returns, when to use it, when not to, and what to do about missing inputs. It is the main lever for correct invocation.</li>
+				<li>Shape results to a few worked-out, meaningful fields with a next action; raw API payloads cost tokens on every later turn and bury what matters.</li>
+				<li>Errors as <code>is_error</code> results with a category, a next step and retryability; never raise into the loop.</li>
+				<li>Client tools for your systems, data and approvals; server tools for web, code execution and remote MCP. Queue side-effecting calls for approval and validate in the tool. Keep the tool set small, non-overlapping and stable, with tool search for large catalogues.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-3.html"><small>Previous</small>7.3: API Key and Credential Handling</a>
+				<a class="next" href="index.html#d8"><small>Next</small>Domain 8</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

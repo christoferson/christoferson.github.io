@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.3: API Key and Credential Handling | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 7.3 (7 December 2026 guide): keeping Claude API keys out of clients with a back-end proxy, choosing personal, service account, legacy workspace or Admin API keys and Workload Identity Federation, separating environments by workspace, expiry and rotation, and auditing keys with the Admin API.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Security and Safety &middot; 8%</span>
+		<h1>7.3: API Key and Credential Handling</h1>
+		<p>Keeping Claude credentials where they belong: on a server, with the narrowest scope that works, separate for each environment, short-lived where possible, and watched so that a leak is caught and shut off quickly.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">API keys</span><span class="tag">Workspaces</span><span class="tag">Admin API</span><span class="tag">Federation</span><span class="tag">Rotation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Never in the client</a></li>
+				<li><a href="#s2">Choosing the credential</a></li>
+				<li><a href="#s3">Separate environments</a></li>
+				<li><a href="#s4">Expiry, rotation and leaks</a></li>
+				<li><a href="#s5">Auditing and monitoring</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.3</span>
+				<p><strong>API Key and Credential Handling</strong>: "Handling Anthropic API keys and credentials correctly in development and production, including server-side proxying rather than client embedding, workspace-scoped keys versus admin keys, environment separation, rotation, and access monitoring, without exposing any key beyond its intended scope."</p>
+			</div>
+			<p>Exam items show where a key lives, what it can reach and who can see it, and ask what's wrong or what to change. Credentials for the tools an agent calls (an egress proxy that injects them, or vaults in Managed Agents) are touched on in <a href="d1-skill-1-1.html#s7">skill 1.1</a>; this page is about Claude's own credentials.</p>
+			<p>Sources: Claude's documentation on authentication, the Admin API and Workload Identity Federation, checked on 20 November 2026 and paraphrased. Both examples were tested with the anthropic Python SDK 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's website has a "Ask about this tent" box, a nightly job writes product descriptions, developers try prompts on their laptops, and a two-year-old integration still uses a key nobody remembers creating.</p></div>
+
+			<!-- ===== Client ===== -->
+			<h2 id="s1">Never in the client</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">The browser talks to your back end; the back end holds the key.</span></p>
+				<div class="code"><span class="file">backend_proxy.py (Python, anthropic SDK)</span>
+<pre><code>"""The browser never sees a key: the web app calls this back end, which holds the key and makes a constrained call."""
+import os
+import time
+
+import anthropic
+
+<span class="c"># The key comes from the environment (filled from a secrets manager), never from code or the front end.</span>
+<span class="c"># Each environment's deployment gets its own key, scoped to that environment's workspace.</span>
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+WINDOW, LIMIT = 3600, 30
+_calls: dict[str, list[float]] = {}
+
+
+def handle(session: dict | None, body: dict) -&gt; tuple[int, dict]:
+    if not session or not session.get("user_id"):          <span class="c"># your own auth: only signed-in customers</span>
+        return 401, {"error": "sign in first"}
+    now, uid = time.time(), session["user_id"]
+    recent = [t for t in _calls.get(uid, []) if now - t &lt; WINDOW]
+    if len(recent) &gt;= LIMIT:                                 <span class="c"># per-user quota, so one account can't run up the bill</span>
+        return 429, {"error": "too many questions, try again later"}
+    _calls[uid] = recent + [now]
+    question = str(body.get("question", ""))[:2000]
+    <span class="c"># The client chooses only the question: model, system prompt and limits are fixed here.</span>
+    msg = client.messages.create(model="claude-haiku-5-5", max_tokens=600,
+                                 system="You answer questions about the shop's gear and policies.",
+                                 messages=[{"role": "user", "content": question}],
+                                 metadata={"user_id": uid})          <span class="c"># an opaque ID for abuse tracing, no personal data</span>
+    return 200, {"answer": "".join(b.text for b in msg.content if b.type == "text")}</code></pre></div>
+				<ul>
+					<li><strong>Why:</strong> anyone using a web page can read a key embedded in its code, and the same goes for a mobile app's binary. The API refuses direct browser requests unless they carry a deliberately alarming opt-in header, which the TypeScript SDK's <code>dangerouslyAllowBrowser</code> sets. Organisations with zero data retention or the Compliance API can't make browser calls at all.</li>
+					<li><strong>What the proxy adds besides hiding the key:</strong>
+						<ul>
+							<li>your own sign-in check;</li>
+							<li>a per-user quota, so one account can't run up the bill;</li>
+							<li>a fixed model, system prompt and <code>max_tokens</code>, so the client chooses only the question;</li>
+							<li>an opaque <code>metadata.user_id</code> for tracing abuse without sending personal data.</li>
+						</ul>
+					</li>
+					<li><strong>Forward correctly:</strong> the back end should build a new request rather than pass the browser's request through, because the browser's <code>Origin</code> header would come with it.</li>
+					<li><strong>Native apps:</strong> for iOS and macOS apps with no back end, App Attest issues each genuine installation a one-hour, workspace-scoped token limited to the Messages API, instead of shipping a key.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Credential types ===== -->
+			<h2 id="s2">Choosing the credential</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">The narrowest identity that does the job.</span></p>
+				<ul>
+					<li><strong>Personal key:</strong> acts as you, with your roles, for your own development and scripts. It stops working when you leave the organisation, so never share one: a shared personal key breaks when its owner leaves.</li>
+					<li><strong>Service account key:</strong> for anything shared or unattended, such as CI and production services. The workload gets its own identity, and the key survives whoever created it.</li>
+					<li><strong>Workspace key</strong> (legacy): belongs to a workspace rather than an identity, and keeps working after its creator leaves. Anthropic recommends replacing these with identity-backed keys or federation.</li>
+					<li><strong>Admin API key</strong> (<code>sk-ant-admin...</code>): manages the organisation (members, workspaces, invites, existing keys), and only admins can create one. It reaches across the whole organisation, so it belongs in an admin tool or audit job, never in an application making model calls.</li>
+					<li><strong>Workload Identity Federation:</strong> the workload exchanges a token from an identity provider you already trust (AWS, Google Cloud, Azure, GitHub Actions, Kubernetes and others) for a short-lived Claude token, and the SDK refreshes it. There's no static key to leak or rotate, and Anthropic prefers it to long-lived keys for production. It's only as strong as the identity provider behind it, so pair it with that provider's controls.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Environments ===== -->
+			<h2 id="s3">Separate environments</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">One workspace and one key per environment.</span></p>
+				<ul>
+					<li><strong>Workspaces:</strong> put development, staging and production in separate workspaces, and give each deployment a key scoped to its own workspace. A key scoped to one workspace works only there. A leaked development key can't touch production traffic, and each environment can have its own rate limits.</li>
+					<li><strong>Unscoped keys</strong> must name a workspace on every request with the <code>anthropic-workspace-id</code> header, and the API returns a 400 error without it. Prefer scoped keys for applications.</li>
+					<li><strong>Where the key lives:</strong> in a secrets manager, injected as <code>ANTHROPIC_API_KEY</code> at run time. Never in code, committed config, logs or error messages.</li>
+					<li><strong>In CI:</strong> a repository secret or, better, federation from the CI provider's identity. GitHub Actions is a supported provider.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Rotation ===== -->
+			<h2 id="s4">Expiry, rotation and leaks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">Limit how long a leaked key works, and shut it off fast.</span></p>
+				<ul>
+					<li><strong>Expiry at creation:</strong> 3 hours, 1 day, 7 days, 30 days, a custom duration, or Never (only for keys you rotate yourself from a secrets manager). Organisations can set a maximum. Expiry can't be changed later. Anthropic emails a warning before longer-lived keys expire, and an expired key returns 401.</li>
+					<li><strong>Rotation:</strong> create the new key, deploy it, confirm requests succeed, then delete the old one. Doing it periodically keeps the procedure practised for the day it's urgent.</li>
+					<li><strong>A suspected leak:</strong> <strong>disable</strong> the key at once. That's reversible: its status becomes <code>inactive</code>. Then rotate and <strong>delete</strong> it, which is permanent: the key is archived.</li>
+					<li><strong>Limit where a key works:</strong> IP allowlisting (in beta) restricts where keys can be used from, so a stolen key fails from elsewhere.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Audit ===== -->
+			<h2 id="s5">Auditing and monitoring</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">A weekly check with the Admin API.</span></p>
+				<div class="code"><span class="file">key_audit.py (Python, anthropic SDK (Admin API))</span>
+<pre><code>"""Weekly key audit with the Admin API: flag keys that could outlive their purpose or reach too far, disable a leaked one.
+Runs with an Admin API key from the secrets manager, used for nothing else."""
+import os
+from datetime import datetime, timedelta, timezone
+
+import anthropic
+
+admin = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_ADMIN_KEY"])   <span class="c"># sk-ant-admin..., admins only</span>
+MAX_AGE = timedelta(days=90)
+WORKSPACES = {"wrkspc_prod": "prod", "wrkspc_staging": "staging", "wrkspc_dev": "dev"}
+
+
+def audit(now: datetime | None = None) -&gt; list[dict]:
+    now = now or datetime.now(timezone.utc)
+    findings = []
+    for key in admin.organization.api_keys.list(status="active"):
+        issues = []
+        if key.principal is None:
+            issues.append("legacy workspace key: replace with a service account key or federation")
+        if key.expires_at is None and now - key.created_at &gt; MAX_AGE:
+            issues.append("never expires and older than 90 days: rotate it")
+        if key.scope.type == "organization":
+            issues.append("not scoped to one workspace: limit it to the app's environment")
+        else:
+            env = WORKSPACES.get(key.scope.workspace_id, "unknown")
+            if env not in key.name:
+                issues.append(f"name doesn't say it belongs to {env}: check where it is deployed")
+        if issues:
+            findings.append({"id": key.id, "name": key.name, "hint": key.partial_key_hint, "issues": issues})
+    return findings
+
+
+def disable(key_id: str) -&gt; str:
+    """Suspected leak: disable at once (reversible), then rotate, then delete the old key."""
+    return admin.organization.api_keys.update(key_id, status="inactive").status</code></pre></div>
+				<ul>
+					<li><strong>What it flags:</strong>
+						<ul>
+							<li>legacy keys with no identity behind them (<code>principal</code> is null);</li>
+							<li>keys that never expire and are older than 90 days;</li>
+							<li>keys not scoped to a single workspace;</li>
+							<li>keys whose name doesn't match their environment.</li>
+						</ul>
+						The two-year-old integration key trips the first two.</li>
+					<li><strong>What the Admin API can do:</strong> list, read, rename and change the status of keys, but not create them; new keys come from the Console. The audit job runs with its own Admin API key, used for nothing else.</li>
+					<li><strong>Watch usage too:</strong> a sudden spike on one key or workspace is often the first sign of a leak. The usage and cost analytics API (in beta) and the Console show where usage comes from. Anthropic's own list adds auditing roles, archiving unused workspaces and checking each key's <code>expires_at</code>.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Use the admin key everywhere so nothing breaks"</strong> is the anti-pattern this skill tests. Every key should reach exactly one purpose: one workload, one environment, the lowest role.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Keys never go in browser or app code: a back end holds the key and fixes the model, prompt and limits; App Attest covers native apps with no back end.</li>
+				<li>Personal keys for your own work, service account keys for shared and production workloads, legacy workspace keys replaced, Admin API keys only for administration; Workload Identity Federation removes static keys entirely.</li>
+				<li>One workspace and one scoped key per environment, injected from a secrets manager; unscoped keys need <code>anthropic-workspace-id</code>.</li>
+				<li>Set expiry at creation, rotate on a schedule, disable (reversible) then delete (permanent) a leaked key, and use IP allowlisting.</li>
+				<li>Audit keys with the Admin API (<code>principal</code>, <code>scope</code>, <code>expires_at</code>, <code>status</code>) and watch usage for spikes.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-2.html"><small>Previous</small>7.2: Deterministic Guardrails and Least Privilege</a>
+				<a class="next" href="d8-skill-8-1.html"><small>Next</small>8.1: Tool Design and Response Shaping</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
