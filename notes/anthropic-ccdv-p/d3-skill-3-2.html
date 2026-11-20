@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.2: Production Monitoring and Alerting | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 3.2: SLIs and SLOs for LLM-backed services, burn-rate alerting and dashboards with token and cost telemetry from the Usage and Cost Analytics API, and detecting quality drift, behavioural regressions after model or prompt changes, and anomalous usage, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Observability and Production Monitoring &middot; 12%</span>
+		<h1>3.2: Production Monitoring and Alerting</h1>
+		<p>An LLM-backed service can be up, fast and wrong. This page defines indicators that capture all three, alerts that wake someone only when the budget is really burning, and the checks that catch quality slipping after a model or prompt change, or a key that has started spending far more than it should.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">SLIs</span><span class="tag">SLOs</span><span class="tag">Alerting</span><span class="tag">Drift</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">SLIs for an LLM-backed service</a></li>
+				<li><a href="#s2">SLOs and burn-rate alerts</a></li>
+				<li><a href="#s3">Dashboards with token and cost telemetry</a></li>
+				<li><a href="#s4">Quality drift and regressions</a></li>
+				<li><a href="#s5">Anomalous usage</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.2</span>
+				<p><strong>Production Monitoring and Alerting</strong>: "Analyzing production signals from LLM-backed services to define service level indicators (SLIs) and SLOs, design alerting and dashboards (including token and cost telemetry), and detect quality drift, behavioral regressions, and anomalous usage, including drift after model updates."</p>
+			</div>
+			<p>Exam items give a set of signals and an incident nobody noticed, or an alert that fires constantly, and ask which indicator, threshold or detector is right. The telemetry these signals come from is <a href="d3-skill-3-1.html">skill 3.1</a>; measuring quality on live traffic in depth is <a href="index.html#d5">skill 5.3</a>.</p>
+			<p>Sources: the Usage and Cost Analytics API page (beta; read on 21 November 2026), the OpenTelemetry and stop reasons pages, and the model deprecations page, paraphrased. SLO targets, burn-rate thresholds and drift rules are my own or common SRE practice, labelled as such. The ticketing company and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A ticketing company&rsquo;s fan-support assistant handles refunds, seating questions and transfers, peaking hard when big events go on sale. It streams answers from Sonnet 5.5 and is graded on a sample of conversations each hour.</p></div>
+
+			<!-- ===== SLIs ===== -->
+			<h2 id="s1">SLIs for an LLM-backed service</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Up, fast and right, measured separately.</span></p>
+				<div class="code"><span class="file">slo.py (slo.py)</span>
+<pre><code>"""SLIs, SLOs and burn-rate alerts for a ticketing company's fan-support assistant (my targets)."""
+
+SLOS = {   <span class="c"># SLI -&gt; (objective, what counts as good)</span>
+    "availability":   (0.995, "a usable answer: not a 5xx/529 after retries, not a timeout"),
+    "first_token_p95": (1.5,  "seconds to first streamed token, 95th percentile"),
+    "quality":        (0.92,  "sampled conversations passing the graded rubric"),
+    "refusal_rate":   (0.004, "refusals on in-scope requests (each one is a failed answer)"),
+    "truncation_rate": (0.002, "answers ending in max_tokens or model_context_window_exceeded"),
+}
+
+
+def burn_rate(bad: int, total: int, objective: float) -&gt; float:
+    """How fast the error budget is being spent: 1.0 spends it exactly over the SLO window."""
+    return (bad / total) / (1 - objective) if total else 0.0
+
+
+def availability_alert(h1: tuple, h6: tuple, objective=0.995) -&gt; str:
+    """Two windows (common SRE practice): page only when both the short and long window burn fast."""
+    b1, b6 = burn_rate(*h1, objective), burn_rate(*h6, objective)
+    if b1 &gt;= 14.4 and b6 &gt;= 14.4:
+        return f"page: burning budget at {b1:.0f}x"
+    if b6 &gt;= 6:
+        return f"ticket: sustained burn at {b6:.0f}x"
+    return "ok"</code></pre></div>
+				<ul>
+					<li><strong>Availability:</strong> a usable answer after your retries and fallbacks, not just an HTTP 200. Count server errors, overload and timeouts; exclude genuine client errors.</li>
+					<li><strong>Latency:</strong> time to first token for streamed chat, and total time for anything a user waits on in full. They respond to different fixes (<a href="index.html#d6">skill 6.2</a>).</li>
+					<li><strong>Quality:</strong> the pass rate of sampled conversations graded against a rubric. Without it, a service that answers quickly and wrongly looks healthy.</li>
+					<li><strong>Refusals and truncations</strong> as their own SLIs: both arrive as 200s, so availability never sees them. Track refusals on in-scope requests and answers that stop at <code>max_tokens</code> or the context window.</li>
+					<li><strong>Cost and cache:</strong> cost per resolved conversation and cache read share are service-level signals for a Claude workload, even if they don&rsquo;t carry an SLO.</li>
+				</ul>
+			</div>
+
+			<!-- ===== SLO ===== -->
+			<h2 id="s2">SLOs and burn-rate alerts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Alert on budget spent, not on every error.</span></p>
+				<ul>
+					<li><strong>Error budget:</strong> a 99.5% availability objective allows 0.5% bad answers over the window. Burn rate is how fast that budget is going; 1x spends it exactly over the window.</li>
+					<li><strong>Two windows</strong> (common SRE practice): page when both the last hour and the last six hours burn at 14.4x or more, so a brief blip doesn&rsquo;t page but a real outage does; open a ticket when the six-hour rate stays above about 6x.</li>
+					<li><strong>Page on symptoms users feel</strong> (availability, latency, quality falling below objective), and ticket on causes (one tool&rsquo;s error rate, a cache rate drop) unless they threaten the SLO.</li>
+					<li><strong>Quality alerts need volume:</strong> grade enough sampled conversations per hour for a drop to be statistically visible, or alert over longer windows.</li>
+					<li><strong>Alert on missing data too:</strong> telemetry export can fail silently, and a quiet dashboard during an on-sale is a warning, not good news.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Dashboards ===== -->
+			<h2 id="s3">Dashboards with token and cost telemetry</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Two sources with different jobs.</span></p>
+				<ul>
+					<li><strong>Traces and metrics (minutes):</strong> tokens, latency, stop reasons and cache read share per route, model and tenant, from the spans in <a href="d3-skill-3-1.html">skill 3.1</a>. Fast, but best effort.</li>
+					<li><strong>Usage and Cost Analytics API (the ledger):</strong> <code>/v1/organizations/analytics/usage</code> and <code>/cost</code> (beta) with an Admin key, grouped by workspace, API key, model, service tier or the identity behind a request, in 1-minute, 1-hour or 1-day buckets. Usage typically appears within about four hours, so it reconciles and attributes rather than alerts.</li>
+					<li><strong>Per-tenant and per-route views:</strong> cost per resolved conversation, tokens per request, cache read share, and rate-limit headroom against the binding limit (<a href="d2-skill-2-2.html">skill 2.2</a>).</li>
+					<li><strong>Version on every panel:</strong> annotate model ID, prompt version and retrieval index version changes, so a step in a chart can be matched to a deploy.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Drift ===== -->
+			<h2 id="s4">Quality drift and regressions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Compare before and after each change, per segment.</span></p>
+				<div class="code"><span class="file">drift.py (drift.py)</span>
+<pre><code>"""Quality drift around a change, and anomalous usage by key or tenant."""
+import math
+import statistics
+
+
+def proportion_shift(pass_a: int, n_a: int, pass_b: int, n_b: int) -&gt; float:
+    """z for the difference in pass rates (before -&gt; after); |z| &gt; 2 is worth a look."""
+    p = (pass_a + pass_b) / (n_a + n_b)
+    se = math.sqrt(p * (1 - p) * (1 / n_a + 1 / n_b))
+    return (pass_b / n_b - pass_a / n_a) / se
+
+
+def drift_report(before: dict, after: dict) -&gt; list[str]:
+    """Per segment, before and after a model, prompt or retrieval change (graded samples)."""
+    out = []
+    for seg in before:
+        z = proportion_shift(*before[seg], *after[seg])
+        if z &lt;= -2:
+            out.append(f"{seg}: quality down after the change (z={z:.1f})")
+    return out
+
+
+def usage_anomalies(daily_tokens: dict[str, list[int]], today: dict[str, int]) -&gt; list[str]:
+    """Flag keys or tenants whose usage today is far above their own recent history."""
+    flags = []
+    for key, hist in daily_tokens.items():
+        mu = statistics.mean(hist)
+        sd = max(statistics.pstdev(hist), 0.1 * mu)        <span class="c"># floor: steady keys still get a tolerance</span>
+        if (today.get(key, 0) - mu) / sd &gt; 4:
+            flags.append(f"{key}: {today[key]:,} tokens vs a mean of {mu:,.0f}; check for a loop or a leaked key")
+    return flags</code></pre></div>
+				<ul>
+					<li><strong>What causes drift:</strong> a new model version (an alias that moves, or a migration), a prompt or tool change, a re-index, or a shift in what users ask, such as a new event type. Pinned snapshot IDs don&rsquo;t change behaviour on their own, so a drop on a pinned model points at your change or your inputs.</li>
+					<li><strong>Segment the comparison:</strong> refunds dropped from 92% to 84% after the change (z of about &minus;3.9) while seating held, so the overall rate barely moved. An average hides exactly the regression that matters.</li>
+					<li><strong>After a model update:</strong> run the golden set before switching (<a href="d2-skill-2-3.html">skill 2.3</a>), then watch live graded samples by segment through the rollout. Refusal and truncation rates are early signs, because a new model may refuse or write at different lengths.</li>
+					<li><strong>Check the grader too:</strong> an LLM judge can drift, so re-check it against a fixed set of human-labelled cases on a schedule (<a href="index.html#d5">skill 5.2</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Anomalies ===== -->
+			<h2 id="s5">Anomalous usage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.2</span><span class="skill-text">Spend that doesn&rsquo;t match the business.</span></p>
+				<ul>
+					<li><strong>Per key and per tenant:</strong> compare today with each one&rsquo;s own history. A web key at nine times its usual volume suggests a retry loop, an agent stuck in a cycle, or a leaked key; the Usage and Cost API grouped by <code>api_key_id</code> also counts requests that sent no spans.</li>
+					<li><strong>Per session:</strong> outliers in turns, tokens or tool calls per conversation catch loops that the daily total hides.</li>
+					<li><strong>Expected spikes:</strong> an on-sale doubles traffic legitimately; annotate scheduled events so the detector doesn&rsquo;t page for them, and compare against the same kind of event instead.</li>
+					<li><strong>Spend cap:</strong> forecast monthly spend against the tier&rsquo;s cap; at the cap the API returns 429s until the month resets.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Alert when the error rate goes above zero"</strong> pages on every transient 529 and trains people to ignore the pager, while still missing a quality collapse that returns 200s. Alert on SLO burn across windows, and treat quality, refusals and truncations as indicators in their own right.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>SLIs for availability (usable answers after retries), latency (first token and total), and graded quality, plus refusals and truncations, which return 200s.</li>
+				<li>Page on multi-window burn rate against the SLO, ticket on sustained slower burns and causes, and alert on missing telemetry.</li>
+				<li>Use traces for fast dashboards and the Usage and Cost Analytics API as the ledger; annotate model, prompt and index versions.</li>
+				<li>Detect drift by comparing graded samples before and after each change, per segment; pinned models don&rsquo;t drift on their own.</li>
+				<li>Flag usage far above a key&rsquo;s or tenant&rsquo;s own history, watch per-session outliers, and forecast against the spend cap.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-1.html"><small>Previous</small>3.1: Telemetry and Instrumentation</a>
+				<a class="next" href="d3-skill-3-3.html"><small>Next</small>3.3: Trace Analysis at Scale</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

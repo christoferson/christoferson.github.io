@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.2: Incident Response and Learning Loops | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 4.2: responding to an outage or quality regression in a Claude system: triage between provider incidents, your own change, spend caps and silent quality drops; mitigation, rollback and communication; and turning the incident into regression cases, monitors and postmortem actions, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Advanced Debugging and Incident Response &middot; 10%</span>
+		<h1>4.2: Incident Response and Learning Loops</h1>
+		<p>During an incident the first question isn&rsquo;t the root cause but which kind of incident this is, because a provider outage, a bad deploy, a spent budget and a silent quality drop each need a different first move. Afterwards, the incident should leave the system harder to break the same way.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Incidents</span><span class="tag">Rollback</span><span class="tag">Communication</span><span class="tag">Postmortems</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Triage: which kind of incident</a></li>
+				<li><a href="#s2">Mitigation and rollback</a></li>
+				<li><a href="#s3">Communication</a></li>
+				<li><a href="#s4">The learning loop</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.2</span>
+				<p><strong>Incident Response and Learning Loops</strong>: "Evaluating incident-response options during an LLM-system outage or quality regression, including triage, mitigation, rollback, and communication, and converting the incident into regression evaluations, monitoring coverage, and postmortem findings."</p>
+			</div>
+			<p>Exam items describe the first minutes or hours of an incident and ask for the best next action, or describe a resolved incident and ask what should change. Finding the origin of one failure is <a href="d4-skill-4-1.html">skill 4.1</a>; the runbooks a handed-over system needs are in <a href="../anthropic-ccar-p/d6-skill-6-3.html">CCAR-P 6.3</a>.</p>
+			<p>Sources: the Claude status page (checked on 21 November 2026) and the error, fallback and rollout material on earlier pages, paraphrased. The playbook, thresholds and the tutoring platform are my own; the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An e-learning platform&rsquo;s tutoring assistant gives hints on maths problems and feedback on essays. During exam season, a prompt update shipped on Monday; on Wednesday a teacher reported that essay feedback had become generic.</p></div>
+
+			<!-- ===== Triage ===== -->
+			<h2 id="s1">Triage: which kind of incident</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Classify from the first signals (my rules).</span></p>
+				<div class="code"><span class="file">incident.py (incident.py)</span>
+<pre><code>"""Triage, mitigation and learning loop for an e-learning platform's tutoring assistant (my playbook)."""
+
+
+def triage(s: dict) -&gt; str:
+    """Classify from signals available in the first minutes."""
+    if s["http_429_no_retry_after"]:
+        return "spend cap"                                        <span class="c"># retries won't help until the month resets</span>
+    if s["provider_status_degraded"] and s["errors_on_all_versions"]:
+        return "provider incident"                                <span class="c"># status.claude.com component degraded</span>
+    if s["started_within_min_of_deploy"] is not None and s["started_within_min_of_deploy"] &lt;= 30 \
+            and s["only_new_version_affected"]:
+        return "our change"
+    if s["quality_drop"] and not s["error_rate_up"]:
+        return "quality regression"                               <span class="c"># 200s that are wrong: no error alert fires</span>
+    return "unclear: widen the search (tools, data, tenants)"
+
+
+MITIGATE = {
+    "spend cap":          ["raise the cap or move to a separately billed platform", "shed batch and bulk work"],
+    "provider incident":  ["switch to the fallback model or platform", "turn on degraded mode (labelled answers)",
+                           "link the status page in the customer notice"],
+    "our change":         ["roll back to the previous prompt, model and server pins", "freeze further deploys"],
+    "quality regression": ["roll back the last change on the affected segment", "route that segment to human tutors"],
+}
+
+
+def communicate(kind: str, minutes_in: int) -&gt; str:
+    who = "students and teachers" if kind != "our change" or minutes_in &gt; 15 else "internal channel only"
+    return f"update {who} every 30 minutes: what is affected, what to do meanwhile, next update time"
+
+
+def learning_loop(inc: dict) -&gt; list[str]:
+    """Turn the incident into lasting changes, each with an owner."""
+    items = [f"regression case: {c}" for c in inc["captured_requests"]]          <span class="c"># replayable, with the expected outcome</span>
+    if inc["detected_by"] != "monitor" or inc["minutes_to_detect"] &gt; 15:
+        items.append(f"monitor: alert on {inc['signal_that_moved_first']} (detection took {inc['minutes_to_detect']} min)")
+    if inc["rollback_minutes"] &gt; 10:
+        items.append("rollback: make the previous version one routing change away")
+    items += [f"postmortem action: {a}" for a in inc["contributing_factors"]]
+    return items</code></pre></div>
+				<ul>
+					<li><strong>Spend cap:</strong> 429s with no <code>retry-after</code> on every route. Retries and fallback models on the same account won&rsquo;t help until the month resets.</li>
+					<li><strong>Provider incident:</strong> errors or overload on every version and route, matching a degraded component on <code>status.claude.com</code> (claude.ai, Console, Claude API, Claude Code, Claude on Cloud Platforms and others). Subscribe to it by webhook or feed so the signal arrives with your alerts. Platforms such as Bedrock have their own health pages.</li>
+					<li><strong>Your change:</strong> the problem started soon after a deploy and affects only traffic on the new version. That points to rollback.</li>
+					<li><strong>Quality regression:</strong> 200s that are wrong. No error alert fires; it shows up in graded quality, user feedback or complaints, as here, two days late.</li>
+					<li><strong>Unclear:</strong> widen to tools, data and specific tenants with the cohort analysis in <a href="d3-skill-3-3.html">skill 3.3</a>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Mitigation ===== -->
+			<h2 id="s2">Mitigation and rollback</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Restore service first; diagnose afterwards.</span></p>
+				<ul>
+					<li><strong>Rollback is the fastest fix for your own change:</strong> route traffic back to the previous prompt, model and server pins. It only works if the previous version is still deployable and one routing change away (<a href="d2-skill-2-3.html">skill 2.3</a>).</li>
+					<li><strong>Provider incidents:</strong> switch to the fallback model or platform, built and tested in advance with its feature differences (<a href="d2-skill-2-1.html">skill 2.1</a>), or turn on labelled degraded answers.</li>
+					<li><strong>Quality regressions can be scoped:</strong> roll back only the affected segment (essay feedback), or route it to people, while the rest keeps the update.</li>
+					<li><strong>Freeze other changes</strong> so the incident doesn&rsquo;t pick up a second cause.</li>
+					<li><strong>Keep evidence:</strong> capture failing requests and traces before rolling back, because they become the regression cases.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Communication ===== -->
+			<h2 id="s3">Communication</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Regular, specific and honest.</span></p>
+				<ul>
+					<li><strong>Who:</strong> internal channel immediately; users once impact is confirmed (here, students and teachers during exam season).</li>
+					<li><strong>What:</strong> what is affected, what users should do in the meantime (ask a teacher for essay feedback), and when the next update comes. Avoid promising a cause or a fix time before you have one.</li>
+					<li><strong>Cadence:</strong> a fixed interval, such as every 30 minutes, even if nothing has changed.</li>
+					<li><strong>Provider incidents:</strong> point to the provider&rsquo;s status page rather than paraphrasing it, and say what you&rsquo;re doing on your side.</li>
+					<li><strong>Quality incidents need extra care:</strong> users may already have acted on wrong answers, so say which answers in which period might be affected.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Learning ===== -->
+			<h2 id="s4">The learning loop</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.2</span><span class="skill-text">Every incident adds a test, a monitor or a fix.</span></p>
+				<ul>
+					<li><strong>Regression cases:</strong> each captured failing request goes into the evaluation suite with the expected behaviour, so the release gate would have blocked this change (<a href="index.html#d5">skill 5.1</a>).</li>
+					<li><strong>Monitoring coverage:</strong> a teacher, not a monitor, found it two days after the update, so the signal that moved first (graded quality on the essay segment) becomes an alert.</li>
+					<li><strong>Rollback speed:</strong> 40 minutes to roll back is an action item in its own right.</li>
+					<li><strong>Postmortem findings:</strong> contributing factors, not a culprit. Here the prompt shipped without the essay golden set, so the gate gets the missing segment.</li>
+					<li><strong>Follow through:</strong> each item has an owner and a date, and the next incident review checks they were done.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Find the root cause before changing anything"</strong> leaves students with generic feedback for hours when a rollback would restore service in minutes. Mitigate first (after capturing evidence), then diagnose, then make sure the same change can&rsquo;t reach production untested again.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Triage first: spend cap, provider incident, your own change, or a quality regression that returns 200s; each has a different first move.</li>
+				<li>Mitigate before diagnosing: roll back pins for your changes, fall back or degrade for provider incidents, scope quality rollbacks to the affected segment.</li>
+				<li>Capture failing requests and traces before rolling back.</li>
+				<li>Communicate at a fixed cadence with impact, workarounds and the next update time; link the provider&rsquo;s status page.</li>
+				<li>Turn every incident into regression cases, a monitor on the signal that moved first, faster rollback, and owned postmortem actions.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d4-skill-4-1.html"><small>Previous</small>4.1: Complex Failure Diagnosis</a>
+				<a class="next" href="index.html#d5"><small>Next</small>Domain 5</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the platform, files and code are original.</div>
+</footer>
+
+</body>
+</html>

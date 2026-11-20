@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.3: Trace Analysis at Scale | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 3.3: analysing high-volume Claude trace data with tail-based sampling and weights, aggregation by facets, failure-cohort analysis that ranks slices by excess failures, and privacy-preserving clustering in the style of Anthropic's Clio, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Observability and Production Monitoring &middot; 12%</span>
+		<h1>3.3: Trace Analysis at Scale</h1>
+		<p>At millions of traces a day, reading traces one by one finds anecdotes, not causes. This page keeps the right traces, aggregates them by the attributes that matter, and ranks the slices of traffic that fail far more than the rest, so a systemic problem shows up with a size attached.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Sampling</span><span class="tag">Aggregation</span><span class="tag">Cohorts</span><span class="tag">Clio</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Why single traces mislead</a></li>
+				<li><a href="#s2">Sampling that keeps the tail</a></li>
+				<li><a href="#s3">Aggregation: facets first</a></li>
+				<li><a href="#s4">Failure-cohort analysis</a></li>
+				<li><a href="#s5">Clustering content without reading it</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.3</span>
+				<p><strong>Trace Analysis at Scale</strong>: "Analyzing high-volume trace data using sampling strategies, aggregation, and failure-cohort analysis to surface and quantify systemic issues that are not visible in individual traces."</p>
+			</div>
+			<p>Exam items describe a large trace store and a vague complaint ("it&rsquo;s worse lately") and ask which analysis would find and size the cause, or why a sampling scheme hid it. Diagnosing one complex failure from its evidence is <a href="d4-skill-4-1.html">skill 4.1</a>; the monitors that alert on a problem are <a href="d3-skill-3-2.html">skill 3.2</a>.</p>
+			<p>Sources: Anthropic&rsquo;s Clio research post (read on 21 November 2026), the multi-agent research system post and the OpenTelemetry pages used earlier, paraphrased. The sampling policy, cohort method and thresholds are my own; the company, files and code are original, and the code is tested on synthetic traces.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An accounting software company&rsquo;s in-app assistant handles about two million conversations a day across ledger, invoice and payroll tools in several languages. Support tickets about wrong payroll answers have crept up for a week, and no single trace looks unusual.</p></div>
+
+			<!-- ===== Why ===== -->
+			<h2 id="s1">Why single traces mislead</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.3</span><span class="skill-text">Systemic problems are rates, not events.</span></p>
+				<ul>
+					<li><strong>Every failure looks plausible on its own:</strong> a wrong answer, a slow turn, a refusal. Only the rate in one slice of traffic, compared with the rest, shows a pattern.</li>
+					<li><strong>Anecdotes pick themselves:</strong> the traces people open are the ones customers complained about, which over-represent loud tenants and dramatic failures.</li>
+					<li><strong>Averages hide slices:</strong> a 30% failure rate in one tool path after a prompt change moves the overall rate by a few points.</li>
+					<li><strong>Anthropic&rsquo;s own practice:</strong> for its multi-agent research system, it monitored agent decision patterns and interaction structures without monitoring the contents of individual conversations.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sampling ===== -->
+			<h2 id="s2">Sampling that keeps the tail</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.3</span><span class="skill-text">Decide after the trace completes (my policy).</span></p>
+				<div class="code"><span class="file">sampling.py (sampling.py)</span>
+<pre><code>"""Tail-based sampling for an in-app accounting assistant: keep every interesting trace, a small
+share of normal ones, and a weight so totals can still be estimated (my policy)."""
+import hashlib
+
+BASE_RATE = 0.01             <span class="c"># normal traces kept</span>
+SMALL_TENANT_RATE = 0.10     <span class="c"># so small customers still appear in cohort analysis</span>
+
+
+def keep(trace: dict, small_tenants: set) -&gt; float | None:
+    """Return the sample weight (1/rate) if kept, else None. Decided after the trace completes."""
+    if (trace["error"] or trace["stop_reason"] in ("refusal", "max_tokens", "model_context_window_exceeded")
+            or trace["latency_s"] &gt; trace["p99_latency_s"] or trace.get("thumbs_down")):
+        return 1.0                                                 <span class="c"># always keep the tail</span>
+    rate = SMALL_TENANT_RATE if trace["tenant"] in small_tenants else BASE_RATE
+    h = int(hashlib.sha256(trace["trace_id"].encode()).hexdigest(), 16) % 10_000
+    return 1 / rate if h &lt; rate * 10_000 else None                 <span class="c"># deterministic per trace ID</span></code></pre></div>
+				<ul>
+					<li><strong>Head sampling</strong> (decide at the start) keeps 1% of everything, including 1% of the rare failures you most need. <strong>Tail sampling</strong> decides after completion, so errors, refusals, truncations, very slow traces and thumbs-down feedback are always kept.</li>
+					<li><strong>Weights:</strong> each kept trace carries 1/rate, so totals and rates can still be estimated. Mixing always-kept failures with 1% of successes without weights inflates the apparent failure rate a hundredfold.</li>
+					<li><strong>Stratify:</strong> keep a higher share for small tenants, so cohort analysis can see them at all.</li>
+					<li><strong>Deterministic by trace ID,</strong> so every service in the request makes the same decision and traces aren&rsquo;t broken into fragments.</li>
+					<li><strong>Know what&rsquo;s missing:</strong> exported spans are best effort, and a caller can switch sampling off in <code>traceparent</code>. Counts for billing come from the Usage and Cost Analytics API (<a href="d3-skill-3-1.html">skill 3.1</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Aggregation ===== -->
+			<h2 id="s3">Aggregation: facets first</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.3</span><span class="skill-text">The attributes you can slice by decide what you can find.</span></p>
+				<ul>
+					<li><strong>Record facets on every trace:</strong> model ID, prompt version, retrieval index version, tool path, tenant, locale, turn count bucket, input length bucket, stop reason, and the outcome (graded pass or fail, user feedback, escalation).</li>
+					<li><strong>Outcome labels make it analysis:</strong> a failure definition (graded fail, thumbs-down, a human took over, a refund reversed) has to be on the trace, or aggregation only counts latency and tokens.</li>
+					<li><strong>Bucket continuous values</strong> (turns, tokens, latency) so cohorts have enough members.</li>
+					<li><strong>Keep facets low in sensitivity:</strong> IDs and categories, not text, so the analysis store can be widely accessible.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Cohorts ===== -->
+			<h2 id="s4">Failure-cohort analysis</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.3</span><span class="skill-text">Rank slices by how many failures they add.</span></p>
+				<div class="code"><span class="file">cohorts.py (cohorts.py)</span>
+<pre><code>"""Failure-cohort analysis over weighted, sampled traces: which slices fail far more than the rest,
+and how many failures each accounts for. Individual traces can't show this."""
+from collections import defaultdict
+from itertools import combinations
+
+DIMENSIONS = ["model", "prompt_version", "tool", "locale", "turns_bucket"]
+
+
+def cohorts(traces: list[dict], min_weight=200, max_dims=2) -&gt; list[dict]:
+    total_w = sum(t["w"] for t in traces)
+    base = sum(t["w"] for t in traces if t["failed"]) / total_w
+    varying = [d for d in DIMENSIONS if len({t[d] for t in traces}) &gt; 1]   <span class="c"># a constant can't explain anything</span>
+    out = []
+    for k in range(1, max_dims + 1):
+        for dims in combinations(varying, k):
+            agg = defaultdict(lambda: [0.0, 0.0])
+            for t in traces:
+                key = tuple(t[d] for d in dims)
+                agg[key][0] += t["w"]
+                agg[key][1] += t["w"] * t["failed"]
+            for key, (w, f) in agg.items():
+                if w &lt; min_weight:
+                    continue                           <span class="c"># too small to trust (and to report)</span>
+                rate = f / w
+                out.append({"cohort": dict(zip(dims, key)), "est_traces": round(w), "fail_rate": round(rate, 3),
+                            "lift": round(rate / base, 1), "excess_failures": round(f - base * w)})
+    return sorted(out, key=lambda c: -c["excess_failures"])</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output on a synthetic week)</span>
+<pre><code>{'cohort': {'prompt_version': 'v14', 'tool': 'payroll'}, 'est_traces': 34090, 'fail_rate': 0.307, 'lift': 4.5, 'excess_failures': 8145}
+{'cohort': {'tool': 'payroll'}, 'est_traces': 67290, 'fail_rate': 0.163, 'lift': 2.4, 'excess_failures': 6381}
+{'cohort': {'prompt_version': 'v14'}, 'est_traces': 100600, 'fail_rate': 0.117, 'lift': 1.7, 'excess_failures': 4889}
+{'cohort': {'tool': 'payroll', 'turns_bucket': '1-5'}, 'est_traces': 23030, 'fail_rate': 0.168, 'lift': 2.5, 'excess_failures': 2306}</code></pre></div>
+				<ul>
+					<li><strong>Every slice, one and two facets deep:</strong> the failure rate in each, compared with the overall rate (lift), skipping slices too small to trust.</li>
+					<li><strong>Rank by excess failures,</strong> not lift alone: failures beyond what the overall rate would predict. A tiny slice with high lift matters less than a large slice with moderate lift.</li>
+					<li><strong>Read the result:</strong> prompt v14 combined with the payroll tool fails 31% of the time, about 4.5 times the base rate, and accounts for roughly 8,100 extra failures in the week. The single-facet rows (payroll alone, v14 alone) are the same problem seen less sharply, which is why the interaction matters.</li>
+					<li><strong>Then confirm causally:</strong> roll back v14 for payroll or replay those cases on v13, and check the cohort&rsquo;s rate falls. Cohort analysis points; a controlled comparison proves.</li>
+					<li><strong>Simplification:</strong> the demo gives every trace the same weight; with the tail-sampling policy above, use each trace&rsquo;s own weight.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Clio ===== -->
+			<h2 id="s5">Clustering content without reading it</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.3</span><span class="skill-text">When facets don&rsquo;t describe the problem.</span></p>
+				<ul>
+					<li><strong>Clio&rsquo;s approach</strong> (Anthropic research, December 2024): Claude extracts facets from each conversation (topic, turn count, language), clusters similar conversations, writes a title and summary for each cluster without private details, and builds a hierarchy. Claude runs every stage, not people.</li>
+					<li><strong>Privacy controls:</strong> a minimum number of unique users or conversations per cluster, a check that summaries aren&rsquo;t identifying, and analysts seeing only higher-level clusters.</li>
+					<li><strong>What it found:</strong> a network of automated accounts using similar prompts for SEO spam, safety classifiers missing violations in translation requests, and false positives on job seekers&rsquo; CV questions and security coding questions. None of these was visible in a single conversation.</li>
+					<li><strong>Applied to your traffic</strong> (my reading): cluster failed conversations by what users were trying to do, with the same minimum-size and no-identifying-detail rules, to find failure themes your facets don&rsquo;t name, such as a new kind of payroll question after a tax-year change.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Pull the 50 most recent failed traces and read them"</strong> finds examples, not the size or the slice. <strong>"Sample 1% of all traces"</strong> throws away 99% of the rare failures. Keep the tail with weights, aggregate by facets, rank cohorts by excess failures, then confirm with a controlled comparison.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Systemic issues are rates in slices of traffic; individual traces and averages both hide them.</li>
+				<li>Tail-sample: keep every error, refusal, truncation, slow and negatively rated trace, a weighted share of the rest, more for small tenants, decided per trace ID.</li>
+				<li>Record facets and outcome labels on every trace: model, prompt and index versions, tool path, tenant, locale, length buckets, stop reason, graded result.</li>
+				<li>Rank one- and two-facet cohorts by excess failures, then confirm the cause with a rollback or replay.</li>
+				<li>For themes facets can&rsquo;t express, cluster conversations Clio-style with minimum cluster sizes and non-identifying summaries.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-2.html"><small>Previous</small>3.2: Production Monitoring and Alerting</a>
+				<a class="next" href="d4-skill-4-1.html"><small>Next</small>4.1: Complex Failure Diagnosis</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

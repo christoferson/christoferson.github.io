@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>4.1: Complex Failure Diagnosis | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 4.1: diagnosing complex production failures in Claude systems: multi-turn, multi-agent and non-deterministic failures, isolating the origin among model output, agent harness, tools and data, with refusals and retrieval-grounding failures as their own classes, and tested triage code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d4">Domain 4</a><span class="sep">/</span><span class="here">4.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 4 &middot; Advanced Debugging and Incident Response &middot; 10%</span>
+		<h1>4.1: Complex Failure Diagnosis</h1>
+		<p>When an agent gets something wrong in the fourteenth turn, through the third agent in a chain, one time in ten, the instinct is to blame the model. Often the model reasoned correctly from what it was given. This page separates model, harness, tools and data, and makes intermittent failures measurable.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Debugging</span><span class="tag">Multi-agent</span><span class="tag">Non-determinism</span><span class="tag">Refusals</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Four origins, and what each leaves behind</a></li>
+				<li><a href="#s2">Non-deterministic failures</a></li>
+				<li><a href="#s3">Harness faults that look like model errors</a></li>
+				<li><a href="#s4">Multi-turn and multi-agent failures</a></li>
+				<li><a href="#s5">Refusals and grounding failures</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 4.1</span>
+				<p><strong>Complex Failure Diagnosis</strong>: "Analyzing evidence from complex production failures, including multi-turn, multi-agent, and non-deterministic failures, to isolate the problem origin among model output, agent harness, tools, and data, including model refusals as a failure class and retrieval-grounding failures."</p>
+			</div>
+			<p>Exam items give the evidence from one failure (a trace, a replay result, the handoffs between agents) and ask where it originated. Root causes at architecture level are in <a href="../anthropic-ccar-p/d4-skill-4-5.html">CCAR-P 4.5</a>; finding a failing slice across many traces is <a href="d3-skill-3-3.html">skill 3.3</a>.</p>
+			<p>Sources: the stop reasons, refusals and fallback, and subagents pages, and the mid-conversation system messages page, as used on earlier pages and paraphrased. The isolation order and replay method are my own; the hotel group, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A hotel group&rsquo;s booking-change agent lets guests move or extend stays. An orchestrator calls an availability subagent and a pricing subagent, then a payments tool. A guest extended a three-night stay and was charged for two.</p></div>
+
+			<!-- ===== Origins ===== -->
+			<h2 id="s1">Four origins, and what each leaves behind</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Check from the outside in (my order).</span></p>
+				<div class="code"><span class="file">isolate.py (isolate.py)</span>
+<pre><code>"""Isolate where a failed booking-change conversation went wrong: tools, data, harness or model.
+Evidence comes from the trace plus a replay of the exact captured request (my method)."""
+
+
+def replay_profile(passes: int, runs: int) -&gt; str:
+    """Re-send the captured request several times. Non-determinism is a rate, not a mystery."""
+    if passes == 0:
+        return "deterministic failure: the request itself produces it"
+    if passes == runs:
+        return "doesn't reproduce: the live request differed from the captured one, or state has changed"
+    return f"intermittent: fails {runs - passes} of {runs}; fix or guard, then measure the rate again"
+
+
+def isolate(e: dict) -&gt; tuple[str, str]:
+    """Check from the outside in; the first origin with evidence is reported."""
+    if e["stop_reason"] == "refusal":
+        return ("model refusal", f"category {e.get('refusal_category') or 'not given'}: check whether the "
+                "request was in scope; retry on a different model, and track the refusal rate as its own signal")
+    if e["tool_errors"]:
+        return ("tool", f"{e['tool_errors'][0]}: fix the tool or return an actionable error the model can use")
+    if e["tool_data"] != e["system_of_record"]:
+        return ("data", "the tool returned stale or wrong data; the model reasoned correctly from bad input")
+    if e["harness_issues"]:
+        return ("agent harness", e["harness_issues"][0])
+    if e["grounded_claims"] &lt; e["claims"]:
+        return ("model output (grounding)", "claims without support in the retrieved or tool data")
+    return ("model output", "inputs and tools were correct; adjust prompt or examples, then re-test on replays")
+
+
+def harness_checks(request: dict) -&gt; list[str]:
+    """Faults in how the application built the request, which look like model mistakes."""
+    issues = []
+    last = request["messages"][-1]
+    if last["role"] == "user" and isinstance(last["content"], list):
+        kinds = [b["type"] for b in last["content"]]
+        if "tool_result" in kinds and "text" in kinds:
+            issues.append("text added beside tool_result blocks: a documented cause of empty end_turn replies")
+    if request.get("dropped_turns"):
+        issues.append(f"history trimmed: {request['dropped_turns']} turns removed, including the guest's dates")
+    if request.get("brief_fields_missing"):
+        issues.append(f"subagent brief missing {', '.join(request['brief_fields_missing'])}")
+    return issues
+
+
+def first_divergence(chain: list[dict], field: str, truth) -&gt; str:
+    """Multi-agent: walk handoffs in order; the first agent whose output has the wrong value owns it."""
+    for step in chain:
+        if step["output"].get(field) != truth:
+            got = step["input"].get(field)
+            return f"{step['agent']}: received {got!r}, produced {step['output'].get(field)!r}"
+    return "no divergence on this field"</code></pre></div>
+				<ul>
+					<li><strong>Tools:</strong> an error on a tool span, an <code>isError</code> result, a timeout, a schema mismatch. Fix the tool, or make its error actionable so the model can recover.</li>
+					<li><strong>Data:</strong> the tool succeeded but returned stale or wrong values; compare with the system of record. The model reasoned correctly from bad input, so a prompt change won&rsquo;t help.</li>
+					<li><strong>Agent harness:</strong> your code built the wrong request: trimmed history, a malformed tool-result turn, a subagent brief missing a field, a compaction that dropped an instruction.</li>
+					<li><strong>Model output:</strong> everything going in was right and the output was still wrong. Only now is the prompt, examples, effort or model the lever.</li>
+					<li><strong>Refusals</strong> are a class of their own, checked first because they arrive as 200s (<a href="#s5">below</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Nondeterminism ===== -->
+			<h2 id="s2">Non-deterministic failures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Turn "sometimes" into a number.</span></p>
+				<ul>
+					<li><strong>Capture the exact request</strong> (system prompt, messages, tools, model ID, effort) on failure, then replay it several times. <code>replay_profile()</code> reads the result.</li>
+					<li><strong>Fails every time:</strong> the request itself produces the failure, so it can be fixed and verified deterministically.</li>
+					<li><strong>Never fails on replay:</strong> the live request differed from what you captured, or state has moved on (a room now booked, a cache expired). Capture is incomplete; that&rsquo;s the finding.</li>
+					<li><strong>Fails some of the time:</strong> sampling variation on a borderline case. Fix it by making the case less borderline (clearer instruction, a tool that computes instead of the model, structured output) or by adding a deterministic check, then measure the rate again. One passing rerun proves nothing.</li>
+					<li><strong>Sampling controls aren&rsquo;t the fix:</strong> from API version 2026-10-21, <code>temperature</code>, <code>top_p</code> and <code>top_k</code> are rejected, so reliability has to come from the design.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Harness ===== -->
+			<h2 id="s3">Harness faults that look like model errors</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Read the request, not just the response.</span></p>
+				<ul>
+					<li><strong>Text beside tool results:</strong> the stop reasons page names adding text blocks right after <code>tool_result</code> as a cause of empty <code>end_turn</code> replies; send only the tool results. (Sonnet 5.5 and Haiku 5.5 document an exception for user input during a loop.) <code>harness_checks()</code> flags it.</li>
+					<li><strong>Mixed server and client tool calls:</strong> a reply with an unanswered server tool call must be sent back unchanged with only your tool results; text in that turn, a missing result or a dropped tool definition returns a 400.</li>
+					<li><strong>History trimming and compaction:</strong> a trimming rule or a lossy summary removes the turn where the guest gave their dates, and the model answers from what&rsquo;s left.</li>
+					<li><strong>Streams that end early:</strong> a stream cut off before <code>message_stop</code> may raise nothing, leaving a partial answer that looks complete. Check for a stop reason.</li>
+					<li><strong>Truncation:</strong> a tool call cut off at <code>max_tokens</code> becomes a malformed action; retry with more output room.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Multi ===== -->
+			<h2 id="s4">Multi-turn and multi-agent failures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Find the first place the value went wrong.</span></p>
+				<ul>
+					<li><strong>Walk the handoffs:</strong> record each agent&rsquo;s input and output for key fields, then find the first agent whose output disagrees with the truth. Here the availability subagent received three nights and produced two; pricing and payments then did their jobs correctly on wrong input.</li>
+					<li><strong>Briefs are the usual culprit:</strong> subagents see only their brief, so a field the orchestrator didn&rsquo;t pass (dates, loyalty tier) is a harness fault upstream, not a subagent reasoning error.</li>
+					<li><strong>Partial results:</strong> a subagent cut off by an API error returns partial output with a note, or "Agent terminated early due to an API error". An orchestrator that treats either as a full answer creates a silent gap.</li>
+					<li><strong>Multi-turn:</strong> find the turn where the conversation first went off course (a misread date, a stale tool result reused), not the turn where the guest noticed.</li>
+					<li><strong>Injected text:</strong> a subagent&rsquo;s report can carry instructions from content it read. Claude Code marks instruction-shaped patterns, but check worker reports as data.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Refusals ===== -->
+			<h2 id="s5">Refusals and grounding failures</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 4.1</span><span class="skill-text">Two failure classes with their own evidence.</span></p>
+				<ul>
+					<li><strong>Refusals:</strong> HTTP 200 with <code>stop_reason: "refusal"</code>; <code>stop_details</code> names the policy category when present, but branch on the stop reason, since the category can be missing. Decide whether the request was legitimately in scope (a false positive) or not, retry in-scope ones on a different model, and track the rate separately from errors.</li>
+					<li><strong>Grounding failures:</strong> claims in the answer with no support in the retrieved passages or tool data. Check retrieval first (was the right passage there?), then the answer&rsquo;s citations (<a href="d2-skill-2-4.html">skill 2.4</a>).</li>
+					<li><strong>Turn each diagnosis into a regression case,</strong> with the captured request and the expected outcome, so the fix stays fixed (<a href="d4-skill-4-2.html">skill 4.2</a>).</li>
+				</ul>
+				<div class="callout trap"><p><strong>"The charge was wrong, so the model miscalculated; add 'double-check the number of nights' to the prompt"</strong> skips the evidence. The handoff record shows the availability subagent produced the wrong value from a correct input, and the brief tells you why. Isolate first, then change the component that failed.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Check refusals, then tools, data, harness and model output, in that order; the first with evidence is the origin.</li>
+				<li>Capture the exact request and replay it several times: always failing, never failing and sometimes failing each point somewhere different.</li>
+				<li>Many "model errors" are harness faults: text beside tool results, trimmed history, missing brief fields, early stream ends, truncation.</li>
+				<li>In multi-agent systems, walk the handoffs to the first agent whose output disagrees with the truth.</li>
+				<li>Treat refusals (200s, branch on stop reason) and grounding failures as their own classes, and keep every diagnosis as a regression case.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-3.html"><small>Previous</small>3.3: Trace Analysis at Scale</a>
+				<a class="next" href="d4-skill-4-2.html"><small>Next</small>4.2: Incident Response and Learning Loops</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the hotel group, files and code are original.</div>
+</footer>
+
+</body>
+</html>
