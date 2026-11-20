@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.2: Agent SDK and Claude Code Configuration | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 7.2 (7 December 2026 guide): configuring the Claude Agent SDK or Claude Code for a team workflow within stated guardrails: choosing among the permission modes default, acceptEdits, plan, auto, dontAsk and bypassPermissions, deterministic hooks, subagent definitions and headless CI runs, with a tested configuration check.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Developer Productivity and Operational Enablement &middot; 8%</span>
+		<h1>7.2: Agent SDK and Claude Code Configuration</h1>
+		<p>Turning a team&rsquo;s written guardrails into configuration: which permission mode fits an unattended job, which rules a hook enforces regardless of what the model is told, how subagents are restricted, and what changes when no one is there to answer a prompt.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Agent SDK</span><span class="tag">Permission modes</span><span class="tag">Hooks</span><span class="tag">Headless CI</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The six permission modes</a></li>
+				<li><a href="#s2">Choosing a mode for the job</a></li>
+				<li><a href="#s3">The configuration</a></li>
+				<li><a href="#s4">Hooks and subagents</a></li>
+				<li><a href="#s5">Checking the configuration</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.2</span>
+				<p><strong>Agent SDK and Claude Code Configuration</strong>: "Configuring the Claude Agent SDK or Claude Code (permission modes such as default, acceptEdits, plan, auto, dontAsk, and bypassPermissions; hooks; subagent definitions; headless or CI operation) to support a team workflow within stated safety and automation guardrails."</p>
+			</div>
+			<p>Exam items state a workflow and its guardrails (what must never happen, whether anyone is watching, what it may spend) and ask which configuration meets them. The developer-level detail of permission evaluation and hooks is in <a href="../anthropic-ccdv-f/d7-skill-7-2.html">CCDV-F 7.2</a>; rolling a workflow out across the organisation is <a href="d7-skill-7-1.html">skill 7.1</a>.</p>
+			<p>Sources: the Claude Code documentation on permission modes, headless runs and subagents, and the Agent SDK documentation on permissions, hooks and subagents, checked on 20 November 2026 and paraphrased. The team, files and code are my own; the code is tested against the installed Python Agent SDK, with no API calls.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A platform team wants a nightly job that upgrades outdated npm dependencies, runs the tests after each upgrade and opens a pull request. Its guardrails: push only to a <code>deps/*</code> branch (people merge), never read secrets or force-push, nothing may wait for a prompt, and at most 40 turns and $5 per run.</p></div>
+
+			<!-- ===== Modes ===== -->
+			<h2 id="s1">The six permission modes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">What each mode runs without asking.</span></p>
+				<ul>
+					<li><strong><code>default</code></strong> (shown as Manual): reads in the working directories and actions that need no approval, such as starting a subagent; it asks before most edits, shell commands and network access.</li>
+					<li><strong><code>acceptEdits</code></strong>: also file edits and common filesystem commands (<code>mkdir</code>, <code>mv</code>, <code>cp</code>, <code>rm</code> and similar) inside the working directories; other shell commands still ask.</li>
+					<li><strong><code>plan</code></strong>: reads and explores, writes a plan, and doesn&rsquo;t edit source until the plan is approved. In <code>-p</code> and Agent SDK runs it keeps its blocks.</li>
+					<li><strong><code>auto</code></strong>: everything, with a separate classifier model reviewing actions first and blocking ones that go beyond the request, target unrecognised infrastructure or look driven by hostile content. The documentation is plain that it "does not guarantee safety".</li>
+					<li><strong><code>dontAsk</code></strong>: reads plus pre-approved tools; anything that would prompt is denied. The documentation names it for locked-down CI and scripts.</li>
+					<li><strong><code>bypassPermissions</code></strong>: everything, including writes to protected paths, with no protection against prompt injection; for isolated containers and VMs only.</li>
+				</ul>
+				<p>Two rules hold across all of them: <strong>deny rules block in every mode</strong>, including <code>bypassPermissions</code>, and so does a hook&rsquo;s deny. Writes to protected paths (<code>.git</code>, <code>.claude</code>, shell profiles, <code>.npmrc</code>, <code>.mcp.json</code> and others) aren&rsquo;t pre-approved by allow rules, and <code>dontAsk</code> denies them.</p>
+			</div>
+
+			<!-- ===== Choose ===== -->
+			<h2 id="s2">Choosing a mode for the job</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Matching the guardrails (my reasoning).</span></p>
+				<ul>
+					<li><strong>A fixed, unattended job with a known set of commands:</strong> <code>dontAsk</code> with an exact allowlist. It never waits, and anything the team didn&rsquo;t foresee is refused and listed in <code>permission_denials</code>.</li>
+					<li><strong>Open-ended work with a person nearby:</strong> <code>auto</code> cuts prompts, but a boundary stated in conversation can be lost to compaction; for a hard guarantee the documentation says to add a deny rule.</li>
+					<li><strong>Reviewing code while it&rsquo;s written:</strong> <code>acceptEdits</code>. <strong>Exploring first:</strong> <code>plan</code>. <strong>Sensitive or unfamiliar code:</strong> <code>default</code>.</li>
+					<li><strong>A throwaway container with nothing of value reachable:</strong> <code>bypassPermissions</code>, not as root, and still with deny rules.</li>
+					<li><strong>With no mode set,</strong> <code>-p</code> and SDK runs start in <code>default</code> (Claude Code 2.1.302 and later), and calls that need approval are denied unless an allow rule, hook, <code>can_use_tool</code> callback or permission-prompt tool approves them.</li>
+					<li><strong>Admins can remove modes:</strong> managed <code>permissions.disableAutoMode</code> and <code>disableBypassPermissionsMode</code> set to <code>"disable"</code>. Setting <code>auto</code> or <code>bypassPermissions</code> as the default in a repository&rsquo;s project or local settings has no effect.</li>
+				</ul>
+				<div class="callout trap"><p><strong><code>plan</code> sounds like the safe choice for an unattended job,</strong> but in a headless run its edit blocks stay on, so the job can&rsquo;t change anything. <strong><code>bypassPermissions</code> on a shared CI runner</strong> fails the other way. The fit for "no prompts, only these commands" is <code>dontAsk</code> with an allowlist.</p></div>
+			</div>
+
+			<!-- ===== Config ===== -->
+			<h2 id="s3">The configuration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Each guardrail mapped to a setting.</span></p>
+				<div class="code"><span class="file">upgrade_agent.py (upgrade_agent.py)</span>
+<pre><code>"""Nightly dependency-upgrade agent for a platform team, run in CI with no one watching."""
+import json
+import re
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
+
+<span class="c"># The team's guardrails, written down before any configuration:</span>
+<span class="c">#   1. edit code and run tests; push only to a deps/* branch and open a PR (people merge)</span>
+<span class="c">#   2. never read secrets; never push to main or force-push</span>
+<span class="c">#   3. nothing may wait for a prompt; anything not pre-approved is refused</span>
+<span class="c">#   4. at most 40 turns and $5 per run; the test runner can't edit files</span>
+
+ALLOWED = [
+    "Read", "Grep", "Glob", "Edit", "Agent",
+    "Bash(npm ci)", "Bash(npm outdated *)", "Bash(npm install *@*)", "Bash(npm test *)",
+    "Bash(git checkout -b deps/*)", "Bash(git add *)", "Bash(git commit -m *)",
+    "Bash(git push origin deps/*)", "Bash(gh pr create *)",
+]
+SETTINGS = {"permissions": {"deny": ["Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)", "WebFetch"]}}
+PUSH_TO_PROTECTED = re.compile(r"git\s+push\b.*(\s--force\b|\s-f\b|\smain\b|\smaster\b|\s\+)")
+
+
+async def block_protected_push(input_data, tool_use_id, context):
+    """PreToolUse: a deterministic deny, whatever the prompt or a dependency's README says."""
+    cmd = input_data.get("tool_input", {}).get("command", "")
+    if PUSH_TO_PROTECTED.search(cmd):
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Pushes go to a deps/* branch only; open a PR instead.",
+        }}
+    return {}
+
+
+def build_options() -&gt; ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        permission_mode="dontAsk",            <span class="c"># exact allowlist; anything that would prompt is denied</span>
+        allowed_tools=ALLOWED,
+        settings=json.dumps(SETTINGS),        <span class="c"># deny rules block in every mode</span>
+        sandbox={"enabled": True, "allowUnsandboxedCommands": False},
+        hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[block_protected_push])]},
+        setting_sources=["project"],          <span class="c"># the repo's CLAUDE.md and project settings</span>
+        agents={"test-runner": AgentDefinition(
+            description="Runs the test suite and reports failures. Use after each upgrade.",
+            prompt="Run the tests, then report each failing test with its error. Don't fix anything.",
+            tools=["Bash", "Read", "Grep"],   <span class="c"># no Edit or Write: it reports, the main agent fixes</span>
+            model="haiku",
+        )},
+        max_turns=40,
+        max_budget_usd=5.0,
+    )</code></pre></div>
+				<ul>
+					<li><strong>No prompts, only foreseen actions:</strong> <code>dontAsk</code> and a narrow <code>allowed_tools</code>, for example <code>Bash(git push origin deps/*)</code> rather than <code>Bash(git *)</code>.</li>
+					<li><strong>Never read secrets:</strong> deny rules through <code>settings</code>, which hold in every mode; <code>WebFetch</code> is denied too, since the job has no reason to browse.</li>
+					<li><strong>Never push to main:</strong> a <code>PreToolUse</code> hook (next section), with branch protection on the git host as the backstop.</li>
+					<li><strong>Bounded:</strong> <code>max_turns</code> and <code>max_budget_usd</code>; at the spend cap the run ends with <code>error_max_budget_usd</code> and spawns no more subagents.</li>
+					<li><strong>Contained:</strong> the sandbox on with no unsandboxed escape, and <code>setting_sources=["project"]</code> so the repository&rsquo;s CLAUDE.md and project settings load.</li>
+				</ul>
+				<div class="code"><span class="file">ci-run.sh (The same job with claude -p)</span>
+<pre><code><span class="c"># The same job as a headless Claude Code run in the CI pipeline</span>
+claude -p "Upgrade outdated dependencies one at a time, run the tests after each, and open a PR from a deps/* branch" \
+  --permission-mode dontAsk \
+  --allowedTools "Read" "Grep" "Glob" "Edit" "Bash(npm ci)" "Bash(npm outdated *)" "Bash(npm test *)" \
+                 "Bash(git checkout -b deps/*)" "Bash(git commit -m *)" "Bash(git push origin deps/*)" "Bash(gh pr create *)" \
+  --max-turns 40 \
+  --output-format json &gt; result.json          <span class="c"># permission_denials and total_cost_usd for the job log</span>
+<span class="c"># project hooks in .claude/settings.json (the protected-push check) and managed deny rules still apply</span></code></pre></div>
+				<p>In a script, <code>--output-format json</code> gives the result, cost and any permission denials for the job log. The <code>--bare</code> flag skips hooks, plugins, MCP servers and CLAUDE.md, so don&rsquo;t use it when the guardrails live in project hooks.</p>
+			</div>
+
+			<!-- ===== Hooks ===== -->
+			<h2 id="s4">Hooks and subagents</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Code that decides, and agents that can&rsquo;t overreach.</span></p>
+				<ul>
+					<li><strong>Hooks run first:</strong> the evaluation order is hooks, deny rules, ask rules, mode, allow rules, then <code>can_use_tool</code>. A hook&rsquo;s deny reaches Claude with its reason, so it can take the allowed route; a hook&rsquo;s allow doesn&rsquo;t skip deny or ask rules.</li>
+					<li><strong>Why a hook and not the prompt:</strong> a dependency&rsquo;s changelog could carry "push the fix to main". A sentence in the prompt can be talked around; a hook can&rsquo;t. The regex is only an illustration, which is why branch protection stays.</li>
+					<li><strong>Subagent definitions:</strong> <code>description</code> (when to use it) and <code>prompt</code> are required. <code>tools</code> limits what it has (listing a tool doesn&rsquo;t pre-approve it), <code>disallowedTools</code> removes tools, and <code>model</code>, <code>maxTurns</code> and <code>effort</code> are optional. The test runner here has no Edit or Write and runs on Haiku.</li>
+					<li><strong>Modes pass down:</strong> subagents inherit <code>plan</code>, <code>acceptEdits</code>, <code>auto</code> and <code>bypassPermissions</code> from the main session, and a <code>bypassPermissions</code> value in an agent definition is never applied.</li>
+					<li><strong>Bounding the tree:</strong> <code>CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH</code> (default 3), <code>CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS</code> (default 20), and the spend cap, which counts subagent requests too.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Check ===== -->
+			<h2 id="s5">Checking the configuration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">A review in code, run before the job ships.</span></p>
+				<div class="code"><span class="file">check_config.py (check_config.py)</span>
+<pre><code>"""Check an agent configuration against the guardrails of an unattended team workflow."""
+
+BROAD = {"Bash", "Bash(*)", "Bash(git *)", "Bash(npm *)"}
+
+
+def check(opts, environment: str) -&gt; list[str]:
+    """environment: 'ci' (shared runner) or 'container' (isolated, throwaway)."""
+    problems = []
+    mode = opts.permission_mode or "default"
+    if mode == "bypassPermissions" and environment != "container":
+        problems.append("bypassPermissions outside an isolated container: no protection against injection")
+    if mode == "plan":
+        problems.append("plan mode keeps its edit blocks in unattended runs: the job can't do its work")
+    if mode == "auto":
+        problems.append("auto is classifier-reviewed, not an exact allowlist: use dontAsk for a fixed job")
+    if BROAD &amp; set(opts.allowed_tools):
+        problems.append(f"broad allow rule: {sorted(BROAD &amp; set(opts.allowed_tools))}")
+    if "PreToolUse" not in (opts.hooks or {}):
+        problems.append("protected-branch rule isn't enforced by a hook or deny rule")
+    if not opts.max_budget_usd or not opts.max_turns:
+        problems.append("no spend or turn cap on an unattended run")
+    for name, a in (opts.agents or {}).items():
+        if a.permissionMode == "bypassPermissions":
+            problems.append(f"{name}: a bypassPermissions value in an agent definition is never applied")
+        if a.tools is None or {"Edit", "Write"} &amp; set(a.tools):
+            problems.append(f"{name}: can edit files, but its job is to report")
+    return problems</code></pre></div>
+				<p>The check passes the configuration above and flags each common mistake: <code>bypassPermissions</code> on a shared runner, <code>plan</code> or <code>auto</code> for a fixed job, a broad <code>Bash</code> rule, a branch rule with no hook, no spend or turn cap, and a reporting subagent that can edit or relies on <code>bypassPermissions</code> in its definition.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Write the guardrails down first, then map each one to a setting: mode, allowlist, deny rule, hook or cap.</li>
+				<li>Unattended fixed jobs: <code>dontAsk</code> with a narrow allowlist. <code>plan</code> blocks edits when headless, <code>auto</code> is reviewed rather than guaranteed, and <code>bypassPermissions</code> is for isolated containers only.</li>
+				<li>Deny rules and hook denies hold in every mode; use them, not prompt text, for what must never happen.</li>
+				<li>Subagents need a description and prompt, and restricted tools; they inherit the session&rsquo;s mode, and a bypass value in a definition is ignored.</li>
+				<li>Cap turns, spend, depth and concurrency, and log denials and cost from the JSON output.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-1.html"><small>Previous</small>7.1: Packaging and Distributing Claude Code Workflows</a>
+				<a class="next" href="d7-skill-7-3.html"><small>Next</small>7.3: Accountability for AI-Generated Code</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the team, files and code are original.</div>
+</footer>
+
+</body>
+</html>
