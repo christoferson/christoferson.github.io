@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.4: Orchestrator and Subagent Decomposition | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 1.4 (7 December 2026 guide): evaluating an orchestrator/subagent design against observability and error-recovery requirements, and finding where task boundaries, control flow or result synthesis will fail, with a tested orchestrator that checkpoints, traces and reports gaps.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Solution Design and Architecture &middot; 18%</span>
+		<h1>1.4: Orchestrator and Subagent Decomposition</h1>
+		<p>Reviewing a design where a lead agent hands work to subagents: will you be able to see what happened, will it recover when one piece fails, and where will the split itself break: overlapping or missing tasks, a stuck control flow, or a final answer that quietly drops what a subagent found?</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Multi-agent</span><span class="tag">Subagents</span><span class="tag">Observability</span><span class="tag">Error recovery</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What Anthropic learned in production</a></li>
+				<li><a href="#s2">Where task boundaries fail</a></li>
+				<li><a href="#s3">Where control flow fails</a></li>
+				<li><a href="#s4">Where synthesis fails</a></li>
+				<li><a href="#s5">A decomposition built for both requirements</a></li>
+				<li><a href="#s6">When not to decompose</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.4</span>
+				<p><strong>Orchestrator and Subagent Decomposition</strong>: "Evaluating a proposed orchestrator/subagent decomposition for a multi-step workload against stated observability and error-recovery requirements, and identifying where task boundaries, control flow, or result synthesis will fail."</p>
+			</div>
+			<p>Exam items describe a multi-agent design and a requirement (every decision must be traceable; a failed step must not restart the whole job) and ask where it breaks. Building coordinator and subagent systems with the Agent SDK is covered in the Foundations notes (<a href="../anthropic-ccar-f/d1-task-1-2.html">CCAR-F 1.2</a> and <a href="../anthropic-ccar-f/d1-task-1-3.html">1.3</a>); this skill is the evaluation.</p>
+			<p>Sources: Anthropic's engineering post on its multi-agent research system and the Agent SDK subagents documentation, checked on 20 November 2026 and paraphrased. The workload and code are my own; the code is tested with a fake subagent runner.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A procurement team reviews suppliers' security evidence (policies, a SOC 2 report, a data processing agreement, a subprocessor list). An orchestrator gives each evidence area to a subagent and writes the final assessment.</p></div>
+
+			<!-- ===== Lessons ===== -->
+			<h2 id="s1">What Anthropic learned in production</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">From its multi-agent research system.</span></p>
+				<ul>
+					<li><strong>Errors compound:</strong> agents run long and hold state, so without mitigations "minor system failures can be catastrophic". Anthropic built the system to resume from where an agent was when the error occurred, rather than starting over.</li>
+					<li><strong>Tell the agent, and add safeguards:</strong> letting the agent know a tool is failing so it can adapt worked well, combined with deterministic retry logic and regular checkpoints.</li>
+					<li><strong>Trace everything:</strong> full production tracing made failures diagnosable; they monitored decision patterns and interaction structure without monitoring conversation contents.</li>
+					<li><strong>Detailed task descriptions:</strong> without them, subagents duplicated work, left gaps or missed information. Each needs an objective, an output format, guidance on tools and sources, and clear boundaries.</li>
+					<li><strong>Pass references, not copies:</strong> subagents stored their work externally and passed lightweight references back, avoiding loss in a "game of telephone".</li>
+					<li><strong>Synchronous waiting is a bottleneck:</strong> the lead can't steer subagents, they can't coordinate, and one slow subagent blocks everything; going asynchronous makes coordination, state consistency and error propagation harder.</li>
+					<li><strong>Cost:</strong> multi-agent runs used roughly 15 times the tokens of a chat.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Boundaries ===== -->
+			<h2 id="s2">Where task boundaries fail</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Signs in a proposed split (my checklist).</span></p>
+				<ul>
+					<li><strong>Overlap:</strong> two subagents both read the SOC 2 report; findings conflict and the cost doubles. Fix: assign sources, not just topics.</li>
+					<li><strong>Gaps:</strong> nobody owns subprocessors, so the assessment is silent on them. Fix: check the task list covers the whole requirement.</li>
+					<li><strong>Hidden dependencies:</strong> the data subagent needs the access subagent's conclusion. Subagents don't see each other's work or the parent's history, so dependent work must run in sequence or be merged.</li>
+					<li><strong>Thin briefs:</strong> a subagent receives only its prompt; "check data security" without scope, sources or output format invites drift.</li>
+					<li><strong>Over-splitting:</strong> a subagent per document for a small review adds cost and coordination for nothing.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Control ===== -->
+			<h2 id="s3">Where control flow fails</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">What happens when one subagent fails, stalls or misbehaves.</span></p>
+				<ul>
+					<li><strong>No retry or timeout:</strong> one stuck subagent blocks the whole review.</li>
+					<li><strong>Restart from scratch:</strong> a failure in the last area reruns the three that succeeded, against an error-recovery requirement.</li>
+					<li><strong>Unvalidated output:</strong> a subagent returns prose instead of the agreed structure, and the orchestrator carries on as if it had findings.</li>
+					<li><strong>Unbounded spawning:</strong> no cap on subagents, turns or budget. The Agent SDK has caps (spawn depth, concurrent subagents, a budget limit), but the design must set them deliberately.</li>
+					<li><strong>Nothing to trace:</strong> without a record per subagent run (task, attempt, outcome, timing), "why is the vendors section empty?" can't be answered.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Synthesis ===== -->
+			<h2 id="s4">Where synthesis fails</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">The last step is where evidence gets lost.</span></p>
+				<ul>
+					<li><strong>Silent omission:</strong> a failed area simply doesn't appear, and the report reads as complete.</li>
+					<li><strong>Telephone effect:</strong> each layer summarises the one below, and specifics (which control, which page of evidence) disappear.</li>
+					<li><strong>Conflicts flattened:</strong> two findings disagree and the summary picks one without saying so.</li>
+					<li><strong>No provenance:</strong> a conclusion can't be traced to the subagent and evidence behind it.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Have the orchestrator summarise whatever the subagents return"</strong> fails both requirements at once: you can't see what each subagent did, and a failure turns into a confident report with a hole in it.</p></div>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s5">A decomposition built for both requirements</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Contracts, references, checkpoints, a trace, and gaps reported.</span></p>
+				<div class="code"><span class="file">review_orchestrator.py (review_orchestrator.py)</span>
+<pre><code>"""Orchestrator for supplier security reviews: one subagent per evidence area, then synthesis.
+
+The decomposition is designed for the two stated requirements:
+- observability: every subagent run leaves a trace record (task, outcome, timing, result reference);
+- error recovery: results are checkpointed, so a rerun skips finished areas, and a failed area
+  becomes a named gap in the report instead of a silent omission.
+run_subagent is injected: in production it starts an Agent SDK subagent or a Messages API loop."""
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Task:                       <span class="c"># the contract each subagent gets: no shared history, so be explicit</span>
+    area: str
+    objective: str
+    sources: tuple                <span class="c"># what it may read: the boundary that stops overlap</span>
+    output: str = "JSON: {findings: [{control, status, evidence_ref}], open_questions: []}"
+
+
+TASKS = [
+    Task("access", "Assess identity and access controls (SSO, MFA, joiner-leaver process).", ("policies/iam*", "soc2/CC6*")),
+    Task("data", "Assess encryption, retention and data residency.", ("policies/data*", "dpa.pdf")),
+    Task("incident", "Assess incident response and breach notification times.", ("policies/ir*", "soc2/CC7*")),
+    Task("vendors", "Assess the supplier's own subprocessors.", ("subprocessors.csv",)),
+]
+
+
+class Orchestrator:
+    def __init__(self, run_subagent, store: Path, max_attempts: int = 2):
+        self.run_subagent, self.store, self.max_attempts = run_subagent, store, max_attempts
+        self.store.mkdir(parents=True, exist_ok=True)
+        self.trace = self.store / "trace.jsonl"
+
+    def _log(self, **event):
+        with self.trace.open("a") as f:
+            f.write(json.dumps({"t": round(time.time(), 3), **event}) + "\n")
+
+    def run_area(self, task: Task) -&gt; dict:
+        ref = self.store / f"{task.area}.json"
+        if ref.exists():                                       <span class="c"># checkpoint: resume, don't redo</span>
+            self._log(area=task.area, outcome="reused", ref=ref.name)
+            return {"area": task.area, "status": "done", "ref": ref.name}
+        for attempt in range(1, self.max_attempts + 1):
+            start = time.time()
+            try:
+                result = self.run_subagent(asdict(task))
+                if not isinstance(result.get("findings"), list):
+                    raise ValueError("output missing 'findings' list")
+                ref.write_text(json.dumps(result))             <span class="c"># store externally, pass a reference</span>
+                self._log(area=task.area, attempt=attempt, outcome="ok", secs=round(time.time() - start, 2), ref=ref.name)
+                return {"area": task.area, "status": "done", "ref": ref.name}
+            except Exception as e:                             <span class="c"># retry once, then record a gap</span>
+                self._log(area=task.area, attempt=attempt, outcome="error", error=str(e)[:200])
+        return {"area": task.area, "status": "gap", "ref": None}
+
+    def review(self, supplier: str) -&gt; dict:
+        results = [self.run_area(t) for t in TASKS]
+        findings, gaps = [], []
+        for r in results:
+            if r["status"] == "gap":
+                gaps.append(r["area"])
+                continue
+            data = json.loads((self.store / r["ref"]).read_text())
+            findings += [dict(f, area=r["area"]) for f in data["findings"]]
+        report = {"supplier": supplier, "findings": findings, "gaps": gaps,
+                  "verdict": "incomplete: rerun or review gaps manually" if gaps else "complete"}
+        self._log(outcome="synthesised", gaps=gaps, findings=len(findings))
+        return report</code></pre></div>
+				<ul>
+					<li><strong>Boundaries:</strong> each <code>Task</code> names its objective, the sources it may read and its output format, so areas don't overlap and nothing is assumed from shared history.</li>
+					<li><strong>Control flow:</strong> each area gets a bounded number of attempts; malformed output counts as a failure; results are checkpointed, so a rerun redoes only what failed.</li>
+					<li><strong>Synthesis:</strong> findings are read from stored references, keep their area and evidence reference, and a failed area becomes a named gap with an "incomplete" verdict.</li>
+					<li><strong>Observability:</strong> every run, retry, reuse and the synthesis itself is a trace line, without storing document contents in the trace.</li>
+					<li><strong>Tested:</strong> one area returns malformed output once, another always fails; the test checks retries, the gap, the trace and that a rerun reuses the three finished areas.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Not ===== -->
+			<h2 id="s6">When not to decompose</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Multi-agent isn't free.</span></p>
+				<ul>
+					<li><strong>Shared context and many dependencies</strong> are a poor fit, Anthropic notes; most coding work is an example.</li>
+					<li><strong>Small or simple workloads</strong> don't justify the token cost; one agent with a few tool calls is cheaper and easier to trace.</li>
+					<li><strong>Parallel, independent, breadth-heavy work</strong> is where subagents pay off: separate areas, separate sources, a synthesis at the end.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Evaluate a decomposition at three points: task boundaries (overlap, gaps, dependencies, thin briefs), control flow (retries, timeouts, restarts, caps, validation) and synthesis (omissions, telephone effect, conflicts, provenance).</li>
+				<li>Observability needs a trace per subagent run; error recovery needs checkpoints so a failure resumes rather than restarts.</li>
+				<li>Anthropic's lessons: errors compound, so resume from the failure point; tell the agent about failing tools and add deterministic retries; trace decisions; write detailed task descriptions; pass references, not copies.</li>
+				<li>A failed subagent must surface as a named gap, never disappear from the final answer.</li>
+				<li>Decompose parallel, independent, breadth-heavy work; keep tightly coupled or small work in one agent.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-3.html"><small>Previous</small>1.3: Architectural Pattern Selection</a>
+				<a class="next" href="d1-skill-1-5.html"><small>Next</small>1.5: Value-Based Architectural Decisions</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the workload and code are original.</div>
+</footer>
+
+</body>
+</html>
