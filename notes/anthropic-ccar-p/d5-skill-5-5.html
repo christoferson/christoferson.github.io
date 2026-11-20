@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.5: Architectural Controls for Compliance Obligations | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 5.5 (7 December 2026 guide): matching compliance obligations to architectural controls on Claude (data residency and surface, zero data retention, HIPAA readiness, PII redaction, audit logging, tenant isolation) and the evidence each produces, with the conflicts to avoid and tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.5</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Governance, Safety, and Risk Management &middot; 16%</span>
+		<h1>5.5: Architectural Controls for Compliance Obligations</h1>
+		<p>Taking an obligation (no vendor storage, protected health information, data in one country, clients kept apart) and choosing the controls that actually satisfy it and produce evidence an auditor can check, while avoiding design choices the obligation quietly rules out.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Compliance</span><span class="tag">Zero data retention</span><span class="tag">HIPAA</span><span class="tag">Data residency</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What each control does, and doesn't</a></li>
+				<li><a href="#s2">Obligation to control to evidence</a></li>
+				<li><a href="#s3">Conflicts to catch early</a></li>
+				<li><a href="#s4">Residual risk to disclose</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.5</span>
+				<p><strong>Architectural Controls for Compliance Obligations</strong>: "Evaluating candidate architectural controls (data residency and deployment surface, retention and zero-data-retention configuration, PII detection and redaction, audit logging, tenant isolation) against a stated compliance obligation, and selecting the control set that evidences the obligation."</p>
+			</div>
+			<p>Exam items state an obligation and offer control sets, some of which address a different obligation. Choosing a surface and runtime under residency constraints is <a href="d1-skill-1-6.html">skill 1.6</a>; key handling and authorisation are <a href="d3-skill-3-2.html">skill 3.2</a>.</p>
+			<p>Sources: the Claude documentation on API and data retention and on data residency, checked on 20 November 2026 and paraphrased. The obligations and code are my own; the code is tested. Contract terms are the final word on what an arrangement covers.</p>
+
+			<!-- ===== Controls ===== -->
+			<h2 id="s1">What each control does, and doesn't</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.5</span><span class="skill-text">Precise scope, from Anthropic's documentation.</span></p>
+				<ul>
+					<li><strong>Zero data retention (ZDR):</strong> Anthropic doesn't store prompts or responses at rest after the response is returned. It's an arrangement per organisation, through the sales team; it doesn't cover the Console, Managed Agents (except self-hosted), features marked ineligible such as code execution, or the Fable 5.x and Mythos models, which require 30-day retention. ZDR organisations can't call the API from a browser.</li>
+					<li><strong>HIPAA readiness:</strong> a signed BAA and a HIPAA-enabled organisation on the Claude API (or Microsoft Foundry with its HIPAA configuration). It isn't available on Claude Platform on AWS, and doesn't cover Claude Code, Console usage or most beta features. The API rejects ineligible features for HIPAA organisations with a 400. Don't put PHI in JSON schemas: compiled schemas are cached without the same protections.</li>
+					<li><strong>Default retention:</strong> Anthropic states conversation content isn't retained by default, except for the models that require 30-day retention, and retained data isn't used for training without permission.</li>
+					<li><strong>Data residency:</strong> <code>inference_geo</code> controls where inference runs (US or global); workspace settings can restrict allowed geos; workspace geo controls where data rests (US only today). On Bedrock and Google-managed Vertex, the cloud provider is the data processor and sets the controls.</li>
+					<li><strong>PII redaction, audit logging, tenant isolation:</strong> your controls, in your architecture: redact before logs and analytics, record who accessed what, and separate clients by workspace, key, index and tool scope.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Map ===== -->
+			<h2 id="s2">Obligation to control to evidence</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.5</span><span class="skill-text">Four obligations, each with its control set and what proves it.</span></p>
+				<div class="code"><span class="file">compliance_controls.py (compliance_controls.py)</span>
+<pre><code>"""Map each compliance obligation to the architectural controls that evidence it, and catch conflicts.
+
+Facts encoded (Claude API data retention and data residency pages, Nov 2026):
+- ZDR: per organization, by arrangement; not for Console, Managed Agents (except self-hosted), Fable 5.x /
+  Mythos models (30-day retention required), code execution and other features marked ineligible.
+- HIPAA readiness: BAA + HIPAA-enabled organization on the Claude API; not on Claude Platform on AWS,
+  Bedrock or Claude Code; ineligible features return 400; no PHI in JSON schemas.
+- Residency: inference_geo "us" per request, workspace allowed_inference_geos to enforce it.
+- Flagged content may be retained up to 2 years under any arrangement."""
+
+CONTROLS = {
+    "no vendor storage of customer content": [
+        ("ZDR arrangement for the organization", "contract + account-team confirmation"),
+        ("only ZDR-eligible features and models", "request builder allowlist; CI check"),
+        ("calls from our back end only", "ZDR orgs can't call the API from browsers"),
+    ],
+    "PHI under HIPAA": [
+        ("signed BAA and HIPAA-enabled organization on the Claude API", "Console HIPAA card, BAA version"),
+        ("eligible features only", "the API returns 400 for ineligible ones; keep the error as evidence"),
+        ("no PHI in JSON schemas, file names or metadata", "schema review in code review"),
+        ("PHI redaction before logs and analytics", "logging pipeline config + sampled audit"),
+    ],
+    "inference in the US": [
+        ("inference_geo 'us' on every request", "usage.inference_geo logged per response"),
+        ("workspace allowed_inference_geos = ['us']", "workspace settings export"),
+    ],
+    "per-client separation and access audit": [
+        ("one workspace and scoped key per client", "key inventory by workspace"),
+        ("per-client retrieval index and tool scopes", "integration tests: client A can't read client B"),
+        ("audit log of who accessed what, with client ID", "log retention policy + sample queries"),
+    ],
+}
+
+
+def plan(obligations: list[str], design: dict) -&gt; dict:
+    controls = [c for o in obligations for c in CONTROLS[o]]
+    conflicts = []
+    if "no vendor storage of customer content" in obligations:
+        if design["model"].startswith(("claude-fable", "claude-mythos")):
+            conflicts.append(f"{design['model']} requires 30-day retention: not available under ZDR without express authorization")
+        if design["runtime"] == "managed agents (cloud)":
+            conflicts.append("Managed Agents keeps session transcripts until deleted: not covered by ZDR")
+        if "code_execution" in design["features"]:
+            conflicts.append("code execution is not ZDR-eligible")
+    if "PHI under HIPAA" in obligations and design["surface"] in ("claude platform on aws", "bedrock"):
+        conflicts.append(f"HIPAA readiness isn't available through Anthropic on {design['surface']}")
+    return {"controls": controls, "conflicts": conflicts,
+            "residual": "flagged content may still be retained up to 2 years (disclose in the DPIA)"}</code></pre></div>
+				<ul>
+					<li><strong>Evidence matters as much as the control:</strong> "we use ZDR" is a claim; the contract, an allowlist that blocks ineligible features, and a CI check are evidence.</li>
+					<li><strong>Some evidence comes from the platform:</strong> each response's <code>usage.inference_geo</code> shows where inference ran; a HIPAA organisation's 400 errors show ineligible features were blocked.</li>
+					<li><strong>Isolation is tested, not asserted:</strong> an integration test that client A can't read client B's documents is the evidence.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Conflicts ===== -->
+			<h2 id="s3">Conflicts to catch early</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.5</span><span class="skill-text">Design choices an obligation rules out.</span></p>
+				<ul>
+					<li><strong>ZDR with Fable 5.2:</strong> the model requires 30-day retention; not available under ZDR without express authorisation.</li>
+					<li><strong>ZDR with hosted Managed Agents:</strong> session transcripts persist until deleted.</li>
+					<li><strong>ZDR with code execution:</strong> not an eligible feature.</li>
+					<li><strong>HIPAA on Claude Platform on AWS:</strong> HIPAA readiness isn't available there.</li>
+					<li>The test feeds a design with all four and checks each is flagged; a compliant design returns no conflicts.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Use ZDR to keep data in the US"</strong> or <strong>"use US inference to stop the vendor storing data"</strong> each picks a real control for the wrong obligation. Retention and residency are separate settings with separate evidence.</p></div>
+			</div>
+
+			<!-- ===== Residual ===== -->
+			<h2 id="s4">Residual risk to disclose</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.5</span><span class="skill-text">What no configuration removes.</span></p>
+				<ul>
+					<li><strong>Flagged content:</strong> even under ZDR or HIPAA arrangements, content flagged by Anthropic's trust and safety systems may be retained for up to 2 years, and data may be kept where the law requires.</li>
+					<li><strong>Third-party integrations:</strong> MCP servers, search providers and other tools have their own data handling, outside these arrangements.</li>
+					<li><strong>Your own copies:</strong> logs, caches, evaluation sets and traces hold the same data; redact or minimise them under the same obligation.</li>
+					<li><strong>Record these in the impact assessment</strong> rather than claiming the obligation is met absolutely.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Match each obligation to controls that address it: ZDR for vendor storage, HIPAA readiness (BAA plus HIPAA-enabled organisation) for PHI, <code>inference_geo</code> and workspace geo restrictions for residency, your own redaction, audit logging and per-client isolation for the rest.</li>
+				<li>Pair every control with evidence: contracts and settings, allowlists and CI checks, logged <code>inference_geo</code>, isolation tests.</li>
+				<li>Catch conflicts: Fable 5.x, hosted Managed Agents and code execution aren't covered by ZDR; HIPAA readiness isn't available on Claude Platform on AWS; no PHI in JSON schemas.</li>
+				<li>Retention and residency are different obligations with different controls.</li>
+				<li>Disclose the residuals: flagged content (up to 2 years), legal holds, third-party tools and your own logs.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-4.html"><small>Previous</small>5.4: Human-in-the-Loop Checkpoints</a>
+				<a class="next" href="d5-skill-5-6.html"><small>Next</small>5.6: Bias Source Identification and Mitigation</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the obligations and code are original. Not legal advice.</div>
+</footer>
+
+</body>
+</html>
