@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.4: Context and Memory Architecture | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 1.4: context policies for long-running Claude agents near context limits or cost ceilings: context editing, compaction, the memory tool, cache-safe mid-conversation system messages, and tool search with deferred loading for large tool catalogues, with tested Messages API code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Advanced Agent Architecture and Orchestration &middot; 17%</span>
+		<h1>1.4: Context and Memory Architecture</h1>
+		<p>An agent that runs for hours fills its window and its budget. This page sets a context policy: what to clear, when to compact, what to keep outside the window, how to change instructions without losing the cache, and how to keep a 300-tool catalogue from crowding everything else out.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Context editing</span><span class="tag">Compaction</span><span class="tag">Memory tool</span><span class="tag">Tool search</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Where the tokens go</a></li>
+				<li><a href="#s2">Clearing, compaction and memory</a></li>
+				<li><a href="#s3">Changing instructions without breaking the cache</a></li>
+				<li><a href="#s4">Keeping a large tool catalogue out of context</a></li>
+				<li><a href="#s5">The policy in code</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.4</span>
+				<p><strong>Context and Memory Architecture</strong>: "Evaluating context-policy options for long-running agents approaching context limits or cost ceilings, including context compaction and editing, persistent memory, cache-safe instruction changes mid-conversation, and tool-use techniques that keep large tool catalogs out of the context window."</p>
+			</div>
+			<p>Exam items describe an agent that is slowing, forgetting or overspending deep into a session and ask which policy change fixes it without breaking something else, usually the cache. The Foundations treatment of the same tools is <a href="../anthropic-ccdv-f/d6-skill-6-1.html">CCDV-F 6.1</a>; persistence across restarts is <a href="d1-skill-1-2.html">skill 1.2</a>.</p>
+			<p>Sources: the mid-conversation system messages page, read on 21 November 2026, and the compaction, context editing, memory tool, tool search and prompt caching pages used for the earlier notes, all paraphrased. The company, files and code are my own; the code is tested by sending each request through the Python SDK to a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A data-platform team runs an agent that migrates warehouse jobs to a new scheduler. Sessions last several hours, it can reach 300 tools from six internal services, and each session has a $30 ceiling.</p></div>
+
+			<!-- ===== Tokens ===== -->
+			<h2 id="s1">Where the tokens go</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Measure before choosing a policy.</span></p>
+				<ul>
+					<li><strong>Tool definitions:</strong> sent on every request. A multi-server setup can carry tens of thousands of tokens of definitions; the tool search documentation cites about 55,000 as typical, and says tool selection degrades past 30 to 50 tools.</li>
+					<li><strong>Tool results:</strong> query output and logs, mostly stale a few turns later.</li>
+					<li><strong>Conversation:</strong> reasoning, decisions and instructions that still matter.</li>
+					<li><strong>The cache read share:</strong> anything that edits the start of the prompt (tools, then system) forces a re-read of everything after it at full price. A context policy that keeps changing the prefix can cost more than it saves.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Lifecycle ===== -->
+			<h2 id="s2">Clearing, compaction and memory</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Match the tool to what is growing.</span></p>
+				<ul>
+					<li><strong>Context editing</strong> (<code>clear_tool_uses_20250919</code>, beta <code>context-management-2025-06-27</code>): clears old tool results above a trigger (default 100,000 input tokens), keeps the most recent few (default 3), and can exclude tools such as memory. It is exact: the conversation itself is untouched, and your application still holds the full history.</li>
+					<li><strong>Compaction</strong> (<code>compact_20260112</code>, beta <code>compact-2026-01-12</code>): summarises the conversation when input reaches a threshold (default 150,000, minimum 50,000). Pass <code>instructions</code> for what must survive verbatim. It loses detail, so don&rsquo;t let it be the only home for facts the agent must keep exact.</li>
+					<li><strong>The memory tool</strong> (<code>memory_20250818</code>): files the agent reads and writes, stored by your application outside the window. It survives clearing, compaction and restarts, and it is ZDR and HIPAA eligible.</li>
+					<li><strong>Order of preference (my reading):</strong> clear stale tool output first, keep durable facts in memory, and compact only when the conversation itself is long. The documentation examples show the two edits separately, so this page doesn&rsquo;t assume they can be combined in one request.</li>
+					<li><strong>Cost ceilings:</strong> the same tools lower input tokens per turn. For a hard stop, cap the session in code and tell the agent when it&rsquo;s close (<a href="#s3">next section</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Cache-safe ===== -->
+			<h2 id="s3">Changing instructions without breaking the cache</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Mid-conversation system messages.</span></p>
+				<ul>
+					<li><strong>The problem:</strong> the cache hashes tools, then system, then messages. Editing the top-level <code>system</code>, even appending a sentence, misses the cache for the system prompt and every message after it; editing <code>tools</code> invalidates the whole conversation.</li>
+					<li><strong>The fix:</strong> append <code>{"role": "system", ...}</code> to <code>messages</code> where the new rule starts. The prefix is unchanged and still read from cache, and the rule carries system weight: it outranks user text, and later system messages win over earlier ones and over the top-level field.</li>
+					<li><strong>Placement:</strong> directly after a user turn (a turn of tool results counts), then either the end of <code>messages</code> or an assistant turn. Between a <code>tool_use</code> and its <code>tool_result</code> it returns a 400.</li>
+					<li><strong>Models:</strong> current Fable, Opus 5.5, Opus 5, Opus 4.8, Sonnet 5.5 and Haiku 5.5. Not Sonnet 5. On Bedrock&rsquo;s <code>bedrock-runtime</code>, InvokeModel only.</li>
+					<li><strong>Documented uses:</strong> a mid-session policy change, and state your application observes, such as the remaining budget dropping below a threshold. Related betas let the same message add or remove tools and change effort.</li>
+					<li><strong>Not for third-party content:</strong> tool output and documents stay in <code>tool_result</code> blocks, where Claude treats them as data.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Tools ===== -->
+			<h2 id="s4">Keeping a large tool catalogue out of context</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Tool search, deferred loading and code.</span></p>
+				<ul>
+					<li><strong>Tool search with <code>defer_loading</code>:</strong> send every definition, mark most as deferred, and add a search tool (<code>tool_search_tool_regex_20251119</code> or the BM25 variant). Claude finds and loads the few it needs; the documentation reports over 85% fewer definition tokens. Keep the three to five most used tools loaded, keep at least one tool non-deferred, and never defer the search tool. Up to 10,000 tools can be deferred.</li>
+					<li><strong>When it&rsquo;s worth it:</strong> ten or more tools, more than about 10,000 tokens of definitions, falling selection accuracy, or several MCP servers. With a handful of tools used on every turn, plain tool use is better.</li>
+					<li><strong>Programmatic tool calling:</strong> Claude writes code that calls tools in the code execution container, so intermediate results don&rsquo;t enter the context. It isn&rsquo;t ZDR eligible.</li>
+					<li><strong>Subagents:</strong> a worker with its own window and a narrow tool set does the bulky part and returns a summary (<a href="d1-skill-1-1.html">skill 1.1</a>).</li>
+					<li><strong>Cache-friendly by design:</strong> deferring keeps the <code>tools</code> array stable across turns, while adding and removing tools by editing it would invalidate the cache each time.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s5">The policy in code</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">One function builds every request.</span></p>
+				<div class="code"><span class="file">context_policy.py (context_policy.py)</span>
+<pre><code>"""Context policy for a long-running data-platform agent: 300 tools across six MCP-backed services,
+sessions of several hours, and a per-session spend ceiling. Builds each Messages API request."""
+
+SYSTEM = [{"type": "text", "text": "You migrate warehouse jobs to the new scheduler. ...",
+           "cache_control": {"type": "ephemeral", "ttl": "1h"}}]          <span class="c"># stable: never edited mid-session</span>
+ALWAYS_LOADED = {"get_job", "run_query", "memory"}                     <span class="c"># the 3-5 tools used on most turns</span>
+CEILING_USD = 30.0
+
+
+def tool_list(catalog: list[dict]) -&gt; list[dict]:
+    """Big catalogue: send every definition, but defer all except the few used every turn."""
+    tools = [{"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+             {"type": "memory_20250818", "name": "memory"}]
+    for t in catalog:
+        tools.append(t if t["name"] in ALWAYS_LOADED else {**t, "defer_loading": True})
+    return tools
+
+
+def context_management(tokens: int, tool_result_share: float) -&gt; tuple[dict | None, list[str]]:
+    """Clear stale tool output first (cheap, exact); compact only when the conversation itself is long."""
+    if tool_result_share &gt;= 0.5 and tokens &lt; 150_000:
+        return ({"edits": [{"type": "clear_tool_uses_20250919",
+                            "trigger": {"type": "input_tokens", "value": 100_000},
+                            "keep": {"type": "tool_uses", "value": 3},
+                            "exclude_tools": ["memory"]}]}, ["context-management-2025-06-27"])
+    if tokens &gt;= 120_000:
+        return ({"edits": [{"type": "compact_20260112",
+                            "trigger": {"type": "input_tokens", "value": 150_000},
+                            "instructions": "Keep every job ID, its migration status and open errors verbatim."}]},
+                ["compact-2026-01-12"])
+    return None, []
+
+
+def notices(spent_usd: float, new_rule: str | None) -&gt; list[dict]:
+    """Instruction and state changes go at the end as one system message, so the cached prefix survives.
+    It must directly follow a user turn (a tool_result turn counts) and end the messages list."""
+    blocks = []
+    if new_rule:
+        blocks.append({"type": "text", "text": new_rule})
+    if spent_usd &gt;= 0.8 * CEILING_USD:
+        blocks.append({"type": "text", "text": f"Budget: ${CEILING_USD - spent_usd:.2f} left. Finish the "
+                       "current job, write progress to memory, then stop."})
+    return [{"role": "system", "content": blocks}] if blocks else []
+
+
+def request(messages, catalog, tokens, tool_result_share, spent_usd, new_rule=None) -&gt; dict:
+    cm, betas = context_management(tokens, tool_result_share)
+    req = {"model": "claude-opus-5-5", "max_tokens": 16000, "system": SYSTEM,
+           "tools": tool_list(catalog), "messages": messages + notices(spent_usd, new_rule),
+           "cache_control": {"type": "ephemeral"}}                      <span class="c"># automatic caching of the growing history</span>
+    if cm:
+        req["context_management"], req["betas"] = cm, betas
+    return req</code></pre></div>
+				<ul>
+					<li><strong>Stable prefix:</strong> the system prompt has a 1-hour breakpoint and is never edited; the tool list is the same every turn, with all but the core three deferred.</li>
+					<li><strong>Tool output dominates:</strong> clear old results, keeping the last three and the memory tool&rsquo;s.</li>
+					<li><strong>The conversation itself is long:</strong> compact, with instructions to keep job IDs, statuses and errors verbatim.</li>
+					<li><strong>A new rule from the team</strong> (dry-run first) and <strong>a budget warning at 80%</strong> arrive as one system message at the end, so neither breaks the cache.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add the new rule to the system prompt"</strong> is the natural edit and the expensive one: every cached turn after it is re-read at full price. <strong>"Remove unused tools from the tools array as the session goes"</strong> has the same effect, for the whole conversation. Append a system message; defer tools instead of removing them.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Find what is growing: tool definitions, tool results or the conversation.</li>
+				<li>Clear stale tool results (exact), keep durable facts in the memory tool, and compact (lossy) only when the conversation itself is long, with instructions for what must survive.</li>
+				<li>Change instructions mid-session with a system message appended after a user turn, not by editing <code>system</code> or <code>tools</code>; not on Sonnet 5.</li>
+				<li>For large catalogues, defer tools behind tool search, keep the core few loaded, and push bulky intermediate work into code or subagents.</li>
+				<li>Enforce cost ceilings in code, and tell the agent its remaining budget as observed state.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-3.html"><small>Previous</small>1.3: Architecture Selection at Scale</a>
+				<a class="next" href="d2-skill-2-1.html"><small>Next</small>2.1: Reliability Engineering for Claude Services</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

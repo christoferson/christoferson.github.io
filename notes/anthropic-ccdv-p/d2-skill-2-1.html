@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.1: Reliability Engineering for Claude Services | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 2.1: resilience patterns for production Claude integrations: classifying rate limits, spend caps, overload, refusals and context-window stops; retry and backoff, circuit breakers, graceful degradation, and cross-model, cross-region and cross-platform fallbacks that respect feature parity, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Production Integration, Reliability, and Knowledge Grounding &middot; 20%</span>
+		<h1>2.1: Reliability Engineering for Claude Services</h1>
+		<p>A production Claude service fails in several distinct ways, and each needs a different response: wait, back off, stop, switch model, switch platform, or give the model more room. This page sorts them, then builds the retry, breaker, fallback and degradation layer around them.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Retries</span><span class="tag">Circuit breakers</span><span class="tag">Fallbacks</span><span class="tag">Feature parity</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Errors versus stop reasons</a></li>
+				<li><a href="#s2">One response per failure class</a></li>
+				<li><a href="#s3">Retries, backoff and circuit breakers</a></li>
+				<li><a href="#s4">Fallbacks: model, region, platform</a></li>
+				<li><a href="#s5">Feature parity and graceful degradation</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.1</span>
+				<p><strong>Reliability Engineering for Claude Services</strong>: "Evaluating and applying resilience patterns for production Claude integrations, including retry and backoff design, circuit breakers, graceful degradation, and cross-model, cross-region, and cross-platform fallbacks that distinguish rate limits from safety refusals from context-window stops while respecting per-platform feature parity."</p>
+			</div>
+			<p>Exam items show a resilience design and its symptoms in production and ask which change makes it correct. The error semantics at Foundations level are in <a href="../anthropic-ccdv-f/d2-skill-2-4.html">CCDV-F 2.4</a>; duplicate side effects and idempotency are in <a href="../anthropic-ccar-p/d3-skill-3-8.html">CCAR-P 3.8</a>; throughput limits are <a href="d2-skill-2-2.html">skill 2.2</a>.</p>
+			<p>Sources: the stop reasons page (read on 21 November 2026) and the errors, refusals and fallback, rate limits and Bedrock pages used for the earlier notes, all paraphrased. The decision table, breaker settings and the newsroom are my own; the code is tested with fake responses and a fake clock.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A newsroom runs an article-summary service with a 99.5% availability objective. It calls the Claude API with Opus 5.5, attaches source documents through the Files API and uses web search; a secondary path runs on Amazon Bedrock.</p></div>
+
+			<!-- ===== Errors vs stop ===== -->
+			<h2 id="s1">Errors versus stop reasons</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1</span><span class="skill-text">Two channels that must not be merged.</span></p>
+				<ul>
+					<li><strong>Errors</strong> are HTTP 4xx or 5xx: the request wasn&rsquo;t processed. A 429 is a rate limit, a ramp limit or the tier&rsquo;s spend cap (no <code>retry-after</code>, keeps failing); 529 is overload; 500 and 504 are server errors (use streaming for long requests); 400, 401 and 403 are your request.</li>
+					<li><strong>Stop reasons</strong> come only from successful responses. <code>refusal</code> is a 200 from the safety classifiers, with <code>stop_details</code> naming the category. <code>max_tokens</code> and <code>model_context_window_exceeded</code> mean the output was cut off: treat it as truncated.</li>
+					<li><strong>Why it matters:</strong> a refusal or a truncation never reaches an exception handler, so a retry wrapper that only catches errors misses them, and one that retries everything treats them as transient.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Classes ===== -->
+			<h2 id="s2">One response per failure class</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1</span><span class="skill-text">Classify first, then act.</span></p>
+				<div class="code"><span class="file">resilience.py (resilience.py)</span>
+<pre><code>"""Resilience layer for a newsroom's article-summary service.
+Primary: Claude API. Secondary: Amazon Bedrock (bedrock-runtime), which lacks some features."""
+import random
+
+<span class="c"># Each outcome class gets its own response; one retry loop for everything is the bug to avoid.</span>
+ACTIONS = {
+    "rate_limit":   "wait retry-after, same target",
+    "spend_cap":    "no retry here; alert, move traffic to the other platform",
+    "overloaded":   "backoff with jitter, count toward the breaker",
+    "server_error": "backoff with jitter, count toward the breaker",
+    "bad_request":  "fail fast; fix the request",
+    "refusal":      "retry once on a different model; record the refusal",
+    "truncated":    "raise max_tokens or continue; never switch model for this",
+    "ok":           "return",
+}
+
+
+def classify(status: int, headers: dict, body: dict) -&gt; str:
+    if status == 429:
+        capped = "retry-after" not in headers or body.get("error_code") == "enforced_spend_limit_reached"
+        return "spend_cap" if capped else "rate_limit"
+    if status == 529:
+        return "overloaded"
+    if status &gt;= 500:
+        return "server_error"
+    if status &gt;= 400:
+        return "bad_request"
+    if body.get("stop_reason") == "refusal":
+        return "refusal"
+    if body.get("stop_reason") in ("max_tokens", "model_context_window_exceeded"):
+        return "truncated"
+    return "ok"
+
+
+def backoff(attempt: int, base=1.0, cap=30.0) -&gt; float:
+    return random.uniform(0, min(cap, base * 2 ** attempt))      <span class="c"># full jitter</span>
+
+
+class Breaker:
+    """Opens after `threshold` overload/server errors in a row; probes again after `cooldown` seconds."""
+    def __init__(self, threshold=5, cooldown=60.0, clock=None):
+        self.threshold, self.cooldown, self.clock = threshold, cooldown, clock
+        self.failures, self.opened_at = 0, None
+
+    def allow(self) -&gt; bool:
+        if self.opened_at is None:
+            return True
+        return self.clock() - self.opened_at &gt;= self.cooldown         <span class="c"># half-open: let one probe through</span>
+
+    def record(self, outcome: str):
+        if outcome in ("overloaded", "server_error"):
+            self.failures += 1
+            if self.failures &gt;= self.threshold:
+                self.opened_at = self.clock()
+        elif outcome == "ok":
+            self.failures, self.opened_at = 0, None
+
+
+BEDROCK_RUNTIME_LACKS = {"web_search", "files_api", "fallbacks"}     <span class="c"># per the Bedrock page; check yours</span>
+
+
+def adapt(request: dict, platform: str) -&gt; tuple[dict, list[str]]:
+    """Feature parity: degrade deliberately and say so, rather than send a request that fails."""
+    if platform != "bedrock-runtime":
+        return request, []
+    req, notes = dict(request), []
+    if "web_search" in req.get("features", []):
+        req["features"] = [f for f in req["features"] if f != "web_search"]
+        notes.append("summary written without live web sources")
+    if req.get("file_id"):
+        req["document_text"] = req.pop("file_id_text")               <span class="c"># inline the text we kept for this case</span>
+        req.pop("file_id")
+        notes.append("document sent inline instead of by Files API reference")
+    req.pop("fallbacks", None)                                       <span class="c"># server-side fallback: do it client-side</span>
+    return req, notes</code></pre></div>
+				<ul>
+					<li><strong>Rate limit:</strong> honour <code>retry-after</code> on the same target. Switching model doesn&rsquo;t help when the limit is the organisation&rsquo;s.</li>
+					<li><strong>Spend cap:</strong> retries fail until the month resets. Alert, and if a separately billed platform exists, move traffic there (my reasoning).</li>
+					<li><strong>Overload and server errors:</strong> back off with jitter and count them toward the circuit breaker.</li>
+					<li><strong>Refusal:</strong> the documentation&rsquo;s answer is to retry on a <em>different</em> Claude model, and to monitor refusals as their own signal.</li>
+					<li><strong>Truncation:</strong> raise <code>max_tokens</code>, continue the response, or trim the input. Another model has the same limit problem. If a <code>tool_use</code> block was cut off, retry with more output room.</li>
+					<li><strong>Bad request:</strong> fail fast; retrying a malformed request only adds load.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Retries ===== -->
+			<h2 id="s3">Retries, backoff and circuit breakers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1</span><span class="skill-text">Bounded retries, and a switch for when they won&rsquo;t help.</span></p>
+				<ul>
+					<li><strong>The SDK already retries:</strong> twice by default, for 408, 409, 429 and 5xx, honouring <code>retry-after</code> and the <code>x-should-retry</code> header. Your own retries multiply on top, so keep the total bounded.</li>
+					<li><strong>Exponential backoff with full jitter</strong> and a cap stops a fleet of clients retrying in step.</li>
+					<li><strong>Circuit breaker:</strong> after several overload or server errors in a row, stop calling that target for a cooldown, send traffic to the fallback, then let one probe through. Refusals and truncations don&rsquo;t trip it: they say nothing about the target&rsquo;s health.</li>
+					<li><strong>Mid-stream errors</strong> arrive after the 200, as an <code>error</code> event; a stream cut off before <code>message_stop</code> may raise nothing. Check that a stream completed before treating it as a success.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Fallbacks ===== -->
+			<h2 id="s4">Fallbacks: model, region, platform</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1</span><span class="skill-text">Three distances to fall back.</span></p>
+				<ul>
+					<li><strong>Cross-model:</strong> for refusals, and as a design choice when a model is overloaded (the documentation doesn&rsquo;t prescribe it for 529). Options are server-side fallback (beta <code>fallbacks</code>, up to three models; Claude API and Google Cloud Anthropic-managed only; not batches), the SDK middleware (any platform), or your own retry with fallback credit. Configure it on every request path, including workers and subagents, and stay on the fallback model for later turns. Haiku 5.5 has no server-side fallback or credit.</li>
+					<li><strong>Cross-region:</strong> on Bedrock, global endpoints route across regions, and regional endpoints (us, eu, jp, apac) cost about 10% more but are needed for residency. On the Claude API, <code>inference_geo</code> is global or us, and rate limits are shared across geos, so changing geo isn&rsquo;t a way round a rate limit.</li>
+					<li><strong>Cross-platform:</strong> a second surface protects against a platform-wide outage or a spend cap. Model IDs, lifecycle dates and limits differ by platform; pin each one and test the path regularly, or it fails the day you need it.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Parity ===== -->
+			<h2 id="s5">Feature parity and graceful degradation</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.1</span><span class="skill-text">The fallback must accept the request you send it.</span></p>
+				<ul>
+					<li><strong>Bedrock&rsquo;s <code>bedrock-runtime</code> lacks</strong> the Files API, server tools (web search, web fetch, code execution), Agent Skills, the MCP connector, Batches, server-side fallback and automatic prompt caching. Bedrock&rsquo;s <code>bedrock-mantle</code> endpoint offers the native Messages API shape with full parity, and Claude Platform on AWS is Anthropic-operated.</li>
+					<li><strong>Degrade deliberately:</strong> <code>adapt()</code> drops web search and says the summary has no live sources, inlines the document text the service kept, and moves fallback to the client. A silent failure on the secondary path is worse than a labelled, reduced answer.</li>
+					<li><strong>Other degradations</strong> (my list): a cached or extractive summary, a smaller model for non-critical routes, queueing non-urgent work for later, or a clear "try again" to the user, chosen per route before the incident.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Retry the same request on the fallback platform"</strong> sounds like a fallback but fails if the request uses features that platform lacks, and it fails at the worst moment. A fallback path is a different request, built and tested ahead of time, with its degradations stated.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Errors (4xx, 5xx) and stop reasons (200s) are different channels; refusals and truncations never raise.</li>
+				<li>Rate limit: wait as told. Spend cap: stop, alert, move platforms. Overload: back off and trip a breaker. Refusal: a different model. Truncation: more output room.</li>
+				<li>Bound total retries, remembering the SDK&rsquo;s own two, and use jittered backoff and a breaker with a half-open probe.</li>
+				<li>Fallbacks go cross-model, cross-region or cross-platform; configure them on every path and test them before the incident.</li>
+				<li>Respect feature parity: build the fallback request for what that platform supports, and label the degraded answer.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-4.html"><small>Previous</small>1.4: Context and Memory Architecture</a>
+				<a class="next" href="d2-skill-2-2.html"><small>Next</small>2.2: Scale and Throughput Management</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the newsroom, files and code are original.</div>
+</footer>
+
+</body>
+</html>

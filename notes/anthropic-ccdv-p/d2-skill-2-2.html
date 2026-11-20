@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.2: Scale and Throughput Management | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 2.2: rate-limit strategy, queueing and backpressure, Message Batches pipeline design, multi-tenant quotas and isolation, and capacity planning for high-volume Claude workloads, including finding whether RPM, token throughput or batch economics binds, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Production Integration, Reliability, and Knowledge Grounding &middot; 20%</span>
+		<h1>2.2: Scale and Throughput Management</h1>
+		<p>High-volume Claude workloads hit organisation-wide limits shared by every tenant and route. This page finds which limit binds, keeps one tenant or a bulk job from starving the rest, pushes back instead of queueing forever, and moves unattended work to batches when the numbers say so.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Rate limits</span><span class="tag">Backpressure</span><span class="tag">Message Batches</span><span class="tag">Multi-tenant</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">How the limits work</a></li>
+				<li><a href="#s2">Finding the binding constraint</a></li>
+				<li><a href="#s3">Queueing, backpressure and tenants</a></li>
+				<li><a href="#s4">Batch pipeline design</a></li>
+				<li><a href="#s5">Capacity planning</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.2</span>
+				<p><strong>Scale and Throughput Management</strong>: "Analyzing rate-limit strategy, queueing and backpressure, batch pipeline design, multi-tenant quota and isolation, and capacity planning for high-volume Claude workloads, and identifying whether rate limits, token throughput, or batch economics is the binding constraint."</p>
+			</div>
+			<p>Exam items give a workload (requests, tokens per request, a deadline, several tenants) and the limits, and ask what binds or which design holds. Handling a 429 when it arrives is <a href="d2-skill-2-1.html">skill 2.1</a>; finding the first component to fail in a whole architecture is <a href="../anthropic-ccar-p/d1-skill-1-2.html">CCAR-P 1.2</a>.</p>
+			<p>Sources: the batch processing page (read on 21 November 2026) and the rate limits and pricing pages used for the CCAR-P notes, paraphrased. Limits shown are one tier&rsquo;s published values for illustration; use your own Console. The SaaS company, workload and code are my own, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A review-insights SaaS serves 40 retailer tenants. Its interactive route answers analysts&rsquo; questions on Sonnet 5.5 at up to 3,000 requests a minute; each night it scores 400,000 new reviews on Haiku 5.5, due by 06:00.</p></div>
+
+			<!-- ===== Limits ===== -->
+			<h2 id="s1">How the limits work</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">What is counted, and where.</span></p>
+				<ul>
+					<li><strong>Three per-model limits, per organisation:</strong> requests (RPM), input tokens (ITPM) and output tokens (OTPM). At the Build tier, Sonnet 5.5 has 10,000 RPM, 5 million ITPM and 1 million OTPM. Every tenant and route shares them, and they&rsquo;re shared across <code>inference_geo</code> values too.</li>
+					<li><strong>Token bucket:</strong> capacity refills continuously, so a short burst can hit a limit that the per-minute figure suggests is far away.</li>
+					<li><strong>Cache-aware ITPM:</strong> cache reads don&rsquo;t count; uncached input and cache writes do. OTPM counts actual output, not <code>max_tokens</code>.</li>
+					<li><strong>Ramp limits:</strong> a sharp increase can return 429 (<code>ramp_limit_exceeded</code>) below the limits. Raise traffic step by step and start bulk jobs low.</li>
+					<li><strong>Workspaces</strong> can have their own lower limits, but the organisation&rsquo;s still apply. Response headers report remaining capacity and reset times.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Binding ===== -->
+			<h2 id="s2">Finding the binding constraint</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Utilisation of each limit at peak.</span></p>
+				<div class="code"><span class="file">capacity.py (capacity.py)</span>
+<pre><code>"""Capacity check for a review-insights SaaS: which limit binds, and is batch worth it?
+Limits are the Build tier for Sonnet 5.5 from the rate-limits page; check your own Console."""
+import math
+
+LIMITS = {"rpm": 10_000, "itpm": 5_000_000, "otpm": 1_000_000}   <span class="c"># organisation-wide, shared by all tenants</span>
+
+
+def utilisation(rpm, uncached_in, output) -&gt; dict:
+    """Cache reads don't count toward ITPM; uncached input and cache writes do. OTPM counts actual output."""
+    use = {"rpm": rpm, "itpm": rpm * uncached_in, "otpm": rpm * output}
+    return {k: round(use[k] / LIMITS[k], 2) for k in use}
+
+
+def binding(u: dict) -&gt; str:
+    k = max(u, key=u.get)
+    return f"{k} at {u[k]:.0%}" + (" (over the limit)" if u[k] &gt; 1 else "")
+
+
+def batch_plan(requests, in_tok, out_tok, price_in, price_out, deadline_h) -&gt; dict:
+    """Batches: half price, up to 100,000 requests per batch, most finish within an hour, expire at 24 h."""
+    realtime = requests * (in_tok * price_in + out_tok * price_out) / 1e6
+    return {"batches": math.ceil(requests / 100_000),
+            "realtime_usd": round(realtime), "batch_usd": round(realtime / 2),
+            "fits_deadline": deadline_h &gt;= 24 or "plan a realtime top-up for anything unfinished"}
+
+
+if __name__ == "__main__":
+    print("chat, now:        ", binding(utilisation(3_000, uncached_in=1_800, output=250)))
+    print("chat, after cache:", binding(utilisation(3_000, uncached_in=1_200, output=250)))
+    print("nightly scoring:  ", batch_plan(400_000, 900, 60, price_in=0.10, price_out=0.50, deadline_h=8))</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>chat, now:         itpm at 108% (over the limit)
+chat, after cache: otpm at 75%
+nightly scoring:   {'batches': 4, 'realtime_usd': 48, 'batch_usd': 24, 'fits_deadline': 'plan a realtime top-up for anything unfinished'}</code></pre></div>
+				<ul>
+					<li><strong>Interactive route, now:</strong> RPM is at 30%, but 1,800 uncached input tokens per request puts ITPM at 108%. Token throughput binds, not request rate, so more concurrency or an RPM increase wouldn&rsquo;t help.</li>
+					<li><strong>After caching:</strong> moving 600 tokens of tenant context into the cached prefix drops ITPM to 72%, and OTPM (75%) becomes the highest. The next lever is output length, not input.</li>
+					<li><strong>Nightly scoring:</strong> four batches (100,000 requests each) at $24 instead of $48. The saving is small; the bigger gain is that batches have their own limits and aren&rsquo;t ramp-limited, so the bulk job stops competing with analysts&rsquo; questions.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Queueing ===== -->
+			<h2 id="s3">Queueing, backpressure and tenants</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Admission control in front of shared limits (my design).</span></p>
+				<div class="code"><span class="file">admission.py (admission.py)</span>
+<pre><code>"""Admission control in front of the shared organisation limits: per-tenant fairness, priority,
+and backpressure instead of an unbounded queue."""
+import time
+
+
+class Bucket:
+    def __init__(self, rate_per_s: float, burst: float, clock=time.monotonic):
+        self.rate, self.cap, self.clock = rate_per_s, burst, clock
+        self.tokens, self.t = burst, clock()
+
+    def take(self, n=1.0) -&gt; bool:
+        now = self.clock()
+        self.tokens = min(self.cap, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+        if self.tokens &gt;= n:
+            self.tokens -= n
+            return True
+        return False
+
+
+class Gate:
+    def __init__(self, tenant_rates: dict, max_queue: int, clock=time.monotonic):
+        self.tenants = {t: Bucket(r, r * 2, clock) for t, r in tenant_rates.items()}  <span class="c"># 2 s of burst each</span>
+        self.queue, self.max_queue = [], max_queue
+
+    def admit(self, tenant: str, priority: str) -&gt; str:
+        if self.tenants[tenant].take():
+            return "send"
+        if priority == "interactive":
+            return "reject: 429 to the caller with Retry-After"      <span class="c"># fail fast; a person is waiting</span>
+        if len(self.queue) &gt;= self.max_queue:
+            return "reject: queue full, shed bulk load"              <span class="c"># backpressure, not unbounded memory</span>
+        self.queue.append(tenant)
+        return "queued"</code></pre></div>
+				<ul>
+					<li><strong>Per-tenant buckets:</strong> each tenant gets a share of the organisation&rsquo;s limits in your gateway, so one tenant&rsquo;s spike can&rsquo;t take everyone else&rsquo;s capacity.</li>
+					<li><strong>Priority:</strong> interactive requests over bulk. An interactive request over quota fails fast with a 429 and <code>Retry-After</code>, because someone is waiting.</li>
+					<li><strong>Bounded queue:</strong> bulk work waits up to a maximum depth, then the gateway sheds load. An unbounded queue turns a short overload into hours of latency and memory pressure.</li>
+					<li><strong>Isolation beyond quotas:</strong> separate workspaces and keys for large or regulated tenants give their own limits, spend controls and usage reporting. Per-tenant prompts, caches and data stay separate in your application.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Batch ===== -->
+			<h2 id="s4">Batch pipeline design</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">What the Message Batches API gives and requires.</span></p>
+				<ul>
+					<li><strong>Economics:</strong> half price on every token. Up to 100,000 requests or 256 MB per batch; most finish within an hour; anything not processed in 24 hours expires.</li>
+					<li><strong>Results:</strong> available for 29 days, in any order, so match by <code>custom_id</code>. Each request ends <code>succeeded</code>, <code>errored</code>, <code>canceled</code> or <code>expired</code>; the last three aren&rsquo;t billed. Resubmit errored (if retryable) and expired requests.</li>
+					<li><strong>Not allowed in a batch:</strong> streaming, fast mode, server-side <code>fallbacks</code> and <code>max_tokens: 0</code>. Tools, server tools, thinking and multi-turn requests are fine.</li>
+					<li><strong>Caching is best-effort,</strong> because requests run concurrently in any order. Use the 1-hour cache for shared context.</li>
+					<li><strong>Deadlines:</strong> "most within an hour" isn&rsquo;t a guarantee, and processing can slow with demand. For an 8-hour deadline, submit early, watch <code>request_counts</code>, and have a realtime top-up path for anything unfinished.</li>
+					<li><strong>Constraints:</strong> batches aren&rsquo;t ZDR eligible (29-day retention) and are available on the Claude API, Claude Platform on AWS and Google Cloud (Anthropic managed), not Bedrock&rsquo;s <code>bedrock-runtime</code>. They can slightly overshoot a workspace spend limit.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Capacity ===== -->
+			<h2 id="s5">Capacity planning</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Plan from peaks and tokens (my method).</span></p>
+				<ul>
+					<li><strong>Model the peak minute,</strong> not the daily average, in all three units, per model. Add the bursts the token bucket will see.</li>
+					<li><strong>Count uncached input,</strong> so the cache hit rate is a capacity input. A deploy that breaks the cache can push ITPM over the limit with no change in traffic.</li>
+					<li><strong>Separate realtime and bulk:</strong> bulk to batches, or to off-peak hours with a ramp.</li>
+					<li><strong>Headroom and triggers:</strong> plan to stay below about 70&ndash;80% of each limit, and request a tier or custom limit increase when forecasts cross it, well before launch.</li>
+					<li><strong>Watch the spend cap too:</strong> at the monthly cap, the API returns 429s until the month resets, whatever the per-minute headroom.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Requests are well under RPM, so we have capacity"</strong> misses token throughput: long prompts can exhaust ITPM at a third of the request limit. <strong>"Move the bulk job to batches to save money"</strong> is right, but the stronger reason is often that it frees realtime capacity.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Limits are per organisation and model, in RPM, ITPM and OTPM, refilled continuously; cache reads don&rsquo;t count toward ITPM, actual output counts toward OTPM.</li>
+				<li>Compute utilisation of all three at peak; the highest binds, and fixing it moves the constraint.</li>
+				<li>Put per-tenant quotas, priority and a bounded queue in front of the shared limits; fail interactive requests fast and shed bulk load.</li>
+				<li>Batches: half price, own limits, no ramp limits, results by <code>custom_id</code> within 24 hours; no streaming, fast mode or fallbacks; plan a top-up for tight deadlines.</li>
+				<li>Plan capacity from the peak minute in tokens, with headroom, cache hit rate and the spend cap included.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-1.html"><small>Previous</small>2.1: Reliability Engineering for Claude Services</a>
+				<a class="next" href="index.html#d2"><small>Next</small>Domain 2</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>
