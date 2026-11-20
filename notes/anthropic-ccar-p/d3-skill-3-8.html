@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>3.8: Production Reliability Controls | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 3.8 (7 December 2026 guide): reading error traces and throughput data from a production Claude integration and choosing the control that fixes the pattern (rate-limit handling, retry with backoff, idempotent side-effecting tools, fallback routing) without causing duplicate effects, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d3">Domain 3</a><span class="sep">/</span><span class="here">3.8</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 3 &middot; Integration &middot; 21%</span>
+		<h1>3.8: Production Reliability Controls</h1>
+		<p>Reading what the traces say (bursts of rate-limit errors, an overloaded model, a cap that won't lift, the same action done twice) and applying the one control that fixes that pattern, making sure the fix can't repeat something that should only happen once.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">Retries</span><span class="tag">Rate limits</span><span class="tag">Idempotency</span><span class="tag">Fallback</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Reading the trace</a></li>
+				<li><a href="#s2">The four controls</a></li>
+				<li><a href="#s3">Controls in code</a></li>
+				<li><a href="#s4">Where duplicates come from</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 3.8</span>
+				<p><strong>Production Reliability Controls</strong>: "Analyzing the failure pattern in error traces or throughput data from a production integration, and specifying the reliability control (rate-limit handling, retry and backoff, idempotency for side-effecting tools, or fallback routing) that addresses it without introducing duplicate effects."</p>
+			</div>
+			<p>Exam items give error traces or throughput data and ask which control addresses the pattern. The guide's own sample question for this skill isn't reproduced here. The API's error semantics in code are in the developer notes (<a href="../anthropic-ccdv-f/d2-skill-2-4.html">CCDV-F 2.4</a>); capacity planning is <a href="d1-skill-1-2.html">skill 1.2</a>.</p>
+			<p>Sources: the Claude API documentation on errors, rate limits, streaming and refusals and fallback, checked on 19 and 20 November 2026 and paraphrased. The agent and code are my own and tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A retailer's fulfilment agent buys courier labels for orders, a paid action, through a <code>buy_label</code> tool. The on-call engineer has a week of traces.</p></div>
+
+			<!-- ===== Trace ===== -->
+			<h2 id="s1">Reading the trace</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.8</span><span class="skill-text">What each pattern means, from the API's error semantics.</span></p>
+				<ul>
+					<li><strong>429 with <code>retry-after</code>, in bursts at 09:00:</strong> a rate limit (or a ramp limit after a sharp jump). It clears; wait the stated time and smooth the spike.</li>
+					<li><strong>429 without <code>retry-after</code>, constantly, from the 28th:</strong> the tier's monthly spend cap. Retries keep failing until the month resets or the tier rises; the error detail says <code>enforced_spend_limit_reached</code>.</li>
+					<li><strong>529 overloaded, for a few minutes:</strong> the model is temporarily overloaded; bounded retries, then another model.</li>
+					<li><strong>400, 401, 403:</strong> the request, credential or permission is wrong; retrying sends the same mistake again.</li>
+					<li><strong>Success, but the action happened twice:</strong> not an API error at all; a side-effecting tool ran twice for the same business action.</li>
+					<li><strong>200 with <code>stop_reason: "refusal"</code>:</strong> a classifier refusal, invisible to error-rate dashboards; monitor it separately.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Controls ===== -->
+			<h2 id="s2">The four controls</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.8</span><span class="skill-text">Each one for a specific pattern.</span></p>
+				<ul>
+					<li><strong>Rate-limit handling:</strong> honour <code>retry-after</code>; ramp traffic up gradually rather than all at 09:00; queue and spread bulk work, or send it through the Message Batches API, which isn't subject to ramp limits; set workspace limits so one workload can't starve another. Treat a spend-cap 429 as a stop-and-alert, not a retry.</li>
+					<li><strong>Retry with backoff:</strong> for transient errors (408, 429, 500, 529): exponential backoff with jitter and a cap on attempts. The Anthropic SDK already retries these twice by default and honours <code>retry-after</code>, so if you add your own loop, set the SDK's <code>max_retries</code> deliberately, or every failure is retried several times over.</li>
+					<li><strong>Idempotency for side-effecting tools:</strong> key each action by what it means in the business (this order, this parcel), not by the attempt, and return the existing result when the key has been seen. Pass the key to the downstream system too, if it supports one.</li>
+					<li><strong>Fallback routing:</strong> after bounded retries on an overloaded model, try another. The API offers server-side fallback in beta (up to three named models, on the Claude API and Anthropic-managed Google Cloud), the SDK offers middleware, or you retry manually. Fallback must be configured on every request path, it doesn't carry into tool-execution calls, and later turns should stay on the fallback model.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s3">Controls in code</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.8</span><span class="skill-text">Error classification, backoff, fallback and an idempotent tool.</span></p>
+				<div class="code"><span class="file">reliability.py (reliability.py)</span>
+<pre><code>"""Reliability controls for a fulfilment agent that buys courier labels (a paid, side-effecting action).
+
+Trace patterns seen in production, and the control for each:
+  429 with retry-after at the 09:00 order spike    -&gt; wait retry-after, back off with jitter, smooth the spike
+  429 without retry-after (monthly spend cap)        -&gt; stop retrying; alert; it will not recover by itself
+  529 overloaded on the primary model                 -&gt; bounded retries, then fall back to another model
+  duplicate labels after long sessions                -&gt; idempotency on the tool, keyed by the business action
+The last one: after old tool results were cleared from context, the agent sometimes called buy_label
+again for an order it had already handled. Retrying the model can't fix that; the tool must."""
+import random
+import time
+
+
+def action_for(status: int, headers: dict, attempt: int, max_attempts: int = 4) -&gt; tuple[str, float]:
+    if status == 429 and "retry-after" not in headers:
+        return "stop", 0.0                                  <span class="c"># spend cap: retries keep failing</span>
+    if attempt &gt;= max_attempts:
+        return "fallback" if status in (529, 500) else "stop", 0.0
+    if status == 429:
+        return "retry", float(headers["retry-after"]) + random.uniform(0, 1)
+    if status in (408, 500, 529):
+        return "retry", min(30.0, 2 ** attempt) + random.uniform(0, 1)   <span class="c"># exponential backoff, capped, jittered</span>
+    return "stop", 0.0                                      <span class="c"># 400, 401, 403...: fix the request, don't retry</span>
+
+
+class LabelTool:
+    """buy_label made idempotent: the same order and parcel always maps to one label."""
+
+    def __init__(self, courier):
+        self.courier, self.done = courier, {}               <span class="c"># in production: a database table with a unique key</span>
+
+    def buy_label(self, order_id: str, parcel: int, service: str) -&gt; dict:
+        key = f"label:{order_id}:{parcel}"                  <span class="c"># the business action, not the attempt or the call ID</span>
+        if key in self.done:
+            return {**self.done[key], "note": "already purchased; returning the existing label"}
+        label = self.courier.purchase(order_id, parcel, service, idempotency_key=key)   <span class="c"># courier dedupes too</span>
+        self.done[key] = label
+        return label
+
+
+def call_with_controls(send, models=("claude-sonnet-5-5", "claude-haiku-5-5"), sleep=time.sleep):
+    """send(model) returns (status, headers, body). Tries the primary with backoff, then the fallback model."""
+    for model in models:
+        for attempt in range(1, 5):
+            status, headers, body = send(model)
+            if status == 200:
+                return {"model": model, "body": body}
+            act, wait = action_for(status, headers, attempt)
+            if act == "retry":
+                sleep(wait)
+                continue
+            if act == "fallback":
+                break
+            raise RuntimeError(f"not retryable: {status}")
+    raise RuntimeError("all models exhausted")</code></pre></div>
+				<p>The test covers each branch: a spend-cap 429 stops at once, a 429 waits its <code>retry-after</code>, a 529 backs off three times and then falls back to the second model, and a second <code>buy_label</code> call for the same order and parcel returns the first label without buying another.</p>
+			</div>
+
+			<!-- ===== Duplicates ===== -->
+			<h2 id="s4">Where duplicates come from</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 3.8</span><span class="skill-text">And why retries are the usual culprit.</span></p>
+				<ul>
+					<li><strong>Client-side retries of calls that already took effect:</strong> the response was lost, not the action. Any retry policy on a side-effecting call needs idempotency underneath it.</li>
+					<li><strong>The model asking twice:</strong> in this agent, old tool results were cleared from context in long sessions, and the model sometimes bought a label it had already bought. No retry setting causes this or fixes it; the tool's idempotency does.</li>
+					<li><strong>Parallel workers:</strong> two workers pick up the same queued order; a unique key on the action prevents both from buying.</li>
+					<li><strong>Fallback after partial work:</strong> switching models mid-task can re-run steps; keep side effects behind idempotent tools so a replay is harmless.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Turn off retries to stop the duplicates"</strong> trades duplicates for lost work and leaves the model-repeat case untouched. <strong>"Retry more aggressively"</strong> during a spend cap or a rate-limit storm makes things worse. Match the control to the pattern.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Read the trace: 429 with <code>retry-after</code> clears; 429 without it is a spend cap that won't; 529 is temporary overload; 4xx request errors aren't retryable; refusals are 200s.</li>
+				<li>Rate limits: honour <code>retry-after</code>, ramp gradually, spread bulk work (Batches skip ramp limits), use workspace limits.</li>
+				<li>Retries: exponential backoff with jitter and a cap, for transient errors only; remember the SDK already retries twice.</li>
+				<li>Idempotency: key side-effecting tools by the business action and return the existing result on a repeat; it covers retries, model repeats and parallel workers.</li>
+				<li>Fallback: bounded retries, then another model, configured on every request path; stay on it for later turns.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d3-skill-3-7.html"><small>Previous</small>3.7: Progressive Discovery vs. Monolithic Context Loading</a>
+				<a class="next" href="index.html#d4"><small>Next</small>Domain 4</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the agent and code are original.</div>
+</footer>
+
+</body>
+</html>
