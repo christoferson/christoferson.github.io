@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.4: Retrieval and Knowledge Grounding at Scale | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 2.4: retrieval architecture for knowledge-grounded Claude applications: agentic search versus RAG, chunking and embeddings, hybrid search and reranking, citations with search_result blocks, uncertainty and confidence signals, and diagnosing retrieval failures stage by stage, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Production Integration, Reliability, and Knowledge Grounding &middot; 20%</span>
+		<h1>2.4: Retrieval and Knowledge Grounding at Scale</h1>
+		<p>A knowledge-grounded application is only as good as the passage that reaches the model. This page covers the retrieval pipeline from chunk to rerank, how answers stay tied to their sources, how the system says when it doesn&rsquo;t know, and how to find the stage that lost the answer when it goes wrong.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">RAG</span><span class="tag">Hybrid search</span><span class="tag">Citations</span><span class="tag">Diagnosis</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Agentic search or a RAG pipeline</a></li>
+				<li><a href="#s2">Chunking, embeddings, hybrid search, reranking</a></li>
+				<li><a href="#s3">Grounding: citations and "not found"</a></li>
+				<li><a href="#s4">Confidence signals</a></li>
+				<li><a href="#s5">Diagnosing failures by stage</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.4</span>
+				<p><strong>Retrieval and Knowledge Grounding at Scale</strong>: "Evaluating retrieval architecture for knowledge-grounded production applications, including agentic search versus RAG tradeoffs, chunking and embedding strategy, hybrid search, and reranking, and designing grounding practices such as source citation, uncertainty declaration, and confidence signals, and diagnosing retrieval-quality failures by stage."</p>
+			</div>
+			<p>Exam items give a retrieval-grounded system with poor answers and its traces, and ask which stage failed or which design change fixes it. Choosing an architecture from corpus and query shape is <a href="../anthropic-ccar-p/d3-skill-3-5.html">CCAR-P 3.5</a>; building a single grounded request is <a href="../anthropic-ccdv-f/d6-skill-6-4.html">CCDV-F 6.4</a>.</p>
+			<p>Sources: Anthropic&rsquo;s contextual retrieval and context engineering posts, and the citations, search results and reduce-hallucinations pages used for the earlier notes, paraphrased. The stage order, thresholds and confidence rule are my own; the operator, files and code are original, and the code is tested with the request sent through the SDK to a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A mobile network operator&rsquo;s field engineers ask an assistant about equipment limits and procedures. The library is about two million pages of vendor manuals and internal method statements, updated weekly, and answers are used on site.</p></div>
+
+			<!-- ===== Arch ===== -->
+			<h2 id="s1">Agentic search or a RAG pipeline</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">The trade-off at scale.</span></p>
+				<ul>
+					<li><strong>Whole corpus in context:</strong> Anthropic&rsquo;s guidance is that under about 200,000 tokens you can include the knowledge base in the prompt and cache it. Two million pages is far beyond that.</li>
+					<li><strong>Pre-built RAG:</strong> indexed retrieval is fast and cheap per query, suits high volume and fairly stable content, and can go stale between re-indexes.</li>
+					<li><strong>Agentic search:</strong> the model explores with tools just in time. It&rsquo;s fresh and handles open questions, but Anthropic notes runtime exploration is slower than pre-computed retrieval, and each query costs several calls.</li>
+					<li><strong>Hybrid (the usual answer at scale):</strong> RAG for the common path, agentic search as the fallback when retrieval is weak or the question spans documents. The routing rule is in <a href="#s4">confidence signals</a>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Pipeline ===== -->
+			<h2 id="s2">Chunking, embeddings, hybrid search, reranking</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Each stage can lose the answer.</span></p>
+				<ul>
+					<li><strong>Chunking:</strong> size, boundaries and overlap matter. A limit stated in a table and qualified in the next paragraph needs both in one chunk; split along the document&rsquo;s own structure (sections, procedures) rather than fixed lengths alone.</li>
+					<li><strong>Contextual retrieval:</strong> prepend 50 to 100 tokens of document context to each chunk ("which manual, which model, which section") before embedding <em>and</em> before building the keyword index. In Anthropic&rsquo;s tests this cut top-20 retrieval failures by 35% with embeddings, 49% adding contextual BM25, and 67% adding reranking. With prompt caching the one-time cost was about $1.02 per million document tokens.</li>
+					<li><strong>Embeddings:</strong> choose and evaluate on your own queries; Voyage and Gemini embeddings did best in Anthropic&rsquo;s tests. Re-embedding the corpus is a migration, so version the index.</li>
+					<li><strong>Hybrid search:</strong> embeddings catch meaning; BM25 catches exact strings such as part numbers and error codes, which field questions are full of.</li>
+					<li><strong>Reranking:</strong> retrieve a wide pool (about 150), rerank to about 20. It adds latency and cost per query and gave the largest single gain.</li>
+					<li><strong>Freshness:</strong> re-index as often as the library changes, and record the document version in each chunk so stale answers can be traced.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Grounding ===== -->
+			<h2 id="s3">Grounding: citations and "not found"</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Answers tied to passages, and permission not to answer.</span></p>
+				<div class="code"><span class="file">grounded_request.py (grounded_request.py)</span>
+<pre><code>"""Build a grounded request: retrieved chunks as search_result blocks with citations, an explicit
+way to say 'not found', and a confidence signal the application computes, not the model."""
+
+RERANK_FLOOR = 0.35          <span class="c"># below this, the best chunk is unlikely to answer (tuned on the labelled set)</span>
+
+
+def build(question: str, chunks: list[dict]) -&gt; dict:
+    results = [{"type": "search_result", "source": c["url"], "title": c["title"],
+                "content": [{"type": "text", "text": c["text"]}], "citations": {"enabled": True}}
+               for c in chunks]
+    rules = ("Answer only from the search results. Cite every claim. If they don't contain the answer, "
+             "say 'Not found in the engineering library' and name what's missing. If sources disagree, "
+             "say so and give both, with their dates.")
+    return {"model": "claude-sonnet-5-5", "max_tokens": 2000, "system": rules,
+            "messages": [{"role": "user", "content": results + [{"type": "text", "text": question}]}]}
+
+
+def route(chunks: list[dict]) -&gt; str:
+    """Decide before calling the model: weak retrieval goes to agentic search, not to a guess."""
+    if not chunks or max(c["rerank_score"] for c in chunks) &lt; RERANK_FLOOR:
+        return "agentic_search"
+    return "answer"
+
+
+def confidence(response_blocks: list[dict], chunks: list[dict]) -&gt; str:
+    """Share of answer text blocks that carry a citation, combined with retrieval strength."""
+    text = [b for b in response_blocks if b["type"] == "text" and b["text"].strip()]
+    cited = sum(1 for b in text if b.get("citations"))
+    coverage = cited / len(text) if text else 0
+    top = max(c["rerank_score"] for c in chunks)
+    if coverage &gt;= 0.9 and top &gt;= 0.6:
+        return "high"
+    return "medium" if coverage &gt;= 0.6 else "low: show sources prominently and suggest an engineer"</code></pre></div>
+				<ul>
+					<li><strong><code>search_result</code> blocks:</strong> each chunk carries a <code>source</code>, <code>title</code> and text content, with citations enabled (they&rsquo;re off by default, and all results in a request must share the setting). Answers come back with <code>search_result_location</code> citations pointing at the exact block. Inside a <code>tool_result</code>, search results must be the only content.</li>
+					<li><strong>Citations are reliable pointers, not proof:</strong> the cited text is guaranteed to exist in the source, but the claim built on it still needs checking. Citations don&rsquo;t combine with structured outputs (a 400).</li>
+					<li><strong>Uncertainty declaration:</strong> the documentation&rsquo;s first hallucination control is to let Claude say it doesn&rsquo;t know. Give it an exact phrase, ask it to name what&rsquo;s missing, and to report conflicting sources with their dates.</li>
+					<li><strong>Restrict to the provided passages</strong> for answers used on site, and put the documents before the question.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Confidence ===== -->
+			<h2 id="s4">Confidence signals</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Computed by the application, from evidence (my design).</span></p>
+				<ul>
+					<li><strong>Before the call:</strong> if the best reranker score is below a floor tuned on the labelled set, don&rsquo;t ask the model to answer from weak passages; route to agentic search.</li>
+					<li><strong>After the call:</strong> the share of answer text that carries a citation, combined with retrieval strength, gives high, medium or low. Low shows the sources prominently and suggests asking an engineer.</li>
+					<li><strong>Not the model&rsquo;s own rating:</strong> a self-reported "I&rsquo;m 90% sure" isn&rsquo;t calibrated. Measured signals can be checked against the labelled set and tuned.</li>
+					<li><strong>Show it to users:</strong> a label and the sources, so an engineer on a mast knows when to double-check.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Diagnose ===== -->
+			<h2 id="s5">Diagnosing failures by stage</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">The first stage that lost the answer is the cause.</span></p>
+				<div class="code"><span class="file">diagnose.py (diagnose.py)</span>
+<pre><code>"""Find the stage where each failed retrieval-grounded answer went wrong, from traces on a labelled set."""
+from collections import Counter
+
+STAGES = ["indexing", "chunking", "retrieval", "reranking", "context", "generation"]
+
+
+def stage_of(c: dict) -&gt; str:
+    """Check stages in pipeline order; the first one that lost the answer is the cause."""
+    if c["gold_doc_version"] != c["indexed_version"]:
+        return "indexing"                    <span class="c"># stale or missing document in the index</span>
+    if not c["gold_chunks"]:
+        return "chunking"                    <span class="c"># no single chunk holds the answer (split or truncated)</span>
+    if not set(c["gold_chunks"]) &amp; set(c["retrieved_150"]):
+        return "retrieval"                   <span class="c"># hybrid search missed it</span>
+    if not set(c["gold_chunks"]) &amp; set(c["reranked_20"]):
+        return "reranking"                   <span class="c"># found, then ranked out</span>
+    if not set(c["gold_chunks"]) &amp; set(c["in_context"]):
+        return "context"                     <span class="c"># dropped by the token budget or deduplication</span>
+    if not c["answer_correct"] or not c["cited_gold"]:
+        return "generation"                  <span class="c"># answer had the evidence and still went wrong or uncited</span>
+    return "ok"
+
+
+def report(cases: list[dict]) -&gt; dict:
+    counts = Counter(stage_of(c) for c in cases)
+    failed = sum(v for k, v in counts.items() if k != "ok")
+    return {s: f"{counts[s]} ({counts[s] / failed:.0%} of failures)" for s in STAGES if counts[s]}</code></pre></div>
+				<ul>
+					<li><strong>What traces must record:</strong> document versions indexed, which chunks contain the answer for labelled questions, the top-150 IDs, the reranked 20, what made it into context, and the citations in the answer.</li>
+					<li><strong>Fixes by stage:</strong> indexing &rarr; re-index cadence and version checks; chunking &rarr; structure-aware chunks and context prefixes; retrieval &rarr; hybrid search, better embeddings, query rewriting; reranking &rarr; a wider pool or a better reranker; context &rarr; budget and deduplication; generation &rarr; prompt and grounding rules.</li>
+					<li><strong>Aggregate, then fix the biggest stage:</strong> the report gives each stage&rsquo;s share of failures. Measure recall at 20 on your own questions before and after.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Answers are wrong, so switch to a larger model"</strong> fixes only the generation stage. If the right chunk was ranked out or never indexed, no model can cite it; the stage report shows where to spend the effort.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>At scale, RAG for the common path and agentic search for weak or cross-document questions; whole-corpus context only under about 200,000 tokens.</li>
+				<li>Structure-aware chunks with contextual prefixes, hybrid embeddings plus BM25, and reranking a wide pool to about 20; re-index as the library changes.</li>
+				<li>Ground with <code>search_result</code> blocks and citations, an explicit "not found", and conflicting sources reported with dates.</li>
+				<li>Compute confidence from retrieval scores and citation coverage, route weak retrieval away from a guess, and show the label.</li>
+				<li>Diagnose by stage in pipeline order, and fix the stage with the most failures.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-3.html"><small>Previous</small>2.3: Production MCP and Change Management</a>
+				<a class="next" href="index.html#d3"><small>Next</small>Domain 3</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the operator, files and code are original.</div>
+</footer>
+
+</body>
+</html>

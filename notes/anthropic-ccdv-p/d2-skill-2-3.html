@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.3: Production MCP and Change Management | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 2.3: operating MCP servers in production and managing change to servers, models and prompts: remote deployment and authentication, tool and schema versioning, migration testing, platform parity and gateways, prompt versioning, and progressive rollout with rollback, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Production Integration, Reliability, and Knowledge Grounding &middot; 20%</span>
+		<h1>2.3: Production MCP and Change Management</h1>
+		<p>Three things change under a running Claude service: the MCP servers it calls, the model it runs on and the prompts it uses. This page treats all three as releases: versioned, tested against what they might break, checked on every platform, rolled out in stages and reversible.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">MCP</span><span class="tag">Versioning</span><span class="tag">Gateways</span><span class="tag">Progressive rollout</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Running remote MCP servers</a></li>
+				<li><a href="#s2">Tool and schema versioning</a></li>
+				<li><a href="#s3">Model migrations and prompt versions</a></li>
+				<li><a href="#s4">Platform parity and gateways</a></li>
+				<li><a href="#s5">Progressive rollout with rollback</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.3</span>
+				<p><strong>Production MCP and Change Management</strong>: "Applying production MCP operation and change-management practice to MCP server deployments, model version migrations, and prompt updates, including remote MCP deployment and authentication, tool and schema versioning, migration testing against breaking behavior changes, platform-specific configuration parity and gateway/routing architectures, prompt versioning, and progressive rollout with rollback."</p>
+			</div>
+			<p>Exam items describe a change that went wrong (a renamed tool, a new model that answers differently, a feature missing on one platform) and ask which practice would have caught it. Choosing a migration response at architecture level is <a href="../anthropic-ccar-p/d4-skill-4-7.html">CCAR-P 4.7</a>; MCP authentication posture is <a href="../anthropic-ccar-p/d3-skill-3-2.html">CCAR-P 3.2</a>.</p>
+			<p>Sources: the MCP specification&rsquo;s tools page and the Claude Code LLM gateway page (read on 21 November 2026), plus the MCP security best practices and model deprecations pages used earlier, paraphrased. The release rules and thresholds are my own; the university, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A university runs a student-services assistant on Sonnet 5.5. It calls three internal MCP servers (fees, timetables, enrolment), serves EU campuses through Bedrock and others through the Claude API, and changes something most weeks.</p></div>
+
+			<!-- ===== Remote MCP ===== -->
+			<h2 id="s1">Running remote MCP servers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Deployment and authentication.</span></p>
+				<ul>
+					<li><strong>Transport:</strong> remote servers use Streamable HTTP (SSE is deprecated); stdio is for local processes. The Messages API MCP connector reaches only public HTTPS servers and supports tools only.</li>
+					<li><strong>No sessions in the protocol:</strong> state lives behind explicit handles returned by a tool, checked against the caller&rsquo;s authorisation on every call, with their lifetime stated in the tool description.</li>
+					<li><strong>Authentication:</strong> a server must reject tokens not issued for it and must never pass a client&rsquo;s token downstream. Start with minimal scopes and step up. <code>tools/list</code> may differ by the caller&rsquo;s scopes, but not by connection.</li>
+					<li><strong>Operations:</strong> servers validate inputs, enforce access control, rate-limit calls and sanitise outputs; clients set timeouts and log tool use. Return tools in a deterministic order, which the specification notes improves prompt cache hit rates.</li>
+					<li><strong>Two error channels:</strong> JSON-RPC protocol errors (unknown tool, malformed request) and tool execution errors with <code>isError: true</code>, which carry actionable text the model can correct from.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Versioning ===== -->
+			<h2 id="s2">Tool and schema versioning</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Know whether a change breaks clients before it ships.</span></p>
+				<div class="code"><span class="file">schema_diff.py (schema_diff.py)</span>
+<pre><code>"""Classify a change to an MCP tool catalogue as breaking or additive before it ships."""
+
+
+def diff(old: list[dict], new: list[dict]) -&gt; dict:
+    o, n = {t["name"]: t for t in old}, {t["name"]: t for t in new}
+    breaking, additive = [], []
+    for name in o.keys() - n.keys():
+        breaking.append(f"{name}: removed")
+    for name in n.keys() - o.keys():
+        additive.append(f"{name}: new tool")
+    for name in o.keys() &amp; n.keys():
+        oi, ni = o[name]["inputSchema"], n[name]["inputSchema"]
+        for p in set(ni.get("required", [])) - set(oi.get("required", [])):
+            breaking.append(f"{name}: new required input {p}")
+        for p, spec in oi.get("properties", {}).items():
+            if p not in ni.get("properties", {}):
+                breaking.append(f"{name}: input {p} removed")
+            elif spec.get("type") != ni["properties"][p].get("type"):
+                breaking.append(f"{name}: input {p} changed type")
+        for p in set(ni.get("properties", {})) - set(oi.get("properties", {})) - set(ni.get("required", [])):
+            additive.append(f"{name}: optional input {p}")
+        oo = o[name].get("outputSchema", {}).get("properties", {})
+        for f in oo.keys() - n[name].get("outputSchema", {}).get("properties", {}).keys():
+            breaking.append(f"{name}: output field {f} removed")
+    return {"breaking": sorted(breaking), "additive": sorted(additive)}
+
+
+def plan(d: dict, name: str) -&gt; str:
+    if not d["breaking"]:
+        return "ship in place; clients see it on the next tools/list, and subscribed clients get list_changed"
+    return (f"publish the changed tool under a new name (for example {name}_v2) beside the old one, "
+            "move clients over, then retire the old name on a stated date")</code></pre></div>
+				<ul>
+					<li><strong>Additive:</strong> a new tool, an optional input, a new output field. Ship in place; clients see it on the next <code>tools/list</code>, and subscribed clients get <code>notifications/tools/list_changed</code>.</li>
+					<li><strong>Breaking:</strong> a removed or renamed tool, a new required input, a changed type, a removed output field. Prompts, few-shot examples, cached tool lists and agents built against the old shape all depend on it.</li>
+					<li><strong>Versioning by name (my rule):</strong> publish the changed tool under a new name such as <code>get_fees_v2</code> beside the old one, move clients, then retire the old name on a stated date. Tool names allow letters, digits, <code>_</code>, <code>-</code> and <code>.</code>.</li>
+					<li><strong>Declare outputs:</strong> with an <code>outputSchema</code>, servers must return conforming <code>structuredContent</code> (plus the JSON as text, for older clients), and clients should validate it. A schema change is then visible in review.</li>
+					<li><strong>Collisions:</strong> clients that aggregate several servers should prefix tool names with a server identifier, since two servers can both expose <code>search</code>.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Model / prompt ===== -->
+			<h2 id="s3">Model migrations and prompt versions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">Behaviour changes are breaking changes too.</span></p>
+				<ul>
+					<li><strong>Pin snapshot IDs</strong> and record which one each route uses. Models get at least 60 days&rsquo; notice before retirement on Anthropic-operated platforms; partner platforms set their own dates.</li>
+					<li><strong>Read the breaking changes</strong> for the target model and API version. For example, API version 2026-10-21 rejects <code>temperature</code>, <code>top_p</code> and <code>top_k</code> with a 400, a request-level break that no amount of prompt testing would find.</li>
+					<li><strong>Find every caller:</strong> the Console usage export by key and model, aliases, subagent definitions, batch jobs.</li>
+					<li><strong>Prompts are versioned artefacts:</strong> stored in source control with an ID, logged on every trace, changed through review, and released through the same gate as code.</li>
+					<li><strong>Migration testing:</strong> run the golden set per segment on the candidate, paired against the current version, and gate on no segment regressing beyond tolerance (<code>migration_gate</code> below). A higher average can hide a segment that got worse.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Parity ===== -->
+			<h2 id="s4">Platform parity and gateways</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">The same release has to work everywhere it runs.</span></p>
+				<ul>
+					<li><strong>Per-platform configuration:</strong> model IDs, available features and lifecycle dates differ. Bedrock&rsquo;s <code>bedrock-runtime</code>, for example, lacks the MCP connector and server tools, so a release that adds web search must say what the EU route does instead.</li>
+					<li><strong>A parity check in the gate:</strong> <code>parity()</code> fails the release when any platform lacks the model mapping or a feature the release uses.</li>
+					<li><strong>Gateways:</strong> one place for credentials, usage attribution, budgets, audit logs and provider switching. For Claude Code, the documentation notes the gateway becomes infrastructure you operate and must keep up with new features, or they break. Distribute its base URL through managed settings, and pin it with <code>allowedProviders</code>.</li>
+					<li><strong>Routing:</strong> a gateway or router can split traffic by version for rollout and send a route back to the old version in one change, which is what makes rollback fast.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Rollout ===== -->
+			<h2 id="s5">Progressive rollout with rollback</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.3</span><span class="skill-text">One gate for servers, models and prompts.</span></p>
+				<div class="code"><span class="file">rollout.py (rollout.py)</span>
+<pre><code>"""One release gate for MCP servers, model versions and prompts: test, check parity, roll out, roll back."""
+
+STAGES = [0.01, 0.10, 0.50, 1.00]
+
+
+def migration_gate(candidate: dict, baseline: dict, tolerance=0.01) -&gt; list[str]:
+    """Golden-set results per segment for the new version against the current one."""
+    problems = []
+    for seg, score in baseline.items():
+        if candidate.get(seg, 0) &lt; score - tolerance:
+            problems.append(f"regression on {seg}: {candidate.get(seg, 0):.2f} vs {score:.2f}")
+    return problems
+
+
+def parity(release: dict, platforms: dict) -&gt; list[str]:
+    """Every platform the service runs on must have the model ID and the features the release uses."""
+    out = []
+    for name, p in platforms.items():
+        if release["model"] not in p["models"]:
+            out.append(f"{name}: no model ID mapped for {release['model']}")
+        for f in set(release["features"]) - set(p["features"]):
+            out.append(f"{name}: lacks {f}")
+    return out
+
+
+def next_step(stage: float, live: dict, base: dict) -&gt; str:
+    if live["error_rate"] &gt; 2 * base["error_rate"] or live["quality"] &lt; base["quality"] - 0.02:
+        return "rollback: route 100% to the previous version (prompt, model and server pins kept)"
+    if live["refusal_rate"] &gt; base["refusal_rate"] + 0.005:
+        return "hold: refusals up; investigate before widening"
+    later = [s for s in STAGES if s &gt; stage]
+    return f"advance to {later[0]:.0%}" if later else "complete"</code></pre></div>
+				<ul>
+					<li><strong>Before traffic:</strong> the migration gate (golden set per segment) and the parity check.</li>
+					<li><strong>Stages:</strong> 1%, 10%, 50%, 100%, each compared with the current version&rsquo;s live baseline.</li>
+					<li><strong>Rollback triggers:</strong> error rate doubling, or quality on sampled grading dropping two points. Rollback routes all traffic to the previous pins, so a release must keep the old prompt, model ID and server version deployable.</li>
+					<li><strong>Hold, don&rsquo;t widen,</strong> on a signal that needs a person, such as a rise in refusals.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Rename the tool and update the prompt in the same deploy"</strong> breaks every client that cached the old list or runs an older prompt version during the rollout. <strong>"Switch the model alias to the new version everywhere at once"</strong> gives no stage at which to notice a regression and no quick way back.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Remote MCP: Streamable HTTP, audience-checked tokens, no passthrough, minimal scopes, explicit state handles, deterministic tool order, actionable <code>isError</code> results.</li>
+				<li>Diff tool catalogues before shipping; ship additive changes in place and breaking ones under a new name beside the old.</li>
+				<li>Pin model IDs and version prompts; test migrations per segment on a golden set and read the API&rsquo;s breaking changes.</li>
+				<li>Check parity on every platform the release runs on; gateways centralise credentials, budgets and routing but must be kept current.</li>
+				<li>Roll out in stages against a live baseline with rollback triggers, keeping the previous version deployable.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-2.html"><small>Previous</small>2.2: Scale and Throughput Management</a>
+				<a class="next" href="d2-skill-2-4.html"><small>Next</small>2.4: Retrieval and Knowledge Grounding at Scale</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the university, files and code are original.</div>
+</footer>
+
+</body>
+</html>
