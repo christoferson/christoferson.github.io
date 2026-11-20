@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.3: Architecture Selection at Scale | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 1.3: using production cost, reliability and quality data to decide whether a running Claude system should move between workflow and agentic patterns, and choosing the harness (tool runner, manual loop, Agent SDK, Claude Code, Managed Agents) and the reusable-pattern standards a team adopts, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Advanced Agent Architecture and Orchestration &middot; 17%</span>
+		<h1>1.3: Architecture Selection at Scale</h1>
+		<p>Once a system is live, its traces say whether the architecture still fits: agents that always take the same path, workflows that push a growing tail to people. This page reads that evidence, then turns to the harness and the shared building blocks a team should standardise on.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Workflows</span><span class="tag">Agents</span><span class="tag">Harness</span><span class="tag">Standards</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Signals that an architecture no longer fits</a></li>
+				<li><a href="#s2">Deciding from the data</a></li>
+				<li><a href="#s3">Making the change safely</a></li>
+				<li><a href="#s4">Choosing the harness</a></li>
+				<li><a href="#s5">Reusable-pattern standards</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.3</span>
+				<p><strong>Architecture Selection at Scale</strong>: "Evaluating production cost, reliability, and quality data to decide whether to evolve a running system between workflow and agentic patterns, and selecting the agent harness, framework, and reusable-pattern standards a team should adopt."</p>
+			</div>
+			<p>Exam items give production numbers for a running system and ask whether to change its pattern, or describe a team&rsquo;s needs and ask which harness or standard fits. The first choice of pattern for a new system is <a href="../anthropic-ccdv-f/d1-skill-1-1.html">CCDV-F 1.1</a> and <a href="../anthropic-ccar-p/d1-skill-1-3.html">CCAR-P 1.3</a>; choosing a deployment surface is <a href="../anthropic-ccar-p/d1-skill-1-6.html">CCAR-P 1.6</a>.</p>
+			<p>Sources: Anthropic&rsquo;s "Building effective agents", the tool runner documentation (read on 21 November 2026), and the Managed Agents and Agent SDK hosting pages used for the Foundations notes, paraphrased. The decision rules and thresholds are my own; the logistics company, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A logistics company runs three Claude systems: an invoice-matching agent, a shipment-exceptions workflow with five fixed routes, and a customs-queries agent. A quarter of production data is in, and the platform team is asked whether any should change shape.</p></div>
+
+			<!-- ===== Signals ===== -->
+			<h2 id="s1">Signals that an architecture no longer fits</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">What the traces show (my reading of Anthropic&rsquo;s guidance).</span></p>
+				<ul>
+					<li><strong>An agent that behaves like a workflow:</strong> most runs call the same tools in the same order. You pay for the model to rediscover a fixed path each time, and variance creeps in on the runs where it doesn&rsquo;t.</li>
+					<li><strong>A workflow with a growing tail:</strong> the routes handle the common cases, and a rising share falls through to "other" and a human queue because those inputs are too varied to route.</li>
+					<li><strong>Reliability by step:</strong> where failures cluster. Agent errors compound over steps; workflow failures sit on a route that can be fixed in code.</li>
+					<li><strong>Cost per resolved case, not per call:</strong> an agent that costs more per run can still be cheaper than the people it replaces on the tail.</li>
+				</ul>
+				<p>Anthropic&rsquo;s advice runs one way by default: find the simplest solution and add complexity only when it improves results. Evolving toward agents needs evidence; evolving back toward code needs only evidence that quality holds.</p>
+			</div>
+
+			<!-- ===== Decide ===== -->
+			<h2 id="s2">Deciding from the data</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">Rules agreed before the numbers are read.</span></p>
+				<div class="code"><span class="file">evolve.py (evolve.py)</span>
+<pre><code>"""Decide from production data whether a running system should move between workflow and agent.
+Thresholds are the team's own, agreed before looking at the numbers."""
+import json
+import sys
+
+MIN_DOMINANT_PATH = 0.85     <span class="c"># agent runs that follow one tool sequence</span>
+MAX_QUALITY_DROP = 0.01      <span class="c"># tolerated drop when replacing agent steps with code</span>
+MIN_TAIL_SHARE = 0.10        <span class="c"># workflow inputs that fall through to the human queue</span>
+MIN_TAIL_SUCCESS = 0.60      <span class="c"># agent success on that tail, measured on shadow traffic</span>
+
+
+def recommend(r: dict) -&gt; str:
+    if r["pattern"] == "agent":
+        if (r["dominant_path_share"] &gt;= MIN_DOMINANT_PATH
+                and r["agent_quality"] - r["workflow_replay_quality"] &lt;= MAX_QUALITY_DROP):
+            saving = 1 - r["workflow_cost"] / r["agent_cost"]
+            return (f"move the dominant path to a workflow ({saving:.0%} cheaper per run, same quality); "
+                    "keep the agent for the remaining runs")
+        return "keep the agent: runs really do vary, or code loses quality"
+    if r["fallthrough_share"] &gt;= MIN_TAIL_SHARE and r["agent_tail_success"] &gt;= MIN_TAIL_SUCCESS:
+        if r["agent_cost_per_resolved"] &lt; r["human_cost_per_case"]:
+            return ("add an agent for the fall-through cases only; keep the workflow routes, "
+                    "which are cheaper and easier to audit")
+        return "tail is large but an agent costs more than people: improve routing instead"
+    return "keep the workflow"
+
+
+if __name__ == "__main__":
+    for r in json.load(open(sys.argv[1])):
+        print(f"{r['system']}: {recommend(r)}")</code></pre></div>
+				<div class="code"><span class="file">production.json (production.json)</span>
+<pre><code>[
+  {"system": "invoice-matching", "pattern": "agent", "runs_per_day": 9000,
+   "dominant_path_share": 0.93, "agent_quality": 0.981, "workflow_replay_quality": 0.979,
+   "agent_cost": 0.042, "workflow_cost": 0.009},
+  {"system": "shipment-exceptions", "pattern": "workflow", "runs_per_day": 4000,
+   "fallthrough_share": 0.18, "agent_tail_success": 0.71,
+   "agent_cost_per_resolved": 0.35, "human_cost_per_case": 6.50},
+  {"system": "customs-queries", "pattern": "agent", "runs_per_day": 600,
+   "dominant_path_share": 0.41, "agent_quality": 0.94, "workflow_replay_quality": 0.88,
+   "agent_cost": 0.11, "workflow_cost": 0.03}
+]</code></pre></div>
+				<div class="code"><span class="file">run_output.txt (Output)</span>
+<pre><code>invoice-matching: move the dominant path to a workflow (79% cheaper per run, same quality); keep the agent for the remaining runs
+shipment-exceptions: add an agent for the fall-through cases only; keep the workflow routes, which are cheaper and easier to audit
+customs-queries: keep the agent: runs really do vary, or code loses quality</code></pre></div>
+				<ul>
+					<li><strong>Invoice matching:</strong> 93% of runs take one path, and a code replay of that path scores within 0.2 points of the agent, so the dominant path becomes a workflow at about a fifth of the cost. The agent stays for the 7% that vary.</li>
+					<li><strong>Shipment exceptions:</strong> 18% fall through to people. On shadow traffic an agent resolves 71% of those at $0.35 against $6.50 for a person, so the agent is added for the tail only; the five routes stay as code.</li>
+					<li><strong>Customs queries:</strong> runs vary (the top path covers 41%) and code loses six points, so the agent stays.</li>
+					<li><strong>Hybrids are normal:</strong> the answer is rarely "replace everything". It is usually code for what&rsquo;s predictable and an agent for what isn&rsquo;t.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Safely ===== -->
+			<h2 id="s3">Making the change safely</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">Evidence before, monitoring after.</span></p>
+				<ul>
+					<li><strong>Replay first:</strong> run the proposed workflow on recorded inputs and grade it against the agent&rsquo;s outcomes, case by case (paired, as in <a href="../anthropic-ccar-p/d4-skill-4-4.html">CCAR-P 4.4</a>).</li>
+					<li><strong>Shadow the agent:</strong> before an agent takes the tail, run it on live fall-through cases without acting, and compare with what people did.</li>
+					<li><strong>Roll out by share,</strong> with the old path ready, and watch cost per resolved case, escalation rate and quality by segment.</li>
+					<li><strong>Write down the thresholds first,</strong> as the code does, so the decision isn&rsquo;t argued from whichever number looks best afterwards.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"The agent works, so make every system an agent"</strong> or <strong>"agents are expensive, so convert them all to workflows"</strong> are both decided without the data. The question is per system: does the evidence show the runs are predictable, or the tail is large and solvable, at a cost that beats the alternative?</p></div>
+			</div>
+
+			<!-- ===== Harness ===== -->
+			<h2 id="s4">Choosing the harness</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">From least to most that you run yourself.</span></p>
+				<div class="code"><span class="file">harness.py (harness.py)</span>
+<pre><code>"""Pick the harness from what the team needs to own (one standard per need, not per team)."""
+
+def choose_harness(n: dict) -&gt; str:
+    if n["no_infrastructure"] and n["long_running_async"]:
+        return "Managed Agents (Anthropic runs the loop and sandbox; beta; check ZDR and HIPAA needs)"
+    if n["coding_or_ci_task"]:
+        return "Claude Code headless (claude -p) with the team's plugin and managed settings"
+    if n["needs_shell_files_subagents_hooks"]:
+        return "Agent SDK, self-hosted (you own the container, sessions and sandbox)"
+    if n["approval_or_logging_per_tool_call"]:
+        return "Messages API with a manual tool loop"
+    return "Messages API with the SDK tool runner (beta): your tools, the loop handled for you"</code></pre></div>
+				<ul>
+					<li><strong>Tool runner (SDK helper, beta):</strong> runs the loop over your own tools, wraps tool errors and manages the conversation, with <code>max_iterations</code> and compaction support. It&rsquo;s available in the Python, TypeScript, Go, Java, C#, PHP and Ruby SDKs, and on every listed platform including Bedrock.</li>
+					<li><strong>Manual tool loop:</strong> the documentation&rsquo;s choice when you need human approval, custom logging or conditional execution on each call.</li>
+					<li><strong>Agent SDK, self-hosted:</strong> Claude Code&rsquo;s loop, built-in file and shell tools, subagents, hooks and sessions, in your container. You own sandboxing, sessions and scaling.</li>
+					<li><strong>Claude Code headless:</strong> for coding and CI tasks, carrying the team&rsquo;s plugins and managed settings.</li>
+					<li><strong>Managed Agents (beta):</strong> Anthropic runs the loop and sandbox for long-running, asynchronous work. It isn&rsquo;t ZDR or HIPAA eligible (except fully self-hosted), and it isn&rsquo;t on Bedrock&rsquo;s <code>bedrock-runtime</code>.</li>
+					<li><strong>Third-party frameworks:</strong> weigh what they add against what they hide. Anthropic&rsquo;s agent guidance suggests starting with the API directly and understanding any framework&rsquo;s underlying code.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Standards ===== -->
+			<h2 id="s5">Reusable-pattern standards</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.3</span><span class="skill-text">What a platform team should make shared (my list).</span></p>
+				<ul>
+					<li><strong>Skills for procedures:</strong> about 100 tokens of metadata each until triggered, loaded on demand, versioned. Custom Skills don&rsquo;t sync across surfaces, so publish them where each team runs.</li>
+					<li><strong>Shared subagent definitions</strong> (reviewer, test runner, researcher) with fixed tools and models, so every team&rsquo;s "reviewer" means the same thing.</li>
+					<li><strong>MCP servers for shared systems,</strong> one per system, owned and versioned, instead of each team wrapping the same API.</li>
+					<li><strong>Plugins to distribute them together,</strong> through a marketplace and managed settings (<a href="../anthropic-ccar-p/d7-skill-7-1.html">CCAR-P 7.1</a>).</li>
+					<li><strong>Common contracts:</strong> structured output schemas, trace attributes and evaluation harnesses, so data from every system can be compared the way this page compares three.</li>
+					<li><strong>One harness per kind of need,</strong> not per team, so operations, security review and on-call knowledge carry across systems.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Read the traces: a dominant tool path suggests code; a large, varied fall-through tail suggests an agent for that tail.</li>
+				<li>Decide on cost per resolved case and quality by segment, against thresholds set beforehand; hybrids are the usual answer.</li>
+				<li>Prove the change with replays and shadow traffic, then roll out by share with the old path ready.</li>
+				<li>Harness: tool runner for simple loops, manual loop for per-call control, Agent SDK for files, shell and hooks on your infrastructure, Claude Code for coding and CI, Managed Agents when you don&rsquo;t want to run the loop.</li>
+				<li>Standardise Skills, subagent definitions, MCP servers, schemas and trace attributes, distributed as plugins.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-2.html"><small>Previous</small>1.2: Durable Execution and State Management</a>
+				<a class="next" href="index.html#d1"><small>Next</small>Domain 1</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

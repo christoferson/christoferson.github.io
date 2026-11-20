@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>1.2: Durable Execution and State Management | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 1.2: making long-running Claude agents survive interruption, restart and model version change: Agent SDK sessions, resume and fork, SessionStore adapters across hosts, file checkpointing, an application progress ledger and memory, with tested Python code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d1">Domain 1</a><span class="sep">/</span><span class="here">1.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 1 &middot; Advanced Agent Architecture and Orchestration &middot; 17%</span>
+		<h1>1.2: Durable Execution and State Management</h1>
+		<p>Keeping an agent&rsquo;s work alive when its worker dies, its container is replaced or its model is retired: which state the SDK keeps for you, which it doesn&rsquo;t, and the application-side record that lets any worker pick the job up again.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Agent SDK</span><span class="tag">Sessions</span><span class="tag">SessionStore</span><span class="tag">Checkpointing</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Three kinds of state</a></li>
+				<li><a href="#s2">Sessions: continue, resume, fork</a></li>
+				<li><a href="#s3">Resuming on another host</a></li>
+				<li><a href="#s4">File checkpointing</a></li>
+				<li><a href="#s5">A runner that survives restarts and model change</a></li>
+				<li><a href="#s6">Memory architecture for long runs</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 1.2</span>
+				<p><strong>Durable Execution and State Management</strong>: "Applying session persistence, checkpointing, resumability, and memory architecture patterns to long-running agents that must survive interruption, restart, and model version change."</p>
+			</div>
+			<p>Exam items describe a long job that lost work (a restarted pod, a store outage, a retired model) and ask which persistence choice would have kept it. Context policies for runs approaching the window limit are <a href="index.html#d1">skill 1.4</a>; choosing the lifecycle tools at architecture level is <a href="../anthropic-ccar-p/d2-skill-2-6.html">CCAR-P 2.6</a>.</p>
+			<p>Sources: the Agent SDK pages on sessions, session storage and file checkpointing, read on 21 November 2026, and the model deprecations page used for CCAR-P, all paraphrased. The company, files and code are my own; the code is tested against the Python Agent SDK with an in-memory store.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A legal-operations team re-tags 60,000 stored contracts against a new clause taxonomy. The agent runs for days on autoscaled workers that can be replaced at any time, and its model, a Sonnet version, is due to retire partway through.</p></div>
+
+			<!-- ===== Kinds ===== -->
+			<h2 id="s1">Three kinds of state</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Know which one each mechanism saves.</span></p>
+				<ul>
+					<li><strong>The conversation:</strong> the SDK session, written to disk automatically as JSONL: prompt, tool calls, results and replies. "Sessions persist the conversation, not the filesystem."</li>
+					<li><strong>Files the agent changed:</strong> covered only by file checkpointing, within limits (<a href="#s4">below</a>), or by git.</li>
+					<li><strong>Business progress:</strong> which contracts are done, which rulings were made. No SDK feature owns this; the application must, in its own database, written after each unit.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sessions ===== -->
+			<h2 id="s2">Sessions: continue, resume, fork</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Returning to a conversation.</span></p>
+				<ul>
+					<li><strong>Within one process:</strong> <code>ClaudeSDKClient</code> keeps the session across <code>query()</code> calls.</li>
+					<li><strong>Continue:</strong> <code>continue_conversation=True</code> picks up the most recent session in the working directory; fine for one conversation at a time.</li>
+					<li><strong>Resume:</strong> <code>resume=&lt;session_id&gt;</code> returns to a specific session. The ID is on every <code>ResultMessage</code>, including error results, so capture it even when a run fails. Resume is how you recover from <code>error_max_turns</code> or <code>error_max_budget_usd</code> with a higher limit.</li>
+					<li><strong>Fork:</strong> <code>fork_session=True</code> with <code>resume</code> starts a new session from a copy of the history and leaves the original alone; it branches the conversation, not the files.</li>
+					<li><strong>Where they live:</strong> <code>~/.claude/projects/&lt;encoded-cwd&gt;/&lt;id&gt;.jsonl</code>, on that machine only.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Hosts ===== -->
+			<h2 id="s3">Resuming on another host</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Ephemeral workers need shared state.</span></p>
+				<ul>
+					<li><strong>Three options, from the documentation:</strong> a <code>SessionStore</code> adapter, copying the session file to the new host, or not relying on resume at all and passing captured results into a fresh session, which the documentation calls often more robust.</li>
+					<li><strong>The adapter:</strong> <code>append</code> and <code>load</code> are required; <code>list_subkeys</code> is needed to restore subagent transcripts, and <code>delete</code> and the list methods are optional. The SDK ships an <code>InMemorySessionStore</code> for tests, reference S3, Redis and Postgres adapters to copy, and a conformance suite.</li>
+					<li><strong>Keys follow the working directory:</strong> resume from the same <code>cwd</code> as the original run.</li>
+					<li><strong>Mirror writes are best-effort:</strong> local disk first, then <code>append</code>, retried up to three attempts in total. Retries can re-deliver entries, so deduplicate by <code>uuid</code>. A batch that still fails produces a <code>mirror_error</code> message and is dropped while the run carries on, so alert on <code>mirror_error</code>.</li>
+					<li><strong>The store can be the only copy:</strong> a run resumed from the store deletes its local transcript at the end. The SDK never deletes from your store, so retention is yours to set.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Checkpointing ===== -->
+			<h2 id="s4">File checkpointing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">Undoing file edits, within limits.</span></p>
+				<ul>
+					<li><strong>How:</strong> <code>enable_file_checkpointing=True</code> plus <code>extra_args={"replay-user-messages": None}</code>; each prompt that starts a turn is a checkpoint (its user message UUID), and <code>rewind_files(uuid)</code> restores files. The conversation isn&rsquo;t rewound.</li>
+					<li><strong>Tracked:</strong> Write, Edit and NotebookEdit in the main conversation.</li>
+					<li><strong>Not tracked:</strong> changes made by Bash (unless the main conversation already edited that file), subagent edits, directory changes, remote files. Checkpoints belong to the session that made them.</li>
+					<li><strong>Doesn&rsquo;t combine with a session store:</strong> the SDK refuses to start with both, because file backups stay on local disk. Multi-host jobs use git (or the system of record) for reversibility instead.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Runner ===== -->
+			<h2 id="s5">A runner that survives restarts and model change</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">The ledger decides how to restart (my design).</span></p>
+				<div class="code"><span class="file">durable_runner.py (durable_runner.py)</span>
+<pre><code>"""A long-running re-tagging agent that survives worker restarts and a model change.
+
+Two layers of state: the SDK session (the conversation, mirrored to a shared store) and the
+application's own progress ledger (what is done, on which model and prompt). The ledger decides."""
+import json
+from dataclasses import asdict, dataclass, field
+from claude_agent_sdk import ClaudeAgentOptions
+
+MODEL = "claude-sonnet-5-5"        <span class="c"># pinned ID, recorded with every checkpoint</span>
+PROMPT_VERSION = "retag-v7"
+
+
+@dataclass
+class Ledger:                      <span class="c"># one row per run in your database, updated after every unit</span>
+    run_id: str
+    model: str
+    prompt_version: str
+    session_id: str | None = None
+    done: list[str] = field(default_factory=list)       <span class="c"># contract IDs already re-tagged and saved</span>
+    decisions: list[str] = field(default_factory=list)  <span class="c"># rulings later units must follow</span>
+
+
+class DedupStore:
+    """SessionStore adapter (in memory here; S3, Redis or Postgres in production).
+    The SDK may re-deliver a batch on retry, so drop entries whose uuid is already stored."""
+    def __init__(self):
+        self.rows: dict[tuple, list] = {}
+
+    async def append(self, key, entries):
+        rows = self.rows.setdefault((key["project_key"], key["session_id"], key.get("subpath")), [])
+        seen = {e.get("uuid") for e in rows if e.get("uuid")}
+        rows.extend(e for e in entries if not e.get("uuid") or e["uuid"] not in seen)
+
+    async def load(self, key):
+        return self.rows.get((key["project_key"], key["session_id"], key.get("subpath")))
+
+
+def plan_resume(ledger: Ledger, session_in_store: bool) -&gt; tuple[str, str]:
+    """Resume the conversation only when it's the same model and prompt; otherwise start fresh
+    from the ledger, which holds everything a new session needs."""
+    todo = "Continue re-tagging. Skip these finished IDs: " + ", ".join(ledger.done or ["none"])
+    rules = "Rulings so far: " + ("; ".join(ledger.decisions) or "none")
+    if ledger.session_id and session_in_store and (ledger.model, ledger.prompt_version) == (MODEL, PROMPT_VERSION):
+        return "resume", todo
+    return "fresh", f"{todo}\n{rules}"   <span class="c"># new model or prompt: don't carry the old transcript over</span>
+
+
+def build_options(ledger: Ledger, store, mode: str) -&gt; ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        model=MODEL,
+        resume=ledger.session_id if mode == "resume" else None,
+        session_store=store,            <span class="c"># any worker can resume; no local file checkpointing with a store</span>
+        cwd="/srv/retag",               <span class="c"># the store key derives from the working directory: keep it fixed</span>
+        allowed_tools=["Read", "Grep", "mcp__contracts__get", "mcp__contracts__save_tags"],
+        max_turns=200,
+        max_budget_usd=40.0,
+    )
+
+
+def record_unit(ledger: Ledger, contract_id: str, ruling: str | None = None) -&gt; str:
+    """Call after save_tags succeeds; the save itself is keyed by contract ID, so a repeat is harmless."""
+    if contract_id not in ledger.done:
+        ledger.done.append(contract_id)
+    if ruling:
+        ledger.decisions.append(ruling)
+    return json.dumps(asdict(ledger))   <span class="c"># write to the database before starting the next unit</span></code></pre></div>
+				<ul>
+					<li><strong>Progress is committed per unit:</strong> after <code>save_tags</code> succeeds, the contract ID is written to the ledger. Saves are keyed by contract, so a unit repeated after a crash does no harm.</li>
+					<li><strong>Interruption or restart:</strong> a new worker reads the ledger and, if the session is in the store and nothing has changed, resumes it with the list of finished IDs.</li>
+					<li><strong>Store outage or lost transcript:</strong> a fresh session from the ledger. Little is lost, because the transcript was never the record of what was done.</li>
+					<li><strong>Model version change:</strong> the ledger records the pinned model and prompt version. When either changes (here, the current Sonnet retiring on 30 November 2026), the runner starts fresh with the rulings carried over rather than continuing an old model&rsquo;s transcript. A new model has its own prompt cache, so resuming a long transcript re-reads it uncached anyway. Run the evaluation set on the new model before the switch.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Memory ===== -->
+			<h2 id="s6">Memory architecture for long runs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.2</span><span class="skill-text">What to keep where.</span></p>
+				<ul>
+					<li><strong>The context window is working memory:</strong> compaction summarises it and loses detail, and it doesn&rsquo;t survive a restart.</li>
+					<li><strong>The memory tool is durable memory for the agent:</strong> files it reads and writes outside the window, kept by your application, so they outlast restarts and model changes.</li>
+					<li><strong>The ledger is durable memory for the system:</strong> progress, rulings, the model and prompt in use. It is what operators query and what decides a restart.</li>
+					<li><strong>Subagents:</strong> their transcripts are separate (<code>subagents/agent-&lt;id&gt;</code> in a store); without <code>list_subkeys</code>, a resume restores only the main conversation.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Enable a session store so the job can't lose work"</strong> covers the conversation only, and only best-effort. It doesn&rsquo;t record what was finished, doesn&rsquo;t revert files, and doesn&rsquo;t help when the model changes. Durable progress lives in application state written after each unit.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Sessions save the conversation; file checkpointing saves Write and Edit changes in one session; the application must save business progress.</li>
+				<li>Capture <code>session_id</code> from every result; resume after restarts or limit errors, fork to try alternatives.</li>
+				<li>Across hosts: a <code>SessionStore</code> keyed by working directory, deduplicating by <code>uuid</code> and alerting on <code>mirror_error</code>, or a fresh session from captured results.</li>
+				<li>File checkpointing can&rsquo;t be combined with a store and misses Bash and subagent edits; use git for multi-host reversibility.</li>
+				<li>Record the pinned model and prompt version with progress; on a change, evaluate, then start fresh from the ledger rather than resume an old transcript.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d1-skill-1-1.html"><small>Previous</small>1.1: Multi-Agent Orchestration</a>
+				<a class="next" href="d1-skill-1-3.html"><small>Next</small>1.3: Architecture Selection at Scale</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>
