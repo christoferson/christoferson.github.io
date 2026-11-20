@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.2: Deterministic Guardrails and Least Privilege | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 7.2 (7 December 2026 guide): layering guardrails so destructive actions can't run under adversarial instruction: least-privilege tools and credentials, permission deny rules, PreToolUse hooks that hold in every mode, approval callbacks, and the OS-level Bash sandbox, with the order Claude Code evaluates them.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Security and Safety &middot; 8%</span>
+		<h1>7.2: Deterministic Guardrails and Least Privilege</h1>
+		<p>Making sure an agent can't do serious damage even if it is fully convinced it should: the narrowest tools and credentials, rules and hooks that refuse in every mode, a person on the writes, and an operating-system boundary around the shell.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Guardrails</span><span class="tag">Least privilege</span><span class="tag">Hooks</span><span class="tag">Permissions</span><span class="tag">Sandbox</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Assume the model is persuaded</a></li>
+				<li><a href="#s2">An agent with six layers</a></li>
+				<li><a href="#s3">The order checks run in</a></li>
+				<li><a href="#s4">Least privilege</a></li>
+				<li><a href="#s5">Hooks and rules as hard stops</a></li>
+				<li><a href="#s6">The OS sandbox</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.2</span>
+				<p><strong>Deterministic Guardrails and Least Privilege</strong>: "Applying guardrail layering, least privilege, and hooks as deterministic enforcement so that destructive actions cannot execute even under adversarial instruction."</p>
+			</div>
+			<p>Exam items describe an agent that could delete, overwrite or leak something, and ask which control makes that impossible rather than unlikely. <a href="d7-skill-7-1.html">Skill 7.1</a> lowers the chance that an injection succeeds; this skill limits what a successful one can do. Building hooks in general is <a href="d1-skill-1-2.html">skill 1.2</a>.</p>
+			<p>Sources: the Agent SDK documentation on permissions and hooks, the Claude Code sandboxing documentation and Anthropic's injection guidance, checked on 19 and 20 November 2026 and paraphrased. The hook and approval callback were tested by calling them directly with claude-agent-sdk 0.2.185.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's operations agent investigates data problems in the orders database and proposes fixes. It reads support tickets, so it will sometimes see text written by attackers.</p></div>
+
+			<!-- ===== Assumption ===== -->
+			<h2 id="s1">Assume the model is persuaded</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Design for the case where every prompt-level defence has failed.</span></p>
+				<p>"Even under adversarial instruction" is the key phrase. Suppose an injected ticket has convinced the agent that dropping a table is the right thing to do. Instructions in the system prompt are what was just overcome, so they can't be the control. The controls that still hold are the ones that don't consult the model:</p>
+				<ul>
+					<li>tools and credentials it was never given;</li>
+					<li>rules and hooks that run before every call;</li>
+					<li>a person who approves writes;</li>
+					<li>an operating-system boundary around the shell.</li>
+				</ul>
+				<p>Layer them so that each one stops the action on its own.</p>
+			</div>
+
+			<!-- ===== Example ===== -->
+			<h2 id="s2">An agent with six layers</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Least privilege, rules, a hook, approval, sandbox and credentials.</span></p>
+				<div class="code"><span class="file">ops_guardrails.py (Python, Agent SDK)</span>
+<pre><code>"""An operations agent that can query and fix the shop's database, where destructive actions can't run whatever it is told.
+Each layer works on its own; none depends on the model choosing well."""
+import json
+import re
+
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, PermissionResultAllow, PermissionResultDeny
+
+DESTRUCTIVE_SQL = re.compile(r"\b(drop|truncate|alter)\b|\bdelete\s+from\s+\w+\s*(;|$)|\bupdate\s+\w+\s+set\b(?!.*\bwhere\b)", re.I | re.S)
+DESTRUCTIVE_SHELL = re.compile(r"\brm\s+-[a-z]*r[a-z]*f|\bgit\s+push\b.*--force|\bpsql\b.*\bprod", re.I)
+
+
+async def block_destructive(input_data, tool_use_id, context):
+    """Layer 3 (hook): runs before the call, in every permission mode, so an injected 'DROP TABLE' never executes."""
+    args = input_data["tool_input"]
+    text = args.get("sql") or args.get("command") or ""
+    if DESTRUCTIVE_SQL.search(text) or DESTRUCTIVE_SHELL.search(text):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": "Destructive statements are blocked. Propose the change "
+                                       "as a migration for review instead."}}
+    return {}
+
+
+def approval(approve):
+    """Layer 4 (approval): writes go to a person; the callback runs for calls that would otherwise prompt."""
+    async def can_use_tool(tool_name, tool_input, ctx):
+        if tool_name == "mcp__db__execute_write":
+            ok = await approve(tool_name, tool_input)          <span class="c"># e.g. a Slack button or a ticket</span>
+            return PermissionResultAllow() if ok else PermissionResultDeny(message="A reviewer declined this write.")
+        return PermissionResultDeny(message=f"{tool_name} isn't allowed for this agent.")
+    return can_use_tool
+
+
+def options(approve) -&gt; ClaudeAgentOptions:
+    settings = {"permissions": {"deny": [                         <span class="c"># Layer 2 (rules): checked before the mode</span>
+        "Read(./.env)", "Read(./secrets/**)", "Bash(rm -rf *)", "Bash(git push --force *)", "Bash(psql *prod*)"]}}
+    return ClaudeAgentOptions(
+        allowed_tools=["Read", "Grep", "mcp__db__query"],                 <span class="c"># Layer 1 (least privilege): read freely ...</span>
+        disallowed_tools=["WebFetch", "WebSearch", "Write"],              <span class="c"># ... and nothing it doesn't need</span>
+        settings=json.dumps(settings),
+        hooks={"PreToolUse": [HookMatcher(matcher="Bash|mcp__db__.*", hooks=[block_destructive], on_failure="block")]},
+        can_use_tool=approval(approve),
+        sandbox={"enabled": True, "allowUnsandboxedCommands": False,      <span class="c"># Layer 5 (OS): Bash can't escape ...</span>
+                 "network": {"allowedDomains": ["db.staging.shop.internal"]}},  <span class="c"># ... or reach anything else</span>
+        env={"DB_ROLE": "readonly"},                                      <span class="c"># Layer 6 (credentials): the query tool's role</span>
+        permission_mode="default",
+        max_turns=30,
+    )</code></pre></div>
+				<ol>
+					<li><strong>Least privilege:</strong> it reads freely with <code>Read</code>, <code>Grep</code> and a read-only <code>query</code> tool, and the web and file-writing tools are removed.</li>
+					<li><strong>Deny rules</strong> refuse secrets, recursive deletes, force pushes and production <code>psql</code>.</li>
+					<li><strong>A <code>PreToolUse</code> hook</strong> refuses destructive SQL and shell commands, with a reason that redirects to a reviewed migration. <code>on_failure="block"</code> means a crashing hook refuses rather than allows.</li>
+					<li><strong>Approval:</strong> <code>can_use_tool</code> sends database writes to a person and denies anything else that would have prompted.</li>
+					<li><strong>Sandbox:</strong> Bash runs inside the OS sandbox, can't opt out, and can reach only the staging database host.</li>
+					<li><strong>Credentials:</strong> the query tool connects with a read-only database role.</li>
+				</ol>
+				<div class="callout trap"><p><strong>The regexes are a layer, not the wall.</strong> Pattern matching on SQL can be evaded with comments, odd spacing or stacked statements. The control an injection can't talk its way past is layer 6: a read-only role cannot drop a table however the statement is written. Put the strongest guarantee where the action happens, in the credentials the tool uses.</p></div>
+			</div>
+
+			<!-- ===== Order ===== -->
+			<h2 id="s3">The order checks run in</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Why a deny holds in every mode.</span></p>
+				<p>For each tool call, the Agent SDK checks, in order:</p>
+				<ol>
+					<li>hooks;</li>
+					<li>deny rules;</li>
+					<li>ask rules;</li>
+					<li>the permission mode;</li>
+					<li>allow rules;</li>
+					<li>the <code>canUseTool</code> callback.</li>
+				</ol>
+				<p>Hooks and deny rules come before the mode, so a hook's deny applies even in <code>bypassPermissions</code>. A hook's allow, on the other hand, doesn't skip deny or ask rules. When several hooks disagree, the most restrictive decision wins.</p>
+				<p>A <code>bypassPermissions</code> value set on a subagent's definition is never applied, though subagents do inherit the main session's mode. So a guardrail written as a hook or deny rule can't be switched off by a mode change, and not by anything the model says either.</p>
+			</div>
+
+			<!-- ===== Least privilege ===== -->
+			<h2 id="s4">Least privilege</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">What isn't granted can't be misused.</span></p>
+				<ul>
+					<li><strong>Tools:</strong> give the agent only the tools the task needs, and remove the rest with <code>disallowed_tools</code>. Remember that <code>allowed_tools</code> pre-approves rather than restricts. Give subagents their own short <code>tools</code> lists.</li>
+					<li><strong>Tool scope:</strong> split read and write into separate tools, so reads can be pre-approved and writes gated. Narrow each tool's parameters too: an email tool that can only send to the verified customer address beats one with a free-text recipient.</li>
+					<li><strong>Credentials:</strong> each tool's own access is the final word. That means a read-only database role, a payments key that can refund only up to a limit, and scoped tokens for each environment (<a href="index.html#d7">skill 7.3</a>).</li>
+					<li><strong>Data:</strong> keep secrets out of the agent's context and reach. Deny-read <code>.env</code> and secrets folders, and pass only the records the task needs.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Hooks and rules ===== -->
+			<h2 id="s5">Hooks and rules as hard stops</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Which to use for what.</span></p>
+				<ul>
+					<li><strong>Deny rules</strong> (<code>Read(./.env)</code>, <code>Bash(rm -rf *)</code>) are simple, declarative and visible in settings. Use them for tools, paths and command patterns.</li>
+					<li><strong>A <code>PreToolUse</code> hook</strong> can inspect the full input and apply logic, such as SQL content, a refund amount against a limit, or a path outside the project. Its reason tells Claude what to do instead, so the agent redirects rather than retrying.</li>
+					<li><strong>Approval</strong> (the <code>can_use_tool</code> callback, or an ask rule) puts a person in the loop for writes that are legitimate but consequential.</li>
+					<li><strong>In Claude Code,</strong> the same layers exist as <code>permissions.deny</code> in settings and hooks in <code>settings.json</code> or a plugin. Managed settings can enforce them across an organisation.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sandbox ===== -->
+			<h2 id="s6">The OS sandbox</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">An operating-system boundary around shell commands.</span></p>
+				<ul>
+					<li><strong>What it covers:</strong> Claude Code's sandbox puts Bash (and PowerShell and Monitor commands, and every process they start) inside an OS-enforced boundary: Seatbelt on macOS, bubblewrap on Linux and WSL2. Native Windows isn't supported, and commands there run unsandboxed.</li>
+					<li><strong>Filesystem:</strong> writes are limited to the working directory, added directories and temp. Reads cover the machine except denied paths, which by default still includes credential files, so add read denials for those.</li>
+					<li><strong>Network:</strong> commands have no direct route out. A proxy checks every hostname against the allowed and denied domains, and the allowed list starts empty.</li>
+					<li><strong>Why it's the bottom layer:</strong> it holds whatever command the model chose, even when an allowed command does more than its name suggests.</li>
+					<li><strong>What it doesn't cover:</strong> <code>Read</code>, <code>Edit</code>, <code>WebFetch</code>, hooks and MCP servers run outside it. Those are governed by permission rules, which merge with the sandbox's paths and domains.</li>
+					<li><strong>Turning it on:</strong> <code>/sandbox</code> or <code>sandbox.enabled</code>. Managed settings can require it, with <code>failIfUnavailable</code> and <code>allowUnsandboxedCommands: false</code> so nothing slips out.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Assume prompt-level defences have failed; the guardrails that matter don't consult the model.</li>
+				<li>Layer them: least-privilege tools and credentials, deny rules, a <code>PreToolUse</code> hook (<code>on_failure="block"</code>), approval for writes, the OS sandbox. Each should stop the action alone.</li>
+				<li>Order of checks: hooks, deny, ask, mode, allow, <code>canUseTool</code>. A hook deny holds even in <code>bypassPermissions</code>; a hook allow doesn't override deny or ask rules.</li>
+				<li>The strongest control sits where the action happens: a read-only role can't drop a table, whatever regex a statement slips past.</li>
+				<li>The sandbox confines Bash's filesystem and network at the OS level (not on native Windows); file and web tools, hooks and MCP servers are governed by permission rules instead.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-1.html"><small>Previous</small>7.1: Prompt Injection and Jailbreak Defense</a>
+				<a class="next" href="index.html#d7"><small>Next</small>Domain 7</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>

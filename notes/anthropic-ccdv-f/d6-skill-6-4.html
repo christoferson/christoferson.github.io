@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>6.4: Grounding and Source Citation | Study Notes for CCDV-F</title>
+	<meta name="description" content="Study notes for CCDV-F skill 6.4 (7 December 2026 guide): building a request that answers only from supplied documents, cites them with the Citations API or search result blocks, and returns NOT_FOUND when the answer isn't there, plus choosing between sending the whole corpus (cached) and retrieving passages by corpus size, cost and freshness.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-f.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-F</a><span class="sep">/</span><a href="index.html#d6">Domain 6</a><span class="sep">/</span><span class="here">6.4</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 6 &middot; Prompt and Context Engineering &middot; 15%</span>
+		<h1>6.4: Grounding and Source Citation</h1>
+		<p>Answers that come only from your documents, point to the passage they rest on, and admit when the documents don't say, plus the decision whether to hand Claude the whole library or just the pages that matter.</p>
+		<div class="tags"><span class="tag code">CCDV-F</span><span class="tag">Grounding</span><span class="tag">Citations</span><span class="tag">Search results</span><span class="tag">RAG</span><span class="tag">Prompt caching</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">What a grounded request needs</a></li>
+				<li><a href="#s2">A grounded answer, two ways</a></li>
+				<li><a href="#s3">Citing the source</a></li>
+				<li><a href="#s4">Returning "not found"</a></li>
+				<li><a href="#s5">Full corpus or retrieval</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 6.4</span>
+				<p><strong>Grounding and Source Citation</strong>: "Constructing a request that grounds answers in the supplied documents, cites their source, and returns 'not found' when the documents do not contain the answer. This includes deciding, based on corpus size, cost, and freshness, whether to supply the full document set in context or retrieve only the relevant passages."</p>
+			</div>
+			<p>Exam items give a question-answering feature that invents policy, can't say where an answer came from, or costs too much. The fix is in how the request is built. Keeping claims attributed across several agents is covered in the architect notes (<a href="../anthropic-ccar-f/d5-task-5-6.html">provenance in synthesis</a>), and recognising a hallucination in a trace is <a href="d4-skill-4-2.html">skill 4.2</a>.</p>
+			<p>Sources: Claude's documentation on citations, search result content blocks, reducing hallucinations, long-context prompting and prompt caching, checked on 19 and 20 November 2026 and paraphrased. The example was tested with the anthropic Python SDK 2.10.0 against a mocked API.</p>
+			<div class="callout note"><p><strong>Running example.</strong> The shop's help assistant answers customers from the returns, delivery and warranty policies. A customer was told the shop price-matches competitors, which no policy says.</p></div>
+
+			<!-- ===== Needs ===== -->
+			<h2 id="s1">What a grounded request needs</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.4</span><span class="skill-text">Four parts, each closing one gap.</span></p>
+				<ul>
+					<li><strong>The documents in the request,</strong> clearly separated from the question. Long material goes before the question.</li>
+					<li><strong>An instruction to use only them:</strong> no general knowledge, and no guessing.</li>
+					<li><strong>An explicit way out:</strong> a fixed reply such as <code>NOT_FOUND</code> when the answer isn't there. Claude's guidance on reducing hallucinations starts with exactly this: give permission to say you don't know.</li>
+					<li><strong>Citations,</strong> so every claim can be traced to a passage and checked.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Example ===== -->
+			<h2 id="s2">A grounded answer, two ways</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.4</span><span class="skill-text">Whole corpus as documents, or retrieved passages as search results.</span></p>
+				<div class="code"><span class="file">grounded_answer.py (Python, anthropic SDK)</span>
+<pre><code>"""Answer only from the shop's policy documents, cite them, and say NOT_FOUND when they don't contain the answer.
+Small, stable corpus: send it all, cached. Large or fast-changing corpus: retrieve passages and send search results."""
+import anthropic
+
+client = anthropic.Anthropic()
+
+SYSTEM = """Answer the customer's question using only the provided documents.
+If the documents don't contain the answer, reply with exactly NOT_FOUND and nothing else. Don't use general knowledge,
+and don't guess: a wrong policy answer costs more than no answer."""
+
+
+def choose_mode(corpus_tokens: int, changes_per_day: int, budget_tokens: int = 200_000) -&gt; str:
+    if corpus_tokens &lt;= budget_tokens and changes_per_day == 0:
+        return "full"          <span class="c"># fits comfortably and rarely changes: send everything, cache the prefix</span>
+    return "retrieve"          <span class="c"># too big, too costly per question, or too fresh to cache: send the top passages</span>
+
+
+def full_corpus(docs: list[dict]) -&gt; list[dict]:
+    blocks = [{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": d["text"]},
+               "title": d["title"], "context": f"updated {d['updated']}", "citations": {"enabled": True}} for d in docs]
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}       <span class="c"># every later question reuses the cached documents</span>
+    return blocks
+
+
+def retrieved(passages: list[dict]) -&gt; list[dict]:
+    return [{"type": "search_result", "source": p["url"], "title": p["title"],
+             "content": [{"type": "text", "text": p["text"]}], "citations": {"enabled": True}} for p in passages]
+
+
+def answer(question: str, mode: str, docs=None, search=None) -&gt; dict:
+    sources = full_corpus(docs) if mode == "full" else retrieved(search(question, k=5))
+    msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=1500, system=SYSTEM,
+                                 messages=[{"role": "user", "content": sources + [{"type": "text", "text": question}]}])
+    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    cites = [(c.title if c.type == "search_result_location" else c.document_title, c.cited_text)
+             for b in msg.content if b.type == "text" for c in (b.citations or [])]
+    if text == "NOT_FOUND":
+        return {"found": False}
+    if not cites:                 <span class="c"># an answer with no supporting passage isn't grounded: don't show it as policy</span>
+        return {"found": False, "reason": "uncited answer withheld", "draft": text}
+    return {"found": True, "answer": text, "citations": cites}</code></pre></div>
+				<ul>
+					<li><strong>Full mode</strong> sends every policy as a <code>document</code> block with citations enabled. Its date goes in <code>context</code>, which Claude sees but never cites, and <code>cache_control</code> sits on the last document so later questions reuse the cached prefix.</li>
+					<li><strong>Retrieve mode</strong> sends the top passages from your search as <code>search_result</code> blocks. Each has a <code>source</code>, a <code>title</code> and its text, with citations enabled.</li>
+					<li><strong>The same system prompt</strong> restricts both modes to the documents and defines <code>NOT_FOUND</code>. The parsing is shared too: <code>NOT_FOUND</code> becomes <code>found: False</code>, and so does an answer with no citations at all.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Cite ===== -->
+			<h2 id="s3">Citing the source</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.4</span><span class="skill-text">Citations from documents and from search results.</span></p>
+				<ul>
+					<li><strong>Documents:</strong> with <code>"citations": {"enabled": true}</code>, cited parts of the answer come back as text blocks carrying <code>cited_text</code> and a location. That's a character range for plain text, a page range for PDFs, or a block range for custom content. The API extracts <code>cited_text</code> itself, so it always points into what you sent, and it doesn't count toward output tokens.</li>
+					<li><strong>Chunking:</strong> plain text and PDFs are split into sentences, the smallest unit Claude can cite. To control the units, for transcripts or bullet lists, use a custom content document, where each text block you provide is one citable unit.</li>
+					<li><strong>Search results</strong> (generally available) are the retrieval-shaped equivalent. Put them directly in the user message, or return them from your own search tool. Citations come back as <code>search_result_location</code> with your <code>source</code> and <code>title</code>, so the answer can link to the page.</li>
+					<li><strong>Search-result rules:</strong> citations are off by default, and every search result in a request must have the same setting. A tool result that contains search results may contain only search results.</li>
+					<li><strong>Limit:</strong> citations can't be combined with structured outputs (a 400 error). Return prose with citations, then structure it yourself (<a href="d6-skill-6-3.html#s5">parsing free-text fallbacks</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Not found ===== -->
+			<h2 id="s4">Returning "not found"</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.4</span><span class="skill-text">Making "the documents don't say" an expected answer.</span></p>
+				<ul>
+					<li><strong>Define the reply exactly</strong> (<code>NOT_FOUND</code> and nothing else) and say why it's preferred: a wrong policy answer costs more than no answer. Your code can then detect it reliably and route the customer to a person.</li>
+					<li><strong>Check the other way too:</strong> an answer with no citations has no supporting passage. The example withholds it rather than presenting it as policy, and keeps the draft for review.</li>
+					<li><strong>For long documents,</strong> asking Claude to quote the relevant passages before answering, and to retract any claim it can't support with a quote, further reduces made-up answers.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add 'be accurate' to the prompt"</strong> doesn't stop invented answers. An explicit permission and format for "not found", a restriction to the supplied documents, and a citation check do.</p></div>
+			</div>
+
+			<!-- ===== Full or retrieve ===== -->
+			<h2 id="s5">Full corpus or retrieval</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.4</span><span class="skill-text">Corpus size, cost and freshness decide.</span></p>
+				<ul>
+					<li><strong>Size:</strong> current models have a 1M-token window, but accuracy and recall fall as context grows. "It fits" isn't the same as "it works well". A few policies (tens of thousands of tokens) can go in whole; a product catalogue or ticket history can't sensibly.</li>
+					<li><strong>Cost:</strong> sending the whole corpus with every question pays for every token every time. Prompt caching cuts that sharply for a stable prefix, since cached reads cost a small fraction of normal input (<a href="d5-skill-5-3.html">skill 5.3</a>), but the cache lasts minutes to an hour. Retrieval sends only the top passages, so cost per question stays small however big the corpus grows.</li>
+					<li><strong>Freshness:</strong> a corpus that changes often breaks the cached prefix on every change. Retrieval reads the current version of each passage at question time.</li>
+					<li><strong>Quality trade-off:</strong> the full corpus can't miss a relevant passage, while retrieval can, if the search returns the wrong passages. Evaluate retrieval recall separately from answer quality.</li>
+				</ul>
+				<p>The example's <code>choose_mode</code> encodes the simple version: send everything, cached, when the corpus is small and stable; otherwise retrieve.</p>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>A grounded request has the documents (before the question), an instruction to use only them, an exact "not found" reply, and citations.</li>
+				<li>Documents with <code>citations</code> enabled return <code>cited_text</code> plus a location; custom content controls the citable units; <code>cited_text</code> is free of output tokens.</li>
+				<li>Search result blocks (<code>source</code>, <code>title</code>, text content) give retrieval citations as <code>search_result_location</code>; citations are off by default and all-or-nothing per request; no structured outputs alongside citations.</li>
+				<li>Treat <code>NOT_FOUND</code> and uncited answers as "not found", route them to a person, and ask for quotes first on long documents.</li>
+				<li>Full corpus (cached) for small, stable sets; retrieval for large, costly-per-question or frequently changing ones. Measure retrieval recall too.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d6-skill-6-3.html"><small>Previous</small>6.3: Structured Output and Defensive Parsing</a>
+				<a class="next" href="d7-skill-7-1.html"><small>Next</small>7.1: Prompt Injection and Jailbreak Defense</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Foundations (CCDV-F) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-F exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; examples are original.</div>
+</footer>
+
+</body>
+</html>
