@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>2.2: System Prompt Diagnosis and Revision | Study Notes for CCAR-P</title>
+	<meta name="description" content="Study notes for CCAR-P skill 2.2 (7 December 2026 guide): finding the underspecification in a system prompt that causes degraded or inconsistent output, and choosing the revision that constrains scope, format and behaviour without over-constraining legitimate variation, with three prompt versions and a tested reply checker.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccar-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCAR-P</a><span class="sep">/</span><a href="index.html#d2">Domain 2</a><span class="sep">/</span><span class="here">2.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 2 &middot; Claude Models, Prompting, and Context Engineering &middot; 13%</span>
+		<h1>2.2: System Prompt Diagnosis and Revision</h1>
+		<p>Reading a system prompt against the outputs it produces, finding what it never told the model, and fixing that with rules that are specific enough to stop the drift but not so rigid that ordinary requests start failing.</p>
+		<div class="tags"><span class="tag code">CCAR-P</span><span class="tag">System prompts</span><span class="tag">Prompt engineering</span><span class="tag">Over-constraint</span><span class="tag">Evaluation</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Reading symptoms back to gaps</a></li>
+				<li><a href="#s2">Three versions of one prompt</a></li>
+				<li><a href="#s3">Signs of over-constraining</a></li>
+				<li><a href="#s4">What a good revision does</a></li>
+				<li><a href="#s5">Proving the revision</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 2.2</span>
+				<p><strong>System Prompt Diagnosis and Revision</strong>: "Diagnosing the underspecification in a system prompt that produces degraded or inconsistent output, and selecting the revision that constrains scope, format, and behavior without over-constraining legitimate variation."</p>
+			</div>
+			<p>Exam items show a system prompt and the symptoms it causes, then offer revisions: one too vague, one too rigid, one that addresses the gap. The developer view of revising prompts under regression tests is <a href="../anthropic-ccdv-f/d6-skill-6-2.html">CCDV-F 6.2</a>; choosing a technique such as few-shot or structured output is <a href="d2-skill-2-3.html">skill 2.3</a>.</p>
+			<p>Sources: Anthropic's prompting best practices, checked on 20 November 2026 and paraphrased. The prompts and checker are my own; the checker is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A property manager's tenant assistant answers repair, rent and building questions by chat. Reviewing 300 logged chats shows inconsistent and sometimes harmful replies.</p></div>
+
+			<!-- ===== Symptoms ===== -->
+			<h2 id="s1">Reading symptoms back to gaps</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Each kind of symptom points to what the prompt left out (my mapping).</span></p>
+				<ul>
+					<li><strong>Answers things it shouldn't</strong> (legal advice, other customers' data): scope was never defined. The model fills the gap with general helpfulness.</li>
+					<li><strong>Invents specifics</strong> (dates, prices, policy details): no rule for what to do when it doesn't know, and no named sources.</li>
+					<li><strong>Format varies widely</strong> between runs: no format or length stated, so each reply guesses.</li>
+					<li><strong>Treats an emergency like routine</strong>: priorities and special cases are missing.</li>
+					<li><strong>Different users get different behaviour</strong> for the same request: the prompt relies on the user to supply context it should hold itself.</li>
+				</ul>
+				<p>Anthropic's test applies directly: show the prompt to a colleague with minimal context and ask them to follow it. If they'd have to guess, so will Claude. Its guidance describes Claude as a brilliant new employee who lacks your norms.</p>
+			</div>
+
+			<!-- ===== Three ===== -->
+			<h2 id="s2">Three versions of one prompt</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Underspecified, over-constrained, then balanced.</span></p>
+				<div class="code"><span class="file">tenant_prompts.txt (Tenant assistant prompts)</span>
+<pre><code>=== v1: underspecified (outputs drift) ===============================================
+You are a helpful assistant for Harbourline Properties. Help tenants with their questions.
+
+Observed on 300 logged chats:
+  - answers questions on eviction law and rent disputes (scope never stated)
+  - promises repair dates it has no way to know (no rule for unknowns)
+  - replies range from one line to 600 words with headings (no format)
+  - treats "water pouring through the ceiling" like a routine ticket (no priorities)
+
+=== v2: over-constrained (fixes v1, breaks legitimate variation) ======================
+CRITICAL: You MUST ONLY answer using the FAQ. NEVER say anything not in the FAQ.
+ALWAYS reply in EXACTLY 3 bullet points. If in doubt, REFUSE.
+
+Observed on the same 300 chats:
+  - refuses "my lock is broken and I also need a parking permit" (two topics)
+  - can't ask a clarifying question ("which unit?") because that isn't in the FAQ
+  - forces an emergency into 3 bullets instead of "call this number now"
+  - refusal rate up from 4% to 31%
+
+=== v3: constrains scope, format and behaviour; leaves room for real variation ========
+You answer tenants of Harbourline Properties about repairs, rent payments, parking,
+moving in and out, and building rules. Tenants write from their phones, often while
+something is going wrong, so keep replies short and practical.
+
+Scope
+- Use the tenant handbook and the tenant's open tickets (provided below) as your sources.
+- For legal questions (eviction, deposit disputes, discrimination), don't give advice:
+  say the property office handles these and give its contact details.
+
+Behaviour
+- Never promise a repair date or cost; say what happens next and who will confirm it.
+- If you need a detail to help (unit number, which appliance), ask one short question.
+- If a message covers several topics, answer each in turn.
+- Emergencies (flooding, gas smell, fire, no heat below 10 C, someone hurt): first line is
+  the 24-hour emergency number, then one sentence on what to do while waiting.
+
+Format
+- Plain text, under 120 words unless the tenant asks for detail; no headings.
+- End with the next step the tenant should expect.
+
+&lt;handbook&gt;...&lt;/handbook&gt;
+&lt;open_tickets&gt;...&lt;/open_tickets&gt;</code></pre></div>
+				<ul>
+					<li><strong>v1</strong> names a role and nothing else, so scope, unknowns, format and priorities are all left to chance.</li>
+					<li><strong>v2</strong> answers the symptoms with absolutes. Each rule fixes one v1 symptom and blocks a legitimate request: two topics in one message, a clarifying question, an emergency that needs a phone number rather than three bullets.</li>
+					<li><strong>v3</strong> states scope (and what to do just outside it), behaviour for unknowns, multi-topic messages and emergencies, and a format with a reason ("tenants write from their phones").</li>
+				</ul>
+			</div>
+
+			<!-- ===== Over ===== -->
+			<h2 id="s3">Signs of over-constraining</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">When the fix becomes the problem.</span></p>
+				<ul>
+					<li><strong>Refusals rise</strong> on requests that are clearly in scope.</li>
+					<li><strong>One shape for every case:</strong> exact counts ("exactly 3 bullets") forced onto content that doesn't fit.</li>
+					<li><strong>No room to clarify:</strong> the model can't ask the question it needs to answer well.</li>
+					<li><strong>Shouted rules:</strong> Anthropic notes newer models are more responsive to the system prompt and follow instructions precisely, so language like "CRITICAL: You MUST" now tends to overtrigger. Its advice is to soften it, for example "Use this tool when...", and its migration guidance flags lines like "If in doubt, use [tool]" as a cause of overtriggering.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add CRITICAL and NEVER to the rules it's breaking"</strong> is the tempting revision, and the wrong one on current models. The fix for underspecification is information (scope, sources, cases, reasons), not volume.</p></div>
+			</div>
+
+			<!-- ===== Good ===== -->
+			<h2 id="s4">What a good revision does</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Constrain the three things the guide names, and nothing more.</span></p>
+				<ul>
+					<li><strong>Scope:</strong> what's in, what's out, and what to do at the boundary (redirect to the property office) rather than a bare refusal.</li>
+					<li><strong>Format:</strong> length and shape with the reason behind them; Anthropic notes Claude generalises from the explanation, so the reason covers cases the rule didn't list.</li>
+					<li><strong>Behaviour:</strong> the cases that matter (unknowns, multi-topic, emergencies) and the sources to use, so specifics come from data, not invention.</li>
+					<li><strong>Room for variation:</strong> ranges ("under 120 words unless asked") instead of exact counts; permission to ask one clarifying question.</li>
+					<li><strong>Positive phrasing:</strong> say what to do ("say what happens next and who will confirm it") rather than only what not to do.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Prove ===== -->
+			<h2 id="s5">Proving the revision</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 2.2</span><span class="skill-text">Score each version on the same chats.</span></p>
+				<div class="code"><span class="file">check_replies.py (check_replies.py)</span>
+<pre><code>"""Score logged replies against the behaviours a system prompt revision is meant to fix.
+
+Run it on the same eval chats for each prompt version: a revision should fix the v1 failures
+without raising the refusal rate (the sign of over-constraining)."""
+import re
+
+DATE_PROMISE = re.compile(r"\b(by|on|before)\s+(mon|tue|wed|thu|fri|sat|sun|tomorrow|\d{1,2}(st|nd|rd|th)?\b)", re.I)
+REFUSAL = re.compile(r"\b(can't help with that|unable to assist|outside what I can)\b", re.I)
+EMERGENCY_IN = re.compile(r"\b(flood|water pouring|gas|fire|no heat|hurt|injur)", re.I)
+
+
+def check(tenant_msg: str, reply: str) -&gt; list[str]:
+    issues = []
+    if DATE_PROMISE.search(reply):
+        issues.append("promises a date")
+    if len(reply.split()) &gt; 120:
+        issues.append("too long")
+    if EMERGENCY_IN.search(tenant_msg) and "0800 555 0199" not in reply.splitlines()[0]:
+        issues.append("emergency number not first")
+    if REFUSAL.search(reply):
+        issues.append("refusal")
+    return issues
+
+
+def score(pairs) -&gt; dict:
+    results = [check(m, r) for m, r in pairs]
+    n = len(results)
+    rate = lambda label: sum(label in r for r in results) / n
+    return {"clean": sum(not r for r in results) / n, "refusal_rate": rate("refusal"),
+            "date_promises": rate("promises a date"), "emergency_misses": rate("emergency number not first")}</code></pre></div>
+				<ul>
+					<li><strong>Two directions at once:</strong> the revision must reduce the v1 failures (date promises, emergency misses, long replies) and must not raise the refusal rate, which is the over-constraint signal.</li>
+					<li><strong>Same eval set for every version</strong>, including multi-topic and emergency messages, so the comparison is fair.</li>
+					<li><strong>Heuristic checks plus review:</strong> simple pattern checks find the obvious regressions; sample replies still need a human read.</li>
+				</ul>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Trace each symptom to a gap: out-of-scope answers to missing scope, invented specifics to no rule for unknowns, varied replies to no format, mishandled emergencies to missing priorities.</li>
+				<li>Use Anthropic's test: would a colleague with minimal context know what to do from this prompt?</li>
+				<li>A good revision constrains scope, format and behaviour with reasons and boundary handling, and leaves room for legitimate variation (ranges, clarifying questions, multi-topic answers).</li>
+				<li>Over-constraint shows as rising refusals and forced shapes; on current models, aggressive wording ("CRITICAL", "MUST", "If in doubt") overtriggers, so soften it.</li>
+				<li>Prove the revision on the same eval set: failures down, refusals not up.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d2-skill-2-1.html"><small>Previous</small>2.1: Model Tier Selection</a>
+				<a class="next" href="d2-skill-2-3.html"><small>Next</small>2.3: Prompting Technique Selection</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Architect &ndash; Professional (CCAR-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCAR-P exam guide, version 1.1 (updated for 7 December 2026). Anthropic's documentation summarized in the author's own words; the prompts and code are original.</div>
+</footer>
+
+</body>
+</html>
