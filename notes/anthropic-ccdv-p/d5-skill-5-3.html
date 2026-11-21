@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>5.3: Online Quality Measurement | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 5.3: measuring the quality of a Claude application on live traffic: stratified live sampling under privacy rules, A/B tests with intervals and sample sizes, explicit and implicit feedback loops, and choosing metrics for extraction, generation, agentic and retrieval-grounded tasks, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d5">Domain 5</a><span class="sep">/</span><span class="here">5.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 5 &middot; Evaluation Engineering and Quality Assurance &middot; 12%</span>
+		<h1>5.3: Online Quality Measurement</h1>
+		<p>Offline suites say whether a change is safe to ship; live traffic says whether it actually helps. This page samples production for grading, runs A/B tests that can tell a real gain from noise, uses feedback without being misled by it, and picks the metric each kind of task deserves.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Online evals</span><span class="tag">A/B testing</span><span class="tag">Feedback</span><span class="tag">Metrics</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Metrics matched to task type</a></li>
+				<li><a href="#s2">Sampling live traffic for grading</a></li>
+				<li><a href="#s3">A/B testing</a></li>
+				<li><a href="#s4">Feedback loops</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 5.3</span>
+				<p><strong>Online Quality Measurement</strong>: "Analyzing quality on live production traffic using online evaluation techniques, including live-traffic sampling, A/B testing, feedback loops, and metric selection matched to task type (extraction, generation, agentic, retrieval-grounded)."</p>
+			</div>
+			<p>Exam items describe a live feature and a proposed measure (thumbs-up rate, a judge score, a business metric) and ask whether it measures quality for that kind of task, or whether an A/B result is real. The offline gate is <a href="d5-skill-5-1.html">skill 5.1</a>; deciding which evaluation suits a decision is in <a href="../anthropic-ccar-p/d4-skill-4-2.html">CCAR-P 4.2</a>.</p>
+			<p>Sources: Anthropic&rsquo;s define-success page, "Demystifying evals for AI agents", the statistical approach to evals post and the OpenTelemetry pages, as used earlier and paraphrased. The metric choices, sampling rule and thresholds are my own; the interval and sample-size formulas are standard statistics. The listings site and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A property-listings site uses Claude four ways: extracting attributes from estate agents&rsquo; free-text listings, writing listing descriptions, an agent that books viewings, and a question-answering feature grounded in listing documents.</p></div>
+
+			<!-- ===== Metrics ===== -->
+			<h2 id="s1">Metrics matched to task type</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3</span><span class="skill-text">Each feature fails differently, so it&rsquo;s measured differently (my choices).</span></p>
+				<div class="code"><span class="file">online.py (online.py)</span>
+<pre><code>"""Online quality for a property-listings site with four Claude features (my metric choices)."""
+import math
+
+METRICS = {   <span class="c"># task type -&gt; primary online metric, plus guard metrics</span>
+    "extraction": ("field accuracy on sampled listings, and the rate agents correct extracted fields",
+                   ["schema-valid rate", "fields left empty"]),
+    "generation": ("rubric score from a calibrated judge on sampled descriptions, and how much agents edit them",
+                   ["length", "policy check (no protected-characteristic wording)"]),
+    "agentic":    ("viewing bookings that exist in the calendar system and were attended",
+                   ["steps per task", "handoffs to staff", "cost per completed booking"]),
+    "retrieval":  ("answers judged correct and grounded on sampled questions",
+                   ["citation coverage", "'not found' rate", "follow-up question rate"]),
+}
+
+
+def sample_for_grading(traces: list[dict], per_segment=50) -&gt; list[dict]:
+    """Stratified live sample: a fixed number per segment, so small segments are graded too."""
+    picked, seen = [], {}
+    for t in sorted(traces, key=lambda t: t["trace_id"]):          <span class="c"># stable order</span>
+        if seen.get(t["segment"], 0) &lt; per_segment and t["consented"]:
+            picked.append(t)
+            seen[t["segment"]] = seen.get(t["segment"], 0) + 1
+    return picked
+
+
+def ab_result(succ_a: int, n_a: int, succ_b: int, n_b: int) -&gt; dict:
+    """Difference in success rate (B - A) with a 95% interval; users, not requests, are the unit."""
+    pa, pb = succ_a / n_a, succ_b / n_b
+    se = math.sqrt(pa * (1 - pa) / n_a + pb * (1 - pb) / n_b)
+    lo, hi = pb - pa - 1.96 * se, pb - pa + 1.96 * se
+    call = "B better" if lo &gt; 0 else "B worse" if hi &lt; 0 else "no detectable difference"
+    return {"diff": round(pb - pa, 3), "ci": (round(lo, 3), round(hi, 3)), "call": call}
+
+
+def users_per_arm(base: float, mde: float) -&gt; int:
+    """Roughly how many users each arm needs to detect `mde` at 95% confidence and 80% power."""
+    p = base + mde / 2
+    return math.ceil(2 * (1.96 + 0.84) ** 2 * p * (1 - p) / mde ** 2)
+
+
+def feedback_rate(thumbs_down: int, thumbs_up: int, sessions: int) -&gt; dict:
+    """Explicit feedback is sparse and skewed toward complaints: report coverage alongside the ratio."""
+    given = thumbs_down + thumbs_up
+    return {"coverage": round(given / sessions, 3), "negative_share": round(thumbs_down / given, 2) if given else None}</code></pre></div>
+				<ul>
+					<li><strong>Extraction:</strong> field-level accuracy against a sampled, human-checked set, plus the rate at which agents correct extracted fields after publication, a free implicit label. Schema validity is a guard, not the quality metric.</li>
+					<li><strong>Generation:</strong> a calibrated judge&rsquo;s rubric score on a sample (<a href="d5-skill-5-2.html">skill 5.2</a>) and how much agents edit the draft before publishing. No single reference answer exists, so string-match metrics don&rsquo;t apply.</li>
+					<li><strong>Agentic:</strong> the outcome in the system of record (a viewing that exists in the calendar and was attended), not the agent saying it booked one. Steps, handoffs to staff and cost per completed booking are guards.</li>
+					<li><strong>Retrieval-grounded:</strong> answers judged correct <em>and</em> grounded on a sample, with citation coverage, the "not found" rate and follow-up questions as signals (<a href="d2-skill-2-4.html">skill 2.4</a>).</li>
+					<li><strong>Multidimensional by default:</strong> Anthropic&rsquo;s define-success guidance expects most use cases to need several criteria, such as task fidelity, tone, privacy, latency and price.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sampling ===== -->
+			<h2 id="s2">Sampling live traffic for grading</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3</span><span class="skill-text">Representative, small enough to grade, allowed to keep.</span></p>
+				<ul>
+					<li><strong>Stratify:</strong> a fixed number per segment (rentals, sales, commercial) so the small segments are graded at all; random sampling of a skewed mix gives the big segment almost every slot.</li>
+					<li><strong>Respect what you may keep:</strong> sample only conversations whose content you&rsquo;re permitted to retain and grade (consent, contract terms). Full-content tracing makes it possible to build evals from real traffic, but the stored content falls under your observability platform&rsquo;s retention (<a href="d3-skill-3-1.html">skill 3.1</a>).</li>
+					<li><strong>Grade promptly and steadily:</strong> a daily sample per segment gives a time series that can show drift (<a href="d3-skill-3-2.html">skill 3.2</a>).</li>
+					<li><strong>Feed the offline suite:</strong> graded live failures become regression and capability tasks, keeping the offline suite close to real traffic.</li>
+				</ul>
+			</div>
+
+			<!-- ===== AB ===== -->
+			<h2 id="s3">A/B testing</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3</span><span class="skill-text">Tell a real gain from noise.</span></p>
+				<ul>
+					<li><strong>Randomise by user,</strong> not by request, so one person doesn&rsquo;t see both versions and their many requests aren&rsquo;t counted as independent. Anthropic&rsquo;s statistics guidance makes the same point for evals: cluster related cases.</li>
+					<li><strong>Report the difference with an interval:</strong> a 2.5-point gain in completed bookings on 10,000 users per arm has an interval clear of zero; 1.5 points on 1,000 users per arm doesn&rsquo;t, which means "can&rsquo;t tell", not "no effect".</li>
+					<li><strong>Size the test in advance:</strong> detecting a 2-point change from a 41% base needs about 9,500 users per arm at the usual 95% confidence and 80% power. Low-traffic features need longer tests or bigger changes.</li>
+					<li><strong>Fix the metric and duration first,</strong> and don&rsquo;t stop the moment the result looks good; checking repeatedly and stopping early overstates effects.</li>
+					<li><strong>Watch guard metrics:</strong> a version that books more viewings but doubles cost per booking or handoffs to staff may not be better.</li>
+					<li><strong>Change one thing:</strong> model, prompt or tool in one arm, everything else identical, so the result has one cause.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Feedback ===== -->
+			<h2 id="s4">Feedback loops</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 5.3</span><span class="skill-text">Useful, sparse and biased.</span></p>
+				<ul>
+					<li><strong>Explicit feedback</strong> (thumbs, ratings) covers a small share of sessions, here 2%, and skews toward complaints. Report coverage next to the ratio, and treat a change in who responds as a possible cause of a change in the ratio.</li>
+					<li><strong>Implicit signals</strong> are often better labels: agents correcting extracted fields, editing generated text, users rephrasing a question, a booking cancelled within an hour, escalation to staff.</li>
+					<li><strong>Close the loop:</strong> route negative feedback and implicit failures into review queues; reviewed cases become labelled data for the judge and tasks for the offline suite.</li>
+					<li><strong>Business metrics lag and confound:</strong> enquiries per listing respond to market conditions as well as descriptions. Use them for direction over months, not to judge a week-long test.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Thumbs-up rate rose after the change, so quality improved"</strong> ignores who gives feedback, how few do, and whether the feature&rsquo;s actual outcome moved. Measure the outcome the task exists for (field accuracy, edit rate, attended viewings, grounded answers), and compare arms with an interval.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Pick the metric by task type: field accuracy for extraction, calibrated rubric scores and edit rates for generation, system-of-record outcomes for agents, correct-and-grounded answers for retrieval.</li>
+				<li>Sample live traffic by segment, within what you may retain, and grade steadily; feed failures back into the offline suite.</li>
+				<li>Randomise A/B tests by user, size them in advance, report differences with intervals, and watch guard metrics.</li>
+				<li>Treat explicit feedback as sparse and skewed; prefer implicit signals and route both into review.</li>
+				<li>Business metrics give direction over time; they make poor short-test verdicts.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-2.html"><small>Previous</small>5.2: LLM-as-Judge Engineering</a>
+				<a class="next" href="d6-skill-6-1.html"><small>Next</small>6.1: Cost Architecture at Scale</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the site, files and code are original.</div>
+</footer>
+
+</body>
+</html>

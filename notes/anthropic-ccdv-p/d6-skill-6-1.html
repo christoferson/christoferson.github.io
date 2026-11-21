@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>6.1: Cost Architecture at Scale | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 6.1: fleet-level cost architecture for Claude workloads: cost modelling and forecasting from token profiles, routing and cascades across Opus, Sonnet and Haiku, caching strategy and diagnostics, batch versus realtime economics, and per-tenant budget enforcement, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d6">Domain 6</a><span class="sep">/</span><span class="here">6.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 6 &middot; Cost and Latency Optimization at Scale &middot; 8%</span>
+		<h1>6.1: Cost Architecture at Scale</h1>
+		<p>With many routes, models and tenants, cost is an architecture question: which model handles which request, how much of each prompt is read from cache, which work waits for a batch, and what happens when one customer spends their budget early. This page models the fleet and the controls.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Cost modelling</span><span class="tag">Cascades</span><span class="tag">Caching</span><span class="tag">Budgets</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">A cost model from token profiles</a></li>
+				<li><a href="#s2">Routing and cascades across the model family</a></li>
+				<li><a href="#s3">Caching strategy and diagnostics</a></li>
+				<li><a href="#s4">Batch versus realtime</a></li>
+				<li><a href="#s5">Per-tenant budget enforcement</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 6.1</span>
+				<p><strong>Cost Architecture at Scale</strong>: "Evaluating fleet-level optimization strategies using usage and cost data, including cost modeling and forecasting, model routing and cascades across the Claude model family, caching strategy and cache diagnostics, batch-versus-realtime economics, and per-tenant budget enforcement."</p>
+			</div>
+			<p>Exam items give usage and cost data for several routes and tenants and ask which strategy brings spend down, or what a forecast or cascade will really cost. Finding the hot spot in one system&rsquo;s telemetry is <a href="../anthropic-ccar-p/d4-skill-4-6.html">CCAR-P 4.6</a>; caching mechanics are in <a href="../anthropic-ccar-p/d2-skill-2-5.html">CCAR-P 2.5</a>.</p>
+			<p>Sources: the pricing page and Anthropic&rsquo;s optimizing-for-cost-and-intelligence guidance, with the batch processing and Usage and Cost Analytics pages used earlier, paraphrased. Route profiles, the cascade arithmetic and budget thresholds are my own; the platform, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A localisation platform translates software for 300 customer companies: short UI strings on Haiku 5.5, marketing copy on Sonnet 5.5, and a backlog of documentation re-translations. Spend is about $15,000 a month and growing 10% a month.</p></div>
+
+			<!-- ===== Model ===== -->
+			<h2 id="s1">A cost model from token profiles</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Price each route from its own token mix.</span></p>
+				<div class="code"><span class="file">cost_model.py (cost_model.py)</span>
+<pre><code>"""Fleet cost model for a localisation platform: forecast, cascade routing and per-tenant budgets.
+Prices are $/MTok from the pricing page (input, 5-minute cache write, cache read, output)."""
+
+PRICE = {"opus":   (4.00, 5.00, 0.20, 20.00),
+         "sonnet": (2.00, 2.50, 0.10, 10.00),
+         "haiku":  (0.10, 0.125, 0.01, 0.50)}           <span class="c"># Haiku 5.5, prompts up to 100k tokens</span>
+
+
+def request_cost(model, uncached, write, read, out, batch=False) -&gt; float:
+    p_in, p_w, p_r, p_out = PRICE[model]
+    usd = (uncached * p_in + write * p_w + read * p_r + out * p_out) / 1e6
+    return usd / 2 if batch else usd                     <span class="c"># Batch API: half price on every token</span>
+
+
+def monthly_forecast(routes: list[dict], growth=0.0) -&gt; dict:
+    """Cost per route per month from volume and token profile; growth is month-on-month."""
+    out = {}
+    for r in routes:
+        per = request_cost(r["model"], r["uncached"], r["write"], r["read"], r["out"], r.get("batch", False))
+        out[r["name"]] = round(per * r["requests_per_month"] * (1 + growth), 2)
+    out["total"] = round(sum(out.values()), 2)
+    return out
+
+
+def cascade_cost(first: str, second: str, escalate_share: float, tokens: tuple) -&gt; float:
+    """Try the cheap model; escalate a share of requests (both calls are paid for those)."""
+    c1, c2 = request_cost(first, *tokens), request_cost(second, *tokens)
+    return c1 + escalate_share * c2
+
+
+def enforce(tenant: dict) -&gt; str:
+    """Per-tenant monthly budget, enforced in your gateway (workspace spend limits are coarser)."""
+    used = tenant["spent"] / tenant["budget"]
+    if used &gt;= 1.0:
+        return "block new realtime work; queue to batch for next cycle; notify the account owner"
+    if used &gt;= 0.9:
+        return "degrade: route this tenant to the cheaper model and move bulk jobs to batch"
+    if used &gt;= 0.8:
+        return "alert the tenant and the account team"
+    return "ok"</code></pre></div>
+				<ul>
+					<li><strong>Per request:</strong> uncached input, cache writes, cache reads and output, each at its own price. For Sonnet 5.5 that&rsquo;s $2, $2.50 (5-minute write), $0.10 and $10 per million tokens; output is usually the largest share.</li>
+					<li><strong>Per route per month:</strong> per-request cost times volume. The example gives $880 for 5 million UI strings on Haiku, $7,920 for 400,000 marketing requests on Sonnet and $5,940 for 600,000 backlog requests in batches: $14,740.</li>
+					<li><strong>Forecast:</strong> volume growth per route, plus planned changes (a new model, a cache fix, moving a route to batch), each as its own scenario. Reconcile monthly against the Usage and Cost Analytics API, grouped by workspace, key and model.</li>
+					<li><strong>Price the tail:</strong> Anthropic advises pricing the long, expensive requests separately; a few long documents can outweigh thousands of short strings.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Routing ===== -->
+			<h2 id="s2">Routing and cascades across the model family</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">The cheapest model that meets the quality floor, per request.</span></p>
+				<ul>
+					<li><strong>Static routing:</strong> each route gets a tier from evaluations on its own traffic: Haiku 5.5 for UI strings, Sonnet 5.5 for marketing copy, Opus 5.5 for legal text where errors are costly.</li>
+					<li><strong>Cascades:</strong> try the cheaper model, check the result (a validator, a confidence rule, a judge), and escalate the rest. Both calls are paid for escalated requests. At 15% escalation, Haiku then Sonnet costs about a fifth of Sonnet alone; at 100% it costs more than Sonnet alone.</li>
+					<li><strong>The check decides the economics:</strong> a cheap, reliable check (glossary terms present, placeholders intact, length within limits) makes a cascade work. If the only check is another expensive model call, the saving shrinks.</li>
+					<li><strong>Anthropic&rsquo;s order:</strong> caching, token hygiene, batching and a prompt audit come before model changes, and tuning one model before adding a second.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Caching ===== -->
+			<h2 id="s3">Caching strategy and diagnostics</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Usually the largest lever.</span></p>
+				<ul>
+					<li><strong>What to cache:</strong> per-customer glossaries, style guides and translation memory that repeat across requests, in a stable prefix ahead of the per-string content.</li>
+					<li><strong>Prices:</strong> reads are 0.05x input on Opus and Sonnet 5.5 (0.1x on Haiku 5.5); writes cost 1.25x for 5 minutes or 2x for 1 hour. Bursty customers suit the 5-minute TTL; customers who send work every 20 minutes need the 1-hour TTL, or every request rewrites the cache.</li>
+					<li><strong>Diagnostics:</strong> cache read share per route and per tenant. Anthropic&rsquo;s agent-loop median is 84%; well below 80% means something breaks the prefix (a timestamp, a reordered glossary, a changed tool list) or entries expire between calls.</li>
+					<li><strong>Multi-tenant caches:</strong> each customer&rsquo;s prefix is its own cache entry, so many small customers get little reuse. Put shared content (instructions, the general style guide) before per-customer content so it&rsquo;s reused across all of them.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Batch ===== -->
+			<h2 id="s4">Batch versus realtime</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Half price for work that can wait.</span></p>
+				<ul>
+					<li><strong>The discount:</strong> 50% on every token, including cached ones, with most batches finishing within an hour and a 24-hour limit. Anthropic calls batching the second-largest free lever after caching for unattended work.</li>
+					<li><strong>Candidates:</strong> the documentation backlog, nightly re-translation after glossary updates, evaluation runs. Interactive editor suggestions stay realtime.</li>
+					<li><strong>Costs of batching:</strong> latency, a pipeline to submit and collect, best-effort caching, no streaming or fast mode, and not ZDR eligible. For small volumes the engineering can cost more than the saving.</li>
+					<li><strong>Capacity bonus:</strong> batches have their own limits, so moving bulk work frees realtime capacity (<a href="d2-skill-2-2.html">skill 2.2</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Budgets ===== -->
+			<h2 id="s5">Per-tenant budget enforcement</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.1</span><span class="skill-text">Graduated controls in your own gateway (my thresholds).</span></p>
+				<ul>
+					<li><strong>Attribute first:</strong> tag every request with the tenant, or give large tenants their own workspace and key, so spend can be grouped per tenant in the Usage and Cost API.</li>
+					<li><strong>80%:</strong> alert the customer and the account team.</li>
+					<li><strong>90%:</strong> degrade gracefully: the cheaper model for that tenant&rsquo;s routes, bulk work moved to batch.</li>
+					<li><strong>100%:</strong> stop new realtime work, queue the rest for the next cycle, tell the account owner.</li>
+					<li><strong>Organisation-level backstops:</strong> workspace spend limits in the Console (batches can slightly exceed them) and the tier&rsquo;s monthly cap. Neither knows your tenants, so they protect the company, not individual customers.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Move every route to Haiku to cut cost"</strong> skips the cheaper levers and breaks the quality floor on routes that need a stronger model. <strong>"Add a Haiku-first cascade everywhere"</strong> can raise cost where most requests escalate. Model the routes, fix caching and batch eligibility first, and cascade only where a cheap check makes escalation rare.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Model cost per route from its token profile (uncached, writes, reads, output) and volume; forecast by scenario and reconcile with the Usage and Cost API.</li>
+				<li>Route by evaluated quality floor; cascades save money only when a cheap check keeps escalation rare, since escalated requests pay twice.</li>
+				<li>Cache shared content first, choose TTLs from call gaps, and investigate any route reading well under about 80% from cache.</li>
+				<li>Batch unattended work for half price and its own capacity, accepting latency and pipeline cost.</li>
+				<li>Enforce per-tenant budgets in your gateway with alert, degrade and stop steps; workspace limits and the tier cap are backstops.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d5-skill-5-3.html"><small>Previous</small>5.3: Online Quality Measurement</a>
+				<a class="next" href="index.html#d6"><small>Next</small>Domain 6</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the platform, files and code are original.</div>
+</footer>
+
+</body>
+</html>
