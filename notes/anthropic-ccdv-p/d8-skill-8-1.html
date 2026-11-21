@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>8.1: Parallel Agent Orchestration for Engineering Work | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 8.1: fanning a large engineering task out to parallel Claude Code agents: isolated git worktrees, decomposition into disjoint file sets, merge order and conflict strategy, and diagnosing fleet-level failure modes such as shared-file conflicts, environment failures and long tails from fleet telemetry, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d8">Domain 8</a><span class="sep">/</span><span class="here">8.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 8 &middot; Agent Fleet Operations for Software Delivery &middot; 10%</span>
+		<h1>8.1: Parallel Agent Orchestration for Engineering Work</h1>
+		<p>A migration across a hundred packages can run as a hundred agents at once, or turn into a hundred conflicting branches. The difference is in the isolation, the way the work is cut up, the order changes come back in, and reading the fleet&rsquo;s results as a whole.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Worktrees</span><span class="tag">Fan-out</span><span class="tag">Merge strategy</span><span class="tag">Fleet telemetry</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Isolation with worktrees</a></li>
+				<li><a href="#s2">Decomposing the task</a></li>
+				<li><a href="#s3">Merge and conflict strategy</a></li>
+				<li><a href="#s4">Fleet-level failure modes</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 8.1</span>
+				<p><strong>Parallel Agent Orchestration for Engineering Work</strong>: "Evaluating parallel fan-out patterns for large engineering tasks, including parallel agents on isolated worktrees, task decomposition, and merge and conflict strategy, and diagnosing fleet-level failure modes from fleet telemetry."</p>
+			</div>
+			<p>Exam items describe a fan-out of coding agents and its results (conflicts, failing tests, a few runs that never finish) and ask what to change in the plan. Orchestration patterns in general are <a href="d1-skill-1-1.html">skill 1.1</a>; reviewing what the fleet produces is <a href="d8-skill-8-2.html">skill 8.2</a>.</p>
+			<p>Sources: the Claude Code worktrees page (read on 21 November 2026) and the subagents and agent teams pages used for skill 1.1, paraphrased. The decomposition rules and diagnosis thresholds are my own; the company, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A payments company is moving a TypeScript monorepo of about 80 packages from its old HTTP client to a new one. One package depends on another, a lockfile and a shared HTTP wrapper are touched by almost everything, and the team wants it done in a day.</p></div>
+
+			<!-- ===== Worktrees ===== -->
+			<h2 id="s1">Isolation with worktrees</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Each agent gets its own files and branch.</span></p>
+				<div class="code"><span class="file">migrator.md (.claude/agents/http-migrator.md)</span>
+<pre><code>---
+name: http-migrator
+description: Migrates one package from the old HTTP client to the new one. Use for each task in the migration plan.
+isolation: worktree
+tools: Read, Edit, Grep, Glob, Bash(npm test *), Bash(git add *), Bash(git commit *)
+---
+
+You get one package and an exact file list. Change only those files. Replace calls to the old
+client with the new one following MIGRATION.md, run that package's tests, and commit on your
+branch. If a change needs a file outside your list, stop and report it instead of editing it.</code></pre></div>
+				<ul>
+					<li><strong>What a worktree is:</strong> a separate working directory on its own branch, sharing the repository&rsquo;s history and remote. <code>claude --worktree &lt;name&gt;</code> creates one under <code>.claude/worktrees/</code>; subagents get one each with <code>isolation: worktree</code> in their definition.</li>
+					<li><strong>Isolation is enforced:</strong> an isolated session can&rsquo;t edit files in the main checkout, run commands there, or redirect git into it. The checks read paths and command text, so a <code>cp</code> or shell redirect into the main checkout is left to permissions and the sandbox.</li>
+					<li><strong>A fresh checkout needs setup:</strong> dependencies are installed per worktree, and gitignored files such as <code>.env</code> are copied only if listed in <code>.worktreeinclude</code>. Missing setup is the usual cause of tests failing in every worktree at once.</li>
+					<li><strong>Base branch:</strong> by default worktrees branch from the remote default branch; <code>worktree.baseRef: "head"</code> branches from your current work instead.</li>
+					<li><strong>Shared things:</strong> the <code>.git</code> directory, project-scope plugins and permission approvals (saved to the main checkout&rsquo;s local settings) are shared across worktrees.</li>
+					<li><strong>Cleanup:</strong> subagent worktrees without changes are removed when the agent finishes; ones with changes stay until a periodic sweep. Headless runs don&rsquo;t clean up their worktrees, so the pipeline must.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Decompose ===== -->
+			<h2 id="s2">Decomposing the task</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Disjoint file sets, right-sized tasks (my method).</span></p>
+				<div class="code"><span class="file">fanout.py (fanout.py)</span>
+<pre><code>"""Fan out a monorepo migration (old HTTP client -&gt; new one across many packages) to parallel
+agents in isolated worktrees, then diagnose the fleet from its run records (my method)."""
+from collections import Counter
+
+SHARED = {"package-lock.json", "tsconfig.base.json", "packages/common/http/index.ts"}   <span class="c"># one owner, done last</span>
+
+
+def plan(packages: dict[str, set], depends_on: dict[str, set], max_files=40) -&gt; dict:
+    """Disjoint file sets per agent; shared files held back; merge order follows dependencies."""
+    tasks, held = [], set()
+    for pkg, files in packages.items():
+        own = files - SHARED
+        held |= files &amp; SHARED
+        for i in range(0, len(sorted(own)), max_files):          <span class="c"># split oversized packages</span>
+            tasks.append({"id": f"{pkg}#{i // max_files}", "package": pkg, "files": set(sorted(own)[i:i + max_files])})
+    order, done = [], set()
+    while len(done) &lt; len(packages):                             <span class="c"># dependencies merge first</span>
+        ready = sorted(p for p in packages if p not in done and depends_on.get(p, set()) &lt;= done)
+        if not ready:
+            raise ValueError("dependency cycle")
+        order += ready
+        done |= set(ready)
+    return {"tasks": tasks, "serial_last": sorted(held), "merge_order": order}
+
+
+def overlaps(tasks: list[dict]) -&gt; list[tuple]:
+    seen, out = {}, []
+    for t in tasks:
+        for f in t["files"]:
+            if f in seen:
+                out.append((seen[f], t["id"], f))
+            seen[f] = t["id"]
+    return out
+
+
+def diagnose(runs: list[dict]) -&gt; list[str]:
+    """Patterns visible only across the fleet."""
+    findings = []
+    n = len(runs)
+    conflict_files = Counter(f for r in runs for f in r["conflicts"])
+    for f, k in conflict_files.items():
+        if k &gt;= 3:
+            findings.append(f"{k} agents conflicted on {f}: give it one owner or move it to the serial step")
+    failing = Counter(r["failed_suite"] for r in runs if r["failed_suite"])
+    for suite, k in failing.items():
+        if k / n &gt;= 0.2:
+            findings.append(f"{suite} failed in {k}/{n} worktrees: likely environment (missing .env or setup), not the code")
+    out_of_scope = [r["id"] for r in runs if r["edited_outside_scope"]]
+    if out_of_scope:
+        findings.append(f"edits outside assigned files: {', '.join(out_of_scope)}: tighten the brief or the hook")
+    med = sorted(r["minutes"] for r in runs)[n // 2]
+    slow = [r["id"] for r in runs if r["minutes"] &gt; 3 * med]
+    if slow:
+        findings.append(f"long tail ({', '.join(slow)}): split those tasks further")
+    return findings</code></pre></div>
+				<ul>
+					<li><strong>One owner per file:</strong> each task gets an exact file list, and no two lists overlap (<code>overlaps()</code> checks). Two agents editing the same file is the agent-teams documentation&rsquo;s first warning too.</li>
+					<li><strong>Hold back shared files:</strong> the lockfile, the base TypeScript config and the shared HTTP wrapper go to one serial step at the end, after the packages that use them.</li>
+					<li><strong>Right-size tasks:</strong> split packages over 40 files, so no single agent becomes the long tail; small tasks, though, cost more in coordination than they save.</li>
+					<li><strong>Brief precisely:</strong> the package, the files, the migration guide and the test command; tell the agent to stop and report if it needs a file outside its list.</li>
+					<li><strong>Bound the fleet:</strong> concurrency and budget caps (20 subagents at once by default), and for runs coordinating hundreds of agents, a scripted workflow rather than turn-by-turn delegation.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Merge ===== -->
+			<h2 id="s3">Merge and conflict strategy</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">How changes come back together.</span></p>
+				<ul>
+					<li><strong>Merge in dependency order:</strong> <code>plan()</code> orders packages so dependencies land first; a package that uses <code>common</code> is rebased on the migrated <code>common</code> before it merges.</li>
+					<li><strong>One branch per task,</strong> each with its own pull request and green tests, rather than one giant branch that can only succeed or fail as a whole.</li>
+					<li><strong>Rebase, don&rsquo;t hand-merge:</strong> when a task conflicts, rebase it on the latest main and rerun its tests; a recurring conflict on the same file is a planning error, not a merge problem.</li>
+					<li><strong>Serial step last:</strong> regenerate the lockfile and update shared files once, after the packages, then run the full test suite.</li>
+					<li><strong>Batch tooling:</strong> Claude Code&rsquo;s <code>/batch</code> runs subagents that each publish their change; the same principles apply to how its tasks are cut.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Fleet ===== -->
+			<h2 id="s4">Fleet-level failure modes</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 8.1</span><span class="skill-text">Patterns no single run reveals.</span></p>
+				<ul>
+					<li><strong>Record per run:</strong> task ID, status, minutes, tokens and cost, tests passed, files touched (in and out of scope), conflicts, retries. <code>diagnose()</code> reads them together.</li>
+					<li><strong>Many conflicts on one file:</strong> four agents conflicted on the shared HTTP wrapper, so it belongs in the serial step with one owner.</li>
+					<li><strong>The same suite failing everywhere:</strong> integration tests failed in a quarter of worktrees, which points at the environment (a missing <code>.env</code> or setup step), not the code changes.</li>
+					<li><strong>Edits outside scope:</strong> an agent changed a file it wasn&rsquo;t given; tighten the brief, or add a hook that denies edits outside the task&rsquo;s list.</li>
+					<li><strong>Long tail:</strong> one run took five times the median; split that task, or check whether it was stuck in a retry loop.</li>
+					<li><strong>Cost per merged change:</strong> the fleet&rsquo;s spend divided by tasks that actually merged, which falls as decomposition improves.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add more agents to finish faster"</strong> without changing the plan multiplies the conflicts on shared files and the environment failures. Fix the decomposition and the worktree setup first; then parallelism speeds things up.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Isolate each agent in a git worktree (<code>--worktree</code> or <code>isolation: worktree</code>), set up its environment with <code>.worktreeinclude</code> and installs, and clean up headless runs.</li>
+				<li>Give each task a disjoint file list, hold shared files for a final serial step, and right-size tasks to avoid a long tail.</li>
+				<li>Merge in dependency order, one branch and pull request per task, rebasing conflicted tasks and rerunning tests.</li>
+				<li>Diagnose the fleet: repeated conflicts mean a planning error, suite failures everywhere mean environment, out-of-scope edits mean a loose brief.</li>
+				<li>Bound concurrency and spend, and track cost per merged change.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-3.html"><small>Previous</small>7.3: Identity, Secrets, and Audit at Scale</a>
+				<a class="next" href="d8-skill-8-2.html"><small>Next</small>8.2: Verification and AI Code Review Operations</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the company, files and code are original.</div>
+</footer>
+
+</body>
+</html>

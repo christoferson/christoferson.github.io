@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.3: Identity, Secrets, and Audit at Scale | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 7.3: enterprise identity for Claude deployments: service accounts per agent, Workload Identity Federation replacing static API keys, federation rule review, secrets handling, least-privilege tool permissions acting on behalf of the user, and tamper-evident audit logs of security-relevant agent actions, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.3</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Runtime Guardrails and Production Security &middot; 11%</span>
+		<h1>7.3: Identity, Secrets, and Audit at Scale</h1>
+		<p>At scale, "the agent did it" isn&rsquo;t an answer. Each workload needs its own identity, credentials that expire on their own, tool access that follows the person being served, and a record of every consequential action that can&rsquo;t be quietly edited afterwards.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Workload identity</span><span class="tag">Service accounts</span><span class="tag">Secrets</span><span class="tag">Audit</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Agent identity: service accounts</a></li>
+				<li><a href="#s2">Workload Identity Federation instead of static keys</a></li>
+				<li><a href="#s3">Reviewing federation rules and secrets</a></li>
+				<li><a href="#s4">Least-privilege tool permissions</a></li>
+				<li><a href="#s5">Audit logging of agent actions</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.3</span>
+				<p><strong>Identity, Secrets, and Audit at Scale</strong>: "Applying enterprise identity and secrets practice to production Claude deployments, including agent identity, workload identity federation replacing static API keys, credential and secrets management, least-privilege tool permissioning, and audit logging of security-relevant agent actions."</p>
+			</div>
+			<p>Exam items describe how agents authenticate and what they log, then ask which change removes a credential risk or makes an action attributable. Key handling at Foundations level is <a href="../anthropic-ccdv-f/d7-skill-7-3.html">CCDV-F 7.3</a>; credential exposure and privilege escalation at architecture level are <a href="../anthropic-ccar-p/d3-skill-3-2.html">CCAR-P 3.2</a>.</p>
+			<p>Sources: the Workload Identity Federation page (read on 21 November 2026), and the authentication, Admin API, MCP security and Agent SDK observability pages used earlier, paraphrased. The rule checks and the audit record design are my own; the carrier, files and code are original, and the code is tested without network calls.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A parcel carrier runs an intake agent that reads damage claims, a payout agent that proposes compensation, and nightly evaluation jobs in CI. Today all three share one API key stored in CI secrets and container environments.</p></div>
+
+			<!-- ===== Identity ===== -->
+			<h2 id="s1">Agent identity: service accounts</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">One non-human identity per workload.</span></p>
+				<ul>
+					<li><strong>Service accounts</strong> (<code>svac_...</code>) are named, non-human identities in the organisation: no email, password or Console login. They act in a workspace once added as members, and every one is implicitly in the default workspace.</li>
+					<li><strong>Why it matters:</strong> in the documentation&rsquo;s words, a workspace API key <em>is</em> a credential, whereas a service account <em>has</em> credentials. Usage and rate limits are attributed per workspace, and you can see which workload acted as which account.</li>
+					<li><strong>One per workload and environment:</strong> intake, payout and evaluation each get their own; production and staging never share one. A shared key makes a leak impossible to scope and an action impossible to attribute.</li>
+					<li><strong>Agent identity isn&rsquo;t user identity:</strong> the service account says which agent called Claude; the person being served is a separate identity carried into tools (<a href="#s4">below</a>).</li>
+				</ul>
+			</div>
+
+			<!-- ===== WIF ===== -->
+			<h2 id="s2">Workload Identity Federation instead of static keys</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">Tokens that expire in minutes, minted from an identity you already have.</span></p>
+				<div class="code"><span class="file">identity.py (identity.py)</span>
+<pre><code>"""Identity, secrets and audit for a parcel carrier's damage-claims agents (Claude API + MCP tools)."""
+import hashlib
+import json
+import os
+from anthropic import Anthropic, IdentityTokenFile, WorkloadIdentityCredentials
+
+
+def client_for(workload: str) -&gt; Anthropic:
+    """Each workload federates as its own service account: no static key to store, rotate or leak."""
+    cfg = WORKLOADS[workload]
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError("ANTHROPIC_API_KEY is set and would silently win over federation; remove it")
+    return Anthropic(credentials=WorkloadIdentityCredentials(
+        identity_token_provider=IdentityTokenFile(cfg["token_file"]),   <span class="c"># projected token, rotated by the platform</span>
+        federation_rule_id=cfg["rule"], organization_id=ORG, service_account_id=cfg["svac"],
+        workspace_id=cfg["workspace"]))
+
+
+ORG = "00000000-0000-0000-0000-000000000000"
+WORKLOADS = {
+    "intake-agent": {"svac": "svac_intake", "rule": "fdrl_intake", "workspace": "wrkspc_prod",
+                     "token_file": "/var/run/secrets/anthropic.com/token"},
+    "eval-ci":      {"svac": "svac_evalci", "rule": "fdrl_evalci", "workspace": "wrkspc_staging",
+                     "token_file": "/var/run/secrets/anthropic.com/token"},
+}
+
+
+def review_rules(rules: list[dict]) -&gt; list[str]:
+    """Federation rules: narrow match, minimal scope, short tokens, one service account per workload."""
+    issues, seen = [], {}
+    for r in rules:
+        sub = r.get("subject_prefix", "")
+        if not sub or (sub.endswith("*") and not (r.get("claims") or r.get("condition"))):
+            issues.append(f"{r['id']}: subject match '{sub}' admits too many workloads; narrow it or add claims")
+        if r.get("scope", "workspace:developer") != "workspace:developer":
+            issues.append(f"{r['id']}: scope {r['scope']} is broader than model calls need")
+        if r.get("token_lifetime_seconds", 3600) &gt; 3600:
+            issues.append(f"{r['id']}: tokens live {r['token_lifetime_seconds']} s; keep to an hour or less")
+        if r["service_account"] in seen and seen[r["service_account"]] != r["env"]:
+            issues.append(f"{r['service_account']}: shared by {seen[r['service_account']]} and {r['env']}")
+        seen.setdefault(r["service_account"], r["env"])
+    return issues
+
+
+def audit_event(prev_hash: str, actor: dict, tool: str, args: dict, decision: str, outcome: str) -&gt; dict:
+    """Append-only record of a security-relevant action, chained so edits or gaps are detectable."""
+    body = {"end_user": actor["user"], "agent": actor["agent"], "service_account": actor["svac"],
+            "tool": tool, "args_sha256": hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest(),
+            "decision": decision, "approver": actor.get("approver"), "outcome": outcome,
+            "trace_id": actor["trace_id"], "prev": prev_hash}
+    body["hash"] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    return body
+
+
+def verify_chain(events: list[dict]) -&gt; bool:
+    prev = "genesis"
+    for e in events:
+        body = {k: v for k, v in e.items() if k != "hash"}
+        if e["prev"] != prev or hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() != e["hash"]:
+            return False
+        prev = e["hash"]
+    return True</code></pre></div>
+				<ul>
+					<li><strong>How it works:</strong> the workload&rsquo;s platform (AWS, Google Cloud, Entra ID, GitHub Actions, Kubernetes, SPIFFE, Okta) issues a signed JWT; the SDK exchanges it at <code>POST /v1/oauth/token</code> for a short-lived token acting as the service account, and refreshes it before expiry.</li>
+					<li><strong>Three resources:</strong> a federation issuer (which identity provider to trust), a service account, and a federation rule (<code>fdrl_...</code>) saying which JWT claims may act as which account, with what scope and token lifetime (default one hour; 60 seconds to 24 hours).</li>
+					<li><strong>Same image everywhere:</strong> inject the rule, organisation, service account, workspace and token-file variables per environment, and construct the client with no key.</li>
+					<li><strong>The migration trap:</strong> <code>ANTHROPIC_API_KEY</code> sits above federation in the SDK&rsquo;s credential order, so a leftover key silently wins. <code>client_for()</code> refuses to start if one is set; the documentation&rsquo;s steps are to configure federation, confirm which credential wins, unset the key everywhere, then delete it.</li>
+					<li><strong>Only as strong as the identity provider:</strong> pair it with the provider&rsquo;s own controls (workload binding, conditional access, audit logs).</li>
+				</ul>
+			</div>
+
+			<!-- ===== Rules ===== -->
+			<h2 id="s3">Reviewing federation rules and secrets</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">The rule is the new secret: review it like one.</span></p>
+				<ul>
+					<li><strong>Narrow matches:</strong> an exact subject such as a specific Kubernetes service account, not a trailing wildcard covering a whole organisation&rsquo;s repositories, unless claims or a condition narrow it further. <code>review_rules()</code> flags <code>repo:acme/*</code> on its own.</li>
+					<li><strong>Minimal scope:</strong> <code>workspace:developer</code> covers model calls; broader scopes are for specific products.</li>
+					<li><strong>Short lifetimes:</strong> the Console wizard suggests 600 seconds; a 24-hour token is close to a static key. The minted token also never outlives twice the remaining life of the identity token it came from.</li>
+					<li><strong>Replay protection:</strong> identity tokens with a <code>jti</code> are single-use by default; reuse fails as <code>jti_reused</code> on the authentication history page.</li>
+					<li><strong>Where static keys remain</strong> (a vendor tool that can&rsquo;t federate): a service account key, not a personal one, in a secrets manager, with an expiry set at creation, IP allowlisting and usage monitored by <code>api_key_id</code>. Admin keys are for organisation management, never for model calls.</li>
+					<li><strong>Tool credentials:</strong> keep the database and payment credentials out of the agent&rsquo;s context and sandbox entirely; inject them in the MCP server or an egress proxy.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Least privilege ===== -->
+			<h2 id="s4">Least-privilege tool permissions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">Tools act for the person, within the agent&rsquo;s role.</span></p>
+				<ul>
+					<li><strong>On behalf of the user:</strong> the claims server authorises each call against the verified identity of the customer or officer in the session, not the agent&rsquo;s blanket access. An MCP server must reject tokens not issued for it and must not pass tokens downstream.</li>
+					<li><strong>Per-agent tool sets:</strong> the intake agent reads claims and attaches photos; only the payout agent can propose a payout, and approving it needs an officer (<a href="d7-skill-7-1.html">skill 7.1</a>).</li>
+					<li><strong>Scopes that start small:</strong> request the minimum and step up for specific actions, rather than wildcard scopes such as <code>claims:*</code>.</li>
+					<li><strong>Review on change:</strong> a new tool, server or scope is a permission change and goes through review like code.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Audit ===== -->
+			<h2 id="s5">Audit logging of agent actions</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.3</span><span class="skill-text">Who, through which agent, did what, approved by whom.</span></p>
+				<ul>
+					<li><strong>What to record</strong> for every security-relevant action: the end user, the agent and its service account, the tool, a hash of the arguments, the permission decision (allow, deny, ask) and approver, the outcome, and the trace ID that links to the full trace.</li>
+					<li><strong>Tamper evidence</strong> (my design): each record carries the hash of the previous one, so <code>verify_chain()</code> detects an edited or deleted entry. Store the log append-only, outside the agent&rsquo;s reach.</li>
+					<li><strong>Feed the SIEM:</strong> the Agent SDK&rsquo;s security events (<code>tool_decision</code>, <code>tool_result</code>, <code>mcp_server_connection</code>, <code>permission_mode_changed</code>) and the WIF authentication history, with end-user and tenant attributes.</li>
+					<li><strong>Hash, don&rsquo;t copy:</strong> argument hashes and IDs prove what happened without duplicating claimants&rsquo; personal data into the log.</li>
+					<li><strong>Review it:</strong> alerts on denied actions, unusual approvals and identity anomalies, and a periodic access review of service accounts and rules.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Rotate the shared API key every 30 days"</strong> shortens a leak&rsquo;s life but keeps a long-lived secret in CI, shared by three workloads, with every action attributed to the same key. Federation gives each workload its own short-lived identity and removes the secret; rotation is for the few keys that can&rsquo;t be replaced.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Give each workload and environment its own service account; agent identity and the served user&rsquo;s identity are separate.</li>
+				<li>Replace static keys with Workload Identity Federation, and remove leftover <code>ANTHROPIC_API_KEY</code> values, which override it silently.</li>
+				<li>Review federation rules: exact subjects or extra claims, minimal scope, short token lifetimes, no sharing across environments.</li>
+				<li>Authorise tool calls on behalf of the verified user, with per-agent tool sets and small scopes; keep tool credentials out of the agent&rsquo;s reach.</li>
+				<li>Log every security-relevant action with user, agent, tool, decision, approver and trace ID, in a tamper-evident, append-only store fed to the SIEM.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-2.html"><small>Previous</small>7.2: Threat Defense and Adversarial Testing for Agentic Systems</a>
+				<a class="next" href="d8-skill-8-1.html"><small>Next</small>8.1: Parallel Agent Orchestration for Engineering Work</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the carrier, files and code are original.</div>
+</footer>
+
+</body>
+</html>
