@@ -60,13 +60,15 @@
 			<p>On this page</p>
 			<ol>
 				<li><a href="#overview">Overview</a></li>
-				<li><a href="#s1">What Anthropic learned in production</a></li>
-				<li><a href="#s2">Where task boundaries fail</a></li>
-				<li><a href="#s3">Where control flow fails</a></li>
-				<li><a href="#s4">Where synthesis fails</a></li>
-				<li><a href="#s5">A decomposition built for both requirements</a></li>
-				<li><a href="#s6">When not to decompose</a></li>
+				<li><a href="#s1">Three places a split fails</a></li>
+				<li><a href="#s2">Bounded tasks</a></li>
+				<li><a href="#s3">Failures without restarts</a></li>
+				<li><a href="#s4">Record every run</a></li>
+				<li><a href="#s5">Keep sources, name gaps</a></li>
+				<li><a href="#s6">A design that holds up</a></li>
+				<li><a href="#s7">When to use subagents</a></li>
 				<li><a href="#summary">Key takeaways</a></li>
+				<li><a href="#sources">Official sources</a></li>
 			</ol>
 		</nav>
 
@@ -78,28 +80,14 @@
 				<p><strong>Orchestrator and Subagent Decomposition</strong>: "Evaluating a proposed orchestrator/subagent decomposition for a multi-step workload against stated observability and error-recovery requirements, and identifying where task boundaries, control flow, or result synthesis will fail."</p>
 			</div>
 			<p>Exam items describe a multi-agent design and a requirement (every decision must be traceable; a failed step must not restart the whole job) and ask where it breaks. Building coordinator and subagent systems with the Agent SDK is covered in the Foundations notes (<a href="../anthropic-ccar-f/d1-task-1-2.html">CCAR-F 1.2</a> and <a href="../anthropic-ccar-f/d1-task-1-3.html">1.3</a>); this skill is the evaluation.</p>
-			<p>Sources: Anthropic's engineering post on its multi-agent research system and the Agent SDK subagents documentation, checked on 20 November 2026 and paraphrased. The workload and code are my own; the code is tested with a fake subagent runner.</p>
-			<div class="callout note"><p><strong>Running example.</strong> A procurement team reviews suppliers' security evidence (policies, a SOC 2 report, a data processing agreement, a subprocessor list). An orchestrator gives each evidence area to a subagent and writes the final assessment.</p></div>
 
-			<!-- ===== Lessons ===== -->
-			<h2 id="s1">What Anthropic learned in production</h2>
+			<!-- ===== Three ===== -->
+			<h2 id="s1">A split across subagents can fail in three places</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">From its multi-agent research system.</span></p>
-				<ul>
-					<li><strong>Errors compound:</strong> agents run long and hold state, so without mitigations "minor system failures can be catastrophic". Anthropic built the system to resume from where an agent was when the error occurred, rather than starting over.</li>
-					<li><strong>Tell the agent, and add safeguards:</strong> letting the agent know a tool is failing so it can adapt worked well, combined with deterministic retry logic and regular checkpoints.</li>
-					<li><strong>Trace everything:</strong> full production tracing made failures diagnosable; they monitored decision patterns and interaction structure without monitoring conversation contents.</li>
-					<li><strong>Detailed task descriptions:</strong> without them, subagents duplicated work, left gaps or missed information. Each needs an objective, an output format, guidance on tools and sources, and clear boundaries.</li>
-					<li><strong>Pass references, not copies:</strong> subagents stored their work externally and passed lightweight references back, avoiding loss in a "game of telephone".</li>
-					<li><strong>Synchronous waiting is a bottleneck:</strong> the lead can't steer subagents, they can't coordinate, and one slow subagent blocks everything; going asynchronous makes coordination, state consistency and error propagation harder.</li>
-					<li><strong>Cost:</strong> multi-agent runs used roughly 15 times the tokens of a chat.</li>
-				</ul>
-			</div>
-
-			<!-- ===== Boundaries ===== -->
-			<h2 id="s2">Where task boundaries fail</h2>
-			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Warning signs in a proposed split.</span></p>
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">What the design looks like, what the exam asks of it, and where it breaks.</span></p>
+				<p>In an orchestrator and subagent design, one agent (the orchestrator) splits a large job into parts, gives each part to a subagent with a written brief, and combines what comes back into one answer. Each subagent works in its own context: it sees only its brief, not the orchestrator&rsquo;s conversation or the other subagents&rsquo; work, and only its final result returns.</p>
+				<p>Take a procurement team checking a supplier&rsquo;s security evidence. There are four areas: the supplier&rsquo;s security policies, its SOC 2 report (an independent auditor&rsquo;s report on its security controls), its data processing agreement, and its list of subprocessors (the other companies that will handle the data). The orchestrator gives each area to a subagent and writes the final assessment.</p>
+				<p>Exam questions describe such a design and two requirements: <strong>observability</strong> (you can see what each part did and why the result came out as it did) and <strong>error recovery</strong> (a failure in one part doesn&rsquo;t ruin or restart the whole job). They ask where the design breaks. It breaks in one of three places:</p>
 				<figure class="arch-fig">
 <svg class="dg dg-wide" viewBox="0 0 900 300" role="img" aria-labelledby="dg14-wide-t">
 <title id="dg14-wide-t">Where a multi-agent decomposition can fail: the orchestrator's briefs to subagents (task boundaries), checking and retrying each result (control flow), and combining the results (synthesis).</title>
@@ -174,44 +162,73 @@
 				<figcaption>Figure: three places a split can break. 1: each subagent needs its own clear brief and sources, or work overlaps and gaps appear. 2: each result is checked, retried a bounded number of times and saved, so a failure doesn&rsquo;t restart everything. 3: the synthesis keeps where each finding came from and names any missing area.</figcaption>
 			</figure>
 				<ul>
-					<li><strong>Overlap:</strong> two subagents both read the SOC 2 report; findings conflict and the cost doubles. Fix: assign sources, not just topics.</li>
-					<li><strong>Gaps:</strong> nobody owns subprocessors, so the assessment is silent on them. Fix: check the task list covers the whole requirement.</li>
-					<li><strong>Hidden dependencies:</strong> the data subagent needs the access subagent's conclusion. Subagents don't see each other's work or the parent's history, so dependent work must run in sequence or be merged.</li>
-					<li><strong>Thin briefs:</strong> a subagent receives only its prompt; "check data security" without scope, sources or output format invites drift.</li>
-					<li><strong>Over-splitting:</strong> a subagent per document for a small review adds cost and coordination for nothing.</li>
+					<li><strong>Task boundaries:</strong> the way the work is split and briefed.</li>
+					<li><strong>Control flow:</strong> what happens when a subagent fails, hangs or returns rubbish.</li>
+					<li><strong>Synthesis:</strong> how the results are combined into the final answer.</li>
+				</ul>
+				<p>The sections below take each place in turn, then look at recording what happened, a design that holds up, and when not to split at all.</p>
+			</div>
+
+			<!-- ===== Boundaries ===== -->
+			<h2 id="s2">Give each subagent its own clearly bounded task</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Task boundaries: most failures start with a vague split.</span></p>
+				<p>A subagent knows only what its brief says. Anthropic found, building its own multi-agent research system, that without detailed task descriptions subagents duplicated each other&rsquo;s work, left gaps, or missed information. Look for these faults in a proposed split:</p>
+				<ul>
+					<li><strong>Overlap.</strong> Two subagents both read the SOC 2 report; their findings conflict and the cost doubles. Fix: assign each subagent its sources, not only its topic.</li>
+					<li><strong>Gaps.</strong> No subagent owns the subprocessor list, so the assessment says nothing about it. Fix: check that the task list covers every part of the requirement before running anything.</li>
+					<li><strong>Hidden dependencies.</strong> The data-handling subagent needs the access-control subagent&rsquo;s conclusion, but subagents can&rsquo;t see each other&rsquo;s work. Fix: run dependent tasks one after the other and pass the earlier result in the brief, or merge them into one task.</li>
+					<li><strong>Thin briefs.</strong> &ldquo;Check data security&rdquo;, with no scope, sources or output format, invites a subagent to drift. Fix: give every brief an objective, the output format to return, which tools and sources to use, and what belongs to someone else.</li>
+					<li><strong>Over-splitting.</strong> A subagent for every document in a small review adds cost and coordination for nothing. Fix: split by independent area, and only when the work is big enough.</li>
 				</ul>
 			</div>
 
 			<!-- ===== Control ===== -->
-			<h2 id="s3">Where control flow fails</h2>
+			<h2 id="s3">A failed subagent must not stop or restart the whole job</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">What happens when one subagent fails, stalls or misbehaves.</span></p>
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Control flow: what happens when one part goes wrong.</span></p>
+				<p>Agents run for a long time and build up state, so small failures add up. Anthropic&rsquo;s write-up warns that without safeguards, &ldquo;minor system failures can be catastrophic&rdquo;. These are the usual faults, each with its fix:</p>
 				<ul>
-					<li><strong>No retry or timeout:</strong> one stuck subagent blocks the whole review.</li>
-					<li><strong>Restart from scratch:</strong> a failure in the last area reruns the three that succeeded, against an error-recovery requirement.</li>
-					<li><strong>Unvalidated output:</strong> a subagent returns prose instead of the agreed structure, and the orchestrator carries on as if it had findings.</li>
-					<li><strong>Unbounded spawning:</strong> no cap on subagents, turns or budget. The Agent SDK has caps (spawn depth, concurrent subagents, a budget limit), but the design must set them deliberately.</li>
-					<li><strong>Nothing to trace:</strong> without a record per subagent run (task, attempt, outcome, timing), "why is the vendors section empty?" can't be answered.</li>
+					<li><strong>No timeout or retry limit.</strong> One stuck subagent holds up the whole review. Fix: a timeout and a fixed number of attempts for each subagent.</li>
+					<li><strong>Starting over after a failure.</strong> The last area fails and the job reruns the three that had already succeeded. Fix: save each finished result (a checkpoint), so a rerun redoes only what failed. Anthropic built its system to resume from where an agent was when the error happened.</li>
+					<li><strong>Accepting whatever comes back.</strong> A subagent returns loose prose instead of the agreed structure, and the orchestrator carries on as if it had findings. Fix: check each result against the expected format in code, and count a bad result as a failed attempt.</li>
+					<li><strong>Hiding failures from the agent.</strong> Anthropic found it worked well to tell the agent when a tool is failing so it can adapt, combined with retry logic in code and regular checkpoints.</li>
+					<li><strong>No limits on the tree.</strong> Nothing caps how many subagents can start, how many turns they take, or what they spend. The Agent SDK has caps for nesting depth, concurrent subagents and budget; set them deliberately.</li>
 				</ul>
+			</div>
+
+			<!-- ===== Trace ===== -->
+			<h2 id="s4">Record every subagent run, so the result can be explained</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Observability: being able to answer &ldquo;why does the report say this?&rdquo;</span></p>
+				<p><strong>What goes wrong.</strong> The assessment&rsquo;s subprocessor section is empty, and nobody can say whether the subagent found nothing, failed, or was never started.</p>
+				<p><strong>What fixes it.</strong> Write a record for every subagent run: which task, which attempt, the outcome, how long it took, and a reference to what it produced. Record retries, reuse of a saved result, and the synthesis too. Anthropic credits full production tracing with making its system&rsquo;s failures diagnosable; it monitored the agents&rsquo; decision patterns and how they interacted, without monitoring the content of the conversations, which keeps sensitive documents out of the trace.</p>
 			</div>
 
 			<!-- ===== Synthesis ===== -->
-			<h2 id="s4">Where synthesis fails</h2>
+			<h2 id="s5">The final answer must keep its sources and name its gaps</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">The last step is where evidence gets lost.</span></p>
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Synthesis: the last step is where evidence gets lost.</span></p>
 				<ul>
-					<li><strong>Silent omission:</strong> a failed area simply doesn't appear, and the report reads as complete.</li>
-					<li><strong>Telephone effect:</strong> each layer summarises the one below, and specifics (which control, which page of evidence) disappear.</li>
-					<li><strong>Conflicts flattened:</strong> two findings disagree and the summary picks one without saying so.</li>
-					<li><strong>No provenance:</strong> a conclusion can't be traced to the subagent and evidence behind it.</li>
+					<li><strong>Silent omission.</strong> A failed area simply doesn&rsquo;t appear, and the assessment reads as complete. Fix: a failed area becomes a named gap in the report, and the overall verdict says &ldquo;incomplete&rdquo;.</li>
+					<li><strong>Details lost in summaries.</strong> Each layer summarises the one below, and the specifics (which control, which page of the evidence) disappear. Anthropic calls this a &ldquo;game of telephone&rdquo;. Fix: subagents store their full results and pass back a short reference; the synthesis reads the stored results.</li>
+					<li><strong>Conflicts smoothed over.</strong> Two findings disagree and the summary picks one without saying so. Fix: show both, with where each came from.</li>
+					<li><strong>No trail to the evidence.</strong> A conclusion can&rsquo;t be traced to the subagent and document behind it. Fix: every finding keeps its area and a reference to its evidence all the way into the report.</li>
 				</ul>
-				<div class="callout trap"><p><strong>"Have the orchestrator summarise whatever the subagents return"</strong> fails both requirements at once: you can't see what each subagent did, and a failure turns into a confident report with a hole in it.</p></div>
+				<div class="callout trap"><p><strong>&ldquo;Have the orchestrator summarise whatever the subagents return&rdquo;</strong> fails both requirements at once: nobody can see what each subagent did, and a failure turns into a confident report with a hole in it.</p></div>
 			</div>
 
 			<!-- ===== Code ===== -->
-			<h2 id="s5">A decomposition built for both requirements</h2>
+			<h2 id="s6">A design that meets both requirements</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">What a split that holds up looks like.</span></p>
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">The fixes above, put together in one orchestrator.</span></p>
+				<ul>
+					<li><strong>Clear tasks.</strong> Each task names its objective, the sources it may read and the format of its result, so areas don&rsquo;t overlap and nothing relies on shared history.</li>
+					<li><strong>Bounded, resumable runs.</strong> Each area gets a fixed number of attempts, a malformed result counts as a failure, and finished results are saved, so a rerun redoes only what failed.</li>
+					<li><strong>A synthesis that keeps evidence.</strong> Findings are read from the stored results, keep their area and evidence reference, and a failed area becomes a named gap with an &ldquo;incomplete&rdquo; verdict.</li>
+					<li><strong>A trace line for everything:</strong> every run, retry and reuse, and the synthesis itself, without document contents in the trace.</li>
+				</ul>
+				<p>The test runs it with one area that returns a malformed result once and another that always fails, and checks the retries, the named gap, the trace, and that a rerun reuses the three finished areas.</p>
 				<div class="code"><span class="file">review_orchestrator.py (review_orchestrator.py)<span class="opt" title="Illustration only: the exam does not test code">Optional</span></span>
 <pre><code>"""Orchestrator for supplier security reviews: one subagent per evidence area, then synthesis.
 
@@ -283,36 +300,33 @@ class Orchestrator:
                   "verdict": "incomplete: rerun or review gaps manually" if gaps else "complete"}
         self._log(outcome="synthesised", gaps=gaps, findings=len(findings))
         return report</code></pre></div>
-				<ul>
-					<li><strong>Boundaries:</strong> each <code>Task</code> names its objective, the sources it may read and its output format, so areas don't overlap and nothing is assumed from shared history.</li>
-					<li><strong>Control flow:</strong> each area gets a bounded number of attempts; malformed output counts as a failure; results are checkpointed, so a rerun redoes only what failed.</li>
-					<li><strong>Synthesis:</strong> findings are read from stored references, keep their area and evidence reference, and a failed area becomes a named gap with an "incomplete" verdict.</li>
-					<li><strong>Observability:</strong> every run, retry, reuse and the synthesis itself is a trace line, without storing document contents in the trace.</li>
-					<li><strong>Tested:</strong> one area returns malformed output once, another always fails; the test checks retries, the gap, the trace and that a rerun reuses the three finished areas.</li>
-				</ul>
 			</div>
 
 			<!-- ===== Not ===== -->
-			<h2 id="s6">When not to decompose</h2>
+			<h2 id="s7">Use subagents only for broad, independent work</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Multi-agent isn't free.</span></p>
-				<ul>
-					<li><strong>Shared context and many dependencies</strong> are a poor fit, Anthropic notes; most coding work is an example.</li>
-					<li><strong>Small or simple workloads</strong> don't justify the token cost; one agent with a few tool calls is cheaper and easier to trace.</li>
-					<li><strong>Parallel, independent, breadth-heavy work</strong> is where subagents pay off: separate areas, separate sources, a synthesis at the end.</li>
-				</ul>
+				<p class="skill-line"><span class="kicker">Skill 1.4</span><span class="skill-text">Splitting costs tokens and coordination, so it has to pay for itself.</span></p>
+				<p><strong>The cost.</strong> Anthropic measured its multi-agent runs using roughly 15 times the tokens of a chat. Waiting for every subagent to finish is also a bottleneck: the orchestrator can&rsquo;t steer them while they work, and one slow subagent holds up the rest; running them asynchronously removes the wait but makes coordination and error handling harder.</p>
+				<p><strong>When it pays off.</strong> Work that splits into separate areas with separate sources, where each part can be done without the others and a synthesis at the end brings them together, like the four evidence areas above.</p>
+				<p><strong>When it doesn&rsquo;t.</strong> Work where every part needs the same context and depends on the others (Anthropic gives most coding work as an example), and small jobs, where one agent with a few tool calls is cheaper and easier to follow.</p>
 			</div>
 
 			<!-- Summary -->
 			<h2 id="summary">Key takeaways</h2>
 			<ul class="summary">
-				<li>Evaluate a decomposition at three points: task boundaries (overlap, gaps, dependencies, thin briefs), control flow (retries, timeouts, restarts, caps, validation) and synthesis (omissions, telephone effect, conflicts, provenance).</li>
-				<li>Observability needs a trace per subagent run; error recovery needs checkpoints so a failure resumes rather than restarts.</li>
-				<li>Anthropic's lessons: errors compound, so resume from the failure point; tell the agent about failing tools and add deterministic retries; trace decisions; write detailed task descriptions; pass references, not copies.</li>
-				<li>A failed subagent must surface as a named gap, never disappear from the final answer.</li>
-				<li>Decompose parallel, independent, breadth-heavy work; keep tightly coupled or small work in one agent.</li>
+				<li>An orchestrator and subagent design fails in one of three places: how the work is split and briefed, what happens when a subagent fails, and how the results are combined.</li>
+				<li>Briefs need an objective, an output format, the sources to use and clear limits; check the split for overlap, gaps and hidden dependencies.</li>
+				<li>Error recovery: timeouts, a fixed number of attempts, results checked in code, and saved results so a rerun redoes only what failed.</li>
+				<li>Observability: a record for every subagent run, retry and reuse, without storing document contents.</li>
+				<li>Synthesis: pass references to stored results rather than summaries, keep each finding&rsquo;s evidence, show conflicts, and turn a failed area into a named gap.</li>
+				<li>Multi-agent runs cost far more tokens; use them for broad, independent work, not for small or tightly coupled jobs.</li>
 			</ul>
 
+			<h2 id="sources">Official sources</h2>
+			<ul>
+				<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system">How we built our multi-agent research system</a> (Anthropic engineering): task descriptions, compounding errors, resuming, tracing, references instead of copies, and token cost.</li>
+				<li><a href="https://code.claude.com/docs/en/agent-sdk/subagents">Subagents</a> (Agent SDK docs): what a subagent receives and returns, and the limits you can set.</li>
+			</ul>
 			<nav class="pager" aria-label="Skill navigation">
 				<a href="d1-skill-1-3.html"><small>Previous</small>1.3: Architectural Pattern Selection</a>
 				<a class="next" href="d1-skill-1-5.html"><small>Next</small>1.5: Value-Based Architectural Decisions</a>
