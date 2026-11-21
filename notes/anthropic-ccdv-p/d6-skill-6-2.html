@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>6.2: Latency Engineering | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 6.2: analysing a Claude application's latency against a target: time to first token versus total latency, and the levers that move each: streaming, parallel tool execution, cache checkpoints and pre-warming, effort tuning, output length, faster models and fast mode, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d6">Domain 6</a><span class="sep">/</span><span class="here">6.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 6 &middot; Cost and Latency Optimization at Scale &middot; 8%</span>
+		<h1>6.2: Latency Engineering</h1>
+		<p>"It&rsquo;s slow" can mean the first word takes too long to appear, or the whole answer takes too long to finish. They have different causes and different fixes. This page splits a turn into its parts and matches each lever to the part it actually moves.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">TTFT</span><span class="tag">Streaming</span><span class="tag">Parallel tools</span><span class="tag">Effort</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Time to first token versus total latency</a></li>
+				<li><a href="#s2">Profiling a turn</a></li>
+				<li><a href="#s3">Streaming and cache checkpoints</a></li>
+				<li><a href="#s4">Parallel tool execution</a></li>
+				<li><a href="#s5">Effort, output length and model speed</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 6.2</span>
+				<p><strong>Latency Engineering</strong>: "Analyzing the latency profile of a Claude application against a latency target, distinguishing time-to-first-token from total latency, and applying streaming, parallel tool execution, cache checkpointing, and effort-level tuning."</p>
+			</div>
+			<p>Exam items give a latency breakdown and a target and ask which change meets it, often with options that improve the wrong part. Choosing between latency and accuracy when both constrain a system is <a href="../anthropic-ccar-p/d3-skill-3-3.html">CCAR-P 3.3</a>; latency SLIs are in <a href="d3-skill-3-2.html">skill 3.2</a>.</p>
+			<p>Sources: the reduce-latency, prompt caching and parallel tool use pages (the last read on 21 November 2026), and the models overview and effort material used earlier, paraphrased. The decomposition and lever thresholds are my own; the grocery app, files and code are original, and the code is tested with fake tools.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A grocery delivery app&rsquo;s order assistant answers questions like "can I swap the oat milk and still get delivery tomorrow?" One turn checks stock, delivery slots and the basket, then answers. Targets: first token within 1 second, the whole answer within 8 seconds at the 95th percentile.</p></div>
+
+			<!-- ===== TTFT ===== -->
+			<h2 id="s1">Time to first token versus total latency</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.2</span><span class="skill-text">Two numbers, two sets of causes.</span></p>
+				<ul>
+					<li><strong>Time to first token (TTFT):</strong> network and gateway, plus processing the prompt before generation starts. It grows with uncached input length, and it is what a streaming user feels first.</li>
+					<li><strong>Total latency:</strong> TTFT plus every tool round trip plus generation time (thinking and output tokens divided by output speed) plus the next call&rsquo;s TTFT in an agent loop.</li>
+					<li><strong>Which matters:</strong> chat users judge TTFT and a steady stream; an API caller that needs the complete JSON judges total latency, and streaming does nothing for it.</li>
+					<li><strong>Anthropic&rsquo;s order:</strong> get a prompt that works first, measure baseline latency and TTFT, then apply one latency technique at a time and check quality after each.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Profile ===== -->
+			<h2 id="s2">Profiling a turn</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.2</span><span class="skill-text">Attribute the seconds, then choose levers.</span></p>
+				<div class="code"><span class="file">latency.py (latency.py)</span>
+<pre><code>"""Latency profile of one turn of a grocery app's order assistant, and the levers that move each part.
+Rates come from your own traces; the numbers in the demo are illustrative."""
+import asyncio
+
+
+def profile(t: dict) -&gt; dict:
+    """Split a turn into what the user waits for before the first token, and after it."""
+    ttft = t["gateway_s"] + t["prefill_s"]
+    tools = sum(t["tool_s"]) if not t["parallel_tools"] else max(t["tool_s"], default=0)
+    generate = (t["thinking_tokens"] + t["output_tokens"]) / t["output_tps"]
+    return {"ttft_s": round(ttft, 2), "tools_s": round(tools, 2), "generate_s": round(generate, 2),
+            "total_s": round(ttft + tools + generate + t["second_call_ttft_s"], 2)}
+
+
+def levers(p: dict, target: dict) -&gt; list[str]:
+    """Match the lever to the part that misses its target (TTFT and total are separate targets)."""
+    out = []
+    if p["ttft_s"] &gt; target["ttft_s"]:
+        out.append("cache the stable prefix (faster time to first token on long prompts); trim the prompt")
+    if p["tools_s"] &gt;= 0.3 * target["total_s"]:
+        out.append("run independent tool calls in parallel; return all results in one user message")
+    if p["generate_s"] &gt; 0.5 * target["total_s"]:
+        out.append("lower effort for this route, ask for shorter answers, or use a faster model / fast mode")
+    if not out and p["total_s"] &gt; target["total_s"]:
+        out.append("stream so the user sees progress, then attack the largest part")
+    return out
+
+
+async def run_tools(calls: list[dict], impl: dict) -&gt; list[dict]:
+    """Run the tool_use blocks of one response concurrently (they are independent reads here)."""
+    results = await asyncio.gather(*(impl[c["name"]](**c["input"]) for c in calls))
+    return [{"type": "tool_result", "tool_use_id": c["id"], "content": r} for c, r in zip(calls, results)]</code></pre></div>
+				<ul>
+					<li><strong>Before:</strong> 2.0 s to first token (a long uncached prompt), 2.4 s of tools run one after another, 10 s generating 1,200 thinking tokens and 300 of answer, and 0.6 s for the follow-up call: 15 s against an 8 s target.</li>
+					<li><strong>The levers the profile points to:</strong> cache the prefix (TTFT over target), run the three lookups in parallel (tools over 30% of the budget), and lower effort or shorten the answer (generation over half the budget).</li>
+					<li><strong>After:</strong> 0.6 s, 0.9 s and 2.0 s, a 4.1 s turn. Each change was checked against the quality eval before the next.</li>
+					<li><strong>Use percentiles from traces,</strong> per route and input size, not a single happy-path run; the slow tail usually comes from long baskets and long conversations.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Streaming / cache ===== -->
+			<h2 id="s3">Streaming and cache checkpoints</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.2</span><span class="skill-text">Faster first token, and progress the user can see.</span></p>
+				<ul>
+					<li><strong>Streaming</strong> improves perceived responsiveness: the user reads while the rest is generated. It doesn&rsquo;t shorten total latency.</li>
+					<li><strong>Cache checkpoints:</strong> a breakpoint at the end of the stable prefix (instructions, tools, store policies) means later requests skip processing it. The caching documentation notes improved TTFT for long documents. The 5-minute and 1-hour caches behave the same for latency; use 1 hour when follow-ups can come more than 5 minutes apart.</li>
+					<li><strong>Pre-warming:</strong> a request with <code>max_tokens: 0</code> writes the cache before the user&rsquo;s first message, lowering the first interaction&rsquo;s TTFT (not available inside batches).</li>
+					<li><strong>Keep the prefix stable:</strong> a timestamp or a reordered tool list at the start forces a full re-read on every call, which shows up as TTFT creeping up with no traffic change.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Parallel ===== -->
+			<h2 id="s4">Parallel tool execution</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.2</span><span class="skill-text">Several tool calls in one response, run at once.</span></p>
+				<ul>
+					<li><strong>On by default:</strong> Claude can return several <code>tool_use</code> blocks in one response. The API doesn&rsquo;t set the execution order; <code>run_tools()</code> runs them together with <code>asyncio.gather</code>, so the turn waits for the slowest, not the sum.</li>
+					<li><strong>Safe to parallelise:</strong> independent, read-only calls (stock, slots, basket). Calls with side effects, shared state or an order dependency (reserve a slot, then charge) may need to run in sequence.</li>
+					<li><strong>Return format keeps it working:</strong> every result in one user message, with no text before the tool results.</li>
+					<li><strong>Encourage it:</strong> a system-prompt instruction to call independent tools together; the documentation notes some models issue fewer parallel calls in long agent loops.</li>
+					<li><strong>Turn it off</strong> with <code>disable_parallel_tool_use: true</code> inside <code>tool_choice</code> (not a top-level parameter), for tools that mustn&rsquo;t run together.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Effort ===== -->
+			<h2 id="s5">Effort, output length and model speed</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 6.2</span><span class="skill-text">Generation time is tokens over speed.</span></p>
+				<ul>
+					<li><strong>Effort:</strong> higher effort means more thinking tokens, which are output tokens and take time. Set it per request: low for the order assistant&rsquo;s routine questions, higher for refunds and disputes. A mid-conversation system message can change it without breaking the cache (beta; <a href="d1-skill-1-4.html">skill 1.4</a>).</li>
+					<li><strong>Output length:</strong> ask for shorter answers (sentence or paragraph limits work better than word counts) and set <code>max_tokens</code> as a hard cap.</li>
+					<li><strong>Model speed:</strong> the models overview labels Haiku 5.5 fastest and Sonnet 5.5 fast; Haiku 5.5 is the documentation&rsquo;s choice for speed-critical work, with effort as its main control.</li>
+					<li><strong>Fast mode:</strong> up to about 2.5 times the output speed at a premium price, on the Claude API, for latency-bound routes where a smaller model loses quality.</li>
+					<li><strong>Fewer round trips:</strong> one well-specified tool that returns stock and slots together beats two calls; each round trip adds the next call&rsquo;s TTFT.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Turn on streaming to meet the 8-second total target"</strong> improves how the wait feels, not how long it is. <strong>"Switch to a faster model"</strong> when the time is spent in sequential tool calls changes little. Profile the turn, then use the lever for the part that misses: caching for TTFT, parallel tools for round trips, effort and length for generation.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Separate TTFT (gateway plus prompt processing) from total latency (plus tools, generation and follow-up calls), and know which one the user or caller feels.</li>
+				<li>Profile real traces by percentile, attribute the seconds, and change one lever at a time with a quality check after each.</li>
+				<li>Cache the stable prefix and pre-warm for TTFT; stream for perceived speed; keep the prefix free of changing values.</li>
+				<li>Run independent tool calls in parallel and return all results in one user message; sequence calls with side effects.</li>
+				<li>Cut generation time with lower effort per route, shorter outputs, a faster model or fast mode, and fewer round trips.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d6-skill-6-1.html"><small>Previous</small>6.1: Cost Architecture at Scale</a>
+				<a class="next" href="d7-skill-7-1.html"><small>Next</small>7.1: Runtime Guardrail Systems</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the app, files and code are original.</div>
+</footer>
+
+</body>
+</html>

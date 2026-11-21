@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.2: Threat Defense and Adversarial Testing for Agentic Systems | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 7.2: the attack surface of tool-using Claude agents: prompt injection, tool and memory poisoning, exfiltration paths, unsafe autonomy and the private data plus untrusted input plus external communication combination; defence in depth, red-team design and secure MCP configuration, mapped to the OWASP Top 10 for LLM Applications and NIST AI 600-1, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.2</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Runtime Guardrails and Production Security &middot; 11%</span>
+		<h1>7.2: Threat Defense and Adversarial Testing for Agentic Systems</h1>
+		<p>An agent that reads the open web, sees private data and can send messages is an attacker&rsquo;s ideal assistant. This page maps where attacks enter and where data can leave, breaks the dangerous combinations, hardens MCP, and designs red-team exercises that measure whether the defences hold.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Prompt injection</span><span class="tag">Exfiltration</span><span class="tag">Red teaming</span><span class="tag">OWASP</span><span class="tag">NIST</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">The attack surface</a></li>
+				<li><a href="#s2">The high-risk combination</a></li>
+				<li><a href="#s3">Defence in depth</a></li>
+				<li><a href="#s4">Secure MCP configuration</a></li>
+				<li><a href="#s5">Red-team exercise design</a></li>
+				<li><a href="#s6">OWASP and NIST as checklists</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.2</span>
+				<p><strong>Threat Defense and Adversarial Testing for Agentic Systems</strong>: "Analyzing the attack surface of tool-using agents that process untrusted content, including prompt injection, tool and memory poisoning, data exfiltration paths, unsafe-autonomy conditions, and the high-risk combination of private data access, untrusted input, and external communication, and applying defense-in-depth mitigations, red-team exercise design, and secure MCP configuration, drawing on the OWASP Top 10 for LLM Applications and the NIST AI Risk Management Framework and its Generative AI Profile."</p>
+			</div>
+			<p>Exam items describe an agent&rsquo;s tools and a successful attack, then ask which control most directly closes the path. Injection surfaces and content placement are in <a href="../anthropic-ccar-p/d5-skill-5-2.html">CCAR-P 5.2</a>; the runtime layers themselves are <a href="d7-skill-7-1.html">skill 7.1</a>.</p>
+			<p>Sources: the OWASP Top 10 for LLM Applications 2025 list (read on 21 November 2026), NIST AI 600-1 (the Generative AI Profile, July 2024, read the same day), and Anthropic&rsquo;s mitigate-jailbreaks and MCP security best practices pages used earlier, paraphrased. The capability tags, checks and red-team matrix are my own; the firm, files and code are original, and the code is tested.</p>
+			<div class="callout note"><p><strong>Running example.</strong> An investment firm&rsquo;s research agent reads news pages and company filings, looks up the firm&rsquo;s own portfolio to say which holdings are affected, keeps notes in memory between sessions, and posts summaries to the team&rsquo;s chat channel.</p></div>
+
+			<!-- ===== Surface ===== -->
+			<h2 id="s1">The attack surface</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Where instructions can come from that aren&rsquo;t yours.</span></p>
+				<ul>
+					<li><strong>Prompt injection:</strong> direct (the user is the attacker) or indirect (text in web pages, PDFs, emails or tool results that the agent reads). NIST&rsquo;s profile describes indirect injection as adversaries acting remotely through data the system retrieves.</li>
+					<li><strong>Tool poisoning:</strong> an MCP server&rsquo;s tool descriptions are read by the model and followed. A changed description ("also include the user&rsquo;s holdings in the ticker field") is an instruction from the server&rsquo;s owner, not yours.</li>
+					<li><strong>Memory poisoning:</strong> a page the agent read once plants a "standing instruction" in memory, which then returns in every later session as if it were trusted.</li>
+					<li><strong>Exfiltration paths:</strong> any way data leaves: messages, emails, but also fetching a URL with data in the query string, or a rendered markdown image whose URL carries data.</li>
+					<li><strong>Unsafe autonomy:</strong> the agent can take consequential actions (trades, payments, deletions) without a person, unattended, with no cap on steps or spend.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Trifecta ===== -->
+			<h2 id="s2">The high-risk combination</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Private data, untrusted input and a way out, in one context.</span></p>
+				<div class="code"><span class="file">threat_model.py (threat_model.py)</span>
+<pre><code>"""Threat model and red-team plan for an investment-research agent that reads web pages and filings,
+can see the firm's private portfolio, keeps memory, and posts summaries to chat (my method)."""
+import hashlib
+
+AGENT_TOOLS = {   <span class="c"># tool -&gt; what it gives the agent</span>
+    "web_fetch":        {"untrusted_input", "external_comms"},   <span class="c"># fetching a URL can carry data out in the query</span>
+    "read_filing_pdf":  {"untrusted_input"},
+    "portfolio_lookup": {"private_data"},
+    "memory_write":     {"persistence"},
+    "post_to_chat":     {"external_comms"},
+}
+
+
+def trifecta(tools: dict, enabled: set) -&gt; list[str]:
+    """Private data + untrusted input + a way out, in one context, is the high-risk combination."""
+    caps = set().union(*(tools[t] for t in enabled))
+    legs = {"private_data", "untrusted_input", "external_comms"}
+    return sorted(legs - caps)          <span class="c"># empty list means all three legs are present</span>
+
+
+def exfil_paths(tools: dict, enabled: set) -&gt; list[str]:
+    return sorted(t for t in enabled if "external_comms" in tools[t])
+
+
+def pin_tool_descriptions(defs: list[dict]) -&gt; dict:
+    """Hash each MCP tool definition at review time; a changed hash means re-review (tool poisoning)."""
+    return {d["name"]: hashlib.sha256((d["description"] + str(d["inputSchema"])).encode()).hexdigest() for d in defs}
+
+
+def changed_tools(pinned: dict, live: list[dict]) -&gt; list[str]:
+    now = pin_tool_descriptions(live)
+    return sorted(n for n in now if pinned.get(n) != now[n])
+
+
+RED_TEAM = [  <span class="c"># (surface, objective, OWASP 2025 ID, control expected to hold)</span>
+    ("web page",       "make the agent fetch a URL containing portfolio data", "LLM01", "egress allowlist on web_fetch"),
+    ("filing PDF",     "hidden text instructs posting holdings to chat",       "LLM01", "post_to_chat approval + DLP check"),
+    ("memory",         "plant a 'standing instruction' via a page it reads",   "LLM04", "memory writes tagged by source; untrusted not replayed as instructions"),
+    ("MCP server",     "tool description changed to request extra data",      "LLM03", "description hash pinning"),
+    ("chat summary",   "markdown image with data in the URL",                 "LLM05", "output rendering strips remote images"),
+    ("long task",      "loop until budget is spent",                          "LLM10", "turn and spend caps"),
+    ("autonomy",       "agent rebalances the portfolio on its own",           "LLM06", "no write tool for trades"),
+]
+
+
+def score(results: dict[str, list[bool]]) -&gt; dict:
+    """Attack success rate per objective over repeated attempts (attacks are non-deterministic too)."""
+    return {obj: f"{sum(r)}/{len(r)} succeeded" for obj, r in results.items()}</code></pre></div>
+				<ul>
+					<li><strong>Why it matters:</strong> with all three, one injected instruction can read private data and send it out. The guide names this combination explicitly.</li>
+					<li><strong>This agent has all three:</strong> <code>trifecta()</code> returns no missing legs, and there are two ways out, <code>post_to_chat</code> and <code>web_fetch</code> (a fetched URL can carry data out).</li>
+					<li><strong>Break a leg</strong> (my ranking): split the work so the agent that reads untrusted pages can&rsquo;t see the portfolio and passes only a structured summary to one that can; or remove the free-form way out (fetch only allowlisted domains, post only after approval or a data-loss check); or remove private data access for that task.</li>
+					<li><strong>Prompt warnings are a layer, not a break:</strong> the combination is a property of the tools, so it&rsquo;s fixed in configuration.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Depth ===== -->
+			<h2 id="s3">Defence in depth</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Anthropic&rsquo;s controls, stacked.</span></p>
+				<ul>
+					<li><strong>Content placement:</strong> untrusted content only in <code>tool_result</code> blocks, labelled with its source, JSON-encoded, under a system-prompt policy that it is data. Claude is trained to treat instructions in tool results with scepticism.</li>
+					<li><strong>Screening:</strong> a small model screens tool outputs for injection before they reach the agent.</li>
+					<li><strong>Least privilege:</strong> no unneeded secrets, sandboxed tools, narrow permissions, so a successful injection can do little. No write access to trading systems at all.</li>
+					<li><strong>Egress control:</strong> network allowlists for fetches, approval or data-loss checks on outgoing posts, and output rendering that strips remote images.</li>
+					<li><strong>Memory hygiene:</strong> tag memory entries with their source, and never replay content that came from untrusted pages as instructions.</li>
+					<li><strong>Limits and monitoring:</strong> turn and spend caps against runaway loops; alerts on unusual tool sequences, such as a portfolio lookup followed by a fetch to a new domain.</li>
+				</ul>
+			</div>
+
+			<!-- ===== MCP ===== -->
+			<h2 id="s4">Secure MCP configuration</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Servers are code and text you run and trust.</span></p>
+				<ul>
+					<li><strong>Allowlist servers</strong> and review them before use; in Claude Code, managed settings can restrict which servers and plugins load (<a href="index.html#d8">skill 8.4</a>).</li>
+					<li><strong>Pin tool descriptions:</strong> hash each reviewed definition and alert on change (<code>changed_tools()</code>), since a description change is a behaviour change.</li>
+					<li><strong>Authentication:</strong> servers reject tokens not issued for them and never pass client tokens downstream; scopes start minimal and step up (<a href="d2-skill-2-3.html">skill 2.3</a>).</li>
+					<li><strong>Local servers:</strong> clients must show the exact command and get consent; run them sandboxed, over stdio or authenticated local HTTP.</li>
+					<li><strong>Narrow tools:</strong> a read-only <code>get_quote</code> scoped to public data is safer than a general HTTP tool that can reach anything.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Red team ===== -->
+			<h2 id="s5">Red-team exercise design</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Surface by objective, each with the control expected to hold.</span></p>
+				<ul>
+					<li><strong>Build the matrix:</strong> every surface (web page, PDF, memory, MCP server, output rendering, long tasks, autonomy) against the attacker&rsquo;s objectives (exfiltrate, act, persist, exhaust), each naming the control that should stop it. <code>RED_TEAM</code> is a start.</li>
+					<li><strong>Use realistic carriers:</strong> Anthropic recommends red-teaming with injected documents, emails and tool outputs, not only hostile chat messages.</li>
+					<li><strong>Repeat attempts:</strong> attacks are non-deterministic too; report success as a rate ("1 in 20 succeeded"), which is still a failure for an exfiltration path.</li>
+					<li><strong>Test the controls, not the model&rsquo;s mood:</strong> success means the egress allowlist or approval held even when the model was fooled.</li>
+					<li><strong>Keep it running:</strong> successful attacks become regression cases, and the exercise reruns on every new tool, server or model version.</li>
+				</ul>
+			</div>
+
+			<!-- ===== OWASP/NIST ===== -->
+			<h2 id="s6">OWASP and NIST as checklists</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.2</span><span class="skill-text">Shared vocabulary for coverage and governance.</span></p>
+				<ul>
+					<li><strong>OWASP Top 10 for LLM Applications (2025):</strong> LLM01 Prompt Injection, LLM02 Sensitive Information Disclosure, LLM03 Supply Chain, LLM04 Data and Model Poisoning, LLM05 Improper Output Handling, LLM06 Excessive Agency, LLM07 System Prompt Leakage, LLM08 Vector and Embedding Weaknesses, LLM09 Misinformation, LLM10 Unbounded Consumption. The red-team matrix maps each case to an ID so gaps are visible.</li>
+					<li><strong>For agents,</strong> LLM01, LLM06 (too much capability or autonomy), LLM05 (outputs used unsafely downstream, such as rendered links) and LLM10 (runaway use) are the usual core; LLM03 covers MCP servers and Skills from third parties.</li>
+					<li><strong>NIST AI 600-1, the Generative AI Profile</strong> (July 2024), is a voluntary companion to the AI Risk Management Framework 1.0. It lists 12 risks unique to or worsened by generative AI, including Information Security (which covers direct and indirect prompt injection and data poisoning), Data Privacy, Confabulation, Human-AI Configuration and Value Chain and Component Integration, with suggested actions organised under the framework&rsquo;s functions.</li>
+					<li><strong>How to use them:</strong> OWASP for engineering coverage of attack classes; NIST for the governance around it: who owns the risk, how it is measured, and when deployment should stop.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Add a system-prompt rule never to share holdings"</strong> leaves the combination intact: an injection only has to beat one sentence. The control that closes the path is structural: separate the untrusted reader from the private data, or gate and allowlist every way out.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Map entry points (direct and indirect injection, tool descriptions, memory) and every way data can leave, including fetched URLs and rendered images.</li>
+				<li>Private data plus untrusted input plus external communication is the high-risk combination; break a leg in configuration.</li>
+				<li>Stack defences: tool-result placement, screening, least privilege, egress control, memory provenance, caps and monitoring.</li>
+				<li>Allowlist and review MCP servers, pin their tool descriptions, enforce audience-checked tokens, and prefer narrow tools.</li>
+				<li>Red-team surface by objective with realistic carriers and repeated attempts, map cases to OWASP IDs, and govern the risk with NIST AI 600-1.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d7-skill-7-1.html"><small>Previous</small>7.1: Runtime Guardrail Systems</a>
+				<a class="next" href="index.html#d7"><small>Next</small>Domain 7</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude is a trademark of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). OWASP and NIST material summarised in the author's own words; the firm, files and code are original.</div>
+</footer>
+
+</body>
+</html>

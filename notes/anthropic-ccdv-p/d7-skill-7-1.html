@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>7.1: Runtime Guardrail Systems | Study Notes for CCDV-P</title>
+	<meta name="description" content="Study notes for CCDV-P skill 7.1: layered runtime guardrails for production Claude agents: input screens and output checks, PII redaction, hook-based policy and destructive-action prevention, sandboxes that allow tool and web access without exposing production, approval gates, refusal handling, and false-positive/false-negative tuning, with tested code.">
+
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="stylesheet" href="ccdv-p.css">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="../index.html">
+			<span class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5V5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-3"/><path d="M9 7h6M9 11h4"/></svg></span>
+			Study Notes
+		</a>
+		<nav class="crumbs" aria-label="Breadcrumb">
+			<a href="../index.html">All notes</a><span class="sep">/</span><a href="../top-anthropic.html">Anthropic</a><span class="sep">/</span><a href="index.html">CCDV-P</a><span class="sep">/</span><a href="index.html#d7">Domain 7</a><span class="sep">/</span><span class="here">7.1</span>
+		</nav>
+	</div>
+</header>
+
+<section class="hero">
+	<div class="wrap">
+		<span class="eyebrow">Domain 7 &middot; Runtime Guardrails and Production Security &middot; 11%</span>
+		<h1>7.1: Runtime Guardrail Systems</h1>
+		<p>No single control makes a production agent safe. This page stacks layers around one: a screen on what comes in, redaction of what goes out, code that decides which tool calls run, a sandbox around what the agent can reach, people for the irreversible steps, and thresholds tuned on data rather than guessed.</p>
+		<div class="tags"><span class="tag code">CCDV-P</span><span class="tag">Guardrails</span><span class="tag">Hooks</span><span class="tag">Sandboxing</span><span class="tag">PII</span></div>
+	</div>
+</section>
+
+<main>
+	<div class="wrap layout">
+
+		<nav class="toc" aria-label="On this page">
+			<p>On this page</p>
+			<ol>
+				<li><a href="#overview">Overview</a></li>
+				<li><a href="#s1">Layers matched to the risk profile</a></li>
+				<li><a href="#s2">The layers in code</a></li>
+				<li><a href="#s3">Sandboxing without exposing production</a></li>
+				<li><a href="#s4">Approval gates, refusals and safety fallbacks</a></li>
+				<li><a href="#s5">Tuning false positives and false negatives</a></li>
+				<li><a href="#summary">Key takeaways</a></li>
+			</ol>
+		</nav>
+
+		<article>
+
+			<h2 id="overview">Overview</h2>
+			<div class="statement">
+				<span class="kicker">Skill 7.1</span>
+				<p><strong>Runtime Guardrail Systems</strong>: "Evaluating layered guardrail architectures against a production agent's risk profile, including input/output filtering, PII redactors, hook-based policy enforcement, destructive-action prevention, sandboxing that grants tool and web access without exposing production systems, approval gates, refusal handling and safety fallbacks, deterministic enforcement for irreversible actions, and false-positive/false-negative tuning."</p>
+			</div>
+			<p>Exam items describe an agent, what it can touch, and a guardrail design, then ask which layer is missing or misplaced, or how to tune one that blocks too much. Deterministic guardrails at Foundations level are <a href="../anthropic-ccdv-f/d7-skill-7-2.html">CCDV-F 7.2</a>; placing a single control against a misuse path is <a href="../anthropic-ccar-p/d5-skill-5-1.html">CCAR-P 5.1</a>; attacks on agents are <a href="d7-skill-7-2.html">skill 7.2</a>.</p>
+			<p>Sources: the mitigate-jailbreaks, Agent SDK permissions and hooks, sandboxing and Managed Agents environment pages, as used earlier and paraphrased. The policy lists, limits, PII patterns and tuning rule are my own; the council, files and code are original, and the code is tested with mocked screen verdicts.</p>
+			<div class="callout note"><p><strong>Running example.</strong> A city council&rsquo;s resident-services agent answers questions about council tax, bins and housing repairs. It reads a resident&rsquo;s own case records, can send letters, issue small refunds and search the public web for opening hours and guidance.</p></div>
+
+			<!-- ===== Layers ===== -->
+			<h2 id="s1">Layers matched to the risk profile</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.1</span><span class="skill-text">Start from what the agent can do, not from a list of filters.</span></p>
+				<ul>
+					<li><strong>The risk profile:</strong> personal data (case records), external actions (letters, refunds), irreversible changes (deleting or merging records), and untrusted content (web pages, resident messages).</li>
+					<li><strong>Input screening:</strong> a lightweight model screen on incoming requests, as Anthropic suggests, with structured output.</li>
+					<li><strong>Redaction:</strong> strip personal identifiers before text reaches logs, analytics or third-party tools.</li>
+					<li><strong>Tool policy in code:</strong> a <code>PreToolUse</code> hook that denies destructive actions, limits amounts and sends external actions to a person.</li>
+					<li><strong>Containment:</strong> least-privilege credentials and a sandbox around anything that executes or browses.</li>
+					<li><strong>Output checks:</strong> the reply mentions only the signed-in resident&rsquo;s own cases.</li>
+					<li><strong>Monitoring:</strong> blocks, approvals and refusals as metrics, with repeat offenders throttled. Anthropic&rsquo;s guidance is to chain safeguards rather than rely on one.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Code ===== -->
+			<h2 id="s2">The layers in code</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.1</span><span class="skill-text">Each layer is small; together they cover the paths.</span></p>
+				<div class="code"><span class="file">guardrails.py (guardrails.py)</span>
+<pre><code>"""Layered runtime guardrails for a city council's resident-services agent (Agent SDK).
+Each layer catches something the others miss; the irreversible ones are code, not prompt."""
+import re
+
+<span class="c"># 1. Input screen: a small model classifies the request first (called via the API; mocked in tests).</span>
+def screen(verdict: dict, stop_reason: str) -&gt; str:
+    if stop_reason == "refusal":
+        return "block"                       <span class="c"># a screening refusal counts as a harmful verdict</span>
+    return "block" if verdict["harmful"] and verdict["confidence"] &gt;= THRESHOLD else "allow"
+
+THRESHOLD = 0.7                              <span class="c"># tuned on a labelled set (see tune())</span>
+
+<span class="c"># 2. PII redaction before text leaves the boundary (logs, third-party tools, analytics).</span>
+PII = [(re.compile(r"\b[A-CEGHJ-PR-TW-Z]{2}\d{6}[A-D]\b"), "[NI NUMBER]"),
+       (re.compile(r"\b(?:\+44\s?7\d{3}|07\d{3})\s?\d{3}\s?\d{3}\b"), "[PHONE]"),
+       (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "[EMAIL]")]
+
+def redact(text: str) -&gt; str:
+    for pattern, label in PII:
+        text = pattern.sub(label, text)
+    return text
+
+<span class="c"># 3. Hook policy on tool calls: deterministic, runs before permission rules, holds in every mode.</span>
+DENY = {"mcp__cases__delete_case", "mcp__cases__merge_records"}                 <span class="c"># never, by any route</span>
+ASK = {"mcp__letters__send_external", "mcp__payments__issue_refund"}             <span class="c"># a person approves</span>
+
+async def policy_hook(input_data, tool_use_id, context):
+    name, args = input_data["tool_name"], input_data["tool_input"]
+    if name in DENY:
+        return _decide("deny", "Destructive record changes are done by staff in the case system.")
+    if name == "mcp__payments__issue_refund" and args.get("amount_gbp", 0) &gt; 250:
+        return _decide("deny", "Refunds over 250 GBP need a finance officer; raise a task instead.")
+    if name in ASK:
+        return _decide("ask", "Needs officer approval.")
+    return {}
+
+def _decide(decision, reason):
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
+                                   "permissionDecisionReason": reason}}
+
+<span class="c"># 4. Output check: the reply mentions only the signed-in resident's own case IDs.</span>
+def output_ok(reply: str, own_cases: set) -&gt; bool:
+    return set(re.findall(r"\bCASE-\d{6}\b", reply)) &lt;= own_cases
+
+<span class="c"># 5. Tuning: choose the screen threshold that keeps misses under a cap with the fewest false blocks.</span>
+def tune(scored: list[tuple[float, bool]], max_fn_rate=0.02) -&gt; tuple[float, float, float]:
+    best = None
+    for t in sorted({s for s, _ in scored}):
+        harmful = [s for s, h in scored if h]
+        benign = [s for s, h in scored if not h]
+        fn = sum(s &lt; t for s in harmful) / len(harmful)
+        fp = sum(s &gt;= t for s in benign) / len(benign)
+        if fn &lt;= max_fn_rate and (best is None or fp &lt; best[2]):
+            best = (t, round(fn, 3), round(fp, 3))
+    return best</code></pre></div>
+				<ul>
+					<li><strong>Screen:</strong> if the screening model itself refuses, Anthropic&rsquo;s guidance is to treat that as a harmful verdict, so <code>screen()</code> blocks on <code>stop_reason == "refusal"</code>.</li>
+					<li><strong>Redaction</strong> is your control: the provider&rsquo;s data handling doesn&rsquo;t remove personal data from your own logs. The patterns here are illustrative; production redaction needs a tested library and review.</li>
+					<li><strong>The hook is deterministic:</strong> hooks run before permission rules, a hook&rsquo;s deny holds even in <code>bypassPermissions</code>, and the most restrictive decision wins. Deletes and merges are denied outright, large refunds are denied with a route to a finance officer, and letters and small refunds go to an officer as <code>ask</code>.</li>
+					<li><strong>The reason reaches Claude,</strong> so it can tell the resident what happens next instead of retrying.</li>
+					<li><strong>The output check</strong> catches a different failure: the agent quoting another resident&rsquo;s case it should never have seen.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Sandbox ===== -->
+			<h2 id="s3">Sandboxing without exposing production</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.1</span><span class="skill-text">Give access to what&rsquo;s needed, through boundaries that hold.</span></p>
+				<ul>
+					<li><strong>Claude Code and Agent SDK sandbox:</strong> an operating-system boundary around shell commands and their children (Seatbelt on macOS, bubblewrap on Linux and WSL2; not native Windows). Network goes through a proxy whose allowed domains start empty; writes are limited to the working directory unless allowed. Read, Edit, WebFetch, hooks and MCP servers run outside it, so they need permission rules too.</li>
+					<li><strong>Managed Agents:</strong> each session gets a fresh cloud container; limited networking with <code>allowed_hosts</code> controls what it can reach. A self-hosted sandbox keeps tool execution inside your network when data can&rsquo;t leave it.</li>
+					<li><strong>Web access without the intranet:</strong> allow public domains (gov.uk, the council&rsquo;s site), deny internal ranges, and keep the agent&rsquo;s credentials out of the sandbox.</li>
+					<li><strong>Data access without production writes:</strong> a read replica or a narrow API scoped to the resident&rsquo;s own records, instead of a database credential. The credential&rsquo;s permissions, not a pattern in a hook, are the real limit.</li>
+					<li><strong>The documentation&rsquo;s framing:</strong> sandboxing, permission rules and permission modes are complementary layers; the sandbox holds even when an allowed command does more than its name suggests.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Approvals ===== -->
+			<h2 id="s4">Approval gates, refusals and safety fallbacks</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.1</span><span class="skill-text">People for the irreversible; a plan for the refused.</span></p>
+				<ul>
+					<li><strong>Gate the effect:</strong> approvals sit right before letters leave and money moves, not on reading a case. Show the officer the exact letter and amount.</li>
+					<li><strong>Asynchronous approval:</strong> a hook can return <code>defer</code> so the session ends and resumes after the decision, rather than holding a process open (<a href="../anthropic-ccar-p/d5-skill-5-4.html">CCAR-P 5.4</a>).</li>
+					<li><strong>Deterministic for the irreversible:</strong> deleting a record is denied in code whatever the conversation says; a prompt instruction can be argued with, a hook can&rsquo;t.</li>
+					<li><strong>Refusal handling:</strong> refusals arrive as 200s with <code>stop_reason: "refusal"</code>. For an in-scope request, retry on a different model; otherwise give the resident a safe, helpful fallback (contact details, the right form) rather than an empty reply.</li>
+					<li><strong>Safety fallback for the agent itself:</strong> when a guardrail blocks, the reply explains what will happen and hands over to staff where needed.</li>
+				</ul>
+			</div>
+
+			<!-- ===== Tuning ===== -->
+			<h2 id="s5">Tuning false positives and false negatives</h2>
+			<div class="item">
+				<p class="skill-line"><span class="kicker">Skill 7.1</span><span class="skill-text">Every filter blocks some good requests and misses some bad ones.</span></p>
+				<ul>
+					<li><strong>Measure both on labelled data:</strong> a set of harmful attempts (red-team and real) and a larger set of legitimate requests, including awkward but valid ones (a resident angry about a repair, a question mentioning violence in a housing complaint).</li>
+					<li><strong>Choose by the cost of each error:</strong> <code>tune()</code> keeps missed harmful requests at or below 2% and then picks the threshold that blocks the fewest legitimate ones. On the synthetic set that&rsquo;s about 0.62, blocking around 1% of legitimate requests.</li>
+					<li><strong>Different layers, different settings:</strong> a lenient input screen is acceptable when deterministic hooks guard the actions; a strict screen in front of a read-only FAQ mostly frustrates residents.</li>
+					<li><strong>Re-tune after changes:</strong> a new screening model, a new feature or a new attack pattern moves both rates; re-run the labelled set, and watch live block and appeal rates.</li>
+				</ul>
+				<div class="callout trap"><p><strong>"Tighten the input screen until no attack gets through"</strong> blocks legitimate residents and still doesn&rsquo;t stop an attack that arrives in a web page or tool result. Tune the screen for its job, and put the hard guarantees where they hold: hooks on actions, scoped credentials and the sandbox.</p></div>
+			</div>
+
+			<!-- Summary -->
+			<h2 id="summary">Key takeaways</h2>
+			<ul class="summary">
+				<li>Derive layers from the agent&rsquo;s risk profile: what data it reads, which actions are external or irreversible, and which content is untrusted.</li>
+				<li>Screen inputs with a small model (a screening refusal counts as harmful), redact personal data yourself, check outputs against the user&rsquo;s own scope.</li>
+				<li>Enforce tool policy in hooks: deny destructive actions, cap amounts, send external actions to a person; hook denies hold in every mode.</li>
+				<li>Sandbox execution and browsing, allowlist domains, and use scoped credentials or read replicas so access never reaches production writes.</li>
+				<li>Tune filter thresholds on labelled harmful and legitimate sets by the cost of each error, and re-tune after every change.</li>
+			</ul>
+
+			<nav class="pager" aria-label="Skill navigation">
+				<a href="d6-skill-6-2.html"><small>Previous</small>6.2: Latency Engineering</a>
+				<a class="next" href="d7-skill-7-2.html"><small>Next</small>7.2: Threat Defense and Adversarial Testing for Agentic Systems</a>
+			</nav>
+
+		</article>
+	</div>
+</main>
+
+<footer>
+	<div class="wrap">Personal study notes for the Claude Certified Developer &ndash; Professional (CCDV-P) exam. Not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic. Skill names and descriptions from the CCDV-P exam guide, version 1.0 (November 2026). Anthropic's documentation summarized in the author's own words; the council, files and code are original.</div>
+</footer>
+
+</body>
+</html>
