@@ -158,11 +158,11 @@
 </svg>
 				<figcaption>Figure: order the prompt from most stable to least, with a cache breakpoint at the end of each stable layer (up to four). The shared layer is written once and read by every later call. One changing value at the very front, such as a timestamp, makes every prefix unique, so nothing is ever read from the cache.</figcaption>
 			</figure>
-				<p>Take an engineering firm&rsquo;s tender-review assistant. Analysts ask about ten questions about each tender, a few minutes apart, against the firm&rsquo;s 12,000-token review guide and the tender&rsquo;s 40,000 tokens of documents.</p>
+				<p>Take a document-review assistant. Reviewers ask about ten questions about each set of documents, a few minutes apart, against a shared 12,000-token review guide and the set&rsquo;s 40,000 tokens of documents.</p>
 				<ul>
-					<li><strong>Layer 1, changes rarely:</strong> the tool definitions and the firm-wide review guide, the same for everyone all day. Breakpoint at its end, with a 1-hour lifetime.</li>
-					<li><strong>Layer 2, changes once per tender:</strong> the tender&rsquo;s documents, the same for a run of questions. Breakpoint at its end, with a 5-minute lifetime.</li>
-					<li><strong>Layer 3, changes on every call:</strong> the analyst&rsquo;s question, after the last breakpoint.</li>
+					<li><strong>Layer 1, changes rarely:</strong> the tool definitions and the shared review guide, the same for everyone all day. Breakpoint at its end, with a 1-hour lifetime.</li>
+					<li><strong>Layer 2, changes once per document set:</strong> that set&rsquo;s documents, the same for a run of questions. Breakpoint at its end, with a 5-minute lifetime.</li>
+					<li><strong>Layer 3, changes on every call:</strong> the reviewer&rsquo;s question, after the last breakpoint.</li>
 				</ul>
 				<p><strong>Keep values that change out of the stable layers.</strong> A timestamp, a user&rsquo;s name, a request ID or &ldquo;today&rsquo;s date&rdquo; at the top of the system prompt makes every request&rsquo;s beginning unique, so nothing is ever read from the cache. Put such values after the last breakpoint, or leave them out.</p>
 			</div>
@@ -172,47 +172,47 @@
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">Same content, same calls; only the order and the breakpoints differ.</span></p>
 				<ul>
-					<li><strong>Bad layout:</strong> a timestamp opens the system prompt, and the tender documents come after the question. No beginning ever repeats, so nothing is read from the cache: $3.31 for the morning.</li>
-					<li><strong>Good layout:</strong> the guide (1-hour breakpoint), then the tender (5-minute breakpoint), then the question. The guide is written once, each tender once, and everything else is read from the cache: $0.48, with 91% of input read from cache.</li>
+					<li><strong>Bad layout:</strong> a timestamp opens the system prompt, and the documents come after the question. No beginning ever repeats, so nothing is read from the cache: $3.31 for the morning.</li>
+					<li><strong>Good layout:</strong> the guide (1-hour breakpoint), then the document set (5-minute breakpoint), then the question. The guide is written once, each document set once, and everything else is read from the cache: $0.48, with 91% of input read from cache.</li>
 				</ul>
 				<p>A useful benchmark: Anthropic reports that agent loops read a median 84% of their input from the cache, and suggests that if you&rsquo;re below about 80%, something is breaking the beginning of the prompt.</p>
 				<p>The code below simulates both layouts over the same calls (it simplifies the caching rules):</p>
-				<div class="code"><span class="file">tender_cache.py (tender_cache.py)<span class="opt" title="Illustration only: the exam does not test code">Optional</span></span>
-<pre><code>"""An engineering firm's tender-review assistant: lay out the prompt so the call pattern reuses the cache.
+				<div class="code"><span class="file">review_cache.py (review_cache.py)<span class="opt" title="Illustration only: the exam does not test code">Optional</span></span>
+<pre><code>"""A document-review assistant: lay out the prompt so the call pattern reuses the cache.
 
-Call pattern (one analyst's morning): 3 tenders, about 10 questions each, a few minutes apart.
+Call pattern (one reviewer's morning): 3 document sets, about 10 questions each, a few minutes apart.
 Layers, most stable first:
-  1. firm review guide + tools      12,000 tokens, same all day   -&gt; 1-hour breakpoint
-  2. this tender's documents        40,000 tokens, same per tender -&gt; 5-minute breakpoint
+  1. shared review guide + tools     12,000 tokens, same all day   -&gt; 1-hour breakpoint
+  2. this set's documents        40,000 tokens, same per document set -&gt; 5-minute breakpoint
   3. the question                       150 tokens, new every call -&gt; after the last breakpoint
 Simplified model of the prompt-caching rules: a breakpoint's prefix is read if the same prefix was
 written or read within its TTL, otherwise written; anything after a changed block is uncached."""
 
-GUIDE, TENDER, QUESTION = 12_000, 40_000, 150
+GUIDE, DOCSET, QUESTION = 12_000, 40_000, 150
 
 
-def good_request(tender_id: str, docs: str, question: str) -&gt; dict:
+def good_request(set_id: str, docs: str, question: str) -&gt; dict:
     return {
         "model": "claude-sonnet-5-5", "max_tokens": 2048,
         "system": [
             {"type": "text", "text": "&lt;firm review guide&gt;", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-            {"type": "text", "text": f"&lt;tender id='{tender_id}'&gt;{docs}&lt;/tender&gt;", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": f"&lt;documents id='{set_id}'&gt;{docs}&lt;/documents&gt;", "cache_control": {"type": "ephemeral"}},
         ],
         "messages": [{"role": "user", "content": question}],
     }
 
 
-def bad_request(tender_id: str, docs: str, question: str, now: str) -&gt; dict:
+def bad_request(set_id: str, docs: str, question: str, now: str) -&gt; dict:
     return {  <span class="c"># a timestamp first and the question before the documents: nothing stable leads the prompt</span>
         "model": "claude-sonnet-5-5", "max_tokens": 2048,
         "system": [{"type": "text", "text": f"Current time: {now}\n&lt;firm review guide&gt;",
                     "cache_control": {"type": "ephemeral"}}],
-        "messages": [{"role": "user", "content": f"{question}\n&lt;tender id='{tender_id}'&gt;{docs}&lt;/tender&gt;"}],
+        "messages": [{"role": "user", "content": f"{question}\n&lt;documents id='{set_id}'&gt;{docs}&lt;/documents&gt;"}],
     }
 
 
 def simulate(calls, layout: str) -&gt; dict:
-    """calls: list of (minute, tender_id). Returns tokens billed as write, read and plain input."""
+    """calls: list of (minute, set_id). Returns tokens billed as write, read and plain input."""
     seen, tot = {}, {"write": 0, "read": 0, "input": 0}
 
     def hit(key, ttl, minute):
@@ -220,14 +220,14 @@ def simulate(calls, layout: str) -&gt; dict:
         seen[key] = minute                         <span class="c"># a write or a read refreshes the entry</span>
         return ok
 
-    for minute, tender in calls:
+    for minute, docset in calls:
         if layout == "good":
             tot["read" if hit("guide", 60, minute) else "write"] += GUIDE
-            tot["read" if hit(("tender", tender), 5, minute) else "write"] += TENDER
+            tot["read" if hit(("docset", docset), 5, minute) else "write"] += DOCSET
             tot["input"] += QUESTION
         else:                                      <span class="c"># timestamp changes every call: the prefix never matches</span>
             tot["write"] += GUIDE
-            tot["input"] += TENDER + QUESTION
+            tot["input"] += DOCSET + QUESTION
     return tot
 
 
@@ -255,8 +255,8 @@ good  write  132,000  read 1,428,000  input    4,500  cache-read share 91%  cost
 				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">5 minutes or 1 hour, from the stated call pattern.</span></p>
 				<ul>
 					<li><strong>Calls less than 5 minutes apart:</strong> the default lifetime is enough, and each read keeps the cache alive.</li>
-					<li><strong>Gaps longer than 5 minutes but under an hour,</strong> such as an analyst who reads for ten minutes between questions: a 5-minute cache expires, and the 40,000 tokens of tender documents are written again. A 1-hour cache costs more to write (2 times instead of 1.25 times) but saves those rewrites. In the simulation, a single nine-minute pause causes a second write.</li>
-					<li><strong>Material shared across users:</strong> the firm&rsquo;s guide serves every analyst, so a 1-hour cache at the front is reused by everyone&rsquo;s calls.</li>
+					<li><strong>Gaps longer than 5 minutes but under an hour,</strong> such as a reviewer who reads for ten minutes between questions: a 5-minute cache expires, and the 40,000 tokens of documents are written again. A 1-hour cache costs more to write (2 times instead of 1.25 times) but saves those rewrites. In the simulation, a single nine-minute pause causes a second write.</li>
+					<li><strong>Material shared across users:</strong> the shared guide serves every reviewer, so a 1-hour cache at the front is reused by everyone&rsquo;s calls.</li>
 					<li><strong>Batches:</strong> caching in the Message Batches API is best-effort, so don&rsquo;t count on cache reads there.</li>
 				</ul>
 			</div>
@@ -266,8 +266,8 @@ good  write  132,000  read 1,428,000  input    4,500  cache-read share 91%  cost
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.5</span><span class="skill-text">Don&rsquo;t send every call what only some calls need.</span></p>
 				<ul>
-					<li><strong>Modules.</strong> Split the guide into a core module, always sent and cached, and specialist modules added only for the tenders that need them. Keep each module in its own block, always in the same order, so different combinations still share the cached core.</li>
-					<li><strong>Skills.</strong> Package procedures that only some tenders need (structural steel checks, environmental compliance) as Agent Skills. Only each Skill&rsquo;s name and description, about 100 tokens, sit in the context until a request needs it; then its full instructions and any scripts load.</li>
+					<li><strong>Modules.</strong> Split the guide into a core module, always sent and cached, and specialist modules added only for the document sets that need them. Keep each module in its own block, always in the same order, so different combinations still share the cached core.</li>
+					<li><strong>Skills.</strong> Package procedures that only some document sets need (specialist checks) as Agent Skills. Only each Skill&rsquo;s name and description, about 100 tokens, sit in the context until a request needs it; then its full instructions and any scripts load.</li>
 					<li><strong>What Skills require.</strong> On the API they run in the code execution container, which has no network access, with up to 20 Skills per request. Custom Skills are shared across a workspace through the Skills API. They aren&rsquo;t eligible for zero data retention or HIPAA.</li>
 					<li><strong>Keep the set stable.</strong> Adding or removing tools or Skills changes the beginning of the prompt and invalidates the cache, so fix the set for a workload rather than changing it per call.</li>
 				</ul>
