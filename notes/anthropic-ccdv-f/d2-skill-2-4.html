@@ -42,13 +42,15 @@
 			<ol>
 				<li><a href="#overview">Overview</a></li>
 				<li><a href="#s1">Error classes</a></li>
-				<li><a href="#s2">What the SDK already does</a></li>
-				<li><a href="#s3">Retry logic that tells errors apart</a></li>
-				<li><a href="#s4">Falling back after a refusal</a></li>
-				<li><a href="#s5">Streams that fail or stop early</a></li>
+				<li><a href="#s2">What the SDK does</a></li>
+				<li><a href="#s3">Retry logic</a></li>
+				<li><a href="#s4">Refusal fallback</a></li>
+				<li><a href="#s5">Broken streams</a></li>
 				<li><a href="#s6">Ingesting files</a></li>
-				<li><a href="#s7">From symptom to defect</a></li>
+				<li><a href="#s7">Symptom to defect</a></li>
+				<li><a href="#practice">Practice questions</a></li>
 				<li><a href="#summary">Key takeaways</a></li>
+				<li><a href="#sources">Official sources</a></li>
 			</ol>
 		</nav>
 
@@ -60,11 +62,9 @@
 				<p><strong>Integration Resilience</strong>: "Analyzing failing or degraded integration code and its error output to find the defect and select a correction consistent with documented API error semantics. Defects include mishandled streaming events and terminal-event semantics, retry and fallback logic that does not distinguish Anthropic's error classes (rate limits, overloaded, invalid request, timeout), and faulty multi-format ingestion through the Files API."</p>
 			</div>
 			<p>Items give code plus an error message or a log excerpt and ask what's wrong and which change fixes it. The three defect families in the guide each get a section, a corrected example and the traps behind the usual wrong answer. The request shapes themselves are in <a href="d2-skill-2-1.html">skill 2.1</a>; diagnosing failures in model output (hallucination, format drift) rather than in the integration is Domain 4.</p>
-			<p>Sources: Anthropic's documentation on API errors, rate limits, streaming, refusals and fallback, fallback credit and the Files API, plus the anthropic Python SDK 2.10.0 source, checked on 8 and 19 November 2026 and paraphrased. The three examples were run against the SDK with a mocked API, including the failure cases; SDK behaviours stated below were observed in those runs.</p>
-			<div class="callout note"><p><strong>Running example.</strong> The shop's back end calls Claude from a job queue: product descriptions, a gear advisor that streams long answers, and a supplier-document reader that uploads invoices, delivery-note photos and price lists.</p></div>
 
 			<!-- ===== Errors ===== -->
-			<h2 id="s1">Error classes</h2>
+			<h2 id="s1">Fix the request on 4xx errors; retry 429, 5xx, 529 and timeouts</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">What each status and error type means, and what it calls for.</span></p>
 				<p>Errors come back as JSON with an <code>error.type</code>, a message and a <code>request_id</code> (also in the <code>request-id</code> header; log it, because support asks for it). New <code>type</code> values can appear, so code must cope with ones it doesn't know.</p>
@@ -77,7 +77,7 @@
 			</div>
 
 			<!-- ===== SDK ===== -->
-			<h2 id="s2">What the SDK already does</h2>
+			<h2 id="s2">The SDK already retries twice; don't stack your own loop on top</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Retries, timeouts and typed exceptions, so you don't do them twice.</span></p>
 				<ul>
@@ -90,9 +90,9 @@
 			</div>
 
 			<!-- ===== Retry code ===== -->
-			<h2 id="s3">Retry logic that tells errors apart</h2>
+			<h2 id="s3">Catch the specific error classes first and sort outcomes into retry or fix</h2>
 			<div class="item">
-				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">A corrected wrapper for the shop's job queue.</span></p>
+				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">A corrected wrapper for a back-end job queue.</span></p>
 				<p>The broken version caught <code>Exception</code>, slept and retried three times on the same model. It re-sent invalid requests, hammered the API during a spend-cap outage, and treated a refusal as success because a refusal isn't an exception. The fix sorts every outcome into "try later" (the queue retries it) or "fix the request" (an alert, no retry):</p>
 				<div class="code"><span class="file">resilient_call.py (Python, anthropic SDK)</span>
 <pre><code>import logging
@@ -151,7 +151,7 @@ def ask(messages: list, model: str = PRIMARY):
 			</div>
 
 			<!-- ===== Fallback ===== -->
-			<h2 id="s4">Falling back after a refusal</h2>
+			<h2 id="s4">Retry a refusal on another model, on every request path</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Retrying a declined request on another model, the documented way.</span></p>
 				<p>On Fable 5.x, Opus 5 and 5.5, Sonnet 5.5 and Haiku 5.5, safety classifiers can decline a request: HTTP 200, <code>stop_reason: "refusal"</code>, and a <code>stop_details.category</code>. Sending the same request to the same model usually gets another refusal; another model can normally answer. There are three ways to do that:</p>
@@ -164,7 +164,7 @@ def ask(messages: list, model: str = PRIMARY):
 			</div>
 
 			<!-- ===== Streams ===== -->
-			<h2 id="s5">Streams that fail or stop early</h2>
+			<h2 id="s5">A stream is complete only when a stop reason arrives</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Terminal-event semantics and recovering a broken stream.</span></p>
 				<p>A healthy stream ends with <code>message_delta</code> (carrying <code>stop_reason</code> and cumulative usage) and then <code>message_stop</code>. Three things go wrong in practice:</p>
@@ -223,7 +223,7 @@ if __name__ == "__main__":
 			</div>
 
 			<!-- ===== Files ===== -->
-			<h2 id="s6">Ingesting files</h2>
+			<h2 id="s6">Match each file type to the right block, and watch file expiry</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Getting PDFs, images and other formats through the Files API.</span></p>
 				<p>The Files API (generally available, no beta header) stores an upload once and returns a <code>file_id</code> that requests reference. The block type has to match the file type:</p>
@@ -292,7 +292,7 @@ if __name__ == "__main__":
 			</div>
 
 			<!-- ===== Diagnosis ===== -->
-			<h2 id="s7">From symptom to defect</h2>
+			<h2 id="s7">Read each symptom back to the defect that causes it</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Reading the evidence the way exam items present it.</span></p>
 				<ul>
@@ -308,6 +308,44 @@ if __name__ == "__main__":
 				</ul>
 			</div>
 
+			<!-- Practice -->
+			<h2 id="practice">Practice questions</h2>
+			<div class="item">
+				<p>Exam-style questions written for these notes. Decide your answer before reading the explanation.</p>
+				<div class="record">
+					<div class="record-title">Question 1</div>
+					<dl>
+						<dt>Scenario</dt><dd>Logs show nine identical calls for one failed job. What is the defect?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> Rate limiting</li><li><b>B.</b> A hand-written retry loop wrapped around the SDK&rsquo;s own retries</li><li><b>C.</b> A streaming error</li><li><b>D.</b> A file expiry</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Three of yours times three of the SDK&rsquo;s; remove the loop and set max_retries.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 2</div>
+					<dl>
+						<dt>Scenario</dt><dd>An except InternalServerError clause is listed before except OverloadedError. What happens on a 529?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> It is caught as an overload</li><li><b>B.</b> It is caught by InternalServerError, since OverloadedError is its subclass</li><li><b>C.</b> It isn&rsquo;t caught</li><li><b>D.</b> It is retried forever</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Order except clauses most specific first.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 3</div>
+					<dl>
+						<dt>Scenario</dt><dd>Every request has failed with 429 for days, with no retry-after header. What is it?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> A rate limit; back off</li><li><b>B.</b> The monthly spend cap; backoff won&rsquo;t help</li><li><b>C.</b> A ramp limit</li><li><b>D.</b> An overload</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>enforced_spend_limit_reached keeps failing until access resumes.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 4</div>
+					<dl>
+						<dt>Scenario</dt><dd>Answers sometimes stop mid-sentence with no error logged. What should the code check?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> The HTTP status</li><li><b>B.</b> That the stream delivered a stop_reason; treat a missing one as an interruption</li><li><b>C.</b> content_block_stop</li><li><b>D.</b> The request ID</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>A stream that closes early raises nothing; only the missing stop reason shows it.</dd>
+					</dl>
+				</div>
+			</div>
+
 			<!-- Summary -->
 			<h2 id="summary">Key takeaways</h2>
 			<ul class="summary">
@@ -318,6 +356,13 @@ if __name__ == "__main__":
 				<li>Files API: PDF and text in <code>document</code>, images in <code>image</code>, other data in <code>container_upload</code>; convert .docx and .xlsx; 500 MB per file; workspace-scoped; optional expiry; uploads can't be downloaded.</li>
 			</ul>
 
+			<h2 id="sources">Official sources</h2>
+			<ul>
+				<li><a href="https://platform.claude.com/docs/en/api/errors">Errors</a> (Claude API docs): error types and request IDs</li>
+				<li><a href="https://platform.claude.com/docs/en/api/rate-limits">Rate limits</a> (Claude API docs): 429s, ramp limits and spend caps</li>
+				<li><a href="https://platform.claude.com/docs/en/build-with-claude/streaming">Streaming</a> (Claude API docs): event order and mid-stream errors</li>
+				<li><a href="https://platform.claude.com/docs/en/build-with-claude/files">Files API</a> (Claude API docs): block types, limits and expiry</li>
+			</ul>
 			<nav class="pager" aria-label="Skill navigation">
 				<a href="d2-skill-2-3.html"><small>Previous</small>2.3: Configuration and SDLC Integration</a>
 				<a class="next" href="d3-skill-3-1.html"><small>Next</small>3.1: Claude Code Operation</a>
