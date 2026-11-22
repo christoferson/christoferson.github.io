@@ -56,12 +56,14 @@
 			<p>On this page</p>
 			<ol>
 				<li><a href="#overview">Overview</a></li>
-				<li><a href="#s1">Agentic search or a RAG pipeline</a></li>
-				<li><a href="#s2">Chunking, embeddings, hybrid search, reranking</a></li>
-				<li><a href="#s3">Grounding: citations and "not found"</a></li>
+				<li><a href="#s1">Agentic search or RAG</a></li>
+				<li><a href="#s2">Retrieval pipeline</a></li>
+				<li><a href="#s3">Grounding</a></li>
 				<li><a href="#s4">Confidence signals</a></li>
-				<li><a href="#s5">Diagnosing failures by stage</a></li>
+				<li><a href="#s5">Diagnosing by stage</a></li>
+				<li><a href="#practice">Practice questions</a></li>
 				<li><a href="#summary">Key takeaways</a></li>
+				<li><a href="#sources">Official sources</a></li>
 			</ol>
 		</nav>
 
@@ -73,13 +75,12 @@
 				<p><strong>Retrieval and Knowledge Grounding at Scale</strong>: "Evaluating retrieval architecture for knowledge-grounded production applications, including agentic search versus RAG tradeoffs, chunking and embedding strategy, hybrid search, and reranking, and designing grounding practices such as source citation, uncertainty declaration, and confidence signals, and diagnosing retrieval-quality failures by stage."</p>
 			</div>
 			<p>Exam items give a retrieval-grounded system with poor answers and its traces, and ask which stage failed or which design change fixes it. Choosing an architecture from corpus and query shape is <a href="../anthropic-ccar-p/d3-skill-3-5.html">CCAR-P 3.5</a>; building a single grounded request is <a href="../anthropic-ccdv-f/d6-skill-6-4.html">CCDV-F 6.4</a>.</p>
-			<p>Sources: Anthropic&rsquo;s contextual retrieval and context engineering posts, and the citations, search results and reduce-hallucinations pages used for the earlier notes, paraphrased. The stage order, thresholds and confidence rule are my own; the operator, files and code are original, and the code is tested with the request sent through the SDK to a mocked API.</p>
-			<div class="callout note"><p><strong>Running example.</strong> A mobile network operator&rsquo;s field engineers ask an assistant about equipment limits and procedures. The library is about two million pages of vendor manuals and internal method statements, updated weekly, and answers are used on site.</p></div>
 
 			<!-- ===== Arch ===== -->
-			<h2 id="s1">Agentic search or a RAG pipeline</h2>
+			<h2 id="s1">At scale, use RAG for the common path and agentic search as the fallback</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">The trade-off at scale.</span></p>
+				<p>Take an assistant that answers questions from about two million pages of equipment manuals and procedures, updated weekly, with answers used on site.</p>
 				<figure class="arch-fig">
 <svg class="dg dg-wide" viewBox="0 0 880 240" role="img" aria-labelledby="dgp24-wide-t">
 <title id="dgp24-wide-t">Grounded retrieval at scale: a RAG pipeline with hybrid search and reranking handles the common path; a confident match is answered with citations; a weak one falls back to agentic search; if that finds nothing, the answer says so.</title>
@@ -163,21 +164,21 @@
 			</div>
 
 			<!-- ===== Pipeline ===== -->
-			<h2 id="s2">Chunking, embeddings, hybrid search, reranking</h2>
+			<h2 id="s2">Chunk by structure, add context to chunks, combine keyword and vector search, then rerank</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Each stage can lose the answer.</span></p>
 				<ul>
 					<li><strong>Chunking:</strong> size, boundaries and overlap matter. A limit stated in a table and qualified in the next paragraph needs both in one chunk; split along the document&rsquo;s own structure (sections, procedures) rather than fixed lengths alone.</li>
 					<li><strong>Contextual retrieval:</strong> prepend 50 to 100 tokens of document context to each chunk ("which manual, which model, which section") before embedding <em>and</em> before building the keyword index. In Anthropic&rsquo;s tests this cut top-20 retrieval failures by 35% with embeddings, 49% adding contextual BM25, and 67% adding reranking. With prompt caching the one-time cost was about $1.02 per million document tokens.</li>
 					<li><strong>Embeddings:</strong> choose and evaluate on your own queries; Voyage and Gemini embeddings did best in Anthropic&rsquo;s tests. Re-embedding the corpus is a migration, so version the index.</li>
-					<li><strong>Hybrid search:</strong> embeddings catch meaning; BM25 catches exact strings such as part numbers and error codes, which field questions are full of.</li>
+					<li><strong>Hybrid search:</strong> embeddings catch meaning; BM25 catches exact strings such as part numbers and error codes, which technical questions are full of.</li>
 					<li><strong>Reranking:</strong> retrieve a wide pool (about 150), rerank to about 20. It adds latency and cost per query and gave the largest single gain.</li>
 					<li><strong>Freshness:</strong> re-index as often as the library changes, and record the document version in each chunk so stale answers can be traced.</li>
 				</ul>
 			</div>
 
 			<!-- ===== Grounding ===== -->
-			<h2 id="s3">Grounding: citations and "not found"</h2>
+			<h2 id="s3">Ground answers with citations and give Claude a way to say it doesn't know</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Answers tied to passages, and permission not to answer.</span></p>
 				<div class="code"><span class="file">grounded_request.py (grounded_request.py)</span>
@@ -223,19 +224,19 @@ def confidence(response_blocks: list[dict], chunks: list[dict]) -&gt; str:
 			</div>
 
 			<!-- ===== Confidence ===== -->
-			<h2 id="s4">Confidence signals</h2>
+			<h2 id="s4">Compute confidence in code from retrieval scores and citation coverage</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">Your code computes it from the evidence.</span></p>
 				<ul>
 					<li><strong>Before the call:</strong> if the best reranker score is below a floor tuned on the labelled set, don&rsquo;t ask the model to answer from weak passages; route to agentic search.</li>
 					<li><strong>After the call:</strong> the share of answer text that carries a citation, combined with retrieval strength, gives high, medium or low. Low shows the sources prominently and suggests asking an engineer.</li>
 					<li><strong>Not the model&rsquo;s own rating:</strong> a self-reported "I&rsquo;m 90% sure" isn&rsquo;t calibrated. Measured signals can be checked against the labelled set and tuned.</li>
-					<li><strong>Show it to users:</strong> a label and the sources, so an engineer on a mast knows when to double-check.</li>
+					<li><strong>Show it to users:</strong> a label and the sources, so someone acting on the answer knows when to double-check.</li>
 				</ul>
 			</div>
 
 			<!-- ===== Diagnose ===== -->
-			<h2 id="s5">Diagnosing failures by stage</h2>
+			<h2 id="s5">Find the first stage that lost the answer, and fix that stage</h2>
 			<div class="item">
 				<p class="skill-line"><span class="kicker">Skill 2.4</span><span class="skill-text">The first stage that lost the answer is the cause.</span></p>
 				<div class="code"><span class="file">diagnose.py (diagnose.py)</span>
@@ -274,6 +275,44 @@ def report(cases: list[dict]) -&gt; dict:
 				<div class="callout trap"><p><strong>"Answers are wrong, so switch to a larger model"</strong> fixes only the generation stage. If the right chunk was ranked out or never indexed, no model can cite it; the stage report shows where to spend the effort.</p></div>
 			</div>
 
+			<!-- Practice -->
+			<h2 id="practice">Practice questions</h2>
+			<div class="item">
+				<p>Exam-style questions written for these notes. Decide your answer before reading the explanation.</p>
+				<div class="record">
+					<div class="record-title">Question 1</div>
+					<dl>
+						<dt>Scenario</dt><dd>Questions often contain exact part numbers and error codes, and vector search misses them. What should be added?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> A larger embedding model</li><li><b>B.</b> Keyword (BM25) search alongside embeddings, then reranking</li><li><b>C.</b> Smaller chunks only</li><li><b>D.</b> A longer prompt</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Embeddings capture meaning; keyword search matches exact strings. Hybrid search plus reranking covers both.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 2</div>
+					<dl>
+						<dt>Scenario</dt><dd>A limit is stated in a table and qualified in the next paragraph, and answers keep quoting the limit without the qualification. Which stage is at fault?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> Generation</li><li><b>B.</b> Chunking, which split the table from its qualification</li><li><b>C.</b> Reranking</li><li><b>D.</b> Citations</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Chunking along the document&rsquo;s structure keeps related content in one chunk.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 3</div>
+					<dl>
+						<dt>Scenario</dt><dd>Answers are wrong, and the team proposes a larger model. Traces show the right chunk was never in the top 150. What should they fix?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> The model</li><li><b>B.</b> Retrieval (or indexing), since no model can cite a passage it never received</li><li><b>C.</b> The citation settings</li><li><b>D.</b> The answer format</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Diagnose by the first stage that lost the answer; here it is before generation.</dd>
+					</dl>
+				</div>
+				<div class="record">
+					<div class="record-title">Question 4</div>
+					<dl>
+						<dt>Scenario</dt><dd>How should the app decide when to label an answer as low confidence?<ol class="opts" style="list-style:none;padding-left:0;margin:8px 0 0"><li><b>A.</b> Ask Claude to rate itself</li><li><b>B.</b> Compute it from retrieval scores and the share of the answer backed by citations, tuned on labelled data</li><li><b>C.</b> Use answer length</li><li><b>D.</b> Always label high</li></ol></dd>
+						<dt>Answer</dt><dd>B</dd>
+						<dt>Why</dt><dd>Measured signals can be calibrated; a model&rsquo;s self-rating isn&rsquo;t.</dd>
+					</dl>
+				</div>
+			</div>
+
 			<!-- Summary -->
 			<h2 id="summary">Key takeaways</h2>
 			<ul class="summary">
@@ -284,6 +323,13 @@ def report(cases: list[dict]) -&gt; dict:
 				<li>Diagnose by stage in pipeline order, and fix the stage with the most failures.</li>
 			</ul>
 
+			<h2 id="sources">Official sources</h2>
+			<ul>
+				<li><a href="https://www.anthropic.com/engineering/contextual-retrieval">Introducing contextual retrieval</a> (Anthropic engineering): contextual embeddings, BM25 and reranking results</li>
+				<li><a href="https://platform.claude.com/docs/en/build-with-claude/search-results">Search results</a> (Claude API docs): search_result blocks and their citations</li>
+				<li><a href="https://platform.claude.com/docs/en/build-with-claude/citations">Citations</a> (Claude API docs): what citations guarantee and their limits</li>
+				<li><a href="https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations">Reduce hallucinations</a> (Claude API docs): allowing &ldquo;I don&rsquo;t know&rdquo; and restricting to sources</li>
+			</ul>
 			<nav class="pager" aria-label="Skill navigation">
 				<a href="d2-skill-2-3.html"><small>Previous</small>2.3: Production MCP and Change Management</a>
 				<a class="next" href="d3-skill-3-1.html"><small>Next</small>3.1: Telemetry and Instrumentation</a>
